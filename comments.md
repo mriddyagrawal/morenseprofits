@@ -3306,6 +3306,57 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of d9f2cb2 — chore(p6.0.deps): add plotly, drop altair from requirements.txt
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** First Phase-6 commit. Single-file mechanical edit. Adds `plotly>=5.20.0` (required for `graph_objects.Heatmap` + `customdata` tooltip composition per DESIGN_SPEC §2.1) and drops `altair` (DESIGN_SPEC §2.1 conditional satisfied: grep-clean across `src/`, `tests/`, `scripts/`).
+
+**What works:**
+- **Smallest-possible commit shape**: 1 file, +4/-1 lines. The smallest nuclear-commit-sized opener for Phase 6.
+- **In-line comment explains the WHY**, not the what, on the new dep line. References DESIGN_SPEC §2.1 by section number — future contributors find the rationale.
+- **Local-verification claim documented** in the commit body ("pytest → 367/367 (no regression — confirming the grep result)"). The grep + the test suite are independent checks; both passing is the right gate.
+
+**Live-verified:**
+- `import plotly` → installed at 6.7.0 (well above the `>=5.20.0` floor).
+- `import altair` → `ModuleNotFoundError` (gone).
+- `grep -rn "altair\|import altair\|from altair" src/ tests/ scripts/` → 0 matches. Grep is clean; the DESIGN_SPEC §2.1 conditional ("drop altair if a repo-wide grep shows no in-tree usage") is satisfied.
+- `.venv/bin/python -m pytest tests/` → **367/367** in 1.41s. No regression.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **Local install is plotly 6.7.0; requirement floor is 5.20.0.** That's intentional ("pin the floor; don't cap the ceiling"). Plotly 6.x introduced a few breaking changes (e.g., the new `plotly.express.imshow` API; removal of some deprecated paths), but `graph_objects.Heatmap` + `customdata` — the API DESIGN_SPEC §2.1 commits to — has been stable since Plotly 4. **No action needed**; just noting the floor-vs-installed delta for the record. If a future contributor pins a fresh venv at exactly 5.20.0, the same Heatmap code will work.
+
+2. **`requirements.txt` doesn't have a hash-pin / lockfile.** Per DESIGN_SPEC §6 dependency policy ("pin in requirements.txt to versions that produced a passing test suite; bump deliberately"), this is consistent with project convention. Hash-pinning is a Phase-7+ tooling concern.
+
+3. **`>=5.20.0` is the right floor.** Plotly 5.20 (March 2024) ships the modern `graph_objects.Heatmap` with `customdata`/`hovertemplate` interop. 5.19 had a known bug where multi-dim `customdata` got flattened in some hover paths. The floor avoids that.
+
+**Domain / correctness checks:**
+- **Determinism**: ✓ no functional changes; only dependency surface.
+- **No silent breakage**: ✓ pytest passes; grep is clean.
+- **Spec traceability**: ✓ commit body cites DESIGN_SPEC §2.1; the §2.1 → p6.0.deps → requirements.txt traceability holds.
+
+**What I tried:**
+- `.venv/bin/python -c "import plotly; import altair"` — plotly 6.7.0; altair ModuleNotFoundError. Both as expected.
+- `grep -rn "altair" src/ tests/ scripts/` — 0 matches.
+- Full pytest → 367/367.
+
+**Sequencing observation:** This is the right first Phase-6 commit. Single-file, mechanical, instantly reversible if needed, unblocks every subsequent Plotly-using commit (`feat(p6.3.pivot)`, `feat(p6.4.yoy)`, etc.). **My 3880d9d review block recommended starting with this commit — BUILDER followed through.** Good responsiveness.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4, the remaining Phase-6.0 sequence:
+1. ✅ `chore(p6.0.deps)` — **landed here.**
+2. `chore(p6.0.spec)` — SPECS §11 web/ page contract; sweep-discovery rule; canonical caveat copy as constants. **My lean: next.** Pins the public surface that the Phase-6.1 modules will implement against. Easier to land before code than to reverse-engineer afterward.
+3. `feat(p6.0.format)` — `src/web/_format.py` per DESIGN_SPEC §2.7. The `format_inr(x)` helper + percent formatter.
+4. `test(p6.0.format)` — boundary tests (₹1L threshold, ₹1Cr threshold, sign handling, ROI-without-sign vs P&L-with-sign).
+
+**Opportunistic riders** (not blocking, fit in the next doc-touching commit):
+- Mark DESIGN_SPEC §9.5 + §9.6 as `RESOLVED in 8893b81` (still stale from my prior reviews).
+- `git mv` the 4 mockup PNGs to `leaderboard.png` / `per_stock.png` / `heatmap.png` / `trends.png` per my 3880d9d review block.
+
+---
+
 ## Review of 3880d9d — docs(design): move DESIGN_SPEC → DESIGN/, add 4 tab mockups, update doc paths
 
 **Verdict:** ✅ accept
