@@ -8,7 +8,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.web.trends import render_headline, render_yoy, render_yoy_n
+from src.web.trends import render_headline, render_moy, render_yoy, render_yoy_n
 
 
 @pytest.fixture
@@ -348,6 +348,85 @@ def test_yoy_n_bar_heights_match_sample_sizes(captured_charts):
     bar = fig.data[0]
     assert list(bar.x) == [2023, 2024]
     assert list(bar.y) == [8, 12]
+
+
+# ============================================================
+# render_moy — MoY seasonality bars
+# ============================================================
+
+def test_moy_single_month_renders_empty_state(captured_charts):
+    """LOAD-BEARING per DESIGN_SPEC §2.6: <2 distinct eligible
+    months → trends_moy_single_month message; NO bar chart."""
+    rows = [_row(year=2024, month=1, roi_pct_annualized=20.0)] * 6
+    render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    kinds = [e["kind"] for e in captured_charts]
+    assert "info" in kinds
+    assert "plotly_chart" not in kinds
+    msg = next(e for e in captured_charts if e["kind"] == "info")["msg"]
+    assert "1 month" in msg
+
+
+def test_moy_multi_month_renders_bar(captured_charts):
+    """≥2 eligible months → real bar chart with month-labelled x-axis."""
+    rows = (
+        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct_annualized=20.0)] * 6 +
+        [_row(year=2024, month=3, roi_pct_annualized=-10.0)] * 6
+    )
+    render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
+    assert len(charts) == 1
+    bar = charts[0]["fig"].data[0]
+    assert bar.type == "bar"
+    # x labels in calendar order
+    assert list(bar.x) == ["Jan", "Feb", "Mar"]
+    assert list(bar.y) == [50.0, 20.0, -10.0]
+
+
+def test_moy_bars_colored_by_value_with_zmid_zero(captured_charts):
+    """LOAD-BEARING per DESIGN_SPEC §2.3: bars use RdYlGn diverging
+    around zero — red for losing months, green for winning. cmid=0
+    pinned so a future refactor that swaps to sequential is caught."""
+    rows = (
+        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct_annualized=-30.0)] * 6
+    )
+    render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    bar = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"].data[0]
+    # Marker color is the y-values themselves (color-by-value)
+    assert list(bar.marker.color) == [50.0, -30.0]
+    # cmid pinned at 0
+    assert bar.marker.cmid == 0
+
+
+def test_moy_hover_surfaces_n_per_month(captured_charts):
+    """Same N-discipline as YoY hover: customdata carries N so
+    seasonality calls can be cross-checked against sample size."""
+    rows = (
+        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct_annualized=20.0)] * 8
+    )
+    render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    bar = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"].data[0]
+    assert len(bar.customdata) == 2
+    assert "N:" in bar.hovertemplate
+    assert "%{customdata[0]}" in bar.hovertemplate
+
+
+def test_moy_silent_on_empty_or_missing_pair(captured_charts):
+    """Silent on no-data / no-pair (parent tab rendered upstream
+    empty-state)."""
+    render_moy(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "entry_offset_td": pd.Series(dtype="int64"),
+        "exit_offset_td": pd.Series(dtype="int64"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }), strategy=None, symbol=None, min_n=5)
+    assert len(captured_charts) == 0
 
 
 def test_naming_rule_pct_cards_have_percent_suffix(captured_metrics):

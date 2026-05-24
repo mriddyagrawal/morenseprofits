@@ -28,6 +28,13 @@ from src.web._format import format_pct
 from src.web.empty_state import render_empty
 
 
+# Calendar month abbreviations used as bar-chart tick labels. Jan=1..Dec=12.
+_MONTH_LABELS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
 # ============================================================
 # Selectors — same shape as heatmap.py's _selector
 # ============================================================
@@ -349,3 +356,90 @@ def render_yoy_n(
         range=[0, 100],   # win rate is bounded; pin so cross-year comparisons read right
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+# ============================================================
+# MoY seasonality bars — Phase 6.4 commit 21 (feat(p6.4.moy))
+# ============================================================
+
+def render_moy(
+    df: pd.DataFrame,
+    *,
+    strategy: Optional[str],
+    symbol: Optional[str],
+    min_n: int,
+) -> None:
+    """Plotly bar chart of median_roi_pct_annualized by calendar
+    month (Jan-Dec, folded across years) for one (strategy, symbol)
+    pair. Months with N < min_n excluded.
+
+    Bars colored RdYlGn diverging by their own value with zmid=0 —
+    matches the heatmap value-pane convention per DESIGN_SPEC §2.3
+    (red = loss, green = profit, no sequential-misleading).
+
+    Empty-state per §2.6:
+      - 0 filtered rows / no pair          → no_rows_after_filters
+      - <2 distinct eligible months        → trends_moy_single_month
+                                              with n_months interpolated
+    """
+    if len(df) == 0 or strategy is None or symbol is None:
+        return  # tab-level no-data state already rendered upstream
+
+    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    if len(pair) == 0:
+        return
+
+    monthly = summarize_by_month(pair)
+    eligible = monthly[monthly["n_trades"] >= min_n].sort_values("month")
+    n_months = int(eligible["month"].nunique())
+    if n_months < 2:
+        render_empty("trends_moy_single_month", n_months=n_months)
+        return
+
+    months = eligible["month"].astype(int).tolist()
+    medians = eligible["median_roi_pct_annualized"].astype(float).tolist()
+    n_per_month = eligible["n_trades"].astype(int).tolist()
+    labels = [_MONTH_LABELS[m - 1] for m in months]
+
+    fig = go.Figure(data=go.Bar(
+        x=labels,
+        y=medians,
+        marker=dict(
+            color=medians,           # color BY value
+            colorscale="RdYlGn",     # diverging per §2.3
+            cmid=0,                  # white at breakeven
+            colorbar=dict(title="%/yr", x=1.02),
+        ),
+        # Show N per bar in the hover so a "best month" call can be
+        # cross-checked against sample size (same discipline as YoY
+        # sister chart).
+        customdata=[[n] for n in n_per_month],
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Median ROI/yr: %{y:+.1f}%<br>"
+            "N: %{customdata[0]}"
+            "<extra></extra>"
+        ),
+        text=[f"{v:+.0f}%" for v in medians],
+        textposition="outside",
+    ))
+    fig.add_hline(
+        y=0, line_dash="dot", line_color="gray",
+        annotation_text="breakeven",
+        annotation_position="bottom right",
+    )
+    fig.update_layout(
+        title=f"Month-of-year seasonality — {strategy} × {symbol}",
+        xaxis_title="Month",
+        yaxis_title="Median ROI/yr (%)",
+        height=420,
+        margin=dict(l=60, r=60, t=50, b=50),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"Months with N ≥ {min_n} included. Bars folded across "
+        f"years — so this chart answers seasonality (which month "
+        f"is best?), not decay (which year is best?). "
+        f"For multi-year drift see the YoY chart above."
+    )
