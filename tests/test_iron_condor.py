@@ -399,7 +399,11 @@ def test_sweep_one_iron_condor_uses_spot_based_margin(monkeypatch, tmp_path):
             "lot_size": pd.array([250, 250], dtype="int64"),
         })
     monkeypatch.setattr(options_loader, "load_option", fake_load_option)
+    # Both modules import RESULTS_DIR independently from src.config —
+    # patch both to prevent leaks into the real data/results/ dir.
     monkeypatch.setattr(sweeper_mod, "RESULTS_DIR", tmp_path)
+    from src.engine import results as results_mod
+    monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)
     cache.CACHE_DIR = tmp_path
 
     out = sweep_one(

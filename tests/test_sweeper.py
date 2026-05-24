@@ -95,7 +95,15 @@ def _wire_mocks(monkeypatch, *, entry_date=date(2024, 1, 4), exit_date=date(2024
 
 
 def _redirect_results(monkeypatch, tmp_path):
+    """Redirect BOTH sweeper.RESULTS_DIR (cache-hit check) AND
+    results.RESULTS_DIR (the actual write path through results_path).
+    Patching only one leaves the other pointing at the real cache, so
+    tests would leak small parquets into data/results/. Both modules
+    `from src.config import RESULTS_DIR` independently → both need
+    patching."""
     monkeypatch.setattr(sweeper_mod, "RESULTS_DIR", tmp_path)
+    from src.engine import results as results_mod
+    monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)
 
 
 # ============================================================
