@@ -40,9 +40,11 @@ SUMMARY_COLUMNS: tuple[str, ...] = (
     # std_* columns use population std (ddof=0) so an n=1 group gets
     # std=0 (not NaN, which would break sort_values rankings). The
     # consequence: this is OBSERVED-SAMPLE DISPERSION, not an unbiased
-    # estimate of population variance. For n=5 the bias vs ddof=1 is
-    # ~20%, for n=20 it's ~2.5%; treat the column as a LOWER BOUND on
-    # true population spread. Reviewer flag from afdd56e.
+    # estimate of population variance. Bias vs ddof=1 sample-std:
+    # ~11% at n=5, ~5% at n=10, ~2.5% at n=20 (= 1 − sqrt((n-1)/n)).
+    # The original afdd56e review wording cited ~20% at n=5, which was
+    # the VARIANCE gap (1 − (n-1)/n); for STD the gap is the sqrt of
+    # that. Treat the column as a LOWER BOUND on true population spread.
     "mean_roi_pct",
     "median_roi_pct",
     "std_roi_pct",

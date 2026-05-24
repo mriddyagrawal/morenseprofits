@@ -321,8 +321,8 @@ Decisions here intentionally minimize Phase-7 surgery and prevent duplication:
 - **CSV / PNG export.** Phase 6 doesn't ship export buttons. `st.download_button` is trivial to add later.
 - **Compound-return projection.** SPECS §4a caveat: `total_net_pnl` is a sum, not compounded. Phase 6 reports both `mean_net_pnl` per trade and `total_net_pnl` over the sample but no compounded projection — Phase 7+ when capital-allocation modeling lands.
 - **Per-symbol slippage override.** SPECS §4b backlog. Phase 6 reports under uniform 1% slippage; UI doesn't expose the knob.
-- **`verify_p5` section (b) prints unmasked heatmap + a count instead of the masked view.** Reviewer flagged 416719f. Tiny (~3 lines) opportunistic followup; lands as `chore(p5.followup): verify_p5 prints masked heatmap` whenever someone touches the script next. Not Phase-6-blocking — verify scripts are operator-facing, not UI-facing.
-- **Empty-frame StringDtype** drifts to object via `_inferred_dtype` (1a5cf01). Cosmetic; deferred.
+- ~~**`verify_p5` section (b) prints unmasked heatmap + a count instead of the masked view.**~~ **RESOLVED in 8893b81** — `scripts/verify_p5.py` lines 120-129 now print the masked view alongside the count; on the current 18-trade dataset this surfaces a fully NaN grid (each cell n=3 < MIN_N=5).
+- ~~**Empty-frame StringDtype** drifts to object via `_inferred_dtype` (1a5cf01).~~ **RESOLVED in 8893b81** — `src/engine/results.py` `_inferred_dtype` now maps string-like columns (`strategy`, `symbol`, `run_id`, `params_json`, `legs_json`, `*_breakdown_json`, `skip_reason`) to `pd.StringDtype()`.
 
 ## 10. Usefulness check — 5-minute operator journey
 
