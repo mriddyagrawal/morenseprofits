@@ -18,8 +18,11 @@ import pytest
 from src.analytics.aggregate import (
     MIN_N_FOR_RANKING,
     SUMMARY_COLUMNS,
+    YEARLY_SUMMARY_COLUMNS,
     empty_summary_frame,
+    empty_yearly_summary_frame,
     summarize_by_stock_strategy,
+    summarize_by_year,
 )
 
 
@@ -198,6 +201,140 @@ def test_perfect_win_rate_when_all_win():
     ]))
     assert df.iloc[0]["n_winning"] == 2
     assert df.iloc[0]["win_rate_pct"] == 100.0
+
+
+# ============================================================
+# summarize_by_year — Phase 5.3 trend aggregator
+# ============================================================
+
+def _yr(strategy, symbol, year, net_pnl, roi_pct, roi_pct_annualized):
+    """Convenience builder — `expiry` is what drives `year`."""
+    return {
+        "strategy": strategy, "symbol": symbol,
+        "expiry": pd.Timestamp(f"{year}-06-15"),  # mid-year placeholder
+        "net_pnl": net_pnl, "roi_pct": roi_pct,
+        "roi_pct_annualized": roi_pct_annualized,
+    }
+
+
+def test_yearly_empty_frame_has_canonical_schema():
+    df = empty_yearly_summary_frame()
+    assert list(df.columns) == list(YEARLY_SUMMARY_COLUMNS)
+    assert len(df) == 0
+    assert "year" in df.columns
+    assert str(df["year"].dtype) == "int64"
+
+
+def test_yearly_columns_extend_summary_with_year():
+    """The yearly schema = (strategy, symbol, year) + per-row stats.
+    Pin the exact column shape so a future refactor that drops 'year'
+    or reorders the prefix is visible."""
+    assert YEARLY_SUMMARY_COLUMNS[:3] == ("strategy", "symbol", "year")
+    # Stat columns are identical to SUMMARY_COLUMNS[2:]
+    assert YEARLY_SUMMARY_COLUMNS[3:] == SUMMARY_COLUMNS[2:]
+
+
+def test_yearly_groups_separately_across_years():
+    """Same (strategy, symbol) across 3 different years → 3 output
+    rows. The decay question depends on this row-per-year shape."""
+    df = summarize_by_year(_fixture([
+        _yr("short_straddle", "X", 2022, 100.0, 1.0, 12.0),
+        _yr("short_straddle", "X", 2022, 200.0, 2.0, 24.0),
+        _yr("short_straddle", "X", 2023, 50.0,  0.5, 6.0),
+        _yr("short_straddle", "X", 2024, -100.0, -1.0, -12.0),
+    ]))
+    assert len(df) == 3
+    assert list(df["year"]) == [2022, 2023, 2024]
+    # 2022: 2 trades, both winning
+    row_2022 = df[df["year"] == 2022].iloc[0]
+    assert row_2022["n_trades"] == 2
+    assert row_2022["n_winning"] == 2
+    assert row_2022["win_rate_pct"] == 100.0
+    assert row_2022["median_roi_pct_annualized"] == 18.0
+    # 2024: 1 trade, losing
+    row_2024 = df[df["year"] == 2024].iloc[0]
+    assert row_2024["n_trades"] == 1
+    assert row_2024["win_rate_pct"] == 0.0
+
+
+def test_yearly_decay_visible_as_descending_median_roi():
+    """Hand-crafted decay scenario: 2022 median +20%, 2023 +10%, 2024
+    +5%. The Phase-6 decay plot shows median_roi_pct_annualized along
+    the y-axis as year increases; it should monotonically decline here.
+
+    This pins the typical "is the strategy decaying" use case."""
+    df = summarize_by_year(_fixture([
+        _yr("S", "X", 2022, 200.0, 2.0, 20.0),
+        _yr("S", "X", 2023, 100.0, 1.0, 10.0),
+        _yr("S", "X", 2024, 50.0,  0.5, 5.0),
+    ]))
+    medians = list(df.sort_values("year")["median_roi_pct_annualized"])
+    assert medians == [20.0, 10.0, 5.0]
+    # Strictly monotonically decreasing — the decay signal
+    assert medians[0] > medians[1] > medians[2]
+
+
+def test_yearly_year_derived_from_expiry_not_entry_date():
+    """SPECS convention: 'year of the trade' = expiry's year. A
+    December-29 expiry traded in late November still counts as the
+    expiry-year, NOT the entry-year. The decay analysis is keyed to
+    when the trade settled, not when it opened."""
+    df = summarize_by_year(_fixture([
+        {**_yr("S", "X", 2024, 100.0, 1.0, 12.0),
+         "expiry": pd.Timestamp("2024-12-31")},
+        {**_yr("S", "X", 2024, 200.0, 2.0, 24.0),
+         "expiry": pd.Timestamp("2024-01-25")},
+    ]))
+    # Both belong to year 2024 — one output row.
+    assert len(df) == 1
+    assert df.iloc[0]["year"] == 2024
+    assert df.iloc[0]["n_trades"] == 2
+
+
+def test_yearly_separate_symbols_get_separate_rows():
+    """Different symbols in same year → separate rows."""
+    df = summarize_by_year(_fixture([
+        _yr("S", "RELIANCE", 2024, 100.0, 1.0, 12.0),
+        _yr("S", "INFY",     2024, 200.0, 2.0, 24.0),
+    ]))
+    assert len(df) == 2
+    assert set(df["symbol"]) == {"RELIANCE", "INFY"}
+
+
+def test_yearly_empty_input_returns_canonical_empty_frame():
+    df = summarize_by_year(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }))
+    assert list(df.columns) == list(YEARLY_SUMMARY_COLUMNS)
+    assert len(df) == 0
+
+
+def test_yearly_missing_expiry_column_raises():
+    """Year derivation needs expiry — loud error if missing."""
+    bad = pd.DataFrame([{
+        "strategy": "s", "symbol": "x",
+        "net_pnl": 1.0, "roi_pct": 1.0, "roi_pct_annualized": 1.0,
+    }])
+    with pytest.raises(ValueError, match="expiry"):
+        summarize_by_year(bad)
+
+
+def test_yearly_sample_size_surfaced_per_year():
+    """Same MIN_N_FOR_RANKING discipline: n_trades surfaced per year
+    so consumers can suppress thin-sample years from a decay trend."""
+    df = summarize_by_year(_fixture([
+        _yr("S", "X", 2022, 100.0, 1.0, 12.0),                # N=1 for 2022
+        *[_yr("S", "X", 2023, 100.0, 1.0, 12.0) for _ in range(6)],  # N=6
+    ]))
+    sizes = dict(zip(df["year"], df["n_trades"]))
+    assert sizes == {2022: 1, 2023: 6}
+    # 2022's row is INCLUDED (no silent drop) — consumer-side filter
+    assert (df["n_trades"] < MIN_N_FOR_RANKING).any()
 
 
 def test_zero_net_pnl_does_not_count_as_winning():
