@@ -1479,3 +1479,37 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** **Move to Phase 2 (universe selection).** The PLAN.md sequence is p2.1 `blue_chip` → p2.2 `momentum classifier` → p2.3 CLI → p2.4 tests. For **`feat(p2.1): blue_chip universe`**, the load-bearing design decision is **how to handle membership drift over time**. Nifty 50 has changed composition ~12 times since 2019, and a true reproducible backtest sweeping 2019→2024 must use the correct membership *as of each year*, not a 2024 snapshot retrospectively applied to 2019 prices (that's the classic *survivorship bias*). Two paths: **(a)** hardcoded `BLUE_CHIP_BY_QUARTER: dict[date, list[str]]` with explicit `as_of` keys and a source citation per snapshot; OR **(b)** a single `BLUE_CHIP_2024_07_01` snapshot with a SPECS callout that v1 ignores survivorship bias (and Phase 7 fixes it). I lean (b) for v1 simplicity, but the *survivorship caveat must be visible in every UI rendering of universe-rooted backtest results* — Phase 5/6 plumbing. Pin the choice + caveat in SPECS before writing the list.
 
 ---
+
+## Review of d61b164 — chore(p2.0): SPECS for universe — survivorship-bias policy + schema + sigs
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin the universe contracts (blue-chip + momentum + survivorship caveat) BEFORE writing any code. Phase 2 work then becomes mechanical.
+
+**What works:**
+- **Chose option (b) with explicit caveat** — matches my recommendation. Single 2024-07-01 Nifty 50 snapshot for v1.
+- **`as_of: date` parameter required even though v1 ignores it** ([SPECS.md:282-283](SPECS.md#L282-L283)) — future-proofs the API for Phase 7's `BLUE_CHIP_BY_QUARTER` without breaking callers. Smart.
+- **Survivorship bias is §6b.3** ([SPECS.md:399-414](SPECS.md#L399-L414)) — explicit section with three mitigations: UI disclaimer, Phase 7 backlog item, and visible in §6b.3 itself. The "load-bearing caveat" framing is the right level of severity.
+- **Momentum classifier defined precisely** ([SPECS.md:387-397](SPECS.md#L387-L397)) — tercile on trailing-6mo returns, bullish/neutral/non_bullish, output sorted alphabetically per list for determinism.
+- **PLAN.md decomposed into 6 nuclear steps** ([PLAN.md:112-117](PLAN.md#L112-L117)), CLI dropped (deferred to Phase 7, not load-bearing).
+- **Exit criterion strengthened** from "identical" → "byte-identical" ([PLAN.md:120](PLAN.md#L120)).
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- **Why 2024-07-01 as the snapshot date?** SPECS picks it without justification. Likely "recent + first day of H2 2024 + post the Adani/Zomato/etc. recent additions". A one-line rationale would prevent "should we update to 2024-12-31?" debates later. Cosmetic.
+- **Tercile boundary math under-specified.** For Nifty 50 = 50 symbols, top third = 17 (ceil) or 16 (floor)? Spec says "top third → bullish; middle third → neutral; bottom third → non_bullish" without resolving the 50/3 remainder allocation. State explicitly: "with `n = len(universe)`, bullish = first `ceil(n/3)`, neutral = next `n - 2*ceil(n/3) + ceil(n/3)` ≈ `n - ceil(n/3) - floor(n/3)`, non_bullish = last `floor(n/3)`"; or pick a simple rule like `ceil/floor/floor`. Otherwise the implementer makes an arbitrary call and the test pins whatever they chose. Worth one line.
+- **`as_of - lookback_months` may land on a holiday/weekend.** For `lookback_months=6` from `as_of=2024-07-01`, the lookback date is `2024-01-01` — Republic Day weekend territory. `load_spot` will then return zero rows for that exact date, and the trailing-return calc divides by 0 or KeyErrors. The momentum classifier needs to **round the lookback date to the most recent trading day on or before `as_of - lookback_months`** — `trading_calendar.offset_trading_days(as_of - lookback_months_as_days, 0)` works. Pin this in SPECS §6b.2 before implementation.
+- **Delisted symbols.** If a 2024-07-01 Nifty 50 stock had been delisted before `as_of`, `load_spot` would `MissingDataError`. Should the classifier (a) drop the symbol with a warning, or (b) propagate? Pick now, document.
+- **No mention of Nifty 50 vs other indices.** "Blue chip" loosely; Phase 7 may want Sensex/Nifty100. Worth one line noting v1 is Nifty 50 only and Phase 7 can add other index_snapshots.
+
+**Domain / correctness checks:**
+- **Survivorship bias:** correctly identified as the dominant statistical concern.
+- **Look-ahead bias:** the `as_of` parameter is the right abstraction; the classifier uses prices through `as_of`, not future. Implicit but worth a comment.
+- **Statistical claims:** tercile cut on trailing return is a reasonable proxy for momentum — defensible methodology; can sensitivity-test in Phase 5.
+
+**What I tried:** Read the SPECS diff in full; cross-referenced the function signatures against the planned p2.1 + p2.2 implementations.
+
+**Next-commit suggestion:** `feat(p2.1): src/universe/blue_chip.py`. Two load-bearing things to get right: **(1)** the 50 symbols themselves — pull from NSE's published Nifty 50 list as of 2024-07-01 (e.g. NSE's index info page) and cite the exact source URL + access date in the file header. A future "update to 2024-12-31" then has a single-source-of-truth to consult. **(2)** the `as_of` parameter is required but ignored in v1 — return the same list regardless. **Test** (next commit): assert `len(blue_chip(any_date)) == 50`; assert `blue_chip(date(2024,1,1)) == blue_chip(date(2024,12,31))` (the ignored-as_of contract); assert the list is sorted alphabetically; spot-check a few known constituents (RELIANCE, TCS, HDFCBANK, INFY all in). The exact 50-list itself doesn't need a `pd.testing.assert_frame_equal`-style pin — a count + sort + spot-check is enough; if a deliberate update happens, the file changes but the test invariants hold.
+
+---
