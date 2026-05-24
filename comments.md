@@ -2392,3 +2392,50 @@ This is the answer to the user's exact question from the cost/margin thread. A n
 **Next-commit suggestion:** `feat(p4.1): src/strategies/registry.py — name → Strategy mapping`. Should land as **one combined commit** with the small rename `SHORT_STRADDLE_MARGIN_OFFSET` (module constant) → `ShortStraddle.recommended_strategy_offset_pct` (class attribute) per the new §6c.1 contract — otherwise the registry will reference an attribute that doesn't exist yet. ~30 lines total. Then the load-bearing tests for the registry: (a) `STRATEGIES["short_straddle"]` returns a Strategy instance, (b) every registered strategy has the class attribute, (c) every registered strategy implements `generate_trades` (Protocol conformance check via `hasattr` or `isinstance(.., Strategy)` if you make it a runtime-checkable Protocol). After registry → p4.2 sweeper, which is where the determinism contract starts to matter.
 
 ---
+
+## Review of 481c566 — feat(p4.1): src/strategies/registry.py + recommended_strategy_offset_pct on ShortStraddle
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the registry per SPECS §6c.1. Combined with the `ShortStraddle.recommended_strategy_offset_pct` class-attribute rename so the sweeper's generic lookup pattern works.
+
+**What works:**
+- **Registry shape clean**: `STRATEGIES: dict[str, Strategy]`, `get_strategy(name)` with helpful KeyError, `list_strategies()` returns sorted names. Sweep iteration order pinned name-asc for determinism per §6c.3.
+- **`ShortStraddle.recommended_strategy_offset_pct = SHORT_STRADDLE_MARGIN_OFFSET`** — dataclass field defaults to the existing module constant. Backward-compat preserved (prior `SHORT_STRADDLE_MARGIN_OFFSET == 0.60` test still passes); canonical interface going forward is the field.
+- **`test_each_registered_strategy_has_required_attrs`** is the contract-structure test — pins the SPECS §6c.1 requirement (name, offset∈(0,1], callable generate_trades) so when Phase 4 adds 4 more strategies, this single test catches any registration that forgets the attribute. Sharp.
+- **`test_unknown_strategy_raises_with_available_list`** — pins the helpful-failure-message UX. Catches typos like "short_stradle".
+- **`test_list_strategies_sorted`** — explicit determinism pin.
+- 210/210 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No registration-time conformance check** — the registry takes any object as a value; the contract test catches missing attributes at test-runtime but not at module-import. A one-line `assert callable(strat.generate_trades)` at module top would fail loud on import if a future entry is malformed. Cosmetic.
+- **`isinstance(s, ShortStraddle)`** in `test_short_straddle_registered` is concrete-class. Phase 4 will add more strategies — the test should generalize to "name matches" (already done) but the type check is concrete. Defer; this test will be one of many type-pinning tests by Phase 4's end.
+- **`STRATEGIES` is module-level mutable** — a future bug could `STRATEGIES["short_straddle"] = AlternateImpl()` and persist. `MappingProxyType` would lock it but for a single-process project this is paranoia. Skip.
+
+**Domain / correctness checks:** N/A this commit — pure plumbing.
+
+**What I tried:**
+- `python -m pytest tests/test_registry.py -v` → 6/6 pass.
+- `python -m pytest tests/` → 210/210.
+- Read the registry + ShortStraddle changes end-to-end.
+
+**Next-commit suggestion:** `feat(p4.2): src/engine/sweeper.py — single-threaded sweep_one() + sweep_grid()`. THIS is where the SPECS §6c.2 per-task pricing path + §6c.3 determinism contract land. Load-bearing decisions:
+
+**(1) `run_id` default hash**: include `(sorted(strategies), sorted(symbols), sorted(expiries), tuple(entry_offsets_td), tuple(exit_offsets_td))`; EXCLUDE `today_fn`, `parallel`, `n_workers`, `offline`. Use `hashlib.sha256(...).hexdigest()[:16]` so it's short + reproducible. **Same inputs → same run_id → idempotent re-runs**.
+
+**(2) Skip policy implementation**: wrap `price_trade` call in `try / except MissingDataError, NoLiquidStrikeError: skip_log.append({...}); continue`. Do NOT catch `OfflineCacheMiss` (per §6a class distinction).
+
+**(3) Sort before persist**: `pd.concat(results).sort_values([strategy, symbol, expiry, entry_offset_td, exit_offset_td]).reset_index(drop=True)`. The §6c.3 determinism recipe.
+
+**(4) Load-bearing tests**:
+   - `test_single_task_sweep_matches_price_trade`: 1×1×1×1×1 grid → 1-row DataFrame equal to `price_trade(trade)` + decorations.
+   - `test_skip_policy_records_missing_data`: monkeypatch one task to raise MissingDataError → result has N-1 rows, skip log has 1 entry, no exception escapes.
+   - `test_offline_cache_miss_propagates_through_sweeper`: monkeypatch one task to raise OfflineCacheMiss → exception propagates, sweep terminates.
+   - `test_run_id_deterministic`: two `sweep_grid` calls with same inputs (different `today_fn`, `parallel`, `n_workers`) → same run_id.
+   - `test_output_sorted_by_canonical_key`: scramble input order, assert output sorted.
+
+After p4.2 → p4.3 (results store: write/read parquet) → p4.4.{a,b,c,d} (4 new strategies, with p4.4.d wiring the caveat #1 spot-vs-strike margin fix) → p4.5 (parallelize) → p4.5 test (byte-identical under n_workers=1 vs 4) → p4.verify (live small sweep).
+
+---
