@@ -18,10 +18,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-import pandas as pd
-
-from src.data import bhavcopy_fo_loader
-from src.data.errors import MissingDataError
+from src.strategies._strikes import (
+    NoLiquidStrikeError,
+    load_available_strikes,
+    pick_nearest,
+)
 from src.strategies.base import Leg, Trade
 
 
@@ -30,10 +31,10 @@ from src.strategies.base import Leg, Trade
 SHORT_STRADDLE_MARGIN_OFFSET = 0.60
 
 
-class NoLiquidStrikeError(MissingDataError):
-    """No traded strikes available for the symbol/expiry on entry_date.
-    Inherits MissingDataError so sweeper's `except MissingDataError`
-    skip-loop handles it uniformly."""
+# Re-exported here so existing `from src.strategies.short_straddle
+# import NoLiquidStrikeError` callers don't break — the canonical home
+# is now src.strategies._strikes.
+__all__ = ["SHORT_STRADDLE_MARGIN_OFFSET", "ShortStraddle", "NoLiquidStrikeError"]
 
 
 @dataclass(frozen=True)
@@ -92,20 +93,9 @@ def _pick_atm_strike(
     entry_date: date,
     spot_at_entry: float,
 ) -> int:
-    """SPECS §5: ATM = strike nearest to spot_at_entry; tiebreaker = lower."""
-    bc = bhavcopy_fo_loader.load_bhavcopy_fo(entry_date)
-    mask = (
-        (bc["symbol"] == symbol.upper())
-        & (bc["instrument"] == "OPTSTK")
-        & (bc["expiry"] == pd.Timestamp(expiry))
-        & (bc["option_type"].isin(["CE", "PE"]))
-    )
-    strikes = sorted({int(s) for s in bc.loc[mask, "strike"].dropna().tolist()})
-    if not strikes:
-        raise NoLiquidStrikeError(
-            f"no OPTSTK strikes for {symbol.upper()} {expiry} in bhavcopy "
-            f"on {entry_date} — symbol/expiry combination not traded?"
-        )
-    # Pick argmin(|K - spot|); tiebreaker = lower strike (sorted ascending,
-    # `min` with stable sort picks the first match → the lower strike).
-    return min(strikes, key=lambda k: (abs(k - spot_at_entry), k))
+    """SPECS §5 ATM picker. Kept as a thin wrapper so external callers
+    (LongStraddle, tests) that imported this name don't break. New
+    callers should use ``_strikes.load_available_strikes`` +
+    ``_strikes.pick_nearest`` directly."""
+    strikes = load_available_strikes(symbol, expiry, entry_date)
+    return pick_nearest(strikes, spot_at_entry)

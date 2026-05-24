@@ -7,26 +7,21 @@ Loses when the underlying drifts between the wings.
 Same OTM strike selection rule as ShortStrangle:
   - call_strike target = spot × (1 + ``strike_offset_pct``)
   - put_strike  target = spot × (1 − ``strike_offset_pct``)
-  - Both picked from available bhavcopy strikes via the SPECS §5
-    rule: argmin(|K − target|), tiebreaker = lower strike.
+  - Both picked from available bhavcopy strikes via the shared SPECS §5
+    helpers in ``_strikes``.
 
 Per SPECS §4a, long-only positions have NO SPAN portfolio-offset
 benefit — premium paid IS the max loss. So
 ``recommended_strategy_offset_pct = 1.0`` (no reduction).
-
-Shares `_pick_strangle_strikes` with ShortStrangle so both strategies
-use one targeting rule.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
 
+from src.strategies._strikes import load_available_strikes, pick_nearest
 from src.strategies.base import Leg, Trade
-from src.strategies.short_strangle import (
-    DEFAULT_STRIKE_OFFSET_PCT,
-    _pick_strangle_strikes,
-)
+from src.strategies.short_strangle import DEFAULT_STRIKE_OFFSET_PCT
 
 
 # Long-only → no offset benefit; margin = sum of premium-paid per leg.
@@ -58,9 +53,9 @@ class LongStrangle:
                 f"strike_offset_pct must be >= 0, got {offset!r}"
             )
 
-        call_strike, put_strike = _pick_strangle_strikes(
-            symbol, expiry, entry_date, spot_at_entry, offset,
-        )
+        strikes = load_available_strikes(symbol, expiry, entry_date)
+        call_strike = pick_nearest(strikes, spot_at_entry * (1.0 + offset))
+        put_strike = pick_nearest(strikes, spot_at_entry * (1.0 - offset))
         legs = (
             Leg(option_type="CE", strike=call_strike, side="BUY", qty_lots=1),
             Leg(option_type="PE", strike=put_strike, side="BUY", qty_lots=1),

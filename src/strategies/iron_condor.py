@@ -43,11 +43,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-import pandas as pd
-
-from src.data import bhavcopy_fo_loader
+from src.strategies._strikes import (
+    NoLiquidStrikeError,
+    load_available_strikes,
+    pick_nearest,
+)
 from src.strategies.base import Leg, Trade
-from src.strategies.short_straddle import NoLiquidStrikeError
 
 
 IRON_CONDOR_MARGIN_OFFSET = 0.35
@@ -124,31 +125,13 @@ def _pick_condor_strikes(
     inner_offset_pct: float,
     outer_offset_pct: float,
 ) -> tuple[int, int, int, int]:
-    """Return (inner_call, outer_call, inner_put, outer_put) from the
-    bhavcopy's available strikes. Each picked via SPECS §5 argmin rule;
-    duplicates are allowed if the grid is sparse (e.g., inner_call ==
-    outer_call when only one strike exists above spot)."""
-    bc = bhavcopy_fo_loader.load_bhavcopy_fo(entry_date)
-    mask = (
-        (bc["symbol"] == symbol.upper())
-        & (bc["instrument"] == "OPTSTK")
-        & (bc["expiry"] == pd.Timestamp(expiry))
-        & (bc["option_type"].isin(["CE", "PE"]))
-    )
-    strikes = sorted({int(s) for s in bc.loc[mask, "strike"].dropna().tolist()})
-    if not strikes:
-        raise NoLiquidStrikeError(
-            f"no OPTSTK strikes for {symbol.upper()} {expiry} in bhavcopy "
-            f"on {entry_date} — symbol/expiry combination not traded?"
-        )
-
-    inner_call_target = spot_at_entry * (1.0 + inner_offset_pct)
-    outer_call_target = spot_at_entry * (1.0 + outer_offset_pct)
-    inner_put_target = spot_at_entry * (1.0 - inner_offset_pct)
-    outer_put_target = spot_at_entry * (1.0 - outer_offset_pct)
-    # SPECS §5 nearest-with-lower-tiebreaker.
-    inner_call = min(strikes, key=lambda k: (abs(k - inner_call_target), k))
-    outer_call = min(strikes, key=lambda k: (abs(k - outer_call_target), k))
-    inner_put = min(strikes, key=lambda k: (abs(k - inner_put_target), k))
-    outer_put = min(strikes, key=lambda k: (abs(k - outer_put_target), k))
+    """Return (inner_call, outer_call, inner_put, outer_put) via the
+    shared SPECS §5 picker. Duplicates allowed if the grid is sparse
+    (e.g., inner_call == outer_call when only one strike exists above
+    spot — silent collapse to a degenerate call spread)."""
+    strikes = load_available_strikes(symbol, expiry, entry_date)
+    inner_call = pick_nearest(strikes, spot_at_entry * (1.0 + inner_offset_pct))
+    outer_call = pick_nearest(strikes, spot_at_entry * (1.0 + outer_offset_pct))
+    inner_put = pick_nearest(strikes, spot_at_entry * (1.0 - inner_offset_pct))
+    outer_put = pick_nearest(strikes, spot_at_entry * (1.0 - outer_offset_pct))
     return inner_call, outer_call, inner_put, outer_put

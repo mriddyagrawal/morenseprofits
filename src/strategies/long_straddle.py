@@ -17,8 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from src.strategies._strikes import load_available_strikes, pick_nearest
 from src.strategies.base import Leg, Trade
-from src.strategies.short_straddle import _pick_atm_strike
 
 
 # Long-only → no offset benefit; margin = sum of premium-paid per leg.
@@ -45,12 +45,13 @@ class LongStraddle:
     ) -> list[Trade]:
         """Return a single Trade with two BUY legs at the ATM strike.
 
-        Available strikes are read from the entry-day bhavcopy via
-        ``_pick_atm_strike`` (shared with ShortStraddle; same SPECS §5
-        rule). Raises ``NoLiquidStrikeError`` if no OPTSTK rows exist
-        for this symbol on entry_date.
+        Strike grid is read from the entry-day bhavcopy; ATM picked via
+        the shared SPECS §5 helpers in ``_strikes``. Raises
+        ``NoLiquidStrikeError`` if no OPTSTK rows exist for this symbol
+        on entry_date.
         """
-        atm = _pick_atm_strike(symbol, expiry, entry_date, spot_at_entry)
+        strikes = load_available_strikes(symbol, expiry, entry_date)
+        atm = pick_nearest(strikes, spot_at_entry)
         legs = (
             Leg(option_type="CE", strike=atm, side="BUY", qty_lots=1),
             Leg(option_type="PE", strike=atm, side="BUY", qty_lots=1),

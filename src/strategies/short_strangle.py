@@ -23,11 +23,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-import pandas as pd
-
-from src.data import bhavcopy_fo_loader
+from src.strategies._strikes import (
+    NoLiquidStrikeError,
+    load_available_strikes,
+    pick_nearest,
+)
 from src.strategies.base import Leg, Trade
-from src.strategies.short_straddle import NoLiquidStrikeError
 
 
 SHORT_STRANGLE_MARGIN_OFFSET = 0.70
@@ -87,32 +88,10 @@ def _pick_strangle_strikes(
     spot_at_entry: float,
     offset_pct: float,
 ) -> tuple[int, int]:
-    """Return (call_strike, put_strike) for the strangle.
-
-    Both strikes picked from the entry-day bhavcopy via the SPECS §5
-    argmin(|K − target|) + lower-tiebreaker rule. If the bhavcopy has
-    no strikes for this symbol/expiry, raises NoLiquidStrikeError.
-
-    Note: when `offset_pct = 0`, both targets equal `spot_at_entry` so
-    call_strike == put_strike (degenerates to the ATM straddle).
-    """
-    bc = bhavcopy_fo_loader.load_bhavcopy_fo(entry_date)
-    mask = (
-        (bc["symbol"] == symbol.upper())
-        & (bc["instrument"] == "OPTSTK")
-        & (bc["expiry"] == pd.Timestamp(expiry))
-        & (bc["option_type"].isin(["CE", "PE"]))
-    )
-    strikes = sorted({int(s) for s in bc.loc[mask, "strike"].dropna().tolist()})
-    if not strikes:
-        raise NoLiquidStrikeError(
-            f"no OPTSTK strikes for {symbol.upper()} {expiry} in bhavcopy "
-            f"on {entry_date} — symbol/expiry combination not traded?"
-        )
-    call_target = spot_at_entry * (1.0 + offset_pct)
-    put_target = spot_at_entry * (1.0 - offset_pct)
-    # SPECS §5: tiebreaker = lower strike (already from sorted ascending +
-    # tuple key (|K-target|, K) picks the lower in equidistant ties).
-    call_strike = min(strikes, key=lambda k: (abs(k - call_target), k))
-    put_strike = min(strikes, key=lambda k: (abs(k - put_target), k))
+    """Return (call_strike, put_strike) for the strangle. Both picked
+    via SPECS §5 argmin rule. When ``offset_pct = 0`` both targets
+    collapse to spot → call_strike == put_strike (ATM straddle)."""
+    strikes = load_available_strikes(symbol, expiry, entry_date)
+    call_strike = pick_nearest(strikes, spot_at_entry * (1.0 + offset_pct))
+    put_strike = pick_nearest(strikes, spot_at_entry * (1.0 - offset_pct))
     return call_strike, put_strike
