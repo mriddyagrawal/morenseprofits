@@ -13,16 +13,18 @@ env/
 .ruff_cache/
 
 # Data caches & results (huge, derivable from jugaad-data)
-data/cache/
+# Wildcard so a CACHE_VERSION bump (which spawns data/cache.v0/) is also ignored.
+data/cache*/
 data/results/
 *.parquet
 !tests/fixtures/*.parquet
 
-# OS / editor
+# OS / editor / tooling state
 .DS_Store
 .idea/
 .vscode/
 *.swp
+.claude/
 
 # Streamlit
 .streamlit/secrets.toml

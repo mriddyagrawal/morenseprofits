@@ -62,7 +62,7 @@ The original ask centered on the **short straddle**; that remains the canonical 
 
 ### Granularity doctrine ("nuclear steps")
 
-A phase is a *goal*. A phase contains *steps*. A step maps to **exactly one commit** and is the smallest atomic change that still leaves the repo in a sensible state. Prefer many small commits over few large ones. After every commit the builder polls `comments.md` for new reviewer blocks before starting the next step. Reviewer blocking issues are addressed in the *very next* commit — no piling on new functionality first.
+A phase is a *goal*. A phase contains *steps*. A step maps to **exactly one commit** and is the smallest atomic change that still leaves the repo in a sensible state. Prefer many small commits over few large ones. After every commit the builder polls `comments.md` for new reviewer blocks before starting the next step. Reviewer **blocking** issues are addressed in the *very next* commit — no piling on new functionality first. Reviewer **non-blocking** suggestions are addressed opportunistically but no later than the end of the current phase; if deferred past the phase boundary they get an entry in the open-questions section so they aren't lost.
 
 Each phase ends with **tests passing** + every planned step committed + a status note added to this file.
 

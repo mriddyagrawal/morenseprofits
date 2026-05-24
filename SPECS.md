@@ -103,6 +103,8 @@ Columns (subset of jugaad `stock_df`, normalized):
 | `expiry_date` | `date` |
 | `month_anchor` | `date` (first calendar day of expiry month) |
 
+> **jugaad-data gotcha:** `expiry_dates(dt, contracts=N)` is **not** "the next N expiries". It returns the set of expiries that had **more than N contracts traded** in the F&O bhavcopy for `dt` (see `archives.py:504`). With `contracts=0` (default) it returns every expiry that showed up in the F&O book on day `dt`. For our expiry calendar, the right approach is to sample the F&O bhavcopy on the first trading day of each month in the lookback window, union the OPTSTK expiries that match `symbol`, and deduplicate. Phase 1.3 implements this.
+
 ### 2.4 Results — `data/results/{strategy}_{run_id}.parquet`
 One row per closed trade.
 | col | dtype | notes |
@@ -227,6 +229,10 @@ If `available_strikes` is empty (illiquid contract), engine raises `NoLiquidStri
 - "Entry offset = 15" means `entry_date = offset_trading_days(expiry, 15)`.
 - "Exit offset = 1" means `exit_date = offset_trading_days(expiry, 1)`; offset 0 = expiry day itself.
 - Trading-day calendar is derived from `load_spot("RELIANCE", ...)` dates (always-traded liquid blue chip used as the calendar source-of-truth). Cached.
+
+## 6a. Offline mode (cache-only enforcement)
+
+Loaders accept an optional `offline: bool = False` keyword (default off). When True, a cache miss raises `MissingDataError` rather than falling back to network. Equivalent env-var override: `MORENSE_OFFLINE=1`. Phase 1.5 wires this and adds telemetry that prints a one-line warning whenever a loader hits the network (regardless of offline mode) so sweep runs surface accidental fetches.
 
 ## 7. Cache invalidation
 

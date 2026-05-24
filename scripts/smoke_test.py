@@ -24,18 +24,25 @@ def main() -> None:
     atm_strike = round(spot_at_first / 20) * 20  # RELIANCE strikes step in ₹20 around this price
     print(f"[atm] spot≈{spot_at_first:.2f} -> guess ATM strike {atm_strike}")
 
-    opt = derivatives_df(
-        symbol=sym,
-        from_date=date(2024, 1, 2),
-        to_date=exp,
-        expiry_date=exp,
-        instrument_type="OPTSTK",
-        strike_price=atm_strike,
-        option_type="CE",
-    )
-    assert not opt.empty, "options fetch returned empty"
-    print(f"[option] {sym} {exp} {atm_strike}CE rows={len(opt)} cols={len(opt.columns)}")
-    print(f"[option] sample MARKET LOT values: {sorted(set(opt['MARKET LOT'].tolist()))[:3]}")
+    for ot in ("CE", "PE"):
+        opt = derivatives_df(
+            symbol=sym,
+            from_date=date(2024, 1, 2),
+            to_date=exp,
+            expiry_date=exp,
+            instrument_type="OPTSTK",
+            strike_price=atm_strike,
+            option_type=ot,
+        )
+        assert not opt.empty, f"{ot} options fetch returned empty"
+        print(f"[option] {sym} {exp} {atm_strike}{ot} rows={len(opt)} cols={len(opt.columns)}")
+        if ot == "CE":
+            lots = sorted(set(opt["MARKET LOT"].tolist()))[:3]
+            print(f"[option] sample MARKET LOT values: {lots}")
+
+    # Confirm pyarrow is actually available — Phase 1 needs it for every parquet write.
+    import pyarrow  # noqa: F401
+    print("[deps] pyarrow importable")
 
     print("OK")
 
