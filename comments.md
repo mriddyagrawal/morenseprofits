@@ -1802,3 +1802,34 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `feat(p3.3): src/engine/costs.py — COST_MODEL_V1`. Per SPECS §4: brokerage ₹20/order × 4 orders/leg-pair = ₹80 flat; STT 0.0625% × premium turnover × SELL-side only; exchange txn 0.0503% × premium turnover (both sides); GST 18% on (brokerage + exchange); SEBI ₹10/crore of premium turnover; stamp duty 0.003% on BUY-side premium turnover (the closing leg of a short trade, the opening leg of a long trade). **Load-bearing test**: hand-compute total cost on the same RELIANCE Jan-2024 short straddle. With CE entry 56.50 + PE entry 50 + CE exit 95 + PE exit 0.50, lot 250: SELL-side premium turnover = (56.50 + 50) × 250 = ₹26,625; BUY-side = (95 + 0.50) × 250 = ₹23,875; brokerage = 4 × ₹20 = ₹80; STT = 0.000625 × 26,625 = ₹16.64; exchange = 0.000503 × (26,625 + 23,875) = ₹25.40; GST = 0.18 × (80 + 25.40) = ₹18.97; SEBI = (50,500 / 1e7) × 10 = ₹0.05; stamp = 0.00003 × 23,875 = ₹0.72; total ≈ ₹141.78. Pin that arithmetic. Once costs land, `price_trade` should also emit `costs` and `net_pnl` — wire them in once the cost module is testable.
 
 ---
+
+## Review of de46d40 — docs(plan): add Phases 8/9/10 as DEFERRED — agent-API, paper trading, live trading
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Docs-only roadmap extension. User asked to track three new phases as DEFERRED (not active work) so they're discoverable in PLAN.md without disrupting the in-flight Phase 3.
+
+**What works:**
+- **Three phases clearly DEFERRED** — explicit labels, not interleaved with Phase 3-7 sequence. PLAN.md remains a usable roadmap.
+- **Phase 8 (agent-callable research API)** is correctly scoped READ-ONLY ([PLAN.md:191-208](PLAN.md#L191-L208)). 6 tools cover the natural research-question surface: universe membership, regime classification, expiry lookup, single backtest, sweep, summary. The dependency on Phase 5 (aggregation) for `summarize` is implicit; worth one line noting the prerequisite.
+- **Phase 9 (paper trading)** ([PLAN.md:210-221](PLAN.md#L210-L221)) sketches the right primitives — positions store, mtm, 3 MCP tools (paper_open/status/close). The "close-on-expiry rule" callout in §11 SPECS is exactly the kind of subtle invariant that bites paper-trading systems for short straddles.
+- **Phase 10 (live trading) is sized as a separate project** ([PLAN.md:223-237](PLAN.md#L223-L237)). The four hard prerequisites — 3-month paper track, written runbook, per-trade approval, kill switch — are the right risk-aware discipline. "Agent proposes, human approves, system executes" is the safe v1 model.
+- **Change-log entry** ([PLAN.md:267](PLAN.md#L267)) records the addition + rationale. Trackable.
+
+**Blocking issues:** None — docs-only, no code impact.
+
+**Non-blocking suggestions:**
+- **Phase 10's "≥ 3 months of paper-trading track record matching backtest expectations"** — "matching" is fuzzy. Pin a concrete acceptance criterion before launching Phase 10: e.g., "paper realized P&L per trade is within ±1σ of backtested P&L distribution for ≥80% of trades", or "Sharpe ratio matches within 0.3". Otherwise the prerequisite is unenforceable and Phase 10 launches based on vibes.
+- **Phase 9 `mtm.py` uses NSELive** ([PLAN.md:218](PLAN.md#L218)) — jugaad's NSELive has a 5s in-memory cache per the docs we read in Phase 1. For frequent `paper_status` polling (1-min cadence), that's fine; for continuous mtm loop with subsecond granularity, the cache will surprise. Worth a SPECS §11 callout when Phase 9 lands.
+- **Phase 8's `backtest_one` / `sweep_windows`** could trigger expensive sweep computations on an MCP call. Worth thinking about resource limits / timeouts at the MCP boundary — an agent calling `sweep_windows(..., entry_grid=range(1,21), exit_grid=range(1,21))` could trigger 400 backtests per symbol. Pin a max grid size before Phase 8 lands.
+- **Read-only via what mechanism?** Phase 8 says "read-only scope, no order execution" but doesn't pin HOW that's enforced architecturally. By convention (the MCP server simply doesn't import the trading layer) or by hard wall (separate Python process)? The architectural choice matters for Phase 10 (live) when read-only-vs-execute becomes a runtime security property.
+
+**Domain / correctness checks:**
+- **Phase 10's per-trade approval gate** is the right model for v1 live trading. Auto-execute is the bigger risk for a backtested-but-not-paper-validated strategy.
+- **Paper-trading mtm** uses NSE live data which has different semantics than historical (e.g., snapshot prices vs daily settle). Worth a SPECS §11 callout that paper P&L is computed on LIVE LTP (or VWAP if available), NOT on the daily-settle convention used in backtests.
+
+**What I tried:** Read the diff end-to-end. Cross-checked the deferred-phase commit sketches against the existing Phase-1-7 nuclear-step doctrine.
+
+**Next-commit suggestion:** No change from my prior `feat(p3.3): costs.py` recommendation. The roadmap additions are background; the critical path is still the Phase-3 short-straddle engine. After p3.3 (cost model) + p3.4 (short_straddle strategy) + p3.verify (live first ₹P&L) land, the user has their original ask working end-to-end. That's the v1 milestone — Phases 4-7 build the platform around it, Phases 8-10 extend it.
+
+---
