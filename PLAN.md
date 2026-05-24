@@ -175,23 +175,30 @@ Exit criteria:
 ### Phase 6 — Web report UI
 **Goal:** The user's actual deliverable.
 
-Commits:
-1. `feat(p6): streamlit app skeleton — sidebar nav, stock picker, strategy picker`
-2. `feat(p6): per-stock dashboard — bar charts of avg P&L by (entry, exit)`
-3. `feat(p6): trend tab — YoY decay, MoY seasonality`
-4. `feat(p6): cross-stock ranker — best (strategy, params) per stock category`
-5. `feat(p6): caveats banner — survivorship + multiple-comparisons disclosures always visible`
+**Scope frozen 2026-05-25 to 4 tabs for v1**: Leaderboard, Per-stock,
+Heatmap, Trends. Detailed UI architecture + 26-sub-commit nuclear
+breakdown is in [DESIGN/DESIGN_SPEC.md](DESIGN/DESIGN_SPEC.md) §4 —
+PLAN.md keeps only the headline goal here to avoid drift.
 
 Exit criteria:
 - `streamlit run app.py` opens a working report on the cached results.
 - Every number in the UI is traceable to a row in the results parquet.
+- All four tabs render against the verify-set parquet without crashes;
+  thin-data UX paths exercised per DESIGN_SPEC §2.6.
+- Tagged `v0.6-ui` at completion.
 
-### Phase 7 — Polish, docs, perf audit
+### Phase 7 — Polish, drill-down, deferred-tab additions
+**Goal:** Close the per-trade evidence loop + ship the polish + docs.
+
 Commits:
-1. `chore(p7): README — quickstart, data refresh, how to add a strategy`
-2. `feat(p7): user-curated-universe skill — operator supplies their own stock list per session, overriding blue_chip(); satisfies SPECS §6b.3 mitigation #2 (point-in-time membership) at the source. Deferred per change-log 2026-05-24.`
-3. `feat(p7): BLUE_CHIP_BY_QUARTER point-in-time membership for true survivorship-bias-free backtests.`
-4. `chore(p7): final commit — Phase 7 complete — project final`
+1. `feat(p7.1): trade-level drill-down tab — pick a (strategy, symbol, entry, exit, expiry) cell, render its ~3-30 actual trades with entry spot, exit spot, per-leg premiums, gross/net P&L. Closes the "show me the evidence behind the median" loop. Most defensible Phase-6-deferred addition per 2026-05-25 scope freeze.`
+2. `feat(p7.2): diagnostics tab — full skip-log breakdown ("180×MissingDataError, 20×NoLiquidStrike"), bhavcopy/options coverage map, run_id history. Operator-tooling complement to the researcher-facing tabs.`
+3. `feat(p7.3): export buttons — CSV + PNG via st.download_button on every tab. DESIGN_SPEC §9 open Q resolved here.`
+4. `feat(p7.4): regime drill-down — surface the classify_momentum output itself (which months are bullish, trailing-return distribution). Useful for trust-building once multi-year data lands.`
+5. `chore(p7): README — quickstart, data refresh, how to add a strategy`
+6. `feat(p7): user-curated-universe skill — operator supplies their own stock list per session, overriding blue_chip(); satisfies SPECS §6b.3 mitigation #2 (point-in-time membership) at the source. Deferred per change-log 2026-05-24.`
+7. `feat(p7): BLUE_CHIP_BY_QUARTER point-in-time membership for true survivorship-bias-free backtests.`
+8. `chore(p7): final commit — Phase 7 complete`
 
 ### Phase 8 (DEFERRED) — Agent-callable research API
 
@@ -274,3 +281,4 @@ Anything not explicitly nailed down above — schema field order, internal helpe
 - 2026-05-24 — Phase 4.4 IronCondor commit split into **p4.4.d.i** (caveat #1 margin fix — `spot_at_entry` kwarg on MarginModelV1) + **p4.4.d.ii** (4-leg IronCondor strategy) per nuclear-commits feedback. The margin fix is independently reviewable on synthetic asymmetric legs; IronCondor then exercises it end-to-end via sweep_one. Same overall content, two smaller commits.
 - 2026-05-24 — **p4.5 (multiprocessing.Pool) deferred until per-task latency is measured.** Reasoning: at typical small-grid verification sweeps (~60 tasks × ~100ms cached = ~6s), serial is already fast. Parallel speedup only matters at the ~30k-task final-report scale, which is a Phase-6 concern. Better to do `chore(p4.verify)` first, learn the actual cache-warm latency, then decide if parallelization is worth the determinism-contract complexity. p4.5 stays in PLAN.md but is now post-p4.verify, not blocking it.
 - 2026-05-24 — Added **chore(p4.4.refactor)** between p4.4.d.ii and p4.verify per reviewer's "now urgent" flag: extract `src/strategies/_strikes.py` with `NoLiquidStrikeError + load_available_strikes + pick_nearest`. The bhavcopy-querying + SPECS §5 picker was copy-pasted across 4 strategies; consolidating now means future strategy adds are ~2 lines instead of ~12.
+- 2026-05-25 — **Phase 6 scope frozen to 4 tabs for v1**: Leaderboard, Per-stock, Heatmap, Trends. PLAN.md §3 Phase-6 commit list replaced with a pointer to DESIGN/DESIGN_SPEC.md §4 (which now owns the nuclear 26-sub-commit breakdown) to prevent drift between the two docs. Three considered-but-deferred tabs added to Phase 7: **trade-level drill-down** (per-cell trade list — closes the "evidence behind the median" loop; most defensible addition), **diagnostics** (full skip-log + coverage map + run_id history), **regime drill-down** (surfaces classify_momentum output). Export buttons (DESIGN_SPEC §9 open Q) also moved to Phase 7 explicitly. Compare-pairs view rejected: largely covered by Heatmap filter-switching + Leaderboard sorting; not unique enough to earn its own tab.
