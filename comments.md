@@ -921,3 +921,41 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `test(p1.3.2)` — make determinism `test_monthly_expiries_is_deterministic` THE FIRST test in the file, with a comment naming it as load-bearing per the module's reason-to-exist. Two calls under the same monkeypatch → `assert result1 == result2` AND `pd.testing.assert_frame_equal(read_cache(), read_cache())` on the on-disk parquet (catches any cache-write nondeterminism). Then pin the **hand-check** against the recorded legacy fixture: monkeypatch `_fetch_raw` so day-1 of Jan-2024 returns the real legacy fixture; assert `monthly_expiries("RELIANCE", Jan-1, Jan-31) == [date(2024,1,25)]`. Plus tests for incremental extension (Jan-only first → Jan-Mar second triggers only 2 new fetches) and the empty-result case (all 7 days MissingDataError → `[]`, ideally with a recorded warning per the silent-loss flag above).
 
 ---
+
+## Review of 2b00c68 — test(p1.3.2): expiry_calendar — 10 tests with determinism as the load-bearing first
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin every contract from `monthly_expiries` with determinism as the FIRST test in the file. Use the recorded legacy fixture to drive the RELIANCE Jan-2024 hand-check.
+
+**What works:**
+- **59/59 pass** in 0.42s.
+- `test_determinism_byte_identical_repeated_calls` ([tests/test_expiry_calendar.py:65-81](tests/test_expiry_calendar.py#L65-L81)) is FIRST in the file. Three calls → `a == b == c` AND `a == sorted(a)` (the second assertion catches a regression where one call's set-iteration order *happened* to be sorted, the next wasn't). Naming the test as load-bearing in the docstring keeps it visible.
+- `test_reliance_jan_2024_hand_check` ([tests/test_expiry_calendar.py:88-100](tests/test_expiry_calendar.py#L88-L100)) — uses the **real parsed legacy fixture** (not a synthetic frame). Error message names the reference's provenance: "This is the load-bearing reference value the entire Phase-1.3 plan was anchored on." A future regression's failure message tells you exactly why it matters.
+- `test_skips_non_trading_days_at_start_of_month` ([tests/test_expiry_calendar.py:145-164](tests/test_expiry_calendar.py#L145-L164)) — call_log pins the EXACT iteration order `[Jan 1, 2, 3, 4]`. Catches off-by-one regressions in the candidate-day loop.
+- `test_extending_window_samples_only_new_months` ([tests/test_expiry_calendar.py:217-264](tests/test_expiry_calendar.py#L217-L264)) — proves the incremental cache contract: Jan-only first → Jan-Mar second samples ONLY Feb+Mar, not Jan again. Avoids the "wider window re-samples everything" bug class.
+- `_make_fake_loader` helper ([tests/test_expiry_calendar.py:36-58](tests/test_expiry_calendar.py#L36-L58)) is a small, configurable loader with optional `call_log`. Reusable for any future expiry_calendar test.
+- `test_only_requested_symbol_returned` includes both positive (RELIANCE → [Jan-25]) and **negative** (DOES_NOT_EXIST → []) — catches symbol-confusion silently.
+- `test_filters_expiries_outside_window` — sample lists Jan/Feb/Mar expiries, narrow Jan window returns Jan only. Closes the leak-from-sample concern.
+- `test_month_with_no_trading_in_first_7_days_returns_empty` pins my flagged silent-loss case as a behavior contract (returns `[]`, no crash).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No test of on-disk parquet stability across regenerations.** Determinism is asserted at the return-list level only. If `sort_values(...).reset_index(drop=True)` ever stops being stable, the OUTPUT is still sorted at return time, but the CACHE bytes could vary call-to-call — a problem for byte-level reproducibility audits. Cheap add: read the on-disk parquet twice via `cache.read(cache.expiry_path("RELIANCE"))` and `pd.testing.assert_frame_equal(...)`.
+- **`test_month_with_no_trading_in_first_7_days_returns_empty` doesn't assert a warning** (the BUILDER didn't add the warning to the implementation either — my prior flag still stands). The test pins "[] returned" but not "operator was told". If the warning gets added later, this test should be updated to `with warnings.catch_warnings(record=True) as wlog:` and assert one warning.
+- **No multi-month partial-failure test.** What if a 3-month window has one month where all 7 candidate days fail? Currently: returns `[]` for that month, others succeed. Worth a test that drives this: months Jan + Mar populated, Feb totally dark → result is union of Jan + Mar only.
+- **`test_only_requested_symbol_returned` uses `DOES_NOT_EXIST`** which would also produce an empty cache file `expiries/DOES_NOT_EXIST.parquet`. That's a minor disk-pollution edge case in the test fixture; harmless because tmp_path is per-test.
+- The pretty `_make_fake_loader` works only for "any day in a configured month" — doesn't model "day X is a holiday but the bhavcopy for day Y exists". The `test_skips_non_trading_days_at_start_of_month` uses the `non_trading_days` set parameter — fine. But for the multi-month-partial-failure test above, the helper supports it (just leave a month out of `per_month_frames`).
+
+**Domain / correctness checks:**
+- **jugaad-data usage / options math / stats:** N/A this commit.
+- **Look-ahead bias:** the tests don't check that the calendar refuses to sample future months — implicit "caller knows what they're doing" semantic. Fine for v1; tighten when Phase 3 plumbs through `today_fn`.
+
+**What I tried:**
+- `python -m pytest tests/ -v` → 59/59 in 0.42s.
+- Read the test file end-to-end; cross-checked the `_make_fake_loader` configuration against each test's monkeypatch contract.
+
+**Next-commit suggestion:** `chore(p1.3.verify): one live-NSE end-to-end run` — the **highest-de-risking single call** is one that **spans the Jul-8-2024 cutover**: `monthly_expiries("RELIANCE", date(2024, 6, 1), date(2024, 9, 30))`. This exercises (a) the legacy fetcher for June, (b) the UDiff fetcher live for July/August/September — which we've never run for real (the recorded fixture was Aug-29 only, captured by the discovery script, not by the loader's actual fetch path). It confirms in one shot: dispatch picks the right channel across the boundary, UDiff fetch works end-to-end with the pinned Chrome UA, and the resulting expiry list matches NSE's published monthly schedule (Jun-27 / Jul-25 / Aug-29 / Sep-26 are the canonical last-Thursday-of-month for 2024). Print the result to stderr + cross-check those 4 dates against known truth. If anything's off, the discovery is contained and offline tests still pass.
+
+---
