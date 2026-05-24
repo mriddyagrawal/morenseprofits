@@ -50,7 +50,12 @@ _SPEC_COLS = list(_RENAMES.values())
 
 def _normalize(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df = raw.rename(columns=_RENAMES)[_SPEC_COLS].copy()
-    df["symbol"] = symbol.upper()
+    # Explicit "string" cast so symbol's StringDtype na_value matches series'.
+    # Without this, scalar-broadcast gives na_value=nan and the explicit
+    # .astype("string") below gives na_value=<NA>; dropna() on either column
+    # would then use different missing-value sentinels — corner-case
+    # correctness drift waiting to happen.
+    df["symbol"] = pd.array([symbol.upper()] * len(df), dtype="string")
     df["series"] = df["series"].astype("string")
     for col in ("open", "high", "low", "close", "vwap", "prev_close"):
         df[col] = df[col].astype("float64")
@@ -76,8 +81,10 @@ def _fetch_year(symbol: str, year: int, today_fn: Callable[[], date]) -> pd.Data
     with warnings.catch_warnings():
         # jugaad emits 'no explicit representation of timezones available for
         # np.datetime64' on every call; harmless and we don't need to scare
-        # the user with it on every sweep.
-        warnings.simplefilter("ignore", UserWarning)
+        # the user with it on every sweep. Filter is narrowed to that exact
+        # message so a future jugaad upgrade can't sneak a meaningful
+        # UserWarning past us.
+        warnings.filterwarnings("ignore", message=r".*timezones available.*")
         raw = stock_df(symbol=symbol.upper(), from_date=start, to_date=end, series="EQ")
     return _normalize(raw, symbol)
 
@@ -105,10 +112,18 @@ def _load_year(
         if max_cached is not None and max_cached >= today:
             return cached
         fresh = _fetch_year(symbol, year, today_fn)
-        if len(fresh) < len(cached):
+        # Subset check: every date currently in the cache must still be
+        # present in the fresh response. Catches both the "shorter" case
+        # AND the "same length but dropped a date in the middle" case —
+        # length-only would silently overwrite the latter.
+        cached_dates = set(cached["date"].tolist())
+        fresh_dates = set(fresh["date"].tolist())
+        if not cached_dates.issubset(fresh_dates):
+            missing = sorted(cached_dates - fresh_dates)
             warnings.warn(
-                f"partial NSE response for {symbol.upper()} {year}: fetched "
-                f"{len(fresh)} rows, cache has {len(cached)}. Keeping cache.",
+                f"partial NSE response for {symbol.upper()} {year}: fresh "
+                f"fetch is missing {len(missing)} dates that exist in cache "
+                f"(first 3: {[str(d) for d in missing[:3]]}). Keeping cache.",
                 stacklevel=3,
             )
             return cached

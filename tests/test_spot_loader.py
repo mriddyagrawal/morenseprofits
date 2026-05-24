@@ -40,7 +40,9 @@ def _fake_jugaad(symbol: str, ist_dates: Sequence[date], closes: Sequence[float]
     # IST date -> UTC datetime at 18:30 of the previous calendar day
     utc_naive = [datetime(d.year, d.month, d.day) - pd.Timedelta(hours=5, minutes=30) for d in ist_dates]
     return pd.DataFrame({
-        "DATE": pd.to_datetime(utc_naive),
+        # ms unit matches real jugaad output; ns vs ms is functionally
+        # equivalent post +5h30m but matching exactly keeps the fake honest.
+        "DATE": pd.to_datetime(utc_naive).astype("datetime64[ms]"),
         "SERIES": ["EQ"] * len(ist_dates),
         "OPEN": [c - 1 for c in closes],
         "HIGH": [c + 2 for c in closes],
@@ -187,6 +189,69 @@ def test_partial_response_refuses_to_shrink_cache(monkeypatch, tmp_path):
 
 
 # === invariant 4: returned frame is monotonic ascending ===
+
+def test_partial_response_with_dropped_dates(monkeypatch, tmp_path):
+    """LOAD-BEARING. The previous length-only check passed any same-length
+    response — even one that DROPPED a date from the middle and added a
+    spurious one. The subset check must reject this and keep the cache."""
+    _redirect_cache(monkeypatch, tmp_path)
+    full = pd.date_range("2024-01-01", "2024-06-14", freq="B").date.tolist()  # ~118 dates
+    # Day-2 fresh: same length, but one date in the middle dropped and
+    # one spurious "future" date added in place. Length-only check would
+    # silently overwrite the cache with this lossy frame.
+    n = len(full)
+    middle_idx = n // 2
+    dropped_date = full[middle_idx]
+    spurious = date(2024, 6, 30)
+    assert spurious not in full
+    dropped_then_padded = full[:middle_idx] + full[middle_idx + 1 :] + [spurious]
+    assert len(dropped_then_padded) == n  # same length — defeats length-only check
+
+    state = {"phase": "full"}
+
+    def factory(symbol, from_date, to_date, series):
+        if state["phase"] == "full":
+            return _fake_jugaad(symbol, full)
+        return _fake_jugaad(symbol, dropped_then_padded)
+
+    _patch_jugaad(monkeypatch, factory)
+    spot_loader.load_spot("X", date(2024, 1, 1), date(2024, 6, 14), today_fn=lambda: date(2024, 6, 15))
+    cached_before = cache.read(cache.spot_path("X", 2024))
+    assert len(cached_before) == n
+    assert pd.Timestamp(dropped_date) in cached_before["date"].tolist()
+
+    state["phase"] = "dropped"
+    with warnings.catch_warnings(record=True) as wlog:
+        warnings.simplefilter("always")
+        spot_loader.load_spot("X", date(2024, 1, 1), date(2024, 6, 14), today_fn=lambda: date(2024, 6, 16))
+
+    cached_after = cache.read(cache.spot_path("X", 2024))
+    assert len(cached_after) == n, "cache length must not change"
+    # Critical: the date that was dropped from the fresh frame must STILL be in cache.
+    assert pd.Timestamp(dropped_date) in cached_after["date"].tolist(), (
+        f"subset check failed — date {dropped_date} got removed from cache"
+    )
+    # Spurious date from fresh must NOT have leaked into cache.
+    assert pd.Timestamp(spurious) not in cached_after["date"].tolist(), (
+        f"spurious date {spurious} leaked into cache"
+    )
+    assert any("partial NSE response" in str(w.message) for w in wlog), (
+        "expected partial-response warning"
+    )
+
+
+def test_symbol_and_series_have_matching_dtype(monkeypatch, tmp_path):
+    """Both string columns must use the same na_value sentinel so that
+    dropna(subset=[...]) behaves consistently across them."""
+    _redirect_cache(monkeypatch, tmp_path)
+    _patch_jugaad(monkeypatch, lambda s, f, t, se: _fake_jugaad(s, [date(2024, 1, 2), date(2024, 1, 3)]))
+    out = spot_loader.load_spot("X", date(2024, 1, 1), date(2024, 12, 31), today_fn=lambda: date(2026, 5, 24))
+    # Both should be the explicit "string" StringDtype, not the
+    # scalar-broadcast version that uses na_value=nan.
+    assert out["symbol"].dtype == pd.StringDtype()
+    assert out["series"].dtype == pd.StringDtype()
+    assert out["symbol"].dtype == out["series"].dtype
+
 
 def test_returned_frame_is_monotonic(monkeypatch, tmp_path):
     _redirect_cache(monkeypatch, tmp_path)
