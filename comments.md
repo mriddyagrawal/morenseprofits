@@ -1402,3 +1402,39 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** PLAN.md sequence has Phase 1.6 (offline-mode kwarg) and Phase 1.7 (cache-hit telemetry) before Phase 2. They're hardening, not new capability. If you want to **defer 1.6/1.7 to start Phase 2 (universe selection) immediately**, that's defensible — the Phase 1 verify run proves the data layer works without offline-mode. If you do continue with 1.6 first, the **load-bearing concern is uniformity**: the `offline: bool = False` kwarg must reach ALL four loaders (spot, bhavcopy_fo, options, expiry_calendar) with identical semantics — `offline=True` AND `MORENSE_OFFLINE=1` env → cache miss raises `MissingDataError` instead of network-fetch. A leaky implementation (one loader respects it, another doesn't) defeats the whole point. Add a parameterized test that hits every loader and asserts the behavior.
 
 ---
+
+## Review of dbb4c65 — feat(p1.6): offline-mode kwarg across all loaders + MORENSE_OFFLINE env
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement SPECS §6a uniformly across all 6 public loader entry points. Use a distinct error class (`OfflineCacheMiss`, NOT a subclass of `MissingDataError`) so the existing swallow loops can't accidentally mask offline failures.
+
+**What works:**
+- **The error-class taxonomy decision is the highlight of this commit.** [src/data/errors.py:30-38](src/data/errors.py#L30-L38) makes `OfflineCacheMiss` a sibling of `MissingDataError`, not a child. Without this, every existing `except MissingDataError: continue` loop (expiry_calendar's candidate-day iteration, options_loader's stale-cache fallback) would silently swallow offline failures → empty results with no operator signal. The reasoning is documented in the class docstring and structurally enforced by `test_offline_cache_miss_is_not_missing_data_error` ([tests/test_offline_mode.py:208-215](tests/test_offline_mode.py#L208-L215)).
+- **`effective_offline` helper** ([src/data/offline.py:22-28](src/data/offline.py#L22-L28)) — single point of truth for `(kwarg OR env)`. Strict env-var spec (only literal "1"). Test pins the strictness via `test_effective_offline_env_var_other_values_ignored`.
+- **6/6 public loaders threaded uniformly**: `load_spot`, `load_bhavcopy_fo`, `load_option`, `monthly_expiries`, `trading_days`, `offset_trading_days`. All 6 import from the same `offline` helper → no behavioral drift possible.
+- **`test_monthly_expiries_offline_propagates_OfflineCacheMiss` is the load-bearing test** ([tests/test_offline_mode.py:111-124](tests/test_offline_mode.py#L111-L124)) — proves the class distinction works in practice (the candidate-day loop does NOT catch offline failures).
+- **Network-must-not-be-called guards** in every loader's offline test (`must_not_be_called` raises RuntimeError) — a future regression that accidentally fetches in offline mode fires loudly.
+- **Cache HIT + offline still works** ([tests/test_offline_mode.py:148-183](tests/test_offline_mode.py#L148-L183)) — offline ≠ "disabled", offline = "trust the cache only". Pre-populate via a normal call, then re-call with offline=True, verifies the hit path.
+- **103/103 pass** in 0.58s.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`force_refresh=True` + `offline=True` interaction not explicitly tested.** Commit message says "offline takes precedence (we never hit the network, period)". The implementation likely does the offline check before reaching force_refresh, but without a test, a future refactor that reorders the checks could silently flip the precedence. Add `test_offline_wins_over_force_refresh` to all three loaders that have `force_refresh`.
+- **Stale-cache + offline path covered for spot/options but no explicit test.** Both loaders' code paths return cached frames rather than raising in this case (defensible: stale-not-empty is still better than no data). Worth a one-line test that pre-populates a current-year cache, then calls offline=True with `today_fn` advanced past the cache's max date — assert it returns the cache without raising.
+- **Env var documentation** — `MORENSE_OFFLINE="true"` is NOT honored (only literal "1" is). The test pins this strictness, but a SPECS callout would prevent docs-driven confusion. Cosmetic.
+- **Cross-layer integration script (`verify_phase1_integration.py`) doesn't exercise offline.** When someone runs `MORENSE_OFFLINE=1 python scripts/verify_phase1_integration.py` after the script has populated the cache once, it should succeed (cache hits) — but if any loader leaked through to network, it'd fail. Worth a follow-up commit that exercises this on a populated cache. Defer.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** offline check happens BEFORE any jugaad call site in every loader. Verified.
+- **Options math / look-ahead / stats:** N/A this commit.
+- **Architectural:** the kwarg-then-env-var precedence (`offline_kwarg OR env`) is the right composition — kwarg-False + env=1 → offline mode. Aligns with "env enables a project-wide flag without code change".
+
+**What I tried:**
+- `python -m pytest tests/` → 103/103 in 0.58s.
+- Read the error taxonomy + the offline helper. Walked through one loader (`spot_loader`) to confirm the offline check sits before any fetch call.
+
+**Next-commit suggestion:** `chore(p1.7): cache-hit telemetry`. The simple shape: emit a one-line `warnings.warn(...)` at the moment a loader DECIDES to fetch (after offline-check passed, after cache-exists check failed). One warning per fetch, not per call. Keep it opt-in: another env var `MORENSE_WARN_ON_FETCH=1` so legitimate Phase-4 sweeps with 60 cold fetches don't spam by default. Mirror the offline `effective_*` helper pattern in `offline.py` (or a new `telemetry.py`). The load-bearing test: monkeypatch the actual fetch function, set the env var, call the loader on a cold cache, assert one warning emitted naming both the loader and the key. After 1.7 lands, **immediately move to Phase 2 (universe selection)** — the data layer is then both feature-complete AND auditable for accidental fetches in production runs.
+
+---
