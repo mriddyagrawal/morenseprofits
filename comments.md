@@ -1513,3 +1513,40 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `feat(p2.1): src/universe/blue_chip.py`. Two load-bearing things to get right: **(1)** the 50 symbols themselves — pull from NSE's published Nifty 50 list as of 2024-07-01 (e.g. NSE's index info page) and cite the exact source URL + access date in the file header. A future "update to 2024-12-31" then has a single-source-of-truth to consult. **(2)** the `as_of` parameter is required but ignored in v1 — return the same list regardless. **Test** (next commit): assert `len(blue_chip(any_date)) == 50`; assert `blue_chip(date(2024,1,1)) == blue_chip(date(2024,12,31))` (the ignored-as_of contract); assert the list is sorted alphabetically; spot-check a few known constituents (RELIANCE, TCS, HDFCBANK, INFY all in). The exact 50-list itself doesn't need a `pd.testing.assert_frame_equal`-style pin — a count + sort + spot-check is enough; if a deliberate update happens, the file changes but the test invariants hold.
 
 ---
+
+## Review of acab8a7 — feat(p2.1): blue_chip universe — 40 large-cap NSE names
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the v1 blue-chip universe as a hardcoded 40-name list per user direction (sized down from 50 to drop low-options-liquidity tail). Survivorship-bias caveat from §6b.3 preserved at source.
+
+**What works:**
+- **40-name list is well-curated** — verified live: all major banks (HDFC/ICICI/SBI/AXIS/KOTAK/INDUSIND), IT majors (TCS/INFY/WIPRO/HCL/TECHM), pharma (CIPLA/DRREDDY/SUNPHARMA), Reliance/L&T/ITC/HUL etc. Defensible "thick options market" cut.
+- **The 10 dropped names** (APOLLOHOSP, BEL, BPCL, HDFCLIFE, INDIGO, JIOFIN, SBILIFE, SHRIRAMFIN, TATACONSUM, TRENT) are indeed the lower-options-liquidity tail per the commit message. All are real NSE-listed; defensible drops.
+- **Spelling matches NSE conventions exactly** ([src/universe/blue_chip.py:39-47](src/universe/blue_chip.py#L39-L47)) — `BAJAJ-AUTO` with hyphen, `M&M` with ampersand. Will work directly with `jugaad-data` without renames.
+- **3 module-level invariants** ([src/universe/blue_chip.py:50-56](src/universe/blue_chip.py#L50-L56)): count=40, no dups, alphabetically sorted. Fire at import time.
+- **Source honestly cited** as Wikipedia + "not a canonical published-research-grade composition" ([src/universe/blue_chip.py:22-23](src/universe/blue_chip.py#L22-L23)) — the right level of disclosure for a v1 shortcut.
+- **`as_of` required, not defaulted** ([src/universe/blue_chip.py:58](src/universe/blue_chip.py#L58)) — forces caller intent at every call site even though v1 ignores it. Phase-7 upgrade then needs no API change.
+- **Three change-log entries**: 50→40 sizing rationale, Phase-7 user-curated-universe skill, Phase-7 BLUE_CHIP_BY_QUARTER. Both deferrals trackable.
+- **Live verify on my end**: 40/40 names, sorted, deduped, `as_of` truly ignored (three different dates return identical lists).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Module-level `assert` for invariants** ([src/universe/blue_chip.py:50-56](src/universe/blue_chip.py#L50-L56)) — same `python -O` stripping risk as the previous options_loader case. The asserts are over a *static literal* so technically the invariants are correct at write time regardless; but if a future drive-by edit accidentally adds a duplicate, `python` would fail at import but `python -O` would silently load the broken list. Convert to `if ... : raise RuntimeError(...)` for consistency with the rest of the project. Cosmetic, low priority.
+- **No `delisted/renamed symbol` guard.** If RELIANCE ever got delisted/renamed, the static list would still ship the old symbol and every downstream call would fail. Outside v1 scope; just noting.
+- **Wikipedia source is fine but ephemeral.** The cited URL doesn't include an access-date in the URL itself (Wikipedia URLs don't snapshot by default). The docstring says "retrieval date ~2024-07-01" but a permanent URL via Wikipedia's "permalink" (`?oldid=N`) would lock the exact snapshot consulted. Defer; for v1 the list is what it is.
+- **`blue_chip(as_of)` returns `list[_BLUE_CHIP_V1]`** which is a new list each call. Cheap (~40 string refs), so the GC churn is negligible. Worth noting that the v1 contract returns a copy (not the tuple) so callers can `.sort()`/`.append()` without mutating the source. Good.
+
+**Domain / correctness checks:**
+- **Survivorship bias:** acknowledged in the docstring with three explicit mitigations referencing SPECS §6b.3 + the Phase 7 backlog items.
+- **Look-ahead bias:** N/A this commit (static list).
+- **Options math / stats:** the "drop low-options-liquidity tail" is a reasonable selection rule for a straddle backtest universe — those names have wider bid-asks and would dominate the realized cost model.
+
+**What I tried:**
+- `python -c "from src.universe.blue_chip import blue_chip; ..."` → 40 names, sorted, dedup, canonical names present, `as_of` ignored across 3 different dates.
+- Read the file end-to-end.
+
+**Next-commit suggestion:** Per the BUILDER's plan, `test(p2.1)` next. The module-level asserts already pin count/sort/dedup at import time, so test value is mostly **API contract** (regression-blocker against a future refactor that breaks the public surface). Recommended tests: (1) `blue_chip(any_date)` returns a `list` (not `tuple` — pin the return type since `_BLUE_CHIP_V1` is a tuple internally); (2) `blue_chip(date1) == blue_chip(date2)` for arbitrary date1, date2 (the as_of-ignored contract — pin it explicitly so a future Phase-7 upgrade has to deliberately UPDATE this test, not silently drift); (3) one spot-check `"RELIANCE" in blue_chip(any_date)` since RELIANCE drives every reference contract in the test suite; (4) `len(blue_chip(any_date)) == 40` — guards against the 40→50 (or any other count) regression. After that, **immediately move to `feat(p2.2): momentum classifier`**. The tercile-boundary + holiday-lookback flags from my d61b164 review still need resolving in SPECS §6b.2 before the impl lands.
+
+---
