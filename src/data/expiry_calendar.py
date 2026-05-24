@@ -18,9 +18,22 @@ as the load-bearing first assertion.
      ``data/cache/expiries/{SYMBOL}.parquet``. Subsequent calls only
      sample months whose ``month_anchor`` is not already cached.
   4. Return ``sorted({expiry_date for any row whose expiry_date ∈ window})``.
+
+**Known v1 limitations** (flagged by the reviewer, accepted as cheap):
+
+- **Empty-month cache miss**: a month whose sample contains zero
+  rows for ``symbol`` (e.g. delisted/pre-listing symbol; pathological
+  test fixture) writes no rows, so ``cached_anchors`` won't include it,
+  so it'll be re-sampled on every future call. Harmless for our
+  blue-chip universe but worth knowing for Phase 7 incremental cache.
+- **All-7-days-non-trading**: returns ``[]`` for that month. NSE has
+  never had 7 consecutive non-trading days, but a future force-majeure
+  closure would silently miss expiries — we ``warnings.warn`` so it
+  surfaces, but the calendar still proceeds.
 """
 from __future__ import annotations
 
+import warnings
 from datetime import date
 from typing import Iterable
 
@@ -62,6 +75,13 @@ def _sample_expiries_for_month(symbol: str, anchor: date) -> list[date]:
         except MissingDataError:
             continue
     if bc is None:
+        warnings.warn(
+            f"no usable F&O bhavcopy in days 1..7 of {anchor:%Y-%m} for "
+            f"symbol={symbol}; this month contributes no expiries. NSE has "
+            f"never had 7 consecutive non-trading days — investigate if "
+            f"you see this in production.",
+            stacklevel=3,
+        )
         return []
     mask = (bc["instrument"] == "OPTSTK") & (bc["symbol"] == symbol)
     seen = bc.loc[mask, "expiry"].dt.date.unique().tolist()

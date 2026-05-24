@@ -168,10 +168,11 @@ def test_skips_non_trading_days_at_start_of_month(monkeypatch, tmp_path):
 # Empty month: all 7 candidate days non-trading → empty result for that month
 # ============================================================
 
-def test_month_with_no_trading_in_first_7_days_returns_empty(monkeypatch, tmp_path):
+def test_month_with_no_trading_in_first_7_days_returns_empty_and_warns(monkeypatch, tmp_path):
     """Defensive — if all 7 candidate days raise MissingDataError, return
-    [] for that month rather than crashing. Has never happened in NSE
-    history but the failure mode should be quiet, not catastrophic."""
+    [] for that month rather than crashing AND emit a warning so the
+    operator sees the silent-loss case (per the 26b964e review flag)."""
+    import warnings as _w
     _redirect_cache(monkeypatch, tmp_path)
     monkeypatch.setattr(
         bhavcopy_fo_loader, "load_bhavcopy_fo",
@@ -180,8 +181,81 @@ def test_month_with_no_trading_in_first_7_days_returns_empty(monkeypatch, tmp_pa
             non_trading_days={date(2024, 1, d) for d in range(1, 8)},
         ),
     )
-    out = expiry_calendar.monthly_expiries("RELIANCE", date(2024, 1, 1), date(2024, 1, 31))
+    with _w.catch_warnings(record=True) as wlog:
+        _w.simplefilter("always")
+        out = expiry_calendar.monthly_expiries("RELIANCE", date(2024, 1, 1), date(2024, 1, 31))
     assert out == []
+    matched = [w for w in wlog if "no usable F&O bhavcopy" in str(w.message)]
+    assert len(matched) == 1, (
+        f"expected one all-7-fail warning, got {len(matched)}: "
+        f"{[str(w.message) for w in wlog]}"
+    )
+
+
+def test_multi_month_partial_failure_returns_only_successful_months(monkeypatch, tmp_path):
+    """Three-month window where Feb is totally dark (all 7 candidate days
+    fail) — Jan and Mar still produce expiries, Feb contributes nothing
+    (plus emits a warning). The calendar must not be all-or-nothing."""
+    import warnings as _w
+    _redirect_cache(monkeypatch, tmp_path)
+
+    def _df(expiry: date) -> pd.DataFrame:
+        return pd.DataFrame({
+            "instrument": pd.array(["OPTSTK"], dtype="string"),
+            "symbol": pd.array(["RELIANCE"], dtype="string"),
+            "expiry": pd.Series([pd.Timestamp(expiry)], dtype="datetime64[us]"),
+            "strike": [2600.0],
+            "option_type": pd.array(["CE"], dtype="string"),
+            "open": [10.0], "high": [11.0], "low": [9.0], "close": [10.0],
+            "settle_price": [10.0],
+            "contracts": [1],
+            "oi": pd.array([100], dtype="Int64"),
+            "oi_change": pd.array([0], dtype="Int64"),
+            "trade_date": pd.Series([pd.Timestamp("2024-01-15")], dtype="datetime64[us]"),
+        })
+
+    frames = {(2024, 1): _df(date(2024, 1, 25)), (2024, 3): _df(date(2024, 3, 28))}
+    feb_dark = {date(2024, 2, d) for d in range(1, 8)}
+
+    monkeypatch.setattr(
+        bhavcopy_fo_loader, "load_bhavcopy_fo",
+        _make_fake_loader(frames, non_trading_days=feb_dark),
+    )
+    with _w.catch_warnings(record=True) as wlog:
+        _w.simplefilter("always")
+        out = expiry_calendar.monthly_expiries("RELIANCE", date(2024, 1, 1), date(2024, 3, 31))
+
+    assert out == [date(2024, 1, 25), date(2024, 3, 28)], (
+        f"Jan + Mar should succeed even when Feb is dark; got {out}"
+    )
+    # Exactly one Feb warning
+    feb_warns = [w for w in wlog if "no usable F&O bhavcopy" in str(w.message) and "2024-02" in str(w.message)]
+    assert len(feb_warns) == 1
+
+
+def test_on_disk_parquet_is_byte_stable_across_regenerations(monkeypatch, tmp_path):
+    """Cache bytes must be stable, not just the return list. A
+    sort-then-reset_index regression could leave returns sorted while the
+    on-disk row order varies — fine for return, bad for byte-level
+    reproducibility audits."""
+    _redirect_cache(monkeypatch, tmp_path)
+    jan = _parsed_legacy_jan25()
+    monkeypatch.setattr(
+        bhavcopy_fo_loader, "load_bhavcopy_fo",
+        _make_fake_loader({(2024, 1): jan}),
+    )
+
+    # Build cache twice (force_refresh-equivalent via wiping the parquet)
+    expiry_calendar.monthly_expiries("RELIANCE", date(2024, 1, 1), date(2024, 1, 31))
+    bytes_first = cache.expiry_path("RELIANCE").read_bytes()
+    # Wipe and rebuild
+    cache.expiry_path("RELIANCE").unlink()
+    expiry_calendar.monthly_expiries("RELIANCE", date(2024, 1, 1), date(2024, 1, 31))
+    bytes_second = cache.expiry_path("RELIANCE").read_bytes()
+    assert bytes_first == bytes_second, (
+        "on-disk parquet bytes differ across regenerations — sort/dedupe "
+        "ordering is not stable"
+    )
 
 
 # ============================================================
