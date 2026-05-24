@@ -452,3 +452,36 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** `feat(p1.3.0): cache.bhavcopy_fo_path` — the one micro-decision that matters here is **the parameter type**. Take `dt: date`, not `dt: datetime`. A `datetime(2024,1,2,9,30)` would format to `"20240102"` and feel correct, but `datetime(2024,1,2,23,59,59)` interpreted as UTC for a sweep running just before midnight IST could silently round to the wrong day. Pinning to `date` removes the class. Test should pass a `date` and either a `datetime` (assert raises or normalizes — pick one and document) so the contract is enforced from commit one.
 
 ---
+
+## Review of 13dacbd — feat(p1.3.0): cache.bhavcopy_fo_path — per-date F&O bhavcopy path helper
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Add the symbol-agnostic per-date bhavcopy path builder, symmetric with `spot_path`/`option_path`/`expiry_path`.
+
+**What works:**
+- 13-line implementation ([src/data/cache.py:99-108](src/data/cache.py#L99-L108)). Path layout `data/cache/bhavcopy_fo/{YYYYMMDD}.parquet` matches SPECS §2.4 verbatim.
+- `_ensure_root()` reused — picks up the existing memoization and version-sentinel guarantees for free.
+- `trade_date: date` signature — duck-typed to also accept `datetime` (subclass of `date`); verified both produce identical paths.
+- YYYYMMDD filename sorts lexicographically = chronologically: confirmed `['20240115', '20240215', '20240315', '20241215']` in lex order.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- `datetime` is silently accepted via Python's `date`-subclass relationship. That's defensible — `strftime("%Y%m%d")` on a `datetime` only consumes the date fields and ignores time/tz, so a naive `datetime(2024,1,2,23,59,59)` still produces `20240102`. Worth a one-line docstring note: "accepts either `date` or `datetime`; only the date portion is used" so a future caller doesn't expect tz-aware time normalization.
+- No reasonableness check (e.g. `trade_date < today`, or in the NSE history range). That's correctly the loader's responsibility, not the path builder's. Skip.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** N/A this commit.
+- **Options math / look-ahead / stats:** N/A.
+
+**What I tried:**
+```python
+cache.bhavcopy_fo_path(date(2024,1,2))            # → .../bhavcopy_fo/20240102.parquet
+cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
+# sorted across months: chronological ✓
+```
+
+**Next-commit suggestion:** Per the plan, `test(p1.3.0)`. Mirror the existing `test_path_builders` shape; mandatory cases: (a) `date(2024,1,2)` resolves to `bhavcopy_fo/20240102.parquet`; (b) a `datetime` with non-midnight time produces the same path as the equivalent `date` (so the duck-typed acceptance is *documented*, not accidental); (c) the parent dir is `bhavcopy_fo`. Then move to `feat(p1.3.1)` where the real work lives — and per b0ef46a's commitment, capture **byte-for-byte recorded fixtures** for one pre-Jul-8-2024 and one ≥Jul-8-2024 bhavcopy NOW so the test can be written against them, not deferred.
+
+---
