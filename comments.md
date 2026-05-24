@@ -1362,3 +1362,43 @@ Trivial followup. Two tiny things closed from the 02e3644 review:
 That single integration proves all four loaders + the calendar agree end-to-end — Phase 1 is then *operationally* ready for Phase 2 (universe) and Phase 3 (engine).
 
 ---
+
+## Review of 2518c50 — chore(p1.5.verify): Phase-1 end-to-end integration verify — ALL GREEN
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** String all five data-layer modules together end-to-end on one realistic backtest preamble — the strongest single integration test possible before Phase 2 / Phase 3.
+
+**What works:**
+- **Independent live run: ALL GREEN, byte-for-byte match** with the BUILDER's reported values:
+  - Step 1 (expiry_calendar): `monthly_expiries("RELIANCE", Jan-2024) == [date(2024,1,25)]` ✓
+  - Step 2 (trading_calendar): `offset_trading_days(2024-01-25, 15) == 2024-01-04` ✓
+  - Step 3 (spot_loader): RELIANCE Jan-4 close = 2596.65 → ATM 2600
+  - Step 4 (options_loader): 16 rows, entry close = 56.50, exit close = 102.40, lot=250, max OI=3894250
+  - Step 5 (bhavcopy_fo): cross-check Jan-4 close = 56.50 — **byte-identical** with options_loader
+- **Realistic economic content** surfaces in the output. RELIANCE rallied ~4% from 2596 to ~2702 over the 15 trading days, so the short ATM straddle would have lost (entry premium ~56, exit intrinsic ~102 = ~₹46/lot loss × 250 = ₹11,500 per lot). That's the kind of trade Phase 3 will quantify.
+- Script structure is clean: per-step `_h(section header)`, explicit per-step timing, fail-fast `return 1` with diagnostic context. Easy to read both during a run and in commit messages.
+- The cross-layer comparison at step 5 is the load-bearing assertion — it triangulates the entire chain against an independent NSE source.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **All timings suspiciously fast** (Step 1: 1.56s; Step 4: 0.01s; Step 5: 0.99s). Step 4's 0.01s is impossible-cold — must be hitting jugaad's pickle cache or our own parquet cache from prior verify runs. Doesn't affect correctness, but for a true cold benchmark a `--clean` flag that wipes both `data/cache/options/RELIANCE/` AND `~/Library/Caches/nsehistory-stock/` before running would be useful documentation. Defer.
+- **No sanity bounds on entry/exit closes.** If a future regression made the parser return premium in paise (×100), cross-layer agreement still holds and the test still passes. A loose check (`5 < entry_close < 500`) would catch that class. Cosmetic; the human-readable output makes the absurdity easy to spot.
+- **Only the CE side is exercised** — short straddle is CE + PE. A `_check_side("PE")` pass would round out the integration. Cheap to add; defer to Phase 3 if not done now.
+- **`ATM = round(spot_close / 20) * 20`** is a magic-step. NSE strike-step is actually variable by underlying price band. For RELIANCE at ~2600 the step IS ₹20 (matches the legacy bhavcopy fixture's 1840/1860/1880/...), so the script is correct. Worth a one-line comment naming this assumption.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** full pipeline exercised via real endpoints.
+- **Options math:** entry CE @ 56.50 + PE @ ~56 = premium ~₹112 total; exit ATM CE @ 102.40 + ATM PE @ ~0 = ~₹102 intrinsic; net loss ≈ ₹10 per share × 250 lot = ₹2500 per lot. (My napkin math; the BUILDER's commit message says ~lost money — agreed.) The numbers are *economically plausible*, which is more than the schema tests can verify.
+- **Look-ahead bias:** `today_fn = date(2026,5,24)` puts the contract firmly in the past; no leak.
+- **Statistical claims:** N/A this commit.
+
+**What I tried:**
+- `python scripts/verify_phase1_integration.py` independently → 5/5 steps green, byte-for-byte agreement at the cross-layer comparison.
+
+**PHASE 1 STATUS:** **DONE.** Six data-layer modules (cache, spot, bhavcopy_fo, expiry_calendar, options, trading_calendar) + 92 offline tests + 4 live verification scripts. All known NSE weirdness captured: dual bhavcopy format, IST date shift in stock_df, holiday-shifted expiries, Saturday special sessions, Diwali Muhurat. Cross-layer agreement holds end-to-end.
+
+**Next-commit suggestion:** PLAN.md sequence has Phase 1.6 (offline-mode kwarg) and Phase 1.7 (cache-hit telemetry) before Phase 2. They're hardening, not new capability. If you want to **defer 1.6/1.7 to start Phase 2 (universe selection) immediately**, that's defensible — the Phase 1 verify run proves the data layer works without offline-mode. If you do continue with 1.6 first, the **load-bearing concern is uniformity**: the `offline: bool = False` kwarg must reach ALL four loaders (spot, bhavcopy_fo, options, expiry_calendar) with identical semantics — `offline=True` AND `MORENSE_OFFLINE=1` env → cache miss raises `MissingDataError` instead of network-fetch. A leaky implementation (one loader respects it, another doesn't) defeats the whole point. Add a parameterized test that hits every loader and asserts the behavior.
+
+---
