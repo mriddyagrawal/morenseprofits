@@ -36,6 +36,7 @@ from src.config import RESULTS_DIR  # noqa: E402
 from src.strategies.registry import list_strategies  # noqa: E402
 from src.web.caveats import render_caveats  # noqa: E402
 from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E402
+from src.web.leaderboard import render_headline as render_leaderboard_headline  # noqa: E402
 
 
 # ============================================================
@@ -203,8 +204,11 @@ def _placeholder(tab_name: str, next_commit: str) -> None:
 def _render_leaderboard_tab(df_filtered: pd.DataFrame) -> None:
     render_caveats()
     st.markdown("## Leaderboard")
-    _placeholder("Leaderboard tab", "feat(p6.2.table) + feat(p6.2.thin) + feat(p6.2.toggle)")
-    st.caption(f"Filtered rows available: {len(df_filtered)}")
+    render_leaderboard_headline(df_filtered, min_n=int(st.session_state["mp_min_n"]))
+    _placeholder(
+        "Leaderboard table + thin-samples sidecar + within/across toggle",
+        "feat(p6.2.table) + feat(p6.2.thin) + feat(p6.2.toggle)",
+    )
 
 
 def _render_per_stock_tab(df_filtered: pd.DataFrame) -> None:
