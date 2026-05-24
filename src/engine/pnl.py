@@ -172,6 +172,7 @@ def price_trade(
     strategy_offset_pct: float = 1.0,
     symbol_margin_pct: float | None = None,
     spot_at_entry: float | None = None,
+    hold_trading_days: int | None = None,
     today_fn: Callable[[], date] = date.today,
 ) -> dict:
     """Price every leg of ``trade``; return one row in the
@@ -196,6 +197,15 @@ def price_trade(
       instead of strike × shares × symbol_pct. The sweeper passes the
       symbol's spot on entry_date to get the better approximation;
       ad-hoc callers can omit to preserve the legacy strike-based path.
+    - ``hold_trading_days`` (default None — SPECS §4a caveat #2):
+      exact trading-day hold count. The sweeper passes
+      ``entry_offset_td − exit_offset_td`` (exact by construction since
+      both are trading-day offsets from expiry); standalone callers can
+      omit and the engine falls back to the 252/365 calendar-day
+      approximation. The approximation rounds short windows (e.g., 2
+      calendar days → 1 trading day) and inflates ``roi_pct_annualized``
+      by up to 2× for short-hold trades — biased exactly where the
+      Phase-5 ranker would over-favor them.
     """
     # Resolve load_option_fn lazily so monkeypatch.setattr on
     # options_loader.load_option takes effect (defaults are evaluated
@@ -238,14 +248,19 @@ def price_trade(
     )
     margin = float(margin_breakdown["total"])
 
-    # Holding-period vs annualized ROI (SPECS §4a caveat #2). Use
-    # calendar-day count divided by 252/365 ≈ 0.69 as the trading-day
-    # approximation to avoid an import dependency on trading_calendar
-    # for the hot path. For cross-strategy ranking the relative
-    # ordering is what matters; the 252/365 vs 252/365.25 nit is in
-    # the noise.
-    hold_calendar_days = max(1, (trade.exit_date - trade.entry_date).days)
-    hold_trading_days = max(1, round(hold_calendar_days * 252 / 365))
+    # Holding-period vs annualized ROI (SPECS §4a caveat #2). When
+    # the caller knows the exact trading-day hold (the sweeper does
+    # — it's just entry_offset_td − exit_offset_td), use it; otherwise
+    # fall back to the calendar-day × 252/365 approximation. The
+    # approximation rounds short windows wrong (e.g., 2 calendar days
+    # → round(1.38) = 1 trading day instead of 2) which biases
+    # short-hold annualized ROI by up to 2×; the sweeper-pass-through
+    # eliminates that for every sweep cell.
+    if hold_trading_days is None:
+        hold_calendar_days = max(1, (trade.exit_date - trade.entry_date).days)
+        hold_trading_days = max(1, round(hold_calendar_days * 252 / 365))
+    else:
+        hold_trading_days = max(1, int(hold_trading_days))
     roi = _safe_roi(net, margin)
     return {
         "symbol": trade.symbol,

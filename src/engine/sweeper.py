@@ -135,6 +135,10 @@ def sweep_one(
             trade,
             strategy_offset_pct=strategy.recommended_strategy_offset_pct,
             spot_at_entry=spot_at_entry,
+            # Exact trading-day hold — both offsets are measured against
+            # the same expiry's trading-day calendar, so their difference
+            # is the true hold (no 252/365 round-trip approximation).
+            hold_trading_days=int(entry_offset_td) - int(exit_offset_td),
             today_fn=today_fn,
         )
     except _SKIPPABLE_ERRORS as e:

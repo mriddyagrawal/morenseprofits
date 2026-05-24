@@ -162,6 +162,34 @@ def test_sweep_one_returns_full_results_dict(monkeypatch, tmp_path):
     assert out["entry_spot"] == 2596.65
 
 
+def test_sweep_one_hold_trading_days_is_exact_offset_difference(monkeypatch, tmp_path):
+    """SPECS §4a caveat #2: the sweeper passes the EXACT trading-day
+    hold (entry_offset_td − exit_offset_td) to price_trade so short
+    windows aren't 2×-inflated by the 252/365 calendar approximation.
+
+    For entry_offset_td=15, exit_offset_td=1 the exact hold is 14 trading
+    days — happens to match the approximation here so the test couldn't
+    catch a regression to the approximation. Use a short-window pair
+    (5 → 3 = 2 trading days) which the approximation would silently
+    round to 1."""
+    _wire_mocks(
+        monkeypatch,
+        entry_date=date(2024, 1, 18),  # T-5
+        exit_date=date(2024, 1, 22),   # T-3 (2 calendar days = 2 trading days)
+    )
+    _redirect_results(monkeypatch, tmp_path)
+    cache.CACHE_DIR = tmp_path
+
+    out = sweep_one(
+        "short_straddle", "RELIANCE", date(2024, 1, 25),
+        entry_offset_td=5, exit_offset_td=3,
+        today_fn=lambda: date(2026, 5, 24),
+    )
+    assert out is not None
+    # Exact: 5 − 3 = 2. The 252/365 approximation would produce 1.
+    assert out["hold_trading_days"] == 2
+
+
 def test_sweep_one_uses_spot_based_margin_basis(monkeypatch, tmp_path):
     """SPECS §4a caveat #1: the sweeper has spot_at_entry locally
     (it sources it from spot_loader before calling generate_trades),

@@ -278,6 +278,48 @@ def test_hold_trading_days_calendar_to_trading_conversion():
     )
 
 
+def test_hold_trading_days_kwarg_overrides_calendar_approximation():
+    """SPECS §4a caveat #2 fix: when the caller knows the exact
+    trading-day hold (the sweeper does — entry_offset_td − exit_offset_td),
+    it passes it via kwarg and the engine uses it instead of the
+    252/365 calendar approximation.
+
+    Canonical bug case caught by p4.verify: 2 calendar days
+    (entry Wed, exit Fri, same week) → round(2 × 252/365) =
+    round(1.38) = 1 trading day, but the real hold is 2. The 2×
+    inflation in roi_pct_annualized polluted the leaderboard for
+    short-window sweep cells. The fix lets the sweeper pass the
+    exact count."""
+    entry = date(2024, 1, 17)   # Wednesday
+    exit_ = date(2024, 1, 19)   # Friday — 2 calendar days, 2 trading days
+    df = _option_frame([(entry, 100.0, 250), (exit_, 50.0, 250)])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),), strategy="test",
+    )
+
+    # Without kwarg → biased approximation (1 trading day)
+    approx_out = price_trade(
+        trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+        slippage_model=_NO_SLIPPAGE,
+    )
+    assert approx_out["hold_trading_days"] == 1  # the bug
+
+    # With kwarg (what the sweeper passes) → exact (2 trading days)
+    exact_out = price_trade(
+        trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+        slippage_model=_NO_SLIPPAGE, hold_trading_days=2,
+    )
+    assert exact_out["hold_trading_days"] == 2
+
+    # And the annualized ROI is halved (no longer 2×-inflated)
+    assert exact_out["roi_pct_annualized"] == pytest.approx(
+        approx_out["roi_pct_annualized"] / 2.0, abs=1e-6,
+    )
+
+
 def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():
     """LOAD-BEARING for the full financial picture: all THREE layers
     tied together on the canonical RELIANCE Jan-2024 short straddle.
