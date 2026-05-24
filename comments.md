@@ -571,3 +571,42 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Stay the course on `feat(p1.3.1): bhavcopy_fo_loader` — the fixture-capture-first guidance from the a359b80 review still applies. One useful add given this commit's "loud over silent" pattern: when the loader detects an unknown format (header doesn't match either pre-Jul-8 or ≥Jul-8 schema), it should raise a `BhavcopyFormatError` (new entry in SPECS §8 error taxonomy) rather than papering over with a permissive parser. Same reasoning as this commit: a future NSE format change should be a loud error, not a silent partial-fill.
 
 ---
+
+## Review of 641276e — chore(p1.3.1.discovery): F&O bhavcopy dual-format reality + recorded fixtures
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Honor the "capture fixtures FIRST" directive — go look at real bhavcopies on both sides of 2024-07-08, write down what's actually there, and correct the SPECS where they were wrong.
+
+**What works:**
+- **Discovery overturned a prior SPECS claim** — b0ef46a/a359b80 had "jugaad handles both transparently"; that's true for *equity* bhavcopy, NOT F&O. `bhavcopy_fo_raw` raises `BadZipFile` for ≥ Jul-8-2024. SPECS §2.4 now reflects reality.
+- Found the correct historical UDiff URL: `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{YYYYMMDD}_F_0000.csv.zip`. Verified live against 4 dates (2024-07-08, 2024-07-25, 2024-08-29, 2024-10-25). The `NSEDailyReports` API only exposes today/yesterday — for historical it's direct-URL construction. Worth committing to the SPECS.
+- Both schemas documented in SPECS §2.4 ([SPECS.md:147-167](SPECS.md#L147-L167)) — 15 cols legacy with `OPTSTK`/`OPTIDX`/`FUTSTK`/`FUTIDX`, 34 cols UDiff with `STO`/`IDO`/`STF`/`IDF` — including the 1:1 instrument-code mapping.
+- Recorded fixtures: 35-row slice each, RELIANCE rows present in both:
+  - [tests/fixtures/bhavcopy_fo_legacy_20240125.csv](tests/fixtures/bhavcopy_fo_legacy_20240125.csv) has the Jan-25 hand-check rows (`OPTSTK,RELIANCE,25-Jan-2024,...`).
+  - [tests/fixtures/bhavcopy_fo_udiff_20240829.csv](tests/fixtures/bhavcopy_fo_udiff_20240829.csv) has the Aug-29 + Oct-31 expiry rows (`STO,...,RELIANCE,...,2024-08-29,2024-10-31,...`).
+- `scripts/capture_bhavcopy_fixtures.py` is the discovery-trail script with all findings in the top-of-file docstring — future-readers don't re-derive.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`XpryDt` vs `FininstrmActlXpryDt` (UDiff) — pick a canonical and document why.** Both fields exist in the UDiff schema. In the captured fixture they agree (Aug-29 trading day → Aug-29 + Oct-31 expiries, same value in both columns). They likely diverge only on **holiday-shifted expiries** (scheduled Thursday is a holiday → contract settles previous trading day). The §2.4 `expiry` column should map to whichever is *actually settled*, since that's what a backtest's exit price ties to. Worth capturing a third fixture from a holiday-affected month (e.g. Diwali week 2024) to disambiguate before p1.3.1 lands.
+- **NSE 403s without a browser User-Agent.** The capture script sets `Mozilla/5.0 ... Chrome/...` headers ([scripts/capture_bhavcopy_fixtures.py:53-57](scripts/capture_bhavcopy_fixtures.py#L53-L57)). The production loader's UDiff fetcher will need the same trick. Pin this in SPECS §2.4 or in the loader's docstring — the next-NSE-quirk-of-the-week shouldn't make us re-derive.
+- **Trailing commas in legacy CSV** (the `25-JAN-2024,` row endings) produce a phantom "Unnamed: 16" column when pandas-parsed. The parser must drop it explicitly or pass `usecols=`. UDiff's `Rmks,Rsvd1..4` mostly-empty columns are similar.
+- **`arc.udiff_start_date`** is referenced in the capture script but the script doesn't pin its current value. If jugaad ships a date constant for the cutover, the loader should *import* it rather than re-hardcode `date(2024, 7, 8)` — keeps us in lockstep with the upstream library's view of the boundary.
+- The discovery script is `scripts/capture_bhavcopy_fixtures.py` — correctly outside `tests/`, but it's a one-shot. Add a `# Run once: ` comment near the top so future-me doesn't accidentally re-run and overwrite the committed fixtures.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** revealed `bhavcopy_fo_raw`'s actual coverage limit. That's a real upstream constraint, not our bug. Naming the URL pattern in SPECS is the right escape hatch.
+- **Options math:** the captured fixtures contain real RELIANCE Jan-25 + Aug-29 contract rows with non-zero `CLOSE`/`SETTLE_PR` and `MARKET LOT=250` — material for sanity-checking the parser later.
+- **Look-ahead bias:** `trade_date` rule from §2.4 still holds; the fetcher should accept the trade date and stamp it onto every row of the normalized output even if upstream doesn't carry it (legacy stores it in `TIMESTAMP`, UDiff stores it in `TradDt`/`BizDt` — both ~= filename date).
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- Read SPECS diff + the capture script top to bottom.
+- `head -5` + `grep RELIANCE` on both fixtures — confirmed the legacy "DD-Mmm-YYYY" + uppercase-codes shape AND the UDiff "ISO-date" + STO-codes shape.
+- Cross-checked the UDiff URL format against the script's `UDIFF_URL_TPL` and the 4-date verification in the commit message.
+
+**Next-commit suggestion:** `feat(p1.3.1): bhavcopy_fo_loader.py` — and the cleanest design separates **fetcher** from **parser**: the *fetcher* dispatches by date (`<` vs `≥` the cutover, prefer `jugaad.archives.NSEArchives.udiff_start_date` if it exists; fall back to `date(2024,7,8)`) and returns `(raw_text, format_tag)`. The *parser* takes `(raw_text, format_tag)` and returns the §2.4 DataFrame. Two independently testable layers — fetcher tests can monkeypatch network; parser tests use the recorded fixtures directly. Add `BhavcopyFormatError` to SPECS §8 for the "neither header matches" case. And lock the **stamping** rule in code: the loader writes `trade_date` from the request date passed in (not from upstream's TIMESTAMP/TradDt), and asserts the inferred value from upstream matches — catches mis-dispatched fetches loudly.
+
+---
