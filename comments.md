@@ -1882,3 +1882,30 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** Per the BUILDER's note, **wire `cost_model` into `engine.pnl.price_trade`** as the immediate next micro-step. Add a `cost_model: CostModelV1 = COST_MODEL_V1` parameter (defaulted, injectable like `load_option_fn`). In the kernel, compute `cost_breakdown = cost_model.total_cost(leg_results)` after summing gross, then return `costs = cost_breakdown["total"]` and `net_pnl = gross_pnl - costs` in the result dict. **Test: update the RELIANCE Jan-2024 hand-check** to assert `gross_pnl == 2750.0`, `costs == 141.78` (or precise: 141.7811...), `net_pnl ≈ 2608.22`. That single assertion proves the gross+cost pipeline ties together correctly. After that → `feat(p3.4): ShortStraddle strategy`.
 
 ---
+
+## Review of 3c82ee0 — fix(p3.3.b): wire COST_MODEL_V1 into price_trade — costs + net_pnl in result
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Mechanical wire-up of the cost model into the P&L kernel. `price_trade` now returns gross + costs + net + breakdown — the full pipeline a sweeper consumes.
+
+**What works:**
+- `cost_model: CostModelV1 = COST_MODEL_V1` kwarg ([src/engine/pnl.py:137](src/engine/pnl.py#L137)) — injectable like `load_option_fn`, default to the singleton. Mirror pattern. Clean.
+- 3 new keys in result dict: `costs`, `net_pnl`, `costs_breakdown_json`. Sweeper / analytics can consume net_pnl directly without re-running the cost layer.
+- **Load-bearing test ties the layers together**: `test_reliance_jan_2024_full_pipeline_gross_costs_net` asserts `gross_pnl=2750.0`, `costs=141.7811`, `net_pnl=2608.22`. If gross and cost computations drift at the boundary, this fires immediately. **This is the test I suggested verbatim.**
+- `test_cost_model_is_injectable_for_sensitivity` pins the Phase-5 sensitivity pattern with a zero-brokerage variant. Singleton unaffected.
+- 152/152 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:** None worth flagging — this is a tight 2-file, ~30-line wire-up that does exactly what was needed.
+
+**Domain / correctness checks:**
+- **Net P&L:** `gross - costs` with costs always positive. Correct.
+- **Cost injection:** kwarg pattern matches `load_option_fn`'s injection — consistent.
+
+**What I tried:** `python -m pytest tests/` → 152/152 in 0.71s. Read the diff end-to-end.
+
+**Next-commit suggestion:** Per the BUILDER's note, **margin module** comes next ("Indian-specific: SELL legs need SPAN-style margin block ~20% of underlying notional; BUY legs only need the premium"). This is a SPECS-amendment-worthy decision — margin is a P&L-relevant concept that hasn't been in the project yet. Before writing code, pin in SPECS: (a) margin formula (SPAN approximation: max(20% × underlying notional, premium × 1.5) for short option legs, premium-only for long); (b) WHERE margin lives in the results schema — as a separate column `margin_required` per SPECS §2.5, or as a `params` field?; (c) what does the engine *do* with margin — does `price_trade` enforce "trade requires more margin than caller's capital"? Or is margin just a reported metric? I lean **reported metric only** for v1 — let the strategy/sweeper decide what to do with it. Implementation can then be a small module like `src/engine/margin.py` with `compute_margin(trade, spot_at_entry, cost_model) -> dict`, wired into `price_trade` via the same injectable-default pattern as `cost_model`.
+
+---
