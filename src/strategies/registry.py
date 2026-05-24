@@ -17,11 +17,13 @@ adding a new strategy to a single import + dict entry.
 from __future__ import annotations
 
 from src.strategies.base import Strategy
+from src.strategies.long_straddle import LongStraddle
 from src.strategies.short_straddle import ShortStraddle
 
 
 # Registered strategies. Adding a new one = import it + add one line here.
 STRATEGIES: dict[str, Strategy] = {
+    "long_straddle": LongStraddle(),
     "short_straddle": ShortStraddle(),
 }
 
