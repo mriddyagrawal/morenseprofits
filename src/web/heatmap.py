@@ -170,6 +170,55 @@ def _format_offset_label(prefix: str, value: int) -> str:
     return f"{prefix}-{int(value)}"
 
 
+def _build_customdata(
+    df: pd.DataFrame,
+    strategy: str,
+    symbol: str,
+    entry_index,
+    exit_columns,
+):
+    """Build a (H, W, 5) numpy-style array of per-cell stats for
+    Plotly's customdata channel:
+
+        customdata[i][j] = [n_trades, win_rate_pct, std_roi_pct_ann,
+                            total_net_pnl, median_roi_pct_ann]
+
+    Aligned with the value/density heatmap grids (entry rows × exit
+    columns). Cells with no trades carry zeros — hover renders
+    accordingly. The (i, j) iteration order matches the pivot's
+    .index / .columns so customdata aligns row-for-row, col-for-col.
+
+    NOTE: the median ROI is computed PER CELL (not per pair) so it
+    matches what the value heatmap renders — fold by the cell's
+    own trades, not by the overall pair's. Matches the value pane's
+    pivot_window aggregation.
+    """
+    import numpy as np
+
+    # Filter to the (strategy, symbol) pair once.
+    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    H, W = len(entry_index), len(exit_columns)
+    out = np.zeros((H, W, 5), dtype=float)
+
+    for i, e in enumerate(entry_index):
+        for j, x in enumerate(exit_columns):
+            cell = pair[
+                (pair["entry_offset_td"] == e)
+                & (pair["exit_offset_td"] == x)
+            ]
+            n = len(cell)
+            if n == 0:
+                continue
+            n_win = int((cell["net_pnl"] > 0).sum())
+            out[i, j, 0] = float(n)
+            out[i, j, 1] = 100.0 * n_win / n if n else 0.0
+            # ddof=0 to match aggregate.py's std convention
+            out[i, j, 2] = float(cell["roi_pct_annualized"].std(ddof=0))
+            out[i, j, 3] = float(cell["net_pnl"].sum())
+            out[i, j, 4] = float(cell["roi_pct_annualized"].median())
+    return out
+
+
 def render_heatmaps(
     df: pd.DataFrame,
     *,
@@ -235,6 +284,13 @@ def render_heatmaps(
     entry_ticks = [_format_offset_label("T", v) for v in values.index]
     exit_ticks = [_format_offset_label("T", v) for v in values.columns]
 
+    # === Per-cell customdata for hover tooltips (p6.3.hover) ===
+    # Compose the full row's stats (win_rate_pct, std_roi_pct_annualized,
+    # total_net_pnl, mean_roi_pct_annualized) into a 3D customdata
+    # array aligned with the (entry, exit) grid. Hover renders the
+    # full per-cell story per DESIGN_SPEC §2.5 + §2.2.
+    custom = _build_customdata(df, strategy, symbol, values.index, values.columns)
+
     # === Left pane — median ROI/yr (diverging colormap) ====
     value_z = masked.values  # NaN cells render as no-data
     value_fig = go.Figure(data=go.Heatmap(
@@ -253,6 +309,16 @@ def render_heatmaps(
         textfont={"size": 12},
         colorbar={"title": "%/yr", "x": 1.02},
         hoverongaps=False,
+        customdata=custom,
+        hovertemplate=(
+            "<b>entry %{y}, exit %{x}</b><br>"
+            "Median ROI/yr: %{z:+.1f}%<br>"
+            "N: %{customdata[0]}<br>"
+            "Win rate: %{customdata[1]:.1f}%<br>"
+            "Std ROI/yr: ±%{customdata[2]:.1f}%<br>"
+            "Net P&L: ₹%{customdata[3]:,.0f}"
+            "<extra></extra>"
+        ),
     ))
     value_fig.update_layout(
         title="Median ROI/yr",
@@ -278,6 +344,14 @@ def render_heatmaps(
         textfont={"size": 12},
         colorbar={"title": "N", "x": 1.02},
         hoverongaps=False,
+        customdata=custom,
+        hovertemplate=(
+            "<b>entry %{y}, exit %{x}</b><br>"
+            "N: %{z}<br>"
+            "Median ROI/yr: %{customdata[4]:+.1f}%<br>"
+            "Win rate: %{customdata[1]:.1f}%"
+            "<extra></extra>"
+        ),
     ))
     density_fig.update_layout(
         title="Sample density (trades per cell)",
@@ -293,6 +367,16 @@ def render_heatmaps(
         st.plotly_chart(value_fig, use_container_width=True)
     with cols[1]:
         st.plotly_chart(density_fig, use_container_width=True)
+
+    # std-bias tooltip text per DESIGN_SPEC §2.2 — surface as a small
+    # caption below the panes since Plotly hovertemplates can't carry
+    # tooltips on a column name.
+    st.caption(
+        "_Std ROI/yr in the hover is observed-sample dispersion "
+        "(ddof=0), not an unbiased population estimate. Bias vs "
+        "ddof=1 sample-std: ~11% at n=5, ~5% at n=10, ~2.5% at n=20. "
+        "Treat as a LOWER BOUND on true population spread._"
+    )
 
     # Footer caption — reinforces the masking story.
     n_masked = int(values.notna().sum().sum() -

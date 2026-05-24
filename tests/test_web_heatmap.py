@@ -282,6 +282,64 @@ def test_all_cells_masked_empty_state(captured_charts):
     assert "plotly_chart" not in kinds
 
 
+def test_cells_have_customdata_for_hover_tooltips(captured_charts):
+    """LOAD-BEARING per DESIGN_SPEC §2.5: per-cell hover tooltips
+    must compose (n_trades, win_rate, std, total_net_pnl, median).
+    Customdata is the Plotly channel; verify it's populated and
+    correctly aligned with each cell."""
+    # 2x2 grid, n=6 each, varied roi to make customdata distinguishable
+    rows = []
+    for e in (15, 10):
+        for x in (3, 1):
+            for _ in range(6):
+                rows.append(_row(entry=e, exit_=x, net_pnl=100.0 * (e + x),
+                                 roi_pct_annualized=10.0 * (e + x)))
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
+    trace = value_fig.data[0]
+    cd = trace.customdata
+    # Shape: (H, W, 5)
+    assert cd.shape == (2, 2, 5)
+    # All visible cells have N=6
+    assert (cd[:, :, 0] == 6).all()
+    # All winning trades → win_rate = 100%
+    assert (cd[:, :, 1] == 100.0).all()
+
+
+def test_hover_template_includes_all_load_bearing_fields(captured_charts):
+    """The hovertemplate string must reference every key field per
+    DESIGN_SPEC §2.5. Pin the field set so a future template edit
+    doesn't drop "N" or "Std" silently."""
+    rows = [_row(entry=e, exit_=x, roi_pct_annualized=50.0)
+            for e in (15, 10) for x in (3, 1) for _ in range(6)]
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
+    tmpl = value_fig.data[0].hovertemplate
+    # Required fields per §2.5
+    assert "Median ROI/yr" in tmpl
+    assert "N:" in tmpl
+    assert "Win rate" in tmpl
+    assert "Std ROI/yr" in tmpl
+    assert "Net P&L" in tmpl
+    # Currency + percent prefixes preserved
+    assert "₹" in tmpl
+    assert "%" in tmpl
+
+
+def test_density_pane_hover_references_value_via_customdata(captured_charts):
+    """Density pane shows N as the main z; hover should ALSO surface
+    the cell's median ROI so the operator doesn't need to switch
+    panes."""
+    rows = [_row(entry=e, exit_=x, roi_pct_annualized=42.0)
+            for e in (15, 10) for x in (3, 1) for _ in range(6)]
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    density_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][1]["fig"]
+    tmpl = density_fig.data[0].hovertemplate
+    assert "N:" in tmpl
+    assert "Median ROI/yr" in tmpl  # via customdata[4]
+    assert "Win rate" in tmpl       # via customdata[1]
+
+
 def test_partial_mask_caption_surfaces_count(captured_charts):
     """Some cells visible, some masked → both charts render AND a
     caption tells the operator HOW MANY cells were masked."""
@@ -297,9 +355,11 @@ def test_partial_mask_caption_surfaces_count(captured_charts):
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
     captions = [e for e in captured_charts if e["kind"] == "caption"]
     assert len(charts) == 2  # both panes
-    assert len(captions) == 1
-    assert "masked" in captions[0]["msg"]
-    assert "min_n=5" in captions[0]["msg"]
+    # Two captions: the always-present std-bias note + the partial-mask
+    # diagnostic. The mask-count caption is the load-bearing one here.
+    mask_caps = [c for c in captions if "masked" in c["msg"]]
+    assert len(mask_caps) == 1
+    assert "min_n=5" in mask_caps[0]["msg"]
 
 
 def test_naming_rule_values_have_percent_suffix(captured_metrics):

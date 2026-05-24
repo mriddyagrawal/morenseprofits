@@ -247,10 +247,6 @@ def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
     render_heatmaps(
         df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
     )
-    _placeholder(
-        "Customdata tooltips (replaces basic hover)",
-        "feat(p6.3.hover)",
-    )
 
 
 def _render_trends_tab(df_filtered: pd.DataFrame) -> None:
