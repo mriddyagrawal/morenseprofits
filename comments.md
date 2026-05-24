@@ -1241,3 +1241,36 @@ Trivial followup. Two tiny things closed from the 02e3644 review:
 **Next-commit suggestion:** `feat(p1.5): data/trading_calendar.py` — implement `trading_days(from, to)` and `offset_trading_days(anchor, n)`. The **load-bearing test is `offset_trading_days` correctness**: every Phase-3 backtest's entry/exit date depends on it; a single off-by-one breaks every backtest's prices silently. Concrete hand-check: `offset_trading_days(date(2024,1,25), 15) == date(2024,1,4)` (Jan-25 expiry → 15 trading days back, skipping weekends + Jan-1 Republic Day-adjacent holidays = Jan-4). Bake in three invariants from commit 1: (a) bootstrap trading-day calendar from `load_spot("RELIANCE", ...)` per SPECS §6 — don't introduce a separate data source; (b) **cross-validate against `jugaad_data.holidays`** as a sanity check (any date returned by `trading_days` that's also in the holidays list is a bug); (c) `offset_trading_days(holiday, 0)` semantics — pin the behavior explicitly (raise? round to next trading day? round to previous?). My recommendation: round-down to previous trading day, since that's what "T+0 means same day" really means when T-itself isn't a trading day.
 
 ---
+
+## Review of fee312f — chore(p1.5.plan): pin offset_trading_days anchor semantics before impl
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pre-resolve the anchor-edge-case ambiguity I flagged on 5689cff so the impl doesn't have to relitigate. Five rules added to SPECS §3's `offset_trading_days` docstring.
+
+**What works:**
+- All five rules pinned ([SPECS.md:249-263](SPECS.md#L249-L263)):
+  1. anchor IS trading day, n=0 → anchor (identity).
+  2. anchor NOT trading day, n=0 → most recent trading day **strictly** before anchor (round-down, matching my recommendation).
+  3. n=1 → "one trading day before anchor".
+  4. n < 0 → ValueError.
+  5. Insufficient history → ValueError.
+- Bootstrap source named explicitly ([SPECS.md:265-266](SPECS.md#L265-L266)) — `load_spot(CALENDAR_SYMBOL, ...)` from SPECS §6, NO separate data source. Reuses existing infrastructure.
+- jugaad_data.holidays cross-validation called out as a test responsibility, not a runtime hard-check (right call — tests catch upstream drift; runtime should trust the bootstrapped calendar).
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- **n=1-from-non-trading-anchor is subtly ambiguous.** Under the rule-3 wording "one trading day before anchor", Saturday→n=1 could mean either: (a) round-down first (Friday), then step 1 back → Thursday; OR (b) "1 trading day before Saturday" → Friday (the prior trading day from a non-trading anchor). These give different answers. The mathematically clean interpretation is **(a) compositional with rule 2**: `offset(anchor, n)` = trading_day_at_index(`rank(anchor) - n`) where `rank(anchor)` is the index of the round-down. Under (a), Saturday → n=0 = Friday, n=1 = Thursday, n=2 = Wednesday. Pin (a) explicitly with an example so the test writer doesn't have to derive it. As-is, the docstring's "regardless of whether anchor itself is a trading day" parenthetical could be read either way.
+- **No timezone note.** `anchor: date` is naïve; NSE trades in IST. `date.today()` is system-tz-dependent. Not a practical issue if callers always use IST-system Python, but worth a one-liner: "anchor is interpreted as a naïve IST date".
+- **No example in the docstring.** "n=15 from Jan-25-2024 expiry returns Jan-4-2024" would make the rules concrete and serve as a documentation hand-check. Cheap add.
+
+**Domain / correctness checks:**
+- **Look-ahead bias:** round-down semantics is the right call for non-trading anchors — round-up could leak future data.
+- **jugaad-data usage / options math / stats:** N/A pure docs.
+
+**What I tried:** Read the diff; mentally traced the rule-3 ambiguity through both interpretations to confirm the trap.
+
+**Next-commit suggestion:** `feat(p1.5): trading_calendar.py` — implementation. Stay with the spot_loader pattern (pure functions, no global state); cache the trading-day list per-year-of-spot rather than its own parquet (the spot_loader cache already has all the dates we need — derived view, not new data source). **Crucial: include a `test_anchor_off_trading_day_compositional` that explicitly nails the n=1-from-Saturday case** so the rule-3 ambiguity gets resolved by code, not by re-reading SPECS. The Jan-25 → n=15 → Jan-4 hand-check is the canonical positive test; the Saturday-anchor case is the canonical edge test.
+
+---
