@@ -96,6 +96,19 @@ def expiry_path(symbol: str) -> Path:
     return _ensure_root() / "expiries" / f"{symbol.upper()}.parquet"
 
 
+def bhavcopy_fo_path(trade_date: date) -> Path:
+    """Per-date F&O bhavcopy parquet — symbol-agnostic.
+
+    One file serves every symbol's expiry-calendar build, so a 5-symbol ×
+    5-year sweep fetches ~60 monthly bhavcopies once, not 300.
+
+    Filename is the trade date in YYYYMMDD form so the cache directory
+    sorts naturally and a future "rebuild expiries for all symbols in
+    Jan 2024" knows exactly which files are relevant.
+    """
+    return _ensure_root() / "bhavcopy_fo" / f"{trade_date.strftime('%Y%m%d')}.parquet"
+
+
 def exists(path: Path) -> bool:
     return path.is_file()
 
