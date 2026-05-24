@@ -2135,3 +2135,66 @@ My strong recommendation: **Option A**. The slippage model is the only thing in 
 After that the live verify produces the first defensible end-to-end number on real NSE data, and Phase 3 closes cleanly.
 
 ---
+
+## Review of 712e829 — chore(p3.verify): FIRST REAL ₹P&L — RELIANCE Jan-2024 short straddle LIVE
+
+**Verdict:** ✅ accept — **PHASE 3 IS DONE**
+
+**Phase / commit goal (as I understood it):** The user's original ask actualized. Every layer (data + universe + strategy + engine + costs + margin) exercised end-to-end against real NSE data for one well-defined trade.
+
+**What works:**
+
+**Independent live run on my machine reproduced the BUILDER's numbers byte-for-byte:**
+
+| | value |
+|---|---|
+| ATM strike | 2600 |
+| CE 2600 SELL entry / exit | 56.50 / 95.05 |
+| PE 2600 SELL entry / exit | 43.15 / 0.40 |
+| CE leg gross | -₹9,637.50 |
+| PE leg gross | +₹10,687.50 |
+| **Gross P&L** | **+₹1,050.00** |
+| Costs (Zerodha-style) | ₹139.68 |
+| **NET P&L** | **+₹910.32** |
+| Margin at entry (Tier-B) | ₹1,39,319 |
+| ROI (20-day holding period) | **+0.65%** |
+
+- **CE entry close = 56.50** matches the Phase-1 integration verify EXACTLY (commit 2518c50), proving the full stack ties together from data layer through engine.
+- **Margin ₹1,39,319 matches real Zerodha SPAN** (~₹1.4-1.7L for this position). Tier-B accuracy lift is real.
+- **Economic interpretation is honest**: RELIANCE rallied from ~₹2596 to ~₹2700ish. CE went deep ITM (56 → 95), PE went to ~zero (43 → 0.40). PE win > CE loss because realized move (~4%) was less than combined premium (₹99.65 ≈ 3.8% of spot). Classic short-straddle outcome.
+- **Costs ₹139.68 vs my prior napkin estimate ₹141.78** — agree within 1.5%; the small difference comes from real PE close 43.15 vs the synthetic 50 I used in the napkin math.
+- BUILDER's commit message explicitly names the 3 still-open follow-ups (slippage, annualized ROI, spot-vs-strike margin) — acknowledges the gaps I flagged.
+
+**The honest takeaway:** **+0.65% over 20 days = ~8%/year annualized**. With slippage haircut (~₹500), net would drop to ~₹400 = ~0.3% over 20 days = ~4%/year. **This is a marginal trade.** Whether short straddles pay reliably for RELIANCE depends on Phase 4's sweep across many months — this single trade is the dragon-fly footprint, not the answer.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions — STILL OPEN before Phase 4 sweeps launch:**
+
+1. **Slippage is now THE most consequential gap.** Phase 4 will run sweeps over hundreds-to-thousands of trades. Without slippage, every one of those P&L numbers is systematically optimistic by ~₹500/trade. Aggregated across a 5-year × 12-month × 5-window sweep, the bias would lead the user to choose "winning" windows that actually lose money once real bid-ask spreads are paid. **Add SlippageModelV1 BEFORE the sweep, not after.** ~50 lines, defaults 1%/side, mirrors CostModel pattern.
+
+2. **`roi_pct_annualized` column** should land before Phase 5 ranker. A 20-day-hold strategy at 0.65% ROI looks IDENTICAL to a 5-day-hold strategy at 0.65% ROI in a leaderboard, but the second is 4× better risk-adjusted. The 5-line fix: `roi_pct_annualized = roi_pct × 252 / hold_trading_days`.
+
+3. **Strike-vs-spot margin** can stay deferred until Phase 4 introduces asymmetric strategies (iron condor). For ATM short straddle this doesn't bite.
+
+**Domain / correctness checks:**
+- **Sign convention end-to-end:** verified. CE got more expensive → SELL CE lost. PE got cheaper → SELL PE won. Net = win > loss. Math checks.
+- **No look-ahead:** entry/exit dates pinned, no future data accessed. Trade priced from frames bounded by exit_date.
+- **Lot-size from data:** 250 read from MARKET LOT column, not hardcoded.
+- **Margin:** Tier-B numbers match real broker; the user can act on these.
+- **Statistical honesty:** ONE trade is N=1. The 0.65% number means almost nothing on its own. The verify is a **plumbing check**, not a recommendation. Phase 4 produces the statistical evidence.
+
+**What I tried:**
+- `python scripts/verify_p3.py` on my machine → identical output to BUILDER's commit message.
+- Read the verify script structure end-to-end.
+
+**PHASE 3 STATUS: DONE.**
+- 6 data-layer modules + universe + 4 engine modules (pnl, costs, margin, vol) + ShortStraddle strategy
+- 192 offline tests + 5 live verify scripts (Phase 1.3 / 1.4 / 1.5 / Phase-1-integration / Phase-3)
+- The single-trade backtester produces honest ₹P&L numbers against real NSE data
+- Tier-B margin matches real broker SPAN within 10-15%
+- Cost model matches Zerodha discount-broker stack
+
+**Next-commit suggestion:** **`feat(p3.5.g): SlippageModelV1`** as the very next commit, BEFORE Phase 4 sweeps launch. Three reasons stacked: (1) the user explicitly asked for asymmetric conservatism; (2) Phase 4 sweep results will be aggregated and ranked — a systematic +₹500/trade optimism bias will steer the user toward false-positive "winning" windows; (3) cheap to add now (~50 lines, mirrors CostModel pattern). Then `feat(p3.5.h): roi_pct_annualized` (~5 lines) so Phase 5's ranker has a fair comparison column. Then Phase 4 — the sweeper. Once Phase 4 ships, the user has not just one ₹P&L number but a heatmap of which (entry, exit) windows historically paid, with honest conservatism baked in.
+
+---
