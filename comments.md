@@ -3306,6 +3306,127 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of a7e0baf — feat(p6.3.headline): heatmap tab — strategy/symbol selectors + 3-card strip
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Open Phase 6.3 with the Heatmap tab's selectors + 3-card headline. The Heatmap tab is unique: aggregating across strategies isn't meaningful, so in-tab selectors are required (operator picks ONE pair). Cards per DESIGN_SPEC §2.5 Heatmap row: BEST / WORST / MEDIAN cell, all post-mask at the sidebar's `min_n`.
+
+**What works:**
+
+- **Selectors with smart-fallback defaults** ([src/web/heatmap.py:37-73](src/web/heatmap.py#L37-L73)):
+  ```python
+  default_strat = st.session_state.get("mp_heatmap_strategy") \
+      if st.session_state.get("mp_heatmap_strategy") in available_strategies \
+      else available_strategies[0]
+  ```
+  **Defensive against stale state**: if the previously-selected strategy is no longer in the sidebar-filtered options, defaults to first-available instead of raising `ValueError: <state value> is not in iterable`. Clean.
+- **`key="mp_heatmap_strategy"` / `key="mp_heatmap_symbol"`** — widget state binds directly to session_state with `mp_` namespace per SPECS §11.4.
+- **Help text on the strategy selectbox** ([src/web/heatmap.py:61](src/web/heatmap.py#L61)): "One pair at a time — heatmaps don't aggregate meaningfully across strategies." Operator understands WHY they're picking instead of seeing aggregates.
+- **4 distinct empty-state paths**, each with a SPECIFIC operator-action message:
+  1. 0 rows after sidebar filters → "no data after filters" ([src/web/heatmap.py:91-96](src/web/heatmap.py#L91-L96))
+  2. Selectors returned None (early empty state) → same path
+  3. Pivot empty (selector picks a pair with zero data) → "no cells for X × Y" ([src/web/heatmap.py:100-105](src/web/heatmap.py#L100-L105))
+  4. Every cell masked at min_n → "all cells N < min_n=K" ([src/web/heatmap.py:109-116](src/web/heatmap.py#L109-L116))
+  
+  **Path #4 is the load-bearing one on the verify set** — every cell has n=3 < default min_n=5, so the operator sees an explicit message instead of a blank grid. Asymmetric-conservatism honored.
+- **§2.5 naming rule honored**: all 3 card values formatted via `format_pct(signed=True, annualized=True)` — `+X.X%/yr` format. **No rupee glyph leaks into percentage cards** (pinned by `test_naming_rule_values_have_percent_suffix`). The mockup bug "BEST CELL +82.3 %/yr alongside AVG ROI +264.1 %/yr" (best can't be lower than average) is now **structurally impossible** — both numbers come from the same `masked` pivot, so by construction `best >= median >= worst`.
+- **Best/worst cell coordinates from `stacked.idxmax/idxmin`** ([src/web/heatmap.py:124-128](src/web/heatmap.py#L124-L128)) — pandas idiom returns `(entry_offset_td, exit_offset_td)` tuple. `_cell_label` formats as `(entry T-?, exit T-?)`. Subtitle gives operator exactly where to look on the heatmap.
+- **Median across visible cells** ([src/web/heatmap.py:121-122](src/web/heatmap.py#L121-L122)) — `masked.stack().median()` + `n_visible_cells = masked.notna().sum().sum()`. Subtitle "across N visible cell(s)" surfaces the sample size used for the median. Operator knows the median is over the same cells they see, not over a hidden superset.
+- **app.py wired** — `_render_heatmap_tab` now: caveats → selectors → headline → placeholder for the dual Plotly heatmaps.
+- **6 new tests; 442/442 full suite** (was 436 + 6).
+
+**Live-tested all 4 branches:**
+
+```
+Test 1: min_n=5 verify set (every cell n=3, all masked)
+  Best/Worst/Median: ('—', 'all cells N < min_n=5')
+
+Test 2: min_n=1 verify set (no masking — actual cells)
+  Best cell:   +365.9%/yr   (entry T-5, exit T-3)
+  Worst cell:  +89.1%/yr    (entry T-5, exit T-1)
+  Median cell: +251.8%/yr   across 6 visible cell(s)
+
+Test 3: empty df
+  All 3: ('—', 'no data after filters')
+
+Test 4: nonexistent (strategy, symbol)
+  All 3: ('—', 'no cells for nonexistent × ALSO_FAKE')
+```
+
+**Cross-checked against my 5bd9145 review's heatmap data**:
+```
+              exit=3    exit=1
+entry=15:     113.5%    253.6%
+entry=10:     253.4%    250.1%
+entry=5 :     365.9%     89.1%
+```
+- Best = 365.9% at (entry=5, exit=3) ✓
+- Worst = 89.1% at (entry=5, exit=1) ✓
+- Median = median([89.1, 113.5, 250.1, 253.4, 253.6, 365.9]) = average(250.1, 253.4) = **251.8** ✓
+
+All hand-computed values match the live render. **The mockup-bug-prevention property holds**: best (365.9%) ≥ median (251.8%) ≥ worst (89.1%) — internally consistent.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **No help text on the symbol selectbox** ([src/web/heatmap.py:67-71](src/web/heatmap.py#L67-L71)) — the strategy selectbox has a `help=` explaining the one-pair-at-a-time rationale; the symbol one doesn't. Minor inconsistency. Could add or leave (the strategy help is sufficient context for both). Cosmetic.
+
+2. **`stacked.idxmax/idxmin` tiebreaker**: if two cells share the max value, idxmax returns the **first** in iteration order (stack iterates in the post-mask sort order). For the Q1-2024 verify set there are no ties so undetectable; on future larger sweeps, ties could land. **The subtitle would show one cell coordinate**, not "+ X other cells tied" — fine in practice; operators can scan the heatmap visually for ties. Worth a docstring note. Cosmetic.
+
+3. **`format_pct(89.1, signed=True)` renders as `+89.1%/yr`** ([test 2 output above]) — the `signed=True` prepends `+` even when the value is naturally positive. **Worst cell at +89.1%/yr is misleading** at first read: the `+` sign signals "this is a positive value" but the operator might initially read "worst with a plus" as a contradiction. **Defensible**: in a heatmap where most cells are positive, the worst is still "best of the worst"; the sign clarifies it's not a loss. **Compare the WORST CELL subtitle wording**: "Worst cell" + value `+89.1%/yr` + coord `(entry T-5, exit T-1)` — taken together, unambiguous. Just noting the asymmetric-conservatism property cuts both ways: `signed=True` exposes positive worst-cells transparently, but a colorblind operator might miss the value-direction signal. Visual-check during chore(p6.3.verify).
+
+4. **`selectbox` `index=...index(default_strat)`** could raise `ValueError` if `default_strat` somehow isn't in `available_strategies` despite the guard — but the guard is comprehensive (`if state in options else first`). Defensive enough.
+
+5. **`return strategy, symbol` after the `st.selectbox` widgets** — the selectbox return is the user's CURRENT selection (not session_state's value); they could differ on the very first render of the new selection. Caller uses these immediately for `pivot_window(df, strategy=strategy, symbol=symbol)` — so the headline reflects the just-clicked selection without a re-render gap. ✓
+
+6. **`pivot_window` and `pivot_counts` called twice via separate functions** — DESIGN_SPEC §2.2 contract: "Cells with n < min_n are masked in the value heatmap via `pivot_window.where(pivot_counts >= min_n)`". Implementation matches: separate calls + boolean masking. Two clean operations. ✓
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ thin-cell masking honored; "all cells N < min_n" message tells operator their data is too thin AND what to do about it.
+- **Mockup-bug prevention**: ✓ best/worst/median come from the same masked pivot; by construction `best ≥ median ≥ worst`. The §2.5 naming rule (% suffix on percentage cards, ₹ prefix on rupee cards) is honored.
+- **Min_n flows top-down per SPECS §11.5**: ✓ sidebar `min_n` → app.py → `render_headline` kwarg.
+- **§2.6 empty-state contract**: ✓ all 4 empty paths have specific operator-action messages.
+- **§11.4 state namespace**: ✓ `mp_heatmap_strategy`, `mp_heatmap_symbol`.
+- **Determinism**: ✓ sorted selector options; stable pivot_window output.
+
+**What I tried:**
+- Read [src/web/heatmap.py](src/web/heatmap.py) end-to-end.
+- Read all 6 new tests in `tests/test_web_heatmap.py`.
+- Live-tested all 4 branches (verify-set with min_n=5 / min_n=1, empty df, nonexistent pair).
+- Cross-checked live best/worst/median values against my 5bd9145 review's heatmap data — exact match.
+- `pytest tests/test_web_heatmap.py -v` → 6/6.
+- `pytest tests/` → 442/442.
+
+**Sequencing observation:** Phase 6.3 starts cleanly. The selector + headline pattern mirrors the leaderboard's headline structure (3 cards in `st.columns` + empty-state branching + `format_pct`/`format_inr` naming rule). Code reuse via patterns is high — `render_empty`, `format_pct`, and the column-config conventions are now well-established. Future Phase 6.3 commits (pivot + hover) will plug into this foundation.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 16: **`feat(p6.3.pivot)`** — the dual Plotly heatmaps (value + density). Critical design decisions:
+1. **Use `plotly.graph_objects.Heatmap`** per DESIGN_SPEC §2.1.
+2. **Diverging colormap `RdYlGn` + `zmid=0`** per DESIGN_SPEC §2.3 (NOT sequential green — even when all cells are positive on the current sweep, the colormap must handle future negative cells correctly).
+3. **Two side-by-side heatmaps**: value (masked) + density (raw counts). Sample-N visualization is separate from value visualization per §2.2.
+4. **Thin cells masked in value heatmap** via `pivot_window.where(pivot_counts >= min_n)`. Mocked-out empty grid for the all-masked case (Q1-2024 verify set at min_n=5).
+
+Then `feat(p6.3.hover)` (commit 17) — `customdata=[n_trades, win_rate, std, total_net_pnl]` per cell. The std tooltip text from DESIGN_SPEC §2.2 (the corrected "~11% at n=5" wording).
+
+**Outstanding flags status (still open from prior reviews, none Phase-6.3-blocking):**
+
+| Origin | Concern | Status |
+|---|---|---|
+| 8a07859 #5 | §2.2 "n_trades immediately right of rank" vs implementation | Open |
+| 8a07859 #1 | rank_strategies UserWarning leaks to Streamlit logs | Open |
+| 452b503 #3 | "across N rank-eligible" vs "total" subtitle wording | Open |
+| c6e3684 #1 | `get_message` "streamlit-free" docstring claim | Open |
+| 334bada+5c801dd #1 | `RESULTS_DIR + importlib.reload` test pattern | Open |
+| 7b12228 #1 | `render_caveats` missing from __all__ | Open |
+| 7b12228 #2 | "~10% discount" claim in MARGIN_TIER_B_CAVEAT | Open |
+| 04647aa #1 | within-stock bypasses rank_strategies warning — needs docstring note | Open |
+
+Phase 6.2 (which closed) didn't run a `chore(p6.2.verify)` cleanup pass. **Lowest-friction option**: when Phase 6.3 closes, BUILDER lands `chore(p6.3.verify)` that batch-closes the cosmetic flags.
+
+---
+
 ## Review of 04647aa — feat(p6.2.toggle): leaderboard within-stock vs across-stocks toggle
 
 **Verdict:** ✅ accept
