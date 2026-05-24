@@ -3306,6 +3306,153 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of d7e511d — feat(p6.5.dash): Per-stock small-multiples — card per strategy with sparklines
+
+**Verdict:** ✅ accept (with one subtle visual-meaning flag on the sparkline color logic)
+
+**Phase / commit goal (as I understood it):** Final code commit of Phase 6. Per-stock tab's main visual: small-multiples grid of per-strategy cards on the selected symbol, each with N + Win% + Median ROI + a per-trade net_pnl sparkline. Cards sorted by median ann ROI DESC; 3 cards per row. Thin-N badge on each card per asymmetric-conservatism (doubled-up warning beyond the headline strip).
+
+**What works:**
+
+- **Sort by `median_roi_pct_annualized DESC`** ([src/web/per_stock.py:245-248](src/web/per_stock.py#L245-L248)) — visually-best card top-left of the grid. Operator's eye anchors on the winning strategy.
+- **`_CARDS_PER_ROW=3`** module-level constant — easy to tune; 5 strategies → 2 rows (3 + 2); 7 strategies → 3 rows (3 + 3 + 1).
+- **🔬 Doubled-up thin-N warning** ([src/web/per_stock.py:264-265](src/web/per_stock.py#L264-L265)): `thin_marker = f" ⚠ N<{min_n}" if n < min_n else ""` appended to the card heading. **The headline strip's "strategies above benchmark" card already says "1/X" — the per-card badge re-surfaces the warning at glance level.** Operator can't miss it even with peripheral vision on the grid.
+- **Card structure is consistent across all strategies**:
+  - Heading: `##### {strategy}{thin_marker}` (markdown h5)
+  - 3 inline mini-metrics: N | Win % | Median ROI/yr (caption + bold value via markdown — `st.metric` would nest too deeply inside the column-inside-card layout)
+  - Sparkline: tiny inline Plotly line at 70px height
+- **Sparkline configuration is clean**:
+  - `mode="lines"` (no markers) — markers would clutter the 70-px height.
+  - `hoverinfo="skip"` — no tooltips on the sparkline; "at-a-glance" semantic per the docstring.
+  - `xaxis(visible=False), yaxis(visible=False)` — axes hidden; sparkline blends into the card.
+  - **Transparent backgrounds** (`rgba(0,0,0,0)`) — `plot_bgcolor` + `paper_bgcolor`. Plotly chart doesn't draw a competing background over the card's dark theme.
+  - **Breakeven hline at y=0**, dotted gray, 40% opacity — present but subdued. Anti-auto-zoom anchor (same pattern as YoY/MoY).
+  - `config={"displayModeBar": False}` — hides Plotly's default toolbar (which would dominate a 70px sparkline).
+- **`"_sparkline needs ≥2 trades_"` caption** ([src/web/per_stock.py:290](src/web/per_stock.py#L290)) — italic markdown explaining the absence when a strategy has 0-1 trades. **Asymmetric-conservatism**: explicit fallback wording instead of a blank space.
+- **Empty paths**:
+  - 0 filtered rows / no symbol → `render_empty("leaderboard_no_rows_after_filters")`
+  - symbol has no trades → `st.info("No trades for {symbol} in this sweep.")`
+  - 0 strategies → `st.info("No strategies for {symbol}.")`
+- **5 new tests** pin: per-strategy card count, sort by median ROI DESC, thin-N badge on cards with N < min_n, empty-state routing, sparkline omitted (with caption) when N < 2.
+- **486/486 full suite** (was 481 + 5).
+
+**Live-tested on verify dataset (RELIANCE, 1 strategy):**
+
+```
+=== render_strategy_dashboard (verify RELIANCE, min_n=5) ===
+  markdown: ##### short_straddle
+  caption:  N
+  markdown: **18**
+  caption:  Win %
+  markdown: **83.3%**
+  caption:  Median ROI/yr
+  markdown: **+247.9%/yr**
+  chart:    lines mode (sparkline)
+
+=== thin-N test (min_n=100, n=18 < 100) ===
+  markdown: ##### short_straddle ⚠ N<100
+  ← thin-N badge appears in heading ✓
+```
+
+Both branches behave correctly. Card structure verbatim per spec.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Sparkline color is based on the LAST trade's `net_pnl`, NOT the overall profitability** ([src/web/per_stock.py:197-198](src/web/per_stock.py#L197-L198)):
+   ```python
+   color = "rgb(0, 100, 0)" if (net_pnls and net_pnls[-1] >= 0) else "rgb(200, 50, 50)"
+   ```
+   **Subtle visual-meaning bug**: a strategy that made ₹100K over 17 trades but lost ₹500 on the 18th would render a RED sparkline. The operator's color-intuition reads "this strategy is bad" — but it actually has total_net_pnl = +₹99,500.
+   
+   **For the verify dataset** (short_straddle on RELIANCE, generally winning), the last trade is likely winning → green. So no visible bug on current data.
+   
+   **For multi-strategy real sweeps**: this could mislead. **Better metrics**:
+   - `sum(net_pnls) >= 0` — color based on total P&L (matches the card's Win% / Median ROI / Total P&L story)
+   - `mean(net_pnls) >= 0` — color based on average per-trade outcome
+   - **Either is more representative** than just the last trade.
+   
+   **My lean**: `sum(net_pnls)` since it matches the operator's mental "did this strategy make money?" question.
+   
+   This is a 1-character fix (`net_pnls[-1]` → `sum(net_pnls)`). Worth catching before `chore(p6.5.sweep)` runs against a real multi-strategy dataset where some strategies will have mixed signals.
+
+2. **Sparkline order is "by sweep iteration order"** ([src/web/per_stock.py:194-196](src/web/per_stock.py#L194-L196) docstring) — not by trade date. **Docstring acknowledges this is intentional** for v1: "trades from different expiries interleave; for Phase-7 trade-level drill-down, sparkline order will switch to entry_date sort". **Defensible** — for an at-a-glance shape (not a forensic timeline), iteration order is fine.
+
+3. **No N count visible NEAR the sparkline** — the heading shows N, but on a quick visual scan, a 5-point sparkline and a 50-point sparkline look very similar without scrolling up to read the heading. **Could** annotate the sparkline with a tiny "(n=18)" annotation. Cosmetic.
+
+4. **Sparkline color is binary (green/red)** — no diverging colormap, no gradient. Defensible (sparklines are tiny; a single color reads faster than a gradient). Consistent with the §2.3 mandate's spirit (don't fake direction; this is a single-line trace where color signals one bit).
+
+5. **`hoverinfo="skip"` means operator can't see individual trade values** in the sparkline — they have to scroll to the headline for the summary stats. **For "at-a-glance" purposes this is fine**. If operators ask for more detail post-launch, can add hovertemplate later. Cosmetic.
+
+6. **Per-card markdown `**{value}**`** for emphasis — Streamlit renders the markdown bold. Worth visual-checking the line-height on a dark theme (`st.caption` is small + light; bold values may not stand out enough). Visual-check at chore(p6.5.verify).
+
+7. **Thin-N badge unicode `⚠` (U+26A0)** — same warning glyph used in caveats banner. Consistency.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ doubled-up thin-N warning (headline + per-card badge); breakeven hline on sparkline; "_sparkline needs ≥2 trades_" explicit fallback.
+- **Mockup-bug prevention**: ✓ card label "N" → integer value; "Win %" → percentage value; "Median ROI/yr" → percentage value with /yr suffix.
+- **Statistical-honesty**: ✓ thin-N strategies surfaced with explicit warning, not dropped from grid.
+- **§2.6 contract**: ✓ 3 empty paths each with operator-action.
+- **§11.5 min_n flow**: ✓ sidebar → app.py → render_strategy_dashboard kwarg.
+- **Phase 6 visual completeness**: ✓ all 4 tabs now render real data.
+
+**What I tried:**
+- Read [src/web/per_stock.py:183-291](src/web/per_stock.py#L183-L291) end-to-end.
+- Read the 5 new tests in test_web_per_stock.py.
+- Live-tested verify-set (RELIANCE, min_n=5) → 1 card with sparkline. ✓
+- Live-tested thin-N branch (min_n=100, n=18 < 100) → thin-N badge appears. ✓
+- `pytest tests/test_web_per_stock.py -v` → 12/12.
+- `pytest tests/` → 486/486 full suite.
+
+**🎉 PHASE 6 CODE COMPLETE.** All 4 tabs (Leaderboard / Heatmap / Trends / Per-stock) fully render real data with empty-state branches, min_n discipline, asymmetric-conservatism, and consistent visual patterns. 26 Phase-6 code commits per DESIGN_SPEC §4 (excluding docs + verify + tag).
+
+**Outstanding Phase 6 work:**
+- `chore(p6.5.sweep)` (commit 24) — live 5-stock × 3-strategy × 2-year sweep (~5,400 cells)
+- `chore(p6.5.verify)` (commit 25) — screenshot every tab against mockups
+- `chore(p6.5.tag)` (commit 26) — `git tag v0.6-ui`
+
+**Sequencing observation:** **Phase 6 from `chore(p6.0.deps)` (d9f2cb2) to `feat(p6.5.dash)` (d7e511d)** — 26 commits, ~1.2 hours wall-clock from first dependency edit to last code commit. Test count: 367 (pre-Phase-6) → 486 (Phase-6 code complete) = **+119 tests** across 26 commits, averaging ~4.6 tests per nuclear commit. **Every Phase-6 commit landed clean** — only one outright blocker (the 2026-07-01 caveat date bug in 7b12228, fixed in 79d50d8 within 86 seconds of my flag). The reviewer-loop pattern operating at scale.
+
+**Next-commit suggestion:**
+
+**Highest leverage: `chore(p6.5.verify)` — even before `chore(p6.5.sweep)`.** Two reasons:
+1. The verify-set (Q1-2024 RELIANCE short_straddle) IS the most-tested dataset and hits the most empty-state paths. A screenshot pass against the mockups NOW catches visual regressions before a 5,400-cell real sweep introduces new variance.
+2. The 12+ outstanding non-blockers from prior reviews would close in a single doc-touch pass. **chore(p6.5.verify)** is the natural place.
+
+**Alternative: `chore(p6.5.sweep)` first.** Defensible if BUILDER wants to exercise the multi-pair / multi-year paths visually before screenshotting. **My lean is still verify-first** — establish the baseline on known data, then sweep, then verify-against-new-data.
+
+**Recommend BUILDER fold sparkline-color fix (#1 above) into `chore(p6.5.verify)` or as a quick standalone fix before p6.5.sweep**. The bug only surfaces on multi-strategy data where last-trade-sign and overall-sign diverge — exactly what the real sweep will produce.
+
+**12 outstanding non-blocker flags catalogued across all Phase-6 reviews:**
+
+| Origin | Concern |
+|---|---|
+| 8a07859 #5 | §2.2 "n_trades immediately right of rank" vs implementation |
+| 8a07859 #1 | rank_strategies UserWarning leaks to Streamlit logs |
+| 452b503 #3 | "across N rank-eligible" vs "total" subtitle wording |
+| c6e3684 #1 | `get_message` "streamlit-free" docstring claim |
+| 334bada+5c801dd #1 | `RESULTS_DIR + importlib.reload` test pattern |
+| 7b12228 #1 | `render_caveats` missing from __all__ |
+| 7b12228 #2 | "~10% discount" claim in MARGIN_TIER_B_CAVEAT |
+| 04647aa #1 | within-stock bypasses rank_strategies warning — docstring note |
+| 87a6707 #1 | YoY green line unconditional even on negative-ROI pairs |
+| 87a6707 #2 / 202b49c #4 | YoY + MoY missing `rangemode="tozero"` |
+| 0845230 #1 | "month 2 (N=6)" in trends headline (partial closure in 202b49c) |
+| 5b88215 #1 vs 202b49c #2 | sign-format inconsistency: heatmap unsigned, MoY signed |
+| 7b9b283 #1 | `_build_customdata` O(H×W×N) — vectorize before p6.5.sweep |
+| 7b9b283 #3 | Zero-count cells render misleading "Median ROI/yr: +0.0%" hover |
+| 7b9b283 #4 | hover Net P&L bypasses format_inr |
+| d7e511d #1 | sparkline color based on LAST trade, not overall profitability (THIS REVIEW) |
+| Phase-wide | DRY `_filter_pair` helper across heatmap.py + trends.py |
+| DESIGN §1.5 | mtime picker dependency on 617878b's fixture fix not documented |
+| Multiple | `chore(p6.X.verify)` skipped at multiple phase boundaries |
+
+**Recommend BUILDER lands a `chore(p6.5.cleanup)` BEFORE `chore(p6.5.verify)` + `chore(p6.5.sweep)` to batch-close these.** ~30 min of work; closes most of the catalogue.
+
+---
+
 ## Review of baec7f5 — feat(p6.5.headline): Per-stock tab — quick-switcher + 4-card strip
 
 **Verdict:** ✅ accept
