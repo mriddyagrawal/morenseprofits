@@ -1833,3 +1833,52 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** No change from my prior `feat(p3.3): costs.py` recommendation. The roadmap additions are background; the critical path is still the Phase-3 short-straddle engine. After p3.3 (cost model) + p3.4 (short_straddle strategy) + p3.verify (live first ₹P&L) land, the user has their original ask working end-to-end. That's the v1 milestone — Phases 4-7 build the platform around it, Phases 8-10 extend it.
 
 ---
+
+## Review of 5ce2929 — feat(p3.3): src/engine/costs.py — COST_MODEL_V1 + 12 tests, ₹141.78 hand-check
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement the SPECS §4 cost model with the 6-component breakdown, pinned to a hand-checked total on the RELIANCE Jan-2024 short straddle.
+
+**What works:**
+- **Hand-check matches my prior review's napkin estimate EXACTLY**: brokerage 80 + STT 16.6406 + exchange 25.4015 + GST 18.9723 + SEBI 0.0505 + stamp 0.7163 = **₹141.7811**. Independently verified live.
+- **`CostModelV1(frozen=True) dataclass`** ([src/engine/costs.py:31-40](src/engine/costs.py#L31-L40)) — pinned rates as keyword defaults. Frozen → safe to share as singleton.
+- **Side accounting subtlety correctly handled** ([src/engine/costs.py:67-79](src/engine/costs.py#L67-L79)):
+  - SELL leg: entry → sell-side turnover (STT applies), exit → buy-side (stamp applies)
+  - BUY leg: entry → buy-side (stamp applies at open), exit → sell-side (STT applies at close)
+  - The long-straddle case (STT on exit, not entry) is the subtle one — `test_stt_sell_side_only` pins both directions explicitly.
+- **`COST_MODEL_V1` singleton** ([src/engine/costs.py:105](src/engine/costs.py#L105)) is the default for every backtest; Phase-5 sensitivity analysis constructs new `CostModelV1` instances (or a future `CostModelV2`) without mutating the default — `test_v2_can_be_constructed_without_mutating_v1` pins this pattern.
+- **12 tests cover every contract**:
+  - Load-bearing hand-check at 1e-6 precision per component
+  - Brokerage flat regardless of premium size (catches "scale by premium" regression)
+  - STT sell-side-only verified on both short AND long contracts
+  - Stamp duty buy-side-only verified analogously
+  - GST applies to brokerage+exchange only (not STT/stamp/SEBI) — real Indian tax law
+  - `total == sum(components)` invariant (catches "computed but excluded from total" typo)
+  - Linear scaling with `qty_lots` (turnover components scale, brokerage stays flat)
+  - Frozen immutability via `pytest.raises(FrozenInstanceError)`
+  - Input validation (empty legs, invalid side)
+- **150/150 in full suite.**
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **"Options-only" assumption not in the docstring.** SPECS §4 says STT 0.0625% is the option-specific rate; equity/futures have different rates. If a future strategy ever uses non-option legs, this cost model would silently apply the wrong STT rate. Worth a one-line callout in the `CostModelV1` docstring: "rates assume STOCK OPTION legs; not valid for equity or futures".
+- **`brokerage_per_order = ₹20` is the simplification.** Real Zerodha is ₹20 OR 0.03% whichever lower. For NSE options the flat ₹20 always wins (premium turnover × 0.03% << ₹20 in typical cases), but documenting the simplification matches the project's "loud > silent" pattern.
+- **`n_orders = len(legs) * 2`** assumes every leg has clean entry + exit. For early-exit / partial-fill / mid-trade adjustments (none of which v1 backtests support), this would over-count. Fine for v1.
+- **`exchange_txn_pct = 0.000503`** — exchange transaction charge for NSE has actually changed twice in 2024 (rate updates by NSE in Sep + Oct 2024). The 0.0503% is the late-2024 rate; pre-Sep-2024 backtests would over-state costs by ~5%. Worth one line in SPECS §4 acknowledging this is a 2024-late snapshot; Phase-5 sensitivity test or Phase-7 historical-rate-curve can fix.
+- **No `cost_model_fn` injection into `engine.pnl.price_trade` yet** — but the BUILDER's commit message says "Next: wire costs into engine.pnl.price_trade". So the integration is the very next micro-step.
+
+**Domain / correctness checks:**
+- **Sign convention:** costs are always positive; `net_pnl = gross - costs`. Correctly modeled.
+- **Side accounting:** the SELL-side-STT and BUY-side-stamp rules are the subtlest part of Indian options tax law, and the implementation gets them right for both long and short trades.
+- **Statistical claims:** N/A this commit (pure cost arithmetic).
+- **Look-ahead bias:** N/A.
+
+**What I tried:**
+- `python -c "..."` → hand-check breakdown line-by-line against my prior napkin math. Every component matches to 4 decimal places.
+- Read [src/engine/costs.py](src/engine/costs.py) end-to-end.
+
+**Next-commit suggestion:** Per the BUILDER's note, **wire `cost_model` into `engine.pnl.price_trade`** as the immediate next micro-step. Add a `cost_model: CostModelV1 = COST_MODEL_V1` parameter (defaulted, injectable like `load_option_fn`). In the kernel, compute `cost_breakdown = cost_model.total_cost(leg_results)` after summing gross, then return `costs = cost_breakdown["total"]` and `net_pnl = gross_pnl - costs` in the result dict. **Test: update the RELIANCE Jan-2024 hand-check** to assert `gross_pnl == 2750.0`, `costs == 141.78` (or precise: 141.7811...), `net_pnl ≈ 2608.22`. That single assertion proves the gross+cost pipeline ties together correctly. After that → `feat(p3.4): ShortStraddle strategy`.
+
+---
