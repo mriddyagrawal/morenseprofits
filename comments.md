@@ -73,3 +73,48 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** Address the 46ffe18 flags before stepping into Phase 1 — your own doctrine demands it. Smallest possible commit: `chore(p0): pin pyarrow/streamlit/pytest into the venv, fix smoke-test PE leg, resolve expiry_dates(contracts=) semantics in SPECS`.
 
 ---
+
+## Review of b8de59 — feat(p1.1): data/cache.py — parquet read/write/exists + CACHE_VERSION guard
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the single parquet persistence layer that every data loader will go through — atomic writes, version sentinel, path builders matching SPECS §2.
+
+**What works:**
+- Atomic write via tmp + `replace()` ([src/data/cache.py:74-80](src/data/cache.py#L74-L80)) — crash-safe on POSIX.
+- Version sentinel raises `CacheVersionMismatch` rather than silently mixing schemas ([src/data/cache.py:30-43](src/data/cache.py#L30-L43)) — exactly the loud-failure stance PLAN.md §4 demands.
+- Path builders match SPECS §2 layout verbatim. Verified by exercising:
+  ```
+  spot/RELIANCE/2024.parquet
+  options/RELIANCE/20240328/2620-CE.parquet
+  expiries/RELIANCE.parquet
+  ```
+- Pyarrow now resolved on the venv (24.0.0) — my 46ffe18 flag is unblocked even though it wasn't called out in the commit message.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- **Silent strike collision via banker's rounding** ([src/data/cache.py:51](src/data/cache.py#L51)): `int(round(50.5))` returns 50 (round-half-to-even), so a hypothetical ₹50 strike and ₹50.50 strike would write to the same file. NSE stock options use whole-rupee strikes today, so this won't bite — but a one-line `assert strike == int(strike)` or `int(round(strike * 100)) / 100` filename scheme would make it future-proof. Cheap insurance.
+- **`_ensure_root()` runs on every path build** ([src/data/cache.py:46-63](src/data/cache.py#L46-L63)) — touches disk (sentinel read) per call. Across a sweep with 10k path constructions this is O(10k) stat calls. Memoize with a module-level `_root_verified: bool`, or only call `_ensure_root` inside `read`/`write`.
+- **SPECS §7 says "never overwrite real historical data unless `--force-refresh`"** — `write()` here unconditionally replaces. Either implement the guard here (refuse to clobber unless an explicit `overwrite=True`) or pin the policy at the loader layer. Either way, write the rule down before the spot loader lands.
+- **No `delete()` helper.** Phase 2's universe membership cache invalidation may need it. Defer until needed; just noting.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** N/A this commit.
+- **Options math:** N/A.
+- **Statistical claims:** N/A.
+- **Look-ahead bias:** N/A — pure I/O. (But: parquet schemas freeze field types, so a date-column-as-string slip here would propagate. Next commit's test should pin dtypes.)
+
+**What I tried:**
+```python
+# imported, built all 3 path types, round-tripped a small df,
+# read sentinel ('1'), corrupted sentinel to '99' and confirmed
+# CacheVersionMismatch is raised. Strike-rounding edge cases:
+#   50.5 -> 50-CE   (banker's rounding, collides with 50)
+#   50.7 -> 51-CE
+#   51.0 -> 51-CE
+```
+
+**Next-commit suggestion:** Per the planned step list this is `test(p1.1)`. Make sure tests pin dtypes (date → datetime64, strike → float64, lot_size → int64) — that's the real value of writing tests next to the helper.
+
+---
