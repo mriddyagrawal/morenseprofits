@@ -540,3 +540,34 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Back on track for `feat(p1.3.1): bhavcopy_fo_loader`. The single concrete action that maximizes downstream velocity: **fetch one pre-Jul-8-2024 and one ≥Jul-8-2024 bhavcopy via `bhavcopy_fo_raw` RIGHT NOW** and inspect them side-by-side before writing any parser code. If the column headers are identical across formats (jugaad's transparent handling), the parser is a single code path with one CSV reader. If they differ, you need format detection (header sniff) + two parsers. Either way, knowing this BEFORE writing code beats writing-then-debugging. Save both raw blobs as `tests/fixtures/bhavcopy_fo_pre_udiff.csv` and `tests/fixtures/bhavcopy_fo_udiff.csv` so the parser tests are fixture-driven from commit one (per the recorded-fixtures commitment in b0ef46a). And map by column NAME — jugaad's `expiry_dates` indexes by position 10, which is exactly the kind of fragility the format change might break.
 
 ---
+
+## Review of 7d15eac — fix(p1.3.0.a): reject datetime in bhavcopy_fo_path — loud > silent truncation
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the duck-typed-acceptance flag from the 13dacbd / 5f9cdeb reviews — `datetime` is a subclass of `date` and would silently slip through, so reject it loudly with a TypeError.
+
+**What works:**
+- Reasoning in the docstring + commit message is precise and correct ([src/data/cache.py:109-114](src/data/cache.py#L109-L114)): tz-aware datetime is **genuinely ambiguous** about which trade date it names (UTC 23:59 vs IST 23:59 straddle different calendar days); naive datetime is just unnecessary. Either way, force the caller to `.date()` first.
+- Error message includes the offending repr AND tells the caller exactly the fix: "Call .date() on it first". Useful failure.
+- `test_bhavcopy_fo_path_rejects_datetime` covers naive datetime, tz-aware datetime, **and** confirms the `date` happy path still works ([tests/test_cache.py:46-62](tests/test_cache.py#L46-L62)) — the third assertion is what catches a future over-eager refactor that breaks legitimate `date` callers too.
+- `inspect.signature` regression-blocker from 5f9cdeb still passes — adding the isinstance check didn't widen the signature.
+- 24/24 pass via `python -m pytest tests/`.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- **The other path builders are inconsistent.** [src/data/cache.py:50](src/data/cache.py#L50) `option_path(..., expiry: date, ...)` also takes a `date` and would silently accept a datetime. The ambiguity is less severe there (options are tied to a fixed expiry date with no time semantics), but for consistency consider applying the same isinstance check. Or accept that bhavcopy_fo is special because tz-awareness matters and explicitly say so in a comment above the other path builders.
+- Imports inside the test body (`from datetime import datetime as _dt`, `from datetime import timezone` at [tests/test_cache.py:51,56](tests/test_cache.py#L51-L56)) work but feel less tidy than top-of-file. Cosmetic.
+
+**Domain / correctness checks:**
+- **Look-ahead bias:** the rejection rule encodes the same point-in-time discipline as PLAN §4 hard rules — only `date` makes sense as a trade-date identity. Implicit alignment.
+- **Other:** N/A this commit.
+
+**What I tried:**
+- `python -m pytest tests/` → 24/24 pass, 0.26s.
+- Read the diff; confirmed the docstring + commit message match the implementation.
+
+**Next-commit suggestion:** Stay the course on `feat(p1.3.1): bhavcopy_fo_loader` — the fixture-capture-first guidance from the a359b80 review still applies. One useful add given this commit's "loud over silent" pattern: when the loader detects an unknown format (header doesn't match either pre-Jul-8 or ≥Jul-8 schema), it should raise a `BhavcopyFormatError` (new entry in SPECS §8 error taxonomy) rather than papering over with a permissive parser. Same reasoning as this commit: a future NSE format change should be a loud error, not a silent partial-fill.
+
+---
