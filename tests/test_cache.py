@@ -43,6 +43,25 @@ def test_path_builders(monkeypatch, tmp_path):
     assert exp.name == "RELIANCE.parquet"
 
 
+def test_bhavcopy_fo_path(monkeypatch, tmp_path):
+    """bhavcopy_fo is symbol-agnostic — one file per trade date, used by
+    every symbol's expiry calendar. Filename is YYYYMMDD for natural sort."""
+    _redirect_cache(monkeypatch, tmp_path)
+    p1 = cache.bhavcopy_fo_path(date(2024, 1, 25))
+    assert p1.name == "20240125.parquet"
+    assert p1.parent.name == "bhavcopy_fo"
+    # Same date → same path (idempotent path build); different dates → different paths
+    assert cache.bhavcopy_fo_path(date(2024, 1, 25)) == p1
+    p2 = cache.bhavcopy_fo_path(date(2024, 2, 29))
+    assert p2.name == "20240229.parquet"
+    assert p1 != p2
+    # No symbol involved — confirms the "share across symbols" contract by API shape.
+    # (The function signature takes only a date; a symbol parameter would be a regression.)
+    import inspect
+    sig = inspect.signature(cache.bhavcopy_fo_path)
+    assert list(sig.parameters) == ["trade_date"]
+
+
 def test_sentinel_created_on_first_use(monkeypatch, tmp_path):
     _redirect_cache(monkeypatch, tmp_path)
     cache.spot_path("X", 2024)  # triggers _ensure_root
