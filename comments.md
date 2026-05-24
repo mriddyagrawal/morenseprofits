@@ -3306,6 +3306,91 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 3880d9d — docs(design): move DESIGN_SPEC → DESIGN/, add 4 tab mockups, update doc paths
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Re-home design artifacts under `DESIGN/` + land 4 tab mockups. Doc move + spec edit + binary asset addition. **The diff isn't a pure move**: DESIGN/DESIGN_SPEC.md is 364 lines vs. the deleted root version's 249 — user authored ~115 lines of substantive content on top of the move. Mockup-coherence pass + correctness audit + new sections.
+
+**What's new in the spec (per the §11 2026-05-25 change log entry I cross-checked against the diff):**
+
+1. **§1.2 per-stock quick-switcher** — explicit hazard prevention ("sidebar canonical, switcher is navigation only"; clicking does NOT mutate the sidebar filter). Cleanly resolves the two-sources-of-truth tension the mockup might have invited.
+2. **§1.4 caveats: revised from "expander, open by default" → "three always-visible cards + dismiss-to-banner"**. Stronger honesty contract — operator can't skip past the first read; even after dismiss the slim banner is always rendered. Session-scoped dismiss (no disk persistence). **This is a meaningful upgrade** — the expander could be trained-to-ignore; the cards force the read.
+3. **🔬 §2.2 std-tooltip math correction (~20% → ~11% at n=5)** — **the user caught a math error in my afdd56e review block**. I cited "20% at n=5" which was the **variance** gap; for **std** the gap is `1 - sqrt((n-1)/n)` ≈ 10.6%. Verifying:
+   ```
+   var ratio = (n-1)/n   = 4/5 = 0.800  →  20.0% variance understatement
+   std ratio = sqrt(0.8)        = 0.894  →  10.6% std understatement
+   ```
+   **The user is right; my afdd56e review wording was wrong.** Variance and std are off by a sqrt; I conflated them. Going forward the §2.2 wording (`~11% at n=5, ~5% at n=10, ~2.5% at n=20`) is what Phase-6 tooltips should render. Acknowledging — historical reviews don't get edited, but the corrected number is now the contract.
+4. **§2.3 dark theme + diverging colormap unconditionally** — defensive: "first negative cell on a later sweep would render mid-green and mislead" is the right concern. Pinned `RdYlGn` + `zmid=0`. Matches every mockup's dark theme.
+5. **§2.5 NEW — headline stats strip per-tab contract**. Pins exactly which cards each tab shows + a **naming rule** that structurally prevents the "AVG ROI ₹25.76L" mockup bug (rupees mislabeled as percentage). Per-tab contracts table is concrete (4-card / 3-card strips with value source + subtitle). **This is the right structural fix** — turning a mockup glitch into a code-enforced contract.
+6. **§2.6 NEW — degenerate / thin-data UX contract**. Six pre-written `st.info` messages for "not enough data" cases per tab. Explicit operator action in each. "Never render a `nan` axis or a one-bar bar chart and call it a trend." Exactly the asymmetric-conservatism mandate applied at the UI layer.
+7. **§2.7 NEW — number formatting contract**. Indian lakhs/crores (`₹X.XX L`, `₹X.XX Cr`); one `format_inr()` helper in `src/web/_format.py`; rounding rules pinned per quantity type. Lands as a new commit `feat(p6.0.format)` + companion test.
+8. **§4 commit count grew 19 → 26**. Added `p6.0.format` + `p6.0.format test` + `p6.1.empty` + one `headline` commit per tab; replaced `p6.4.n_hover` with `p6.4.yoy_n` (the YoY sister chart visible in the Trends mockup). Each individual commit still nuclear-sized.
+9. **§10 NEW — 5-minute operator user journey**. Concrete walkthrough where the operator runs the §3.2 sweep, lands on Leaderboard, drills into HDFCBANK iron condor, validates via heatmap → trends → regime filter. **This is the usefulness check the design needed** — proves the architecture supports the actual research workflow, not just looks coherent on paper. The journey identifies exactly which design choice each step depends on (cross-tab state via st.tabs, sidebar canonicality, sister chart for "is the drift real or N-fluke"). If the journey ever stops flowing, the corresponding design decision is the regression.
+
+**Mockups (binary assets):**
+- 4 PNGs at 3600×2338, totalling ~3.2 MB. Reasonable for design references in a non-binary-heavy repo.
+- Viewed Leaderboard, Per-stock, Heatmap, Trends mockups. Each renders the dark theme + 3 caveat cards + tab-specific layout from the spec.
+- **The mockup bugs the user calls out in §11 are real and visible**:
+  - Leaderboard mockup labels a `₹25.76 L` value as "AVG ROI" — rupees mislabeled as a percentage. §2.5's naming rule prevents code from inheriting this.
+  - Heatmap mockup shows `AVG ROI +264.1 %/yr` alongside `BEST CELL +82.3 %/yr` — best can't be lower than average; mathematically impossible. User notes "reconcile before screenshots are reused as docs."
+  - Heatmap mockup's colormap looks sequential green (all-positive cells) — §2.3's `RdYlGn + zmid=0` mandate explicitly catches this.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+
+1. **🔬 §9 stale-followup items NOT audited.** Same issue I flagged in 8a49165 review: §9.5 (verify_p5 prints unmasked heatmap) and §9.6 (StringDtype drifts to object) BOTH describe deferred followups that **8893b81 closed**. The 2026-05-25 change log entry mentions §§1-8 + §10 but leaves §9 untouched. **Recommended edit (~3 lines)**: in the next doc-touching commit, mark §9.5 + §9.6 as `RESOLVED in 8893b81` and prepend the resolved items with "~~struck-through~~ +RESOLVED note". Future contributors reading §9 will otherwise think these are still pending.
+
+2. **🔬 Mockup filenames are unhelpful for the cross-check workflow.** The commit body says "each commit will be cross-checked against the matching tab image", but the filenames are:
+   ```
+   image.png            — Leaderboard tab
+   image copy.png       — Per-stock tab
+   image copy 2.png     — Heatmap tab
+   image copy 3.png     — Trends tab
+   ```
+   These are macOS's default "Save → Copy" auto-names. To actually check a Phase-6 commit against the right mockup, a contributor has to remember the mapping (Heatmap = `image copy 2`? `image copy 3`?). **Recommended rename** (single subsequent doc commit, no spec edit needed):
+   ```
+   git mv "DESIGN/image.png"           DESIGN/leaderboard.png
+   git mv "DESIGN/image copy.png"      DESIGN/per_stock.png
+   git mv "DESIGN/image copy 2.png"    DESIGN/heatmap.png
+   git mv "DESIGN/image copy 3.png"    DESIGN/trends.png
+   ```
+   Plus a `DESIGN/README.md` mapping each PNG to the §4 commit it scopes (e.g., `leaderboard.png` → `p6.2.headline + p6.2.table + p6.2.thin + p6.2.toggle`). Cheap; high-leverage for the next 26 commits.
+
+3. **§1.5 still says "newest by mtime" without referencing the 617878b test-fixture-leak fix** as a load-bearing prerequisite. Same concern from my 8a49165 review block. Either §1.5 references 617878b OR §8 adds "all `RESULTS_DIR` consumers must be in `_redirect_results`" as a wiring constraint. Still non-blocking.
+
+4. **Spec ↔ code drift surface area** — DESIGN_SPEC.md is now 364 lines + 4 PNGs + a 26-commit roadmap. **The `[REVISED YYYY-MM-DD]` discipline in §11 is what keeps this from rotting**. As Phase 6 actually lands, departures from the spec should land in this changelog, not in commit messages. The change-log discipline is already 2 entries deep (2026-05-24 + 2026-05-25) — good momentum; keep it.
+
+**Doc internal-consistency checks:**
+- §2.5 "headline stats strip per-tab contract" matches §4 commit sequence (each tab gets a `*.headline` commit before the main visual). ✓
+- §2.6 "degenerate/thin-data UX contract" matches §4's `feat(p6.1.empty)` commit which creates `src/web/empty_state.py`. ✓
+- §2.7 "number formatting" matches §4's `feat(p6.0.format)` + `test(p6.0.format)` commits. ✓
+- §10 operator journey references "sister chart" — matches §4's new `feat(p6.4.yoy_n)` which replaced `p6.4.n_hover`. ✓
+- §10 references "per-stock quick-switcher" — matches §1.2's new sub-section AND §4's `feat(p6.5.headline)` which includes the switcher. ✓
+- §0.1 reviewer-flag table — all 6 origin SHAs still match real review commits (416719f, 955d0f3, 416719f, afdd56e × 2). ✓
+
+**What I tried:**
+- `git show 3880d9d` — confirmed the move + 4 PNG additions + PROJECT_DESCRIPTION.md path tweaks + spec content delta.
+- Read DESIGN/DESIGN_SPEC.md end-to-end; cross-referenced §§ against the §11 change log entries.
+- Verified the std-bias math correction (0.8 vs sqrt(0.8) → ~20% var, ~11% std). **User caught my afdd56e error.**
+- `file DESIGN/*.png` — all valid 3600×2338 PNGs.
+- Viewed all 4 mockup PNGs in turn. Confirmed the dark theme + 3-card caveat row + tab-specific layouts match the spec. Confirmed the two mockup bugs the user flagged in the change log are real.
+- Cross-referenced §0.1's reviewer-flag SHAs against git log. All 6 commits exist.
+
+**Sequencing observation:** The 2026-05-25 spec revision is substantial (~115 lines of new content). BUILDER could have split this into a "doc move" commit + a "spec amendment" commit; bundling is defensible since the move is what triggered the mockup-coherence audit. **One-commit policy isn't violated**: the mockup-coherence pass is the *reason* for the move, and §11 documents the audit. Acceptable bundle.
+
+**Next-commit suggestion:** Per the user-revised §4, the Phase-6 sequence now starts with:
+1. `chore(p6.0.spec)` — SPECS §11 web contract.
+2. `chore(p6.0.deps)` — `requirements.txt` (add plotly, drop altair).
+3. `feat(p6.0.format)` — `src/web/_format.py` per §2.7.
+4. `test(p6.0.format)` — boundary tests.
+
+**My lean**: `chore(p6.0.deps)` first (smallest mechanical commit, single-file edit, unblocks any Plotly-using commit). Then `chore(p6.0.spec)` to lock SPECS §11. Then `feat(p6.0.format)` + its test as a pair. **Opportunistic riders**: if BUILDER touches DESIGN_SPEC.md again before Phase 6.1 starts, batch the §9 staleness fix + the mockup filename rename — they're 5-minute edits that improve the cross-check workflow over the next 26 commits.
+
+---
+
 ## Review of 8a49165 — docs: PROJECT_DESCRIPTION + DESIGN_SPEC
 
 **Verdict:** ✅ accept (docs-only; not exercising)
