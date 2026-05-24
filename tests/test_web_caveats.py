@@ -35,6 +35,18 @@ def test_multiple_comparisons_caveat_re_exported_identical():
     assert MULTIPLE_COMPARISONS_CAVEAT is _RANK_CAVEAT
 
 
+def test_survivorship_caveat_cites_correct_snapshot_date():
+    """LOAD-BEARING anti-regression for the 2026-07-01 typo (reviewer
+    flag on 7b12228). Universe snapshot is 2024-07-01 per SPECS §6b.3
+    + src/universe/blue_chip.py. Pin this so a future copy-edit can't
+    drift the date again — a wrong date in an honest-disclosure
+    constant silently undermines every backtest result an operator
+    interprets."""
+    assert "2024-07-01" in SURVIVORSHIP_CAVEAT
+    # Explicit anti-regression for the specific typo
+    assert "2026-07-01" not in SURVIVORSHIP_CAVEAT
+
+
 def test_survivorship_caveat_is_substantive_paragraph():
     """Should be a single paragraph at least one screenful long,
     paraphrasing SPECS §6b.3. Pin length so a future trim doesn't

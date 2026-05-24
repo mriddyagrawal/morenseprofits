@@ -49,7 +49,7 @@ DISMISS_KEY: str = "mp_caveats_dismissed"
 # v1 paraphrase of SPECS §6b.3. Phase 6 surfaces this verbatim
 # alongside any leaderboard derived from the blue-chip universe.
 SURVIVORSHIP_CAVEAT = (
-    "The blue-chip universe is a 2026-07-01 snapshot. Stocks that "
+    "The blue-chip universe is a 2024-07-01 snapshot. Stocks that "
     "DELISTED before the snapshot — including bankruptcies, mergers, "
     "and de-listings for non-compliance — are absent by construction. "
     "Backtests on this universe systematically OVERSTATE the realized "
