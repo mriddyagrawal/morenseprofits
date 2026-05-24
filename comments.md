@@ -2640,3 +2640,40 @@ Then p4.4.b (ShortStrangle — strike_offset_pct param), p4.4.c (LongStrangle), 
 **Next-commit suggestion:** `feat(p4.4.b): src/strategies/short_strangle.py`. The first strategy with a TUNABLE PARAM: `strike_offset_pct` (default ~2%). Strikes are OTM: call_strike ≈ argmin(|K - spot × (1 + offset_pct)|), put_strike ≈ argmin(|K - spot × (1 - offset_pct)|), both with the SPECS §5 lower-tiebreaker rule against the available bhavcopy strikes. Load-bearing tests: **(a)** `strike_offset_pct=0` → degenerates to ShortStraddle (both legs ATM); **(b)** `strike_offset_pct=0.02` on spot 2596 → call ≈ 2640 (closest in ₹20 grid to 2648), put ≈ 2540 (closest to 2544); **(c)** `recommended_strategy_offset_pct=0.70` per SPECS §4a; **(d)** unavailable target strike falls back to nearest available (no crash). The strangle is also the first place where caveat #1 (strike-vs-spot margin) starts to matter — though the bias is small for symmetric strangles (both wings cancel). p4.4.d (IronCondor) is where it really bites.
 
 ---
+
+## Review of adc7290 — feat(p4.4.b): ShortStrangle strategy with tunable strike_offset_pct
+
+**Verdict:** ✅ accept
+
+**What works:**
+- All four load-bearing tests I asked for present and passing: degenerates-to-straddle at offset=0, picks 2640/2540 at offset=2% on spot 2596, margin_offset=0.70 per SPECS §4a, sparse-grid fallback to nearest. ✓
+- **`strike_offset_pct` persisted in `params_json`** ([src/strategies/short_strangle.py:71](src/strategies/short_strangle.py#L71)) — Phase-5 ranker can filter the leaderboard by offset. Sweep table rows are self-describing.
+- Negative offset rejected with ValueError. ✓
+- 12 new tests; 253/253 full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Bhavcopy-querying code duplicated** between `short_straddle._pick_atm_strike` and `short_strangle._pick_strangle_strikes` — ~12 lines repeated. p4.4.c (LongStrangle) and p4.4.d (IronCondor) will need it too. Worth a shared `src/strategies/_strikes.py` helper:
+  ```python
+  def pick_strike(symbol, expiry, entry_date, target_strike) -> int: ...
+  ```
+  Defer to a `chore(p4.4.refactor)` after all 4 strategies land — premature abstraction otherwise.
+- **`out_params = {"strike_offset_pct": offset}`** drops other caller-supplied params. v1 has no other tunables but a future `qty_lots` or such would be lost. One-line fix: `{**params, "strike_offset_pct": offset}`. Cosmetic.
+- **No upper bound on `strike_offset_pct`** — `offset=1.5` (150%) produces a negative put_target (= spot × -0.5). argmin on a negative target picks the lowest strike. Silly but not crashy. Add `if offset > 0.5: raise ValueError` to catch typos. Cosmetic.
+
+**Domain / correctness checks:**
+- **Symmetric OTM**: call and put offset by equal % from spot. For wide strangles (e.g., 5%) the implied IV smile means real-world entries aren't perfectly symmetric in premium, but for backtest purposes the strike-equidistant rule is the standard convention.
+- **`offset_pct=0` collapse**: call and put both land at ATM → effectively SHORT STRADDLE traded through the ShortStrangle code path. The two strategies' results would be identical at offset=0 — worth knowing for sweep-grid de-duplication. Phase-5 ranker should be aware that `(short_strangle, offset=0)` is a duplicate of `short_straddle` and either pre-filter or annotate.
+
+**What I tried:** `python -m pytest tests/test_short_strangle.py -v` → 12/12 pass.
+
+**Next-commit suggestion:** `feat(p4.4.c): LongStrangle` — mirror of ShortStrangle with `side="BUY"` and `recommended_strategy_offset_pct = 1.0`. Same `strike_offset_pct` param. Load-bearing test: sign-mirror — ShortStrangle and LongStrangle on the same fixture produce opposite-sign gross_pnl (no slippage). Same trick as p4.4.a's LongStraddle.
+
+After p4.4.c → `feat(p4.4.d): IronCondor` is the substantive one. **Iron condor has 4 legs**:
+- SELL near-OTM CE + BUY far-OTM CE (call spread, capped loss to the upside)
+- SELL near-OTM PE + BUY far-OTM PE (put spread, capped loss to the downside)
+
+Two `strike_offset_pct`-like params: `inner_offset_pct` (~2%) for the SELL strikes, `outer_offset_pct` (~5%) for the BUY wings. Iron condor is **the asymmetric-strategy case where caveat #1 (strike-vs-spot margin basis) actually bites** — because the four strikes flank the spot at four different distances. This is where the BUILDER should land the `spot_at_entry`-based margin fix in `MarginModelV1.estimate(legs, *, spot_at_entry=None)`. Defaults preserve Tier-B behavior; when provided, use spot × shares × symbol_pct instead of strike × shares × symbol_pct.
+
+---
