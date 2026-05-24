@@ -3306,6 +3306,73 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of aae03c0 — chore: close 3 reviewer-flag cleanup items
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Single bundled cleanup commit closing 3 small non-blocking items I had been flagging across the prior 3-4 reviews (each individually too small for a nuclear commit; unified by "outstanding reviewer flags"). All non-blocking, none gated future work, but the bundle gets them off the followup ledger before Phase-6 code starts.
+
+**What works — item-by-item closure:**
+
+1. **🔬 std-bias math correction in [aggregate.py:43-47](src/analytics/aggregate.py#L43-L47)** — "~20% at n=5 → ~11%" correction now lives in the SUMMARY_COLUMNS docstring, with the **historical reviewer-error trail preserved in code**:
+   > The original afdd56e review wording cited ~20% at n=5, which was the VARIANCE gap (1 − (n-1)/n); for STD the gap is the sqrt of that.
+   
+   **This is the right discipline.** Future contributors reading the docstring see the corrected number AND the WHY of the historical confusion. Matches DESIGN_SPEC §2.2 verbatim. Code change is comment-only — 367/367 unchanged.
+
+2. **Mockup PNG renames + DESIGN/README.md** — `git mv image.png → leaderboard.png` etc., tracked as git renames (history preserved). New `DESIGN/README.md` provides:
+   - **Mockup-to-commit table**: each PNG mapped to the specific Phase-6 §4 commits that implement it. The cross-check workflow is now mechanical — a Phase-6.3 reviewer can `open DESIGN/heatmap.png` without having to remember which "image copy N" was the heatmap.
+   - **Mockup-bugs-not-to-inherit section**: explicitly catalogues the rupees-labeled-as-percentage and best-<-average bugs the user flagged in DESIGN_SPEC §11. **This carries the warning forward** — even if DESIGN_SPEC §11 ever gets compressed, the README preserves the gotcha for the next contributor.
+   - **Cross-cutting-elements list** at the bottom — top bar, caveats row, sidebar layout. Useful onboarding doc for anyone implementing a tab.
+
+3. **DESIGN_SPEC §9 strikethrough + RESOLVED** — both §9.5 and §9.6 are now ~~struck-through~~ with "**RESOLVED in 8893b81**" + exact code-location references. **Archival pattern: preserve the historical concern, don't delete it.** A future reader sees the original deferred-followup AND the resolution; the audit trail is complete.
+
+**Live-verified:**
+- `.venv/bin/python -m pytest tests/` → **367/367**. Only code change is the aggregate.py comment-edit.
+- `ls DESIGN/` → `DESIGN_SPEC.md`, `README.md`, `heatmap.png`, `leaderboard.png`, `per_stock.png`, `trends.png`. The macOS auto-names are gone.
+- Cross-checked the strikethrough wording — original text preserved inside `~~...~~`, new RESOLVED clause appended with the closing commit SHA + code locations. Audit-trail intact.
+- Cross-checked the README mockup-bug note against my own viewing of the mockups in the 3880d9d review — both bugs match what's actually visible in the PNGs.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **Bundle-rationale check**: 3 unrelated items in one commit could be a nuclear-commit-discipline violation, BUT each item is too small for its own commit (1 comment edit + 4 git mvs + a strikethrough markup), the items are thematically united ("close accumulated reviewer flags"), and the bundle has zero coupling risk (no single change depends on another). **Bundling is correct here**; 3 separate commits would be churn. Same justification I applied to 8893b81 (the 7-flag-closeout bundle) — the principle is "bundle when the changes are cosmetic + thematically unified + risk-decoupled".
+
+2. **The README cross-cutting-elements section** ([DESIGN/README.md:38p+](DESIGN/README.md)) describes "top bar: project name, sweep selector + run_id, last-updated timestamp, cache-fetch status". Looking at the mockups I viewed earlier in 3880d9d, the top bar does have these elements. **Worth verifying once `feat(p6.1.app)` lands** that the app implements the cross-cutting top bar per this README, not just per the mockup (which has the mockup-bugs caveat). Cosmetic; not blocking.
+
+3. **DESIGN_SPEC §1.5 mtime picker dependency on 617878b** is STILL not documented (flagged in my 8a49165 + 3880d9d + 1c00f69 reviews). This wasn't in the 3-item closure list. Acceptable — it's the lowest-priority of the outstanding flags. **Next opportunity** when someone touches §1.5 or §8 wiring constraints.
+
+**Domain / correctness checks:**
+- **Reviewer-flag traceability**: ✓ commit body cross-references each closure to the originating review SHA (3880d9d, b7fe7e5, 8a49165). Auditable.
+- **No regression risk**: ✓ comment edit + file renames + markdown strikethrough. 367/367 unchanged.
+- **DESIGN_SPEC ↔ code consistency**: ✓ §2.2 wording now exactly matches `aggregate.py` SUMMARY_COLUMNS docstring.
+- **Asymmetric-conservatism**: ✓ the corrected std-bias wording ("~11% at n=5") is the right "lower bound on true spread" interpretation — under-promise the consistency story by the right magnitude.
+
+**What I tried:**
+- `git show --stat aae03c0` — 7 files, mostly renames + 1 markdown edit + 1 comment edit + 1 README creation.
+- Verified the rename detection: git correctly identifies `image.png → leaderboard.png` etc. as renames (not separate adds + deletes), so the PNG content is preserved in history.
+- Read DESIGN/README.md end-to-end.
+- Confirmed the strikethrough preserved original §9 wording (essential — losing the original would break the audit trail).
+- Ran the full test suite: 367/367.
+
+**Sequencing observation:** This is the cleanest "Phase-N close-out" pattern: between two phase boundaries (Phase-5 done; Phase-6 about to start landing code), batch-close the accumulated reviewer flags. By the time `feat(p6.0.format)` lands, the followup ledger is empty and code reviews can focus on the actual implementation. Same pattern as 8893b81 ("close 7 flags between Phase 5 and Phase 5.verify"), now applied at the Phase-5 → Phase-6 transition.
+
+**Outstanding non-blockers status after this commit:**
+- ✅ std-bias math correction → CLOSED (this commit)
+- ✅ Mockup PNG filenames → CLOSED (this commit)
+- ✅ DESIGN_SPEC §9 staleness → CLOSED (this commit)
+- 🔄 §1.5 mtime picker ↔ 617878b dependency note → still open; lowest priority
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4, Phase 6 code starts with:
+1. `feat(p6.0.format)` — `src/web/_format.py` per §2.7. `format_inr(x)` for ₹1L / ₹1Cr thresholds; `format_pct(x, *, signed, annualized)` for ROI vs. P&L disambiguation.
+2. `test(p6.0.format)` — boundary tests (₹99,999 → "₹99,999"; ₹1,00,000 → "₹1.00 L"; ₹99,99,999 → "₹99.99 L"; ₹1,00,00,000 → "₹1.00 Cr"; sign handling for ROI; integer formatting for counts).
+
+**These two should land as a pair** — code without a test is incomplete; one is meaningless without the other. The previous BUILDER convention has been `feat + test` as separate commits but the test always lands within ~5 minutes of the feature. Approve either approach.
+
+After `feat(p6.0.format)` + `test(p6.0.format)` → `feat(p6.1.discover)` per §11.2 contract. The first real Phase-6 module.
+
+---
+
 ## Review of 1c00f69 — fix(p6.0.spec): SPECS §11 reconciliation with DESIGN_SPEC §1.4 revised caveats
 
 **Verdict:** ✅ accept
