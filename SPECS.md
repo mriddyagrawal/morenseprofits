@@ -246,7 +246,26 @@ def monthly_expiries(symbol: str, from_date: date, to_date: date) -> list[date]:
 # src/data/trading_calendar.py
 def trading_days(from_date: date, to_date: date) -> list[date]: ...
 def offset_trading_days(anchor: date, n: int) -> date:
-    """Return the date that is n trading days BEFORE anchor (n>=0)."""
+    """Return the date that is n trading days BEFORE anchor (n>=0).
+
+    Anchor semantics — pinned per Phase-1.5 design:
+      - If `anchor` IS a trading day, n=0 returns `anchor` itself.
+      - If `anchor` is NOT a trading day (weekend or NSE holiday), n=0
+        returns the most recent trading day STRICTLY before `anchor`
+        (round-down). Backtests anchored on monthly expiries are always
+        anchored on a trading day so this branch rarely fires in
+        practice, but the rule is unambiguous.
+      - n=1 returns "one trading day before anchor" (which is the same
+        as the previous trading day, regardless of whether anchor itself
+        is a trading day) — and so on.
+      - n < 0 raises ValueError; "trading days after" is a separate API.
+      - If NSE history doesn't go back far enough to satisfy `n`,
+        raises ValueError.
+
+    Bootstrap source: `load_spot(CALENDAR_SYMBOL, ...)` (RELIANCE per
+    SPECS §6). Cross-validated against `jugaad_data.holidays` in tests
+    — any date returned by `trading_days` that's also in `holidays()`
+    is a bug somewhere upstream."""
 
 # src/strategies/base.py
 @dataclass(frozen=True)
