@@ -1613,3 +1613,43 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `feat(p2.2): src/universe/momentum.py` is now mechanical. The **load-bearing test** is `test_classify_momentum_is_deterministic` — two calls with identical inputs → byte-identical bullish/neutral/non_bullish lists. Same pattern as expiry_calendar. Three other tests must land in the immediately-following `test(p2.2)` commit because the implementation surfaces them as risks: **(1)** `test_split_sizes_sum_to_universe` (bullish+neutral+non_bullish == len(universe), no leaks) — guards against an off-by-one in the slice arithmetic; **(2)** `test_delisted_symbol_dropped_with_warning` — monkeypatch `load_spot` to `MissingDataError` for one universe entry, assert it's absent from ALL three lists AND a warning was emitted; **(3)** `test_OfflineCacheMiss_propagates` — sister test ensures the distinct-class semantic from SPECS §6a still holds at the classifier layer (one stale name should NOT silently mask an offline failure). Pin those three at minimum.
 
 ---
+
+## Review of d581ab5 — feat(p2.2): momentum classifier + tests — tercile split on trailing return
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement SPECS §6b.2 momentum classifier + 9 tests covering determinism + all three load-bearing decisions (tercile, lookback, delisted) plus edge cases. Single combined feat+test commit since the contract was fully pinned in 397ad65.
+
+**What works:**
+- 129/129 pass; 9/9 momentum-specific tests in 0.11s.
+- **Tercile arithmetic** ([src/universe/momentum.py:114-117](src/universe/momentum.py#L114-L117)) — `n_bullish=ceil(n/3)`, `n_non_bullish=floor(n/3)`, `n_neutral=n - n_bullish - n_non_bullish`. Sums to n by construction. `test_tercile_split_n40_top_heavy` pins 14/13/13.
+- **Sort key `(-return, symbol_asc)`** ([src/universe/momentum.py:112](src/universe/momentum.py#L112)) — tie-break alphabetical ascending. `test_tie_break_by_symbol_name_ascending` exercises all-equal-returns case → `bullish==[A,B]`. Smart.
+- **Three determinism sort gates**: rank-sort by `(-return, symbol_asc)` then output-list `sorted(...)` per bucket. `test_determinism_byte_identical` calls THREE times and asserts `a==b==c` AND each list is `== sorted(list)`.
+- **Delisted-symbol policy** ([src/universe/momentum.py:46-52](src/universe/momentum.py#L46-L52)) — `MissingDataError` swallow with `warnings.warn`. `test_delisted_symbol_dropped_with_warning` pins three sub-properties at once: symbol absent from all 3 buckets, remaining 3 still classify normally (n=3 → 1/1/1 split), exactly one warning naming DELISTED.
+- **OfflineCacheMiss propagates** — implementation just doesn't catch it (the `except MissingDataError` is sibling-only). `test_offline_cache_miss_propagates` explicitly pins the SPECS §6a class-distinction guarantee at the classifier boundary.
+- **`test_lookback_routed_through_offset_trading_days`** is the clever one ([tests/test_momentum.py:210-246](tests/test_momentum.py#L210-L246)) — monkeypatches `offset_trading_days` to return a sentinel date (2023-12-21) that no naive arithmetic could produce, then asserts that exact date flowed into `load_spot.from_date`. A future "optimization" that bypasses the trading_calendar regresses LOUDLY.
+- **Zero-denominator guard** ([src/universe/momentum.py:66-72](src/universe/momentum.py#L66-L72)) — covers the corrupt-data case where lookback close is 0. Defensive.
+- **Edge cases**: empty universe returns `{"bullish": [], "neutral": [], "non_bullish": []}` via early-return; `lookback_trading_days <= 0` raises `ValueError`.
+- **Live sanity in commit message**: ICICIBANK+RELIANCE bullish, INFY+TCS neutral, HDFCBANK non_bullish for 5-stock blue chips on 2024-07-01. Plausible regime classification (banks split, IT in the middle, HDFCBANK was indeed a 2024 H1 laggard).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No test for the zero-denominator guard.** The `denom_close == 0` branch ([src/universe/momentum.py:66-72](src/universe/momentum.py#L66-L72)) emits a warning and skips the symbol but isn't exercised by any test. Future regression that drops the guard would silently propagate a `ZeroDivisionError`. One test mirroring the delisted-symbol pattern would close it.
+- **`_make_fake_spot` helper** sets the denom + numer based on `returns[symbol]` directly. Means the helper doesn't actually exercise the "from_date+to_date filter" path inside the classifier — the synthetic frame has exactly 2 rows regardless of how many trading days span the window. Defensible because the impl picks `.iloc[0]` and `.iloc[-1]`, but if someone refactors to a date-mask-based selector, the test still passes spuriously. Cosmetic; functional correctness pinned by other tests.
+- **No `partial-history` test.** A symbol that started trading mid-window (`load_spot` returns 30 rows for what should be 126) wouldn't crash but would have a *different effective lookback* than its peers. Worth a one-liner: `assert classify_momentum(...) doesn't blow up when one symbol has 5 rows and another has 126` — pins the "smaller window doesn't crash" behavior.
+- **`_trailing_return` swallows `df.empty` separately** ([src/universe/momentum.py:53-59](src/universe/momentum.py#L53-L59)) — different warning text vs the MissingDataError case. Both result in `None`. Defensible separation; alternatively, combining into one branch would be tighter. Cosmetic.
+
+**Domain / correctness checks:**
+- **Look-ahead bias:** `load_spot(symbol, lookback_date, as_of)` is bounded above by `as_of`. No leak.
+- **Statistical claims:** trailing-126-trading-day return is a standard momentum factor. Tercile cut is reasonable. The top-heavy split is a convention, not a measurement bias.
+- **jugaad-data:** classifier never calls it directly — delegates to `load_spot` + `offset_trading_days`, both already tested.
+
+**What I tried:**
+- `python -m pytest tests/test_momentum.py -v` → 9/9 in 0.11s.
+- `python -m pytest tests/` → 129/129 in 0.63s (1 warning from the intentional MORENSE_WARN_ON_FETCH test).
+- Read the impl + tests end-to-end.
+
+**Next-commit suggestion:** Per the BUILDER's plan, `chore(p2.verify)` next. The strongest single live check: run `classify_momentum(date(2024, 7, 1), blue_chip(date(2024, 7, 1)))` end-to-end against real NSE and assert (a) the three buckets sum to ≤40 (some symbols may be delisted post-2024-07-01 in NSE's archives), (b) exact split sizes for the non-delisted slice (14/13/13 if all 40 resolve), (c) a few hand-verifiable economic constraints — e.g. RELIANCE's classification matches its actual H1-2024 return (rallied → likely bullish); HDFCBANK's classification matches its H1-2024 underperformance (likely non_bullish). Print everything to stderr for human cross-check. Independent reproducibility against the BUILDER's own run is the strongest test we can do before Phase 3 lands.
+
+---
