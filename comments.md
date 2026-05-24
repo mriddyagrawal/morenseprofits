@@ -1909,3 +1909,53 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** Per the BUILDER's note, **margin module** comes next ("Indian-specific: SELL legs need SPAN-style margin block ~20% of underlying notional; BUY legs only need the premium"). This is a SPECS-amendment-worthy decision — margin is a P&L-relevant concept that hasn't been in the project yet. Before writing code, pin in SPECS: (a) margin formula (SPAN approximation: max(20% × underlying notional, premium × 1.5) for short option legs, premium-only for long); (b) WHERE margin lives in the results schema — as a separate column `margin_required` per SPECS §2.5, or as a `params` field?; (c) what does the engine *do* with margin — does `price_trade` enforce "trade requires more margin than caller's capital"? Or is margin just a reported metric? I lean **reported metric only** for v1 — let the strategy/sweeper decide what to do with it. Implementation can then be a small module like `src/engine/margin.py` with `compute_margin(trade, spot_at_entry, cost_model) -> dict`, wired into `price_trade` via the same injectable-default pattern as `cost_model`.
 
 ---
+
+## Review of 3f975ae — feat(p3.5): margin model (Indian options-specific) + wire into price_trade
+
+**Verdict:** ⚠️ accept-with-followups
+
+**Phase / commit goal (as I understood it):** Add margin to the result pipeline. BUY legs pay premium, SELL legs block ~20% × notional (SPAN+Exposure approx.). ROI = net_pnl / margin_at_entry becomes the cross-strategy ranking metric.
+
+**What works:**
+- **The BUY/SELL margin asymmetry is real and correctly modeled.** Indian F&O does exactly this: long premium-only, short SPAN-blocked.
+- **Hand-check arithmetic correct**: 0.20 × 2600 × 250 × 2 legs = ₹2,60,000. Verified live.
+- **The "intentionally conservative" framing is defensible**. Real Zerodha SPAN for this position is ~₹1.5L (single-leg offset credit applies); BUILDER's ₹2.6L is ~1.6× overstated. Overstating margin → understating ROI → SAFER for paper-to-live pipeline. Right direction of bias.
+- **Phase-7 backlog clearly named**: parse NSE's daily SPAN file for accurate per-position margin. Defers correctly.
+- **`roi_pct` added to result dict** with None-on-zero-margin guard. Phase-5 ranking has its primary metric.
+- **Frozen dataclass + injectable default** = same pattern as cost_model. Consistent.
+- **12 tests + extended pnl hand-check** = `gross 2750 / costs 141.78 / net 2608.22 / margin 260000 / ROI 1.00%`. Four-layer tie-together is the load-bearing assertion.
+- 164/164 pass.
+
+**GRILLING — issues that warrant SPECS clarification (not blocking, but the user said "we need to get this right"):**
+
+1. **`margin = SPAN_PCT × STRIKE × shares`** uses the contract's strike, NOT the spot. For ATM trades these are equal so the v1 canonical short straddle hand-check works perfectly. **For non-ATM strategies the divergence is material** (verified live):
+   - Far-OTM short put (2000 strike, spot 2600): BUILDER 100K vs real-SPAN-on-spot 130K → **23% understated**
+   - Far-OTM short call (3200 strike, spot 2600): BUILDER 160K vs real-SPAN-on-spot 130K → **23% overstated**
+   - For **symmetric** short-vol strategies (short straddle, symmetric short strangle): the over/under partially cancel because put-strike < spot < call-strike.
+   - For **asymmetric** strategies (single-leg short, asymmetric wings, iron condors with uneven wings): real bias.
+   - Real NSE SPAN is fundamentally **spot-driven** (worst-case price-move scenarios applied to the contract); strike-based is a simplification. **Recommend SPECS §4a update**: explicitly use `spot_at_entry` (which the strategy already has) rather than `leg.strike`. Same 0.20 constant; just change the multiplicand. Phase-5 multi-strategy ranking will be more accurate without this strike-vs-spot bias.
+   - The BUILDER may have intentionally chosen strike for **stability** (strike is a fixed contract property; spot fluctuates over the trade's life). For backtest reproducibility, strike is invariant. That's a defensible reason — but a different one than "this is what SPAN does". Pin the rationale either way.
+
+2. **`roi_pct` is holding-period return, NOT annualized.** A 30-day-hold strategy will look ~6× better than a 5-day-hold strategy at the same daily rate. Phase-5 ranking will silently favor longer holds. SPECS §2.5 should call out: "roi_pct is non-annualized holding-period return; cross-strategy ranking should normalize by hold length when comparing different (entry_offset, exit_offset) windows."
+
+3. **The 0.20 constant doesn't vary by symbol.** Low-vol HDFCBANK has SPAN ~14%; high-vol ADANIENT has SPAN ~25%. Same 0.20 for both means ADANIENT trades look better than reality, HDFCBANK trades look worse. Phase-7 SPAN-file parsing fixes this, but the v1 ranking bias is real. Worth an explicit caveat for the eventual UI: "v1 margin estimate is uniform across symbols; high-vol stocks would have higher real margin and lower realized ROI."
+
+4. **Multi-leg conservatism (1.6× overstatement)** is acknowledged in the docstring but the **ranking implication** isn't named: short straddle's real-margin offset credit is BIG (~2× reduction); a "long calendar spread" has SMALL offset credit. Comparing them by v1 ROI will silently favor calendars because their margin estimate is closer to real, while short straddle's is 60% too high. Worth a caveat in Phase-5 ranking docs.
+
+**Non-blocking suggestions:**
+- Switch `leg.strike` → `spot_at_entry` parameter (have to add it to the margin model's interface). Most defensible single change.
+- Add `roi_pct_annualized` as a separate column = `roi_pct * 252 / hold_trading_days`. Or compute it at sweep aggregation time.
+
+**Domain / correctness checks:**
+- **BUY/SELL asymmetry:** correct.
+- **Conservative-bias direction:** correct (overstate margin → understate ROI → paper-to-live safe).
+- **Hand-check arithmetic:** correct.
+- **Strike-vs-spot basis:** technically diverges from real SPAN; defensible for ATM-canonical v1 but **must be documented** before Phase 4 multi-strategy sweeps land.
+
+**What I tried:**
+- `python -m pytest tests/` → 164/164.
+- Hand-arithmetic on 4 scenarios (ATM straddle, far-OTM put, deep-ITM call, far-OTM call) to grill the strike-vs-spot question.
+
+**Next-commit suggestion:** **Before `feat(p3.4): ShortStraddle`, do a small `chore(p3.5.b): SPECS §4a — strike-vs-spot rationale + ROI-non-annualized caveat + uniform-rate symbol-bias`.** Three or four added sentences. Pins the v1 simplifications IN WRITING so a Phase-5 reader doesn't draw wrong ranking conclusions. Then `feat(p3.4): ShortStraddle`. The strategy itself is mechanical given the SPECS §5 ATM rule already pinned.
+
+---
