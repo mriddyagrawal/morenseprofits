@@ -22,19 +22,79 @@ def _leg(side, qty_lots, lot_size, entry_px, strike, exit_px=0.0):
 # LOAD-BEARING: RELIANCE 2600 short straddle calibration
 # ============================================================
 
-def test_reliance_short_straddle_calibration():
-    """SPECS §4a hand-check: RELIANCE 2600 short straddle, lot 250.
-    SELL CE 2600: 0.20 × 2600 × 250 = ₹130,000.
-    SELL PE 2600: 0.20 × 2600 × 250 = ₹130,000.
-    Total = ₹260,000. Conservative vs real ~₹1.5L SPAN benefit."""
+def test_reliance_short_straddle_calibration_tier_a_default():
+    """Tier-A (default kwargs): sum of per-leg (20% × strike × shares).
+    RELIANCE 2600 short straddle → ₹2.6L total. Conservative vs real
+    ~₹1.5L. Pin the default behavior so the new kwargs are truly
+    additive."""
     legs = [
-        _leg("SELL", 1, 250, 56.50, 2600.0),  # CE
-        _leg("SELL", 1, 250, 50.00, 2600.0),  # PE
+        _leg("SELL", 1, 250, 56.50, 2600.0),
+        _leg("SELL", 1, 250, 50.00, 2600.0),
     ]
     out = MARGIN_MODEL_V1.estimate(legs)
-    assert out["sell_leg_margin"] == 260_000.0
+    assert out["sell_leg_margin_raw"] == 260_000.0
+    assert out["sell_leg_margin"] == 260_000.0  # offset_pct defaults to 1.0
     assert out["buy_leg_premium"] == 0.0
     assert out["total"] == 260_000.0
+    assert out["strategy_offset_pct"] == 1.0
+    assert out["symbol_margin_pct"] == 0.20
+
+
+def test_reliance_short_straddle_tier_b_with_strategy_offset():
+    """Tier-B: strategy_offset_pct=0.60 for short straddle.
+    sell_leg_margin_raw stays at ₹2.6L (sum of legs); sell_leg_margin
+    drops to ₹2.6L × 0.6 = ₹1.56L. Total = ₹1.56L. Much closer to
+    real broker ~₹1.5L block."""
+    legs = [
+        _leg("SELL", 1, 250, 56.50, 2600.0),
+        _leg("SELL", 1, 250, 50.00, 2600.0),
+    ]
+    out = MARGIN_MODEL_V1.estimate(legs, strategy_offset_pct=0.60)
+    assert out["sell_leg_margin_raw"] == 260_000.0
+    assert out["sell_leg_margin"] == 260_000.0 * 0.60
+    assert out["total"] == 156_000.0
+    assert out["strategy_offset_pct"] == 0.60
+
+
+def test_high_vol_symbol_blocks_more_margin():
+    """Tier-B: symbol_margin_pct overrides the uniform 20%.
+    ADANIENT-style high-vol → 0.25 → larger block per leg."""
+    legs = [
+        _leg("SELL", 1, 250, 2000.0, 2000.0),
+        _leg("SELL", 1, 250, 2000.0, 2000.0),
+    ]
+    # Tier-A: 0.20 × 2000 × 250 × 2 = 200,000
+    out_v1 = MARGIN_MODEL_V1.estimate(legs)
+    assert out_v1["sell_leg_margin_raw"] == 200_000.0
+    # Tier-B with high-vol override: 0.25 × 2000 × 250 × 2 = 250,000
+    out_high_vol = MARGIN_MODEL_V1.estimate(legs, symbol_margin_pct=0.25)
+    assert out_high_vol["sell_leg_margin_raw"] == 250_000.0
+
+
+def test_tier_b_both_kwargs_combine():
+    """Both strategy_offset and symbol_margin_pct apply.
+    ADANIENT short strangle: 0.25 × strikes × shares × 0.70 offset."""
+    legs = [
+        _leg("SELL", 1, 250, 100.0, 1900.0),  # short put OTM
+        _leg("SELL", 1, 250, 100.0, 2100.0),  # short call OTM
+    ]
+    out = MARGIN_MODEL_V1.estimate(
+        legs, strategy_offset_pct=0.70, symbol_margin_pct=0.25,
+    )
+    expected_raw = 0.25 * (1900 + 2100) * 250  # 250,000
+    assert out["sell_leg_margin_raw"] == expected_raw
+    assert out["sell_leg_margin"] == expected_raw * 0.70  # 175,000
+    assert out["total"] == 175_000.0
+
+
+def test_offset_must_be_in_valid_range():
+    legs = [_leg("SELL", 1, 250, 50.0, 2600.0)]
+    with pytest.raises(ValueError, match="strategy_offset_pct"):
+        MARGIN_MODEL_V1.estimate(legs, strategy_offset_pct=0.0)
+    with pytest.raises(ValueError, match="strategy_offset_pct"):
+        MARGIN_MODEL_V1.estimate(legs, strategy_offset_pct=1.5)
+    with pytest.raises(ValueError, match="strategy_offset_pct"):
+        MARGIN_MODEL_V1.estimate(legs, strategy_offset_pct=-0.5)
 
 
 # ============================================================
