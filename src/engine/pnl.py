@@ -43,6 +43,7 @@ from src.data import options_loader
 from src.data.errors import LookaheadError, MissingDataError
 from src.engine.costs import COST_MODEL_V1, CostModelV1
 from src.engine.margin import MARGIN_MODEL_V1, MarginModelV1
+from src.engine.vol import symbol_margin_pct as _symbol_margin_pct
 from src.strategies.base import Leg, Trade, side_sign
 
 
@@ -145,6 +146,8 @@ def price_trade(
     load_option_fn: LoadOptionFn = options_loader.load_option,
     cost_model: CostModelV1 = COST_MODEL_V1,
     margin_model: MarginModelV1 = MARGIN_MODEL_V1,
+    strategy_offset_pct: float = 1.0,
+    symbol_margin_pct: float | None = None,
     today_fn: Callable[[], date] = date.today,
 ) -> dict:
     """Price every leg of ``trade``; return one row in the
@@ -152,8 +155,18 @@ def price_trade(
     `gross_pnl`, `costs`, `net_pnl`, `margin_at_entry`, and `roi_pct`
     (net_pnl / margin × 100).
 
-    ``cost_model`` / ``margin_model`` default to the project singletons;
-    Phase-5 sensitivity injects alternate instances without touching them.
+    Tier-B margin kwargs (per SPECS §4a):
+
+    - ``strategy_offset_pct`` (default 1.0): multiplier on sell-leg
+      margin to reflect SPAN's multi-leg offset benefit. Strategy
+      classes pass their real-world offset (short straddle 0.60, etc.);
+      single-leg / long-only trades leave at 1.0.
+    - ``symbol_margin_pct`` (default None = auto): per-symbol SPAN%
+      derived from the symbol's realized vol via ``engine.vol``. If
+      ``None``, the engine computes it from spot cache as of
+      ``trade.entry_date``; passing an explicit float overrides
+      (useful for tests and sensitivity analysis). Falls back to
+      the margin model's uniform default if computation fails.
     """
     leg_results = [
         _price_one_leg(trade, leg, load_option_fn=load_option_fn, today_fn=today_fn)
@@ -163,7 +176,26 @@ def price_trade(
     cost_breakdown = cost_model.total_cost(leg_results)
     costs = float(cost_breakdown["total"])
     net = gross - costs
-    margin_breakdown = margin_model.estimate(leg_results)
+
+    # Resolve symbol_margin_pct: explicit kwarg > auto-compute > default.
+    resolved_symbol_pct: float | None = symbol_margin_pct
+    if resolved_symbol_pct is None:
+        try:
+            resolved_symbol_pct = _symbol_margin_pct(
+                trade.symbol, trade.entry_date, today_fn=today_fn,
+            )
+        except Exception:
+            # Vol computation can fail (insufficient history, missing
+            # data) — fall back to the margin model's uniform default
+            # silently. The margin number is still a reasonable
+            # estimate; no need to break the whole trade pricing.
+            resolved_symbol_pct = None
+
+    margin_breakdown = margin_model.estimate(
+        leg_results,
+        strategy_offset_pct=strategy_offset_pct,
+        symbol_margin_pct=resolved_symbol_pct,
+    )
     margin = float(margin_breakdown["total"])
     return {
         "symbol": trade.symbol,

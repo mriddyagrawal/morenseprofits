@@ -265,12 +265,66 @@ def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():
         ),
         strategy="short_straddle",
     )
-    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    # Explicit symbol_margin_pct=0.20 pins the Tier-A baseline behavior
+    # for this assertion; the new auto-vol path is tested separately
+    # in test_auto_vol_resolves_symbol_margin_pct below.
+    out = price_trade(
+        trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+        symbol_margin_pct=0.20,
+    )
     assert out["gross_pnl"] == 2750.0
     assert out["costs"] == pytest.approx(141.780645, abs=1e-3)
     assert out["net_pnl"] == pytest.approx(2608.219, abs=1e-3)
     assert out["margin_at_entry"] == 260_000.0  # 2 × 0.20 × 2600 × 250
     assert out["roi_pct"] == pytest.approx(100 * 2608.219 / 260_000.0, abs=1e-3)
+
+
+def test_auto_vol_resolves_symbol_margin_pct_when_kwarg_absent(monkeypatch):
+    """When symbol_margin_pct is NOT passed, price_trade auto-computes
+    it from the symbol's realized vol. Pin the resolution path."""
+    # pnl.py imports the function as `_symbol_margin_pct`; patch at the
+    # call site, not at src.engine.vol.
+    from src.engine import pnl as pnl_mod
+    monkeypatch.setattr(pnl_mod, "_symbol_margin_pct", lambda *a, **kw: 0.17)
+
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame([(entry, 100.0, 250), (exit_, 50.0, 250)])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="RELIANCE", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),), strategy="test",
+    )
+    # No symbol_margin_pct kwarg → engine auto-computes (via the mocked
+    # vol module = 0.17). Margin = 0.17 × 2600 × 250 = 110500.
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    assert out["margin_at_entry"] == pytest.approx(0.17 * 2600 * 250, abs=1e-6)
+
+
+def test_strategy_offset_pct_flows_through_to_margin():
+    """Strategy classes pass their real-world offset; price_trade
+    forwards it. Short straddle 0.60 → margin drops by 40%."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    ce = _option_frame([(entry, 100.0, 250), (exit_, 10.0, 250)])
+    pe = _option_frame([(entry, 100.0, 250), (exit_, 10.0, 250)])
+    load = _stub_load_option({(2600.0, "CE"): ce, (2600.0, "PE"): pe})
+    trade = Trade(
+        symbol="RELIANCE", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1), Leg("PE", 2600, "SELL", 1)),
+        strategy="short_straddle",
+    )
+    # Pin symbol_margin_pct=0.20 to isolate the strategy_offset effect.
+    no_offset = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+                            symbol_margin_pct=0.20)
+    with_offset = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+                              symbol_margin_pct=0.20, strategy_offset_pct=0.60)
+    assert no_offset["margin_at_entry"] == 260_000.0
+    assert with_offset["margin_at_entry"] == pytest.approx(260_000.0 * 0.60, abs=1e-6)
+    # ROI improves correspondingly (same net, lower margin)
+    assert with_offset["roi_pct"] > no_offset["roi_pct"]
 
 
 def test_cost_model_is_injectable_for_sensitivity():
