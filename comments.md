@@ -151,3 +151,39 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** `feat(p1.2): data/spot_loader.py`. When you write it, decide the force-refresh policy first (SPECS §7) so `load_spot` knows whether to re-call NSE when a year-parquet exists. The cleanest answer is probably: `force=False` default, never re-fetch a *closed* year; always re-fetch the current year up to today's date.
 
 ---
+
+## Review of 75f6a21 — chore(p0): address reviewer non-blocking flags before Phase 1.2
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Clear the non-blocking flag backlog from the 46ffe18 + 15e1d9 reviews before opening Phase 1.2 — pyarrow / smoke-test PE leg / `.gitignore` for versioned caches / jugaad `expiry_dates` semantics / offline-mode contract / doctrine extension for non-blocking flags.
+
+**What works:**
+- [.gitignore:16](.gitignore#L16) → `data/cache*/` catches the cache-version directory bump. [.gitignore:27](.gitignore#L27) adds `.claude/` so harness state stays untracked.
+- Smoke test now exercises **both** CE and PE ([scripts/smoke_test.py:27-41](scripts/smoke_test.py#L27-L41)) and explicitly imports pyarrow ([scripts/smoke_test.py:44](scripts/smoke_test.py#L44)). I ran it: green; 42 rows CE + 42 rows PE for the expiry it picked; `[deps] pyarrow importable` printed.
+- [SPECS.md:106](SPECS.md#L106) documents the `expiry_dates(contracts=N)` gotcha — verified against jugaad source: `filter(lambda x: int(x[10])>contracts, cells)` confirms it's a liquidity threshold, not a "next N expiries" knob. Spec note matches reality.
+- [SPECS.md:233-235](SPECS.md#L233-L235) pins offline-mode contract: kwarg + `MORENSE_OFFLINE=1` env + telemetry on accidental fetch. Clean.
+- [PLAN.md:65](PLAN.md#L65) doctrine extension is exactly what was missing — non-blocking flags get an open-questions entry if they slip past the phase boundary.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- **NEW finding — jugaad `expiry_dates` is non-deterministic across runs.** The function ends with `return list(set(dts))` (jugaad_data/nse.py inside `expiry_dates`). Across runs the same call gave me Mar-28, then Feb-29; the BUILDER's hand-run gave Jan-25. That's set iteration order, not a NSE inconsistency. **Phase 1.3's `monthly_expiries()` must `sorted(...)` the result before caching**, and any expiry-picker (e.g. "first expiry on/after X") must work on the sorted view. Otherwise test_engine determinism (SPECS.md:253) becomes flaky-by-construction.
+- The same set-nondeterminism is *why* the 46ffe18 commit-message confusion arose. Worth noting in PLAN.md change log so future-you doesn't re-derive it.
+- `data/cache*/` will also match `data/cachezzz/` if someone makes a typo. Probably fine. `data/cache(.*)?/` is the pedantic form — skip unless it bites.
+- The smoke test still prints `lots = sorted(set(opt["MARKET LOT"]))` only on the CE branch ([scripts/smoke_test.py:38-40](scripts/smoke_test.py#L38-L40)). Cheap to also assert `lot == 250` so smoke fails loudly if lot size silently drifts.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** verified by reading source — `contracts` is a `>N` filter on the bhavcopy `int(x[10])` column. SPECS now accurately reflects this.
+- **Options math:** PE leg now in smoke; sign-convention work still pending in Phase 3.
+- **Look-ahead bias:** `MORENSE_OFFLINE=1` and the "warn on network fetch during sweep" telemetry are the right hooks to *enforce* no-lookahead during production runs. Worth keeping in mind when wiring Phase 1.5.
+- **Lot size:** smoke confirms `MARKET LOT=250` for RELIANCE 2024 — current NSE spec.
+
+**What I tried:**
+- `python scripts/smoke_test.py` → green, both legs, pyarrow OK.
+- `inspect.getsource(jugaad_data.nse.expiry_dates)` → confirmed `filter(... > contracts)` and `list(set(dts))` return; the gotcha note in SPECS is correct *and* a determinism hazard.
+- Re-read SPECS §2.3 + §6a hunks end-to-end.
+
+**Next-commit suggestion:** `feat(p1.2): data/spot_loader.py` — but bake **two non-negotiables** into the loader from commit 1: (a) sort the returned DataFrame by `date` ascending before write/return, and assert monotonicity (this kills the set-order class of bug at the data layer for *every* loader, not just expiries); (b) pin the force-refresh policy now — closed years are immutable on disk, current year re-fetches the tail. Both decisions are cheaper to make once than to retrofit across 5 loaders.
+
+---
