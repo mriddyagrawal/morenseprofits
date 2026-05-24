@@ -2088,3 +2088,50 @@ Part of the Tier-B cluster. Pure-Python vol calc from the existing spot cache (n
 My strong recommendation: **Option A**. The slippage model is the only thing in the project that gives the user the asymmetric conservatism they explicitly asked for. Without it, even with perfect margin, the project will silently mislead them on borderline-profitable trades.
 
 ---
+
+## Review of 3b035d8 — feat(p3.4): src/strategies/short_straddle.py — ATM CE+PE picker + 9 tests
+
+**Verdict:** ✅ accept (BUILDER picked Option C from the prior review — proceeding to live verify with documented Tier-B accuracy + open caveats noted)
+
+**What works:**
+- **ATM selection is correct**: `min(strikes, key=lambda k: (abs(k - spot), k))` — primary key distance ascending, tiebreaker strike ascending (lower wins). SPECS §5 implemented literally.
+- **Strike grid from real bhavcopy** ([src/strategies/short_straddle.py:89-101](src/strategies/short_straddle.py#L89-L101)) — no hardcoded grid. `load_bhavcopy_fo(entry_date)` → filter `(symbol, OPTSTK, expiry, CE|PE)` → unique strikes. The right architectural pattern.
+- **Two SELL legs at ATM**, qty_lots=1, strategy="short_straddle" matching the Trade.strategy convention.
+- **`SHORT_STRADDLE_MARGIN_OFFSET = 0.60` exported as module constant** ([src/strategies/short_straddle.py:30](src/strategies/short_straddle.py#L30)) — calibrated against real broker (₹1.5L / ₹2.6L ≈ 0.58, rounded to 0.60).
+- **`NoLiquidStrikeError(MissingDataError)`** — sweeper's `except MissingDataError` skip-loop handles it uniformly.
+- 9 tests + 190/190 in full suite. Hand-check pinned: `spot=2596.65` on Jan-4 with strikes [2540..2660] → ATM=2600 (matches Phase-1 integration verify exactly).
+- Tiebreaker test pins SPECS §5 lower-strike rule. Symbol normalization, filter precision, empty-strike handling, determinism all tested.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`NoLiquidStrikeError` parent class diverges from SPECS §8.** Spec has `class NoLiquidStrikeError(DataError)` (sibling of MissingDataError). Code has `class NoLiquidStrikeError(MissingDataError)` (subclass). BUILDER's choice is functionally cleaner (sweeper's existing catch-loop handles it) but breaks the written contract. Update SPECS §8 to match the code, OR change the code to match the SPECS. Pick one and write it down.
+- **`SHORT_STRADDLE_MARGIN_OFFSET` is module-level constant, not class attribute.** Sweeper has to import the constant from each strategy module to pass into `price_trade(strategy_offset_pct=...)`. Cleaner: expose on the strategy class itself as `recommended_strategy_offset_pct` — Phase 4 sweeper iterates strategies and reads the attribute generically. Defer until Phase 4 surface forces the issue.
+- **`int(s)` strike conversion** ([src/strategies/short_straddle.py:96](src/strategies/short_straddle.py#L96)) silently truncates fractional strikes. For NSE whole-rupee strikes this never bites; but `cache.option_path`'s loud guard catches the input case and the bhavcopy parser produces clean integers. Defensible.
+- **No `qty_lots` param** — hardcoded to 1. Phase 4 will add `qty_lots` + `strike_offset_pct` for strangles. Fine for v1.
+
+**REMINDING — these from the Tier-B cluster review are STILL OPEN going into p3.verify:**
+1. **Strike-vs-spot bias** on asymmetric strategies (~10 lines to fix). Doesn't bite ATM short straddle.
+2. **`roi_pct` non-annualized** (~5 lines to fix). Will bite when Phase-5 ranker compares different (entry_offset, exit_offset) windows.
+3. **Slippage absent** — this is the asymmetric-conservatism gap the user explicitly asked about. The first-real-₹P&L number from `p3.verify` will look more optimistic than reality without it.
+
+**Domain / correctness checks:**
+- **ATM rule:** correctly implemented per SPECS §5.
+- **Strike-grid source:** bhavcopy is the authoritative source. No look-ahead because we query `entry_date`'s bhavcopy only.
+- **Sign convention:** strategy emits SELL legs; engine kernel applies the +1 sign. Verified end-to-end via the prior Tier-B tests.
+
+**What I tried:**
+- Read [src/strategies/short_straddle.py](src/strategies/short_straddle.py) end-to-end.
+- 190/190 in full suite.
+
+**Next-commit suggestion:** Per the BUILDER's plan, `chore(p3.verify): live short straddle on RELIANCE Jan-2024 (T-15 → T-1) — first real ₹P&L number`. This is the user's original ask actualizing.
+
+**Two recommendations before the verify lands**:
+
+1. **Add slippage** (`feat(p3.5.g): SlippageModelV1`) — single-module add, ~50 lines, defaults to 1% per side. Without it, the first-real-₹P&L number the user sees will be optimistic relative to what they'd actually realize on NSE. With it, the number is honestly asymmetric-conservative per their direction. The verify is the user-facing number; it should be the number they can act on, not the number they'd disclaim. **This is the most consequential thing the BUILDER could do before the verify.**
+
+2. **In the verify script itself, print BOTH Tier-A and Tier-B margin / ROI** side-by-side, so the user sees the accuracy lift the cluster bought. E.g.: "Tier-A: margin ₹2.6L, ROI 1.0%. Tier-B: margin ₹1.5L, ROI 1.7%. Real broker would block ~₹1.5L."
+
+After that the live verify produces the first defensible end-to-end number on real NSE data, and Phase 3 closes cleanly.
+
+---
