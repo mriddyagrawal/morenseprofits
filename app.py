@@ -50,6 +50,10 @@ from src.web.leaderboard import (  # noqa: E402
     render_thin_samples,
     render_within_stock_rank,
 )
+from src.web.per_stock import (  # noqa: E402
+    _quick_switcher as render_per_stock_switcher,
+    render_headline as render_per_stock_headline,
+)
 from src.web.trends import (  # noqa: E402
     _selector as render_trends_selector,
     render_headline as render_trends_headline,
@@ -239,7 +243,10 @@ def _render_leaderboard_tab(df_filtered: pd.DataFrame) -> None:
 def _render_per_stock_tab(df_filtered: pd.DataFrame) -> None:
     render_caveats()
     st.markdown("## Per-stock")
-    _placeholder("Per-stock tab", "feat(p6.5.dash)")
+    min_n = int(st.session_state["mp_min_n"])
+    symbol = render_per_stock_switcher(df_filtered)
+    render_per_stock_headline(df_filtered, symbol=symbol, min_n=min_n)
+    _placeholder("Per-strategy small-multiples dashboard", "feat(p6.5.dash)")
 
 
 def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
