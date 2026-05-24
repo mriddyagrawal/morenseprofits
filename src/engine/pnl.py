@@ -1,0 +1,160 @@
+"""Per-trade gross P&L kernel.
+
+The load-bearing module of Phase 3 — turns a Trade into a number.
+The sign convention from SPECS §3a is implemented here once and only
+here; every backtest depends on it.
+
+Contracts:
+
+1. **Sign convention** (SPECS §3a): per-leg gross P&L is
+   ``(entry_px - exit_px) * side_sign(leg.side) * leg.qty_lots * lot_size``.
+   SELL profits from premium decay; BUY profits from premium expansion.
+
+2. **No look-ahead** (SPECS §3b): the kernel queries ``load_option`` with
+   ``from_date=entry_date, to_date=exit_date``. It NEVER inspects any
+   data with ``date > exit_date``. A frame returned by the loader that
+   contains rows past exit_date is treated as a code bug and raises
+   ``LookaheadError`` — that's stricter than necessary (the loader is
+   already supposed to filter) but it pins the contract in code.
+
+3. **No silent interpolation** (PLAN §4 rule #2): if any leg lacks a
+   traded price on either entry_date OR exit_date,
+   ``MissingDataError`` propagates. No averaging, no nearest-neighbour,
+   no fill-forward.
+
+4. **Lot size from the data, not a constant** (PLAN §4 rule #3): the
+   per-row ``lot_size`` column on the entry-date option frame
+   determines the multiplier. NSE changes lot sizes periodically;
+   reading from per-row data sidesteps that whole class of bug.
+
+Returns a dict matching SPECS §2.5 (`results` schema). Costs are NOT
+applied here — see ``src/engine/costs.py``. The caller (sweeper /
+single-trade runner) does ``net_pnl = gross_pnl - costs(trade)``.
+"""
+from __future__ import annotations
+
+import json
+from datetime import date
+from typing import Callable
+
+import pandas as pd
+
+from src.data import options_loader
+from src.data.errors import LookaheadError, MissingDataError
+from src.strategies.base import Leg, Trade, side_sign
+
+
+# Type alias for a loader function — pluggable so tests can inject
+# a deterministic fake without monkeypatching the module.
+LoadOptionFn = Callable[..., pd.DataFrame]
+
+
+def _pick_close_on(df: pd.DataFrame, target: date, *, context: str) -> tuple[float, int]:
+    """Return (close, lot_size) for the row whose date equals ``target``.
+
+    Raises ``MissingDataError`` if no such row exists; raises
+    ``LookaheadError`` if multiple rows share the date (parser bug).
+    Does NOT check for rows past ``target`` — that lookahead check is
+    enforced ONCE per leg in ``_price_one_leg`` against
+    ``trade.exit_date`` (the trade's outer bound), since the kernel
+    legitimately needs both entry and exit rows in the same frame."""
+    if df.empty:
+        raise MissingDataError(
+            f"{context}: load_option returned empty frame; no price to use"
+        )
+    row = df[df["date"].dt.date == target]
+    if len(row) == 0:
+        raise MissingDataError(
+            f"{context}: no traded row on {target}; can't price this leg"
+        )
+    if len(row) > 1:
+        raise LookaheadError(
+            f"{context}: multiple rows on {target} — duplicate date suggests "
+            f"a parser bug, refusing to pick one silently"
+        )
+    return float(row.iloc[0]["close"]), int(row.iloc[0]["lot_size"])
+
+
+def _price_one_leg(
+    trade: Trade,
+    leg: Leg,
+    *,
+    load_option_fn: LoadOptionFn,
+    today_fn: Callable[[], date],
+) -> dict:
+    """Price a single leg of ``trade``. Returns a dict that the trade-
+    level pricer aggregates into the results-schema row."""
+    df = load_option_fn(
+        trade.symbol,
+        trade.expiry,
+        leg.strike,
+        leg.option_type,
+        trade.entry_date,
+        trade.exit_date,
+        today_fn=today_fn,
+    )
+    context = (
+        f"{trade.symbol} {trade.expiry} {int(leg.strike)}-{leg.option_type}"
+    )
+    # No-look-ahead invariant (SPECS §3b): the frame returned by the
+    # loader for window [entry_date, exit_date] must contain ZERO rows
+    # past exit_date. Real loaders filter; this checks they did.
+    if not df.empty and (df["date"].dt.date > trade.exit_date).any():
+        offenders = df.loc[df["date"].dt.date > trade.exit_date, "date"].head(3).tolist()
+        raise LookaheadError(
+            f"{context}: frame contains rows past exit_date {trade.exit_date}: "
+            f"{[str(d) for d in offenders]}. Look-ahead bias would leak."
+        )
+    entry_px, entry_lot = _pick_close_on(df, trade.entry_date, context=f"{context} entry")
+    exit_px, exit_lot = _pick_close_on(df, trade.exit_date, context=f"{context} exit")
+    # Lot size at ENTRY is what's used for the P&L calc (NSE rarely
+    # changes lot size mid-contract; if it ever does, exit_lot would
+    # differ and we'd want to know — assert).
+    if entry_lot != exit_lot:
+        raise LookaheadError(  # not really lookahead, but loud-failure class
+            f"{context}: lot_size changed mid-contract "
+            f"({entry_lot} -> {exit_lot}); refusing to price silently"
+        )
+    sign = side_sign(leg.side)
+    gross = (entry_px - exit_px) * sign * leg.qty_lots * entry_lot
+    return {
+        "option_type": leg.option_type,
+        "strike": float(leg.strike),
+        "side": leg.side,
+        "qty_lots": leg.qty_lots,
+        "lot_size": entry_lot,
+        "entry_px": entry_px,
+        "exit_px": exit_px,
+        "gross_pnl": gross,
+    }
+
+
+def price_trade(
+    trade: Trade,
+    *,
+    load_option_fn: LoadOptionFn = options_loader.load_option,
+    today_fn: Callable[[], date] = date.today,
+) -> dict:
+    """Price every leg of ``trade``; return one row in the
+    results-schema (SPECS §2.5) shape.
+
+    The returned dict has ``gross_pnl`` summed across legs but NO
+    ``costs`` or ``net_pnl`` — those are applied by the caller via
+    ``src/engine/costs.py``. Keeping pricing and costs separate makes
+    cost-model sensitivity analysis (Phase 5) a swap.
+    """
+    leg_results = [
+        _price_one_leg(trade, leg, load_option_fn=load_option_fn, today_fn=today_fn)
+        for leg in trade.legs
+    ]
+    gross = sum(r["gross_pnl"] for r in leg_results)
+    return {
+        "symbol": trade.symbol,
+        "expiry": trade.expiry,
+        "entry_date": trade.entry_date,
+        "exit_date": trade.exit_date,
+        "strategy": trade.strategy,
+        "params_json": json.dumps(trade.params, sort_keys=True),
+        "legs_json": json.dumps(leg_results, sort_keys=True, default=str),
+        "gross_pnl": float(gross),
+    }

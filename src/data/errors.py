@@ -27,6 +27,14 @@ class OptionsFormatError(DataError):
     stripped under ``python -O``."""
 
 
+class LookaheadError(DataError):
+    """The engine consulted market data dated past the trade's
+    ``exit_date``. SPECS §3b — the kernel must NEVER read post-exit
+    rows. A frame returned by a loader that contains such rows is
+    treated as a code bug, not a recoverable data issue, and surfaces
+    here loudly before any P&L number is produced."""
+
+
 class OfflineCacheMiss(DataError):
     """``offline=True`` (or env ``MORENSE_OFFLINE=1``) was requested but
     the on-disk cache didn't have what was asked for.
