@@ -93,20 +93,26 @@ Columns (subset of jugaad `stock_df`, normalized):
 | `prev_close` | `float64` | INR |
 
 ### 2.2 Options — `data/cache/options/{SYMBOL}/{EXPIRY:yyyymmdd}/{STRIKE_INT}-{CE|PE}.parquet`
+
+One parquet per (symbol, expiry, strike, option_type). On the first
+fetch, the loader pulls the **full lifetime** of the contract (~120
+calendar days back from expiry, or up to ``today_fn()`` if expiry is
+in the future) — so narrow-window callers later don't re-fetch.
+
 | col | dtype | notes |
 |---|---|---|
-| `date` | `datetime64[ns]` | trading date |
-| `symbol` | `string` | underlying |
-| `expiry` | `date` | contract expiry |
-| `strike` | `float64` | INR strike |
-| `option_type` | `string` | `CE` or `PE` |
+| `date` | `date` (see §2.0) | trading date. *No IST shift needed* — unlike `stock_df`, `derivatives_df` returns DATE at `00:00:00` naive (already midnight IST). |
+| `symbol` | `string` | underlying, uppercase |
+| `expiry` | `date` (see §2.0) | contract expiry |
+| `strike` | `float64` | INR strike (whole-rupee per SPECS §5; `cache.option_path` enforces) |
+| `option_type` | `string` | `"CE"` or `"PE"` |
 | `open`, `high`, `low`, `close` | `float64` | premium INR |
 | `ltp` | `float64` | last traded price |
-| `settle_price` | `float64` | NSE daily settlement |
-| `lot_size` | `int64` | from `MARKET LOT` |
-| `volume` | `int64` | from `TOTAL TRADED QUANTITY` |
-| `oi` | `int64` | from `OPEN INTEREST` |
-| `oi_change` | `int64` | from `CHANGE IN OI` |
+| `settle_price` | `float64` | NSE daily settlement of the option |
+| `lot_size` | `int64` (plain) | from `MARKET LOT` — historical per row per §4 rule 3; never absent in jugaad output |
+| `volume` | `int64` (plain) | from `TOTAL TRADED QUANTITY` — in **share units**, NOT contract units. ``contracts = volume // lot_size`` if needed |
+| `oi` | `Int64` (nullable) | from `OPEN INTEREST`. jugaad emits float64 with occasional NaN; cast to nullable per §2.0/§2.4 convention |
+| `oi_change` | `Int64` (nullable) | from `CHANGE IN OI`. Same nullable reasoning |
 
 ### 2.3 Expiry calendar — `data/cache/expiries/{SYMBOL}.parquet`
 | col | dtype |
