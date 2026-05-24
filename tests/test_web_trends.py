@@ -1,0 +1,169 @@
+"""Tests for src.web.trends — Phase 6.4 headline strip.
+
+DESIGN_SPEC §2.5 Trends row. 4 cards: BEST MONTH, WORST MONTH,
+TIGHTEST MONTH STD, LATEST YEAR ROI.
+"""
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+from src.web.trends import render_headline
+
+
+@pytest.fixture
+def captured_metrics(monkeypatch):
+    metrics: list[dict] = []
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n_or_spec):
+        n = n_or_spec if isinstance(n_or_spec, int) else len(n_or_spec)
+        return [_NullCtx() for _ in range(n)]
+
+    def fake_metric(label, value, delta=None, delta_color="normal", **kw):
+        metrics.append({"label": label, "value": value, "delta": delta})
+
+    import src.web.trends as tr
+    monkeypatch.setattr(tr.st, "columns", fake_columns)
+    monkeypatch.setattr(tr.st, "metric", fake_metric)
+    return metrics
+
+
+def _row(strategy="S", symbol="X", year=2024, month=1,
+         net_pnl=100.0, roi_pct=1.0, roi_pct_annualized=12.0):
+    return {
+        "strategy": strategy, "symbol": symbol,
+        "expiry": pd.Timestamp(f"{year}-{month:02d}-15"),
+        "entry_offset_td": 15, "exit_offset_td": 1,
+        "net_pnl": net_pnl, "roi_pct": roi_pct,
+        "roi_pct_annualized": roi_pct_annualized,
+    }
+
+
+# ============================================================
+# Empty paths
+# ============================================================
+
+def test_empty_df_renders_four_dashes(captured_metrics):
+    render_headline(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "entry_offset_td": pd.Series(dtype="int64"),
+        "exit_offset_td": pd.Series(dtype="int64"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }), strategy=None, symbol=None, min_n=5)
+    assert len(captured_metrics) == 4
+    assert [m["label"] for m in captured_metrics] == [
+        "Best month", "Worst month", "Tightest month std",
+        "Latest year ROI",
+    ]
+    assert all(m["value"] == "—" for m in captured_metrics)
+
+
+def test_no_trades_for_selected_pair_renders_dashes(captured_metrics):
+    """Selector picked a pair but the filtered df has no rows for it."""
+    rows = [_row(strategy="OTHER", symbol="X")] * 6
+    render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    assert all(m["value"] == "—" for m in captured_metrics)
+    assert any("no trades for S × X" in m["delta"] for m in captured_metrics)
+
+
+# ============================================================
+# Populated paths — hand-derived month/year aggregates
+# ============================================================
+
+def test_best_and_worst_month_identified(captured_metrics):
+    """Jan is best (50%/yr), Mar is worst (-20%/yr). Each month
+    has N=6 trades (above min_n=5)."""
+    rows = (
+        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct_annualized=20.0)] * 6 +
+        [_row(year=2024, month=3, roi_pct_annualized=-20.0)] * 6
+    )
+    render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    best = captured_metrics[0]
+    worst = captured_metrics[1]
+    assert "+50.0%/yr" in best["value"]
+    assert "month 1" in best["delta"]
+    assert "-20.0%/yr" in worst["value"]
+    assert "month 3" in worst["delta"]
+
+
+def test_tightest_month_std_card_identifies_lowest_std(captured_metrics):
+    """Month with the smallest std_roi_pct_annualized = tightest."""
+    rows = (
+        # month 1: 6 identical trades at 30%/yr → std=0
+        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 6 +
+        # month 2: varied trades → larger std
+        [_row(year=2024, month=2, roi_pct_annualized=10.0)] * 3 +
+        [_row(year=2024, month=2, roi_pct_annualized=50.0)] * 3
+    )
+    render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    tightest = captured_metrics[2]
+    # Month 1's std = 0 → "±0.0%/yr"; subtitle names month 1
+    assert "±0.0%/yr" in tightest["value"]
+    assert "month 1" in tightest["delta"]
+    assert "consistent" in tightest["delta"].lower()
+
+
+def test_latest_year_roi_with_prior_year_delta(captured_metrics):
+    """2024 latest year, prior was 2023 — subtitle shows "vs 2023:
+    +X.X pp" (percentage points delta)."""
+    rows = (
+        # 2023: median 20%/yr
+        [_row(year=2023, month=1, roi_pct_annualized=20.0)] * 6 +
+        # 2024: median 50%/yr → +30 pp vs 2023
+        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6
+    )
+    render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    latest = captured_metrics[3]
+    assert "+50.0%/yr" in latest["value"]
+    assert "2024" in latest["delta"]
+    assert "vs 2023" in latest["delta"]
+    assert "+30.0 pp" in latest["delta"]
+
+
+def test_latest_year_card_single_year_omits_delta(captured_metrics):
+    """Only one eligible year → "no prior year for delta" subtitle.
+    NEVER a fake +0 pp."""
+    rows = [_row(year=2024, month=1, roi_pct_annualized=25.0)] * 6
+    render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    latest = captured_metrics[3]
+    assert "+25.0%/yr" in latest["value"]
+    assert "no prior year" in latest["delta"]
+
+
+def test_all_months_below_min_n_dashes_for_month_cards(captured_metrics):
+    """Every month has N < min_n → best/worst/tightest say so; the
+    yearly card may still render IF year-level n ≥ min_n."""
+    rows = (
+        # 3 trades in month 1 (below min_n=5)
+        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 3 +
+        [_row(year=2024, month=2, roi_pct_annualized=10.0)] * 2
+        # Total across months = 5 → year-level passes min_n=5
+    )
+    render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    # Best/Worst/Tightest dashed
+    for m in captured_metrics[:3]:
+        assert m["value"] == "—"
+        assert "N ≥ 5" in m["delta"] or "N >= 5" in m["delta"]
+    # Latest year populated (year-level N=5 passes)
+    latest = captured_metrics[3]
+    assert latest["value"] != "—"
+    assert "2024" in latest["delta"]
+
+
+def test_naming_rule_pct_cards_have_percent_suffix(captured_metrics):
+    """LOAD-BEARING §2.5: best/worst/latest values end in % or %/yr."""
+    rows = [_row(year=2024, month=1, roi_pct_annualized=42.0)] * 6
+    render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    for m in captured_metrics:
+        if m["value"] != "—":
+            assert "%" in m["value"]
+            assert "₹" not in m["value"]

@@ -50,6 +50,10 @@ from src.web.leaderboard import (  # noqa: E402
     render_thin_samples,
     render_within_stock_rank,
 )
+from src.web.trends import (  # noqa: E402
+    _selector as render_trends_selector,
+    render_headline as render_trends_headline,
+)
 
 
 # ============================================================
@@ -252,8 +256,13 @@ def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
 def _render_trends_tab(df_filtered: pd.DataFrame) -> None:
     render_caveats()
     st.markdown("## Trends")
+    min_n = int(st.session_state["mp_min_n"])
+    strategy, symbol = render_trends_selector(df_filtered)
+    render_trends_headline(
+        df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
+    )
     _placeholder(
-        "Trends tab",
+        "YoY line + YoY sister chart + MoY bars",
         "feat(p6.4.yoy) + feat(p6.4.yoy_n) + feat(p6.4.moy)",
     )
 
