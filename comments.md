@@ -3306,6 +3306,152 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 2033fbd + 202b49c — feat(p6.4.yoy_n) + feat(p6.4.moy) — Phase 6.4 closure pair
+
+**Verdict:** ✅ accept (both commits) — **Phase 6.4 Trends tab COMPLETE.**
+
+**Self-correction**: I missed the watcher notification for 2033fbd (`feat(p6.4.yoy_n)` landed at 01:43:47) — only saw 202b49c (`feat(p6.4.moy)` at 01:47:11). The 202b49c commit body's claim "474/474 (was 469 + 5)" tipped me off — 469 implied a prior +5 step I hadn't reviewed. Found 2033fbd in `git log` and reviewed both as the Phase-6.4 closure pair.
+
+### 2033fbd — feat(p6.4.yoy_n): sister chart with win-rate line + sample-size bars
+
+**Phase / commit goal (as I understood it):** Dual-axis Plotly subplots — bars (sample size, left y) + line (win rate, right y) on the same year axis. Per DESIGN_SPEC §10 user-journey step 4: operator sees drift on the main YoY line, then checks here for "(a) win-rate moved in the same direction → real signal" + "(b) sample size didn't collapse → not an N-fluke". **Replaces the original `p6.4.n_hover` plan** per the spec's mockup-alignment revision.
+
+**What works:**
+
+- **Silent-sister contract** ([src/web/trends.py:300-308](src/web/trends.py#L300-L308)) — renders NOTHING on single-year / empty / missing-pair branches. The main `render_yoy` ALREADY rendered the empty-state message; duplicating it would be banner-blindness. **Anti-banner-blindness pattern is now a project-wide discipline.**
+- **Dual-y-axis via `make_subplots(specs=[[{"secondary_y": True}]])`** — standard Plotly idiom for dual-scale charts. Bars on `secondary_y=False` (primary left axis = N count); line on `secondary_y=True` (secondary right axis = win rate %).
+- **Bars first, line on top** ([src/web/trends.py:319-343](src/web/trends.py#L319-L343)) — `add_trace` order determines Plotly z-order; line draws over the bars for readability.
+- **🔬 Win-rate y-axis pinned to [0, 100]** ([src/web/trends.py:353-357](src/web/trends.py#L353-L357)):
+  ```python
+  fig.update_yaxes(
+      title_text="Win rate (%)", secondary_y=True,
+      range=[0, 100],   # win rate is bounded; pin so cross-year comparisons read right
+  )
+  ```
+  **This is the asymmetric-conservatism move.** Without this pin, Plotly's auto-zoom on win rates of [95%, 99%] would auto-fit to ~[94, 100] making the 4pp drift look enormous. The [0, 100] pin keeps the full range visible — operator sees the drift relative to the actual win-rate scale, not the auto-zoomed scale.
+- **Translucent cornflower-blue bars** (`rgba(100, 149, 237, 0.5)`) + **orange line** (`rgb(220, 100, 0)`) — distinct from the main YoY chart's GREEN line. Operator can visually associate without confusion which line is which chart.
+- **Horizontal legend at top** (`orientation="h", y=1.02`) — compact for 2-series chart; doesn't waste vertical space.
+- **5 new tests** pin: silent-on-single-year, silent-on-empty/missing-pair, dual-trace-on-multi-year (Bar + Scatter), win-rate y-axis [0, 100], bar heights match actual `n_trades`. ✓ Anti-regression catches a future contributor removing the y-axis pin or swapping the silent-sister contract.
+
+**Live-tested** (synthetic 2-year via `*0.7` scaling on 2023):
+```
+2 traces:
+  Bar:     y=[18, 18]      marker=rgba(100,149,237,0.5)  ← sample sizes
+  Scatter: y=[83.3, 83.3]  line=rgb(220,100,0) lines+markers  ← win rate
+  yaxis2 range: (0, 100)  ← THE [0, 100] PIN IS HONORED ✓
+```
+Both traces render correctly; the y-axis pin is operational.
+
+**Non-blocking observations (yoy_n):**
+
+1. **No `rangemode="tozero"` on the primary y-axis (sample size)** — Plotly's auto-zoom might cut off zero. For N count, zero is the natural floor (a missing year shouldn't visually compete with present years for "bar height starts here"). **Recommended**: `fig.update_yaxes(rangemode="tozero", secondary_y=False)`. Cosmetic; visual-check at chore(p6.4.verify).
+
+2. **`barmode="group"`** ([src/web/trends.py:350](src/web/trends.py#L350)) — irrelevant for the single-bar-per-year case (only one bar trace), but a defensible default. Would matter only if a future commit adds a second bar series (e.g., loss count alongside win count).
+
+3. **Orange line color is fine** — win rate doesn't have a sign convention ("above 50%" is conventional but not universal). Orange is visually distinct from the main YoY's green. ✓
+
+---
+
+### 202b49c — feat(p6.4.moy): MoY seasonality bars with RdYlGn coloring
+
+**Phase / commit goal (as I understood it):** Plotly bar chart of `summarize_by_month`'s median annualized ROI by calendar month (Jan-Dec, folded across years). Bars colored by their own value via RdYlGn diverging colormap + `cmid=0` — same §2.3 convention as the heatmap value pane. Per-bar text annotation + hover with N. Closes Phase 6.4.
+
+**What works:**
+
+- **Calendar-month labels via `_MONTH_LABELS` constant** ([src/web/trends.py:31-35](src/web/trends.py#L31-L35)):
+  ```python
+  _MONTH_LABELS = ("Jan", "Feb", "Mar", ..., "Dec")
+  ```
+  **Closes my 0845230 review flag** (partially — see non-blocker #1 below) — bars show "Jan / Feb / Mar" instead of "1 / 2 / 3". Operator reads calendar order natively.
+- **🔬 RdYlGn diverging colormap with `cmid=0`** ([src/web/trends.py:407-411](src/web/trends.py#L407-L411)) — color BY value, anchored at zero. **Same §2.3 mandate as the heatmap value pane.** Anti-sequential-misleading discipline extends to the MoY bars.
+- **Bar text annotations show signed value** ([src/web/trends.py:423-424](src/web/trends.py#L423-L424)): `text=[f"{v:+.0f}%" for v in medians]` + `textposition="outside"`. Each bar reads "+269%" / "-30%" above its top. Operator can scan without hovering.
+- **Per-bar hover with N** ([src/web/trends.py:416-422](src/web/trends.py#L416-L422)) — same diagnostic pattern as YoY. Operator's "Feb is the best month" call is cross-checkable against sample size.
+- **Breakeven hline + annotation** ([src/web/trends.py:426-430](src/web/trends.py#L426-L430)) — same anti-auto-zoom pattern as YoY line.
+- **Footer caption explicitly disambiguates seasonality vs decay** ([src/web/trends.py:440-445](src/web/trends.py#L440-L445)):
+  > "Months with N ≥ K included. Bars folded across years — so this chart answers seasonality (which month is best?), not decay (which year is best?). For multi-year drift see the YoY chart above."
+  **Cross-references the YoY chart explicitly** so operator doesn't confuse the two analytical questions (orthogonal per DESIGN_SPEC §2 — month-of-year is a SEASONALITY axis; year-over-year is a DECAY axis).
+- **Empty-state branches** ([src/web/trends.py:394-397](src/web/trends.py#L394-L397)) — `n_months < 2` → `render_empty("trends_moy_single_month", n_months=N)`. Single-month sweeps get an explicit "monthly seasonality needs ≥2 calendar months" message.
+- **5 new tests** pin: single-month → empty-state; multi-month → bar chart with Jan-ordered labels; **color-by-value with cmid=0** (anti-sequential-regression); per-month N in customdata; silent on empty/missing-pair.
+
+**Live-tested** (Q1-2024 verify-set has 3 months):
+```
+Bar trace:
+  x=['Jan', 'Feb', 'Mar']         ← humanized labels ✓
+  y=[251.8, 269.3, 106.5]         ← matches p5.4 verify output ✓
+  text=['+252%', '+269%', '+106%']  ← rounded signed annotations
+  colorscale=RdYlGn (starts rgb(165,0,38) deep red)
+  cmid=0                          ← §2.3 mandate ✓
+  customdata=[[6], [6], [6]]      ← N per month
+
+Caption:
+  "Months with N ≥ 5 included. Bars folded across years — so this
+  chart answers seasonality (which month is best?), not decay (which
+  year is best?). For multi-year drift see the YoY chart above."
+
+Single-month test (Feb only):
+  0 figures, render_empty('trends_moy_single_month', n_months=1) ✓
+```
+Numbers match my p5.4 (d982bf7) review exactly (Jan 251.78, Feb 269.25, Mar 106.46). ✓
+
+**Non-blocking observations (moy):**
+
+1. **🔬 `_MONTH_LABELS` is only used in the MoY chart x-axis — NOT in the headline subtitles.** My 0845230 review flag was "month 2 (N=6)" → "Feb (N=6)" for the headline cards (Best month / Worst month / Tightest month std). **Partial closure**: the chart uses humanized labels; the headline still reads "month 2". The fix would be `_MONTH_LABELS[int(best['month']) - 1]` in the headline subtitles. One-line edit; high readability win. Could be a quick polish commit OR fold into chore(p6.4.verify).
+
+2. **🔬 Sign-format inconsistency between heatmap-cell annotations and MoY-bar annotations**:
+   - Heatmap cells: `f"{val:.0f}%/yr"` (unsigned — "248%/yr")
+   - MoY bars: `f"{v:+.0f}%"` (signed — "+269%")
+   
+   **The colormap (RdYlGn) is the same on both** — visual sign signal is consistent. **Both formats are defensible** (heatmap has many small cells, unsigned saves space; MoY has fewer larger bars, signed reinforces magnitude). **But the inconsistency could confuse operators switching between tabs.** Recommendation: pick one convention and apply uniformly. **My lean**: use signed everywhere (`:+.0f%`) — the `+` is one extra char but unambiguous; the heatmap cells aren't THAT small. Cosmetic; revisit at chore(p6.4.verify).
+
+3. **No `_filter_pair(df, strategy, symbol)` helper** — the pattern `df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]` is now repeated 4 times in `trends.py` (render_headline, render_yoy, render_yoy_n, render_moy). DRY refactor opportunity. Cosmetic.
+
+4. **`add_hline(y=0)` again missing `rangemode="tozero"`** — same observation as my 87a6707 review #2. The breakeven hline may render off-screen if Plotly's auto-zoom doesn't include zero. **For MoY specifically**: with bar values [251.8, 269.3, 106.5] all positive, auto-zoom might be ~[90, 280] and the y=0 hline would be off-screen. **Visual-check at chore(p6.4.verify); apply `rangemode="tozero"` if needed.**
+
+5. **Color application via `marker=dict(color=medians, ...)`** — Plotly looks up each value in the colorscale based on its position relative to `cmin`/`cmax` (auto-derived from the values themselves). With all-positive values, `cmid=0` anchors zero in the middle of the scale — green for positive, but red would only appear if a negative value exists. **For the verify-set**: all 3 months are positive (Jan +252, Feb +269, Mar +106) — all bars render as some shade of green/yellow. **On a future sweep with a losing month**, that bar would be red. ✓ Asymmetric-conservatism via colormap.
+
+**Domain / correctness checks (both commits):**
+
+- **Asymmetric-conservatism**: ✓ silent-sister (yoy_n); win-rate y-axis [0, 100] pin; RdYlGn diverging unconditionally on MoY bars; breakeven hline on MoY.
+- **§2.3 colormap mandate**: ✓ MoY bars use RdYlGn diverging with `cmid=0` (matches heatmap convention).
+- **§10 user-journey step 4 honored**: ✓ yoy_n provides the win-rate + N-bars diagnostic for distinguishing real drift from N-fluke.
+- **§2.6 empty-state contract**: ✓ silent-sister vs canonical empty-state — both consistent with the project's anti-banner-blindness discipline.
+- **Min_n discipline**: ✓ thin months / years suppressed before chart construction.
+- **Cross-tab consistency**: ✓ §2.3 colormap mandate now operational in 3 places (heatmap value pane, MoY bars, AND tests pin the RGB fingerprint).
+
+**What I tried:**
+- Read both [src/web/trends.py:275-358](src/web/trends.py#L275-L358) (yoy_n) and [src/web/trends.py:361-445](src/web/trends.py#L361-L445) (moy) end-to-end.
+- Live-tested yoy_n with synthetic 2-year data → 2 traces, yaxis2 range pinned to (0, 100). ✓
+- Live-tested moy with verify-set 3 months → x=['Jan', 'Feb', 'Mar'], y=[251.8, 269.3, 106.5], RdYlGn cmid=0, customdata N=6 per month. ✓
+- Live-tested moy single-month → empty-state correctly triggered. ✓
+- `pytest tests/test_web_trends.py -v` → **23/23 trends tests**.
+- `pytest tests/` → **474/474 full suite**.
+
+**Phase 6.4 status: COMPLETE.**
+- ✅ p6.4.headline (0845230) — 4-card strip
+- ✅ p6.4.yoy (87a6707) — Plotly line
+- ✅ p6.4.yoy_n (2033fbd) — sister chart (replaces the original p6.4.n_hover)
+- ✅ p6.4.moy (202b49c) — MoY bars
+
+**Sequencing observation:** Phase 6.4 closed in 4 commits per DESIGN_SPEC §4 (after the §4 revision that swapped `n_hover` for `yoy_n`). **Three of four tabs (Leaderboard / Heatmap / Trends) are now fully implemented.** Only Per-stock + the deferred `chore(p6.1.verify)` remain before Phase 6 closes.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 22: **`feat(p6.5.headline)`** — Per-stock tab 4-card strip + per-stock quick-switcher buttons per §1.2. The per-stock dashboard is the LAST tab to land. After it:
+- `feat(p6.5.dash)` (commit 23) — small-multiples cards per strategy with sparklines per strategy
+- `chore(p6.5.sweep)` (commit 24) — live run of the §3.2 sweep (5 stocks × 3 strategies × 2 years × 5 entry × 3 exit ≈ 5,400 cells)
+- `chore(p6.5.verify)` (commit 25) — screenshot every tab against mockups
+- `chore(p6.5.tag)` (commit 26) — `git tag v0.6-ui`
+
+**Opportunistic riders flagged for chore(p6.5.verify) or earlier polish pass:**
+- Apply `_MONTH_LABELS` to headline subtitles (#1 above + 0845230 review #1) — 1-line edit.
+- Resolve sign-format inconsistency between heatmap cells and MoY bars (#2 above).
+- Add `rangemode="tozero"` to YoY + MoY y-axes (87a6707 review #2 + this #4).
+- Consider conditional line color for YoY on negative-ROI pairs (87a6707 review #1).
+- DRY `_filter_pair` helper.
+- The 10+ outstanding non-blockers from prior reviews still catalogued.
+
+**A `chore(p6.4.verify)` doc-touch pass would be a productive checkpoint** — batch-close 5-7 cosmetic flags before Phase 6.5 starts. Recommend at this boundary.
+
+---
+
 ## Review of 87a6707 — feat(p6.4.yoy): Plotly YoY line — median ROI/yr over years
 
 **Verdict:** ✅ accept
