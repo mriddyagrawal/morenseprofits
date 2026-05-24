@@ -3306,6 +3306,108 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 87a6707 — feat(p6.4.yoy): Plotly YoY line — median ROI/yr over years
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** First chart on the Trends tab. Single Plotly Scatter line of `summarize_by_year`'s `median_roi_pct_annualized` over years for the selected pair. Years with `n_trades < min_n` excluded. Custom hover surfaces N per year per DESIGN_SPEC §10 user-journey step 4 ("distinguish real drift from thin-sample noise"). The current verify set (Q1-2024 only) intentionally hits the single-year empty-state branch so the operator gets an explicit message instead of an empty chart.
+
+**What works:**
+
+- **Plotly `Scatter(mode="lines+markers")`** ([src/web/trends.py:235-251](src/web/trends.py#L235-L251)) — markers + line gives visible anchors even on sparse data; line connects them so drift is obvious. The `markers=dict(size=10)` and `line(width=3)` make the points readable on the dark theme.
+- **Customdata + hovertemplate surfaces N per year** ([src/web/trends.py:244-250](src/web/trends.py#L244-L250)):
+  ```
+  <b>2024</b>
+  Median ROI/yr: +247.9%
+  N: 18
+  ```
+  **N is on every tooltip** — operator hovering on the line gets the sample size context inline. **This closes the §10 step 4 contract at the chart level** even before the sister chart lands.
+- **🔬 `fig.add_hline(y=0, ..., annotation_text="breakeven")`** ([src/web/trends.py:263-267](src/web/trends.py#L263-L267)) — **the zero-anchor is load-bearing for asymmetric-conservatism.** Commit body explicitly addresses this: "a +5%/yr drift on a chart auto-zoomed to [+30%, +35%] doesn't read more dramatic than the data warrants." Plotly's default auto-zoom would otherwise stretch the y-axis to fit data tightly, making small drifts look exaggerated. The breakeven hline anchors the eye. **Excellent intent.**
+- **Empty-state branches**:
+  - 0 filtered rows / no pair → `render_empty("leaderboard_no_rows_after_filters")`
+  - selected pair has 0 trades → `st.info("No trades for X × Y.")`
+  - `n_years < 2` → `render_empty("trends_yoy_single_year", n_years=N)` — **the verify-set's load-bearing path**: 1 year of data → operator sees "YoY decay needs ≥2 years. This sweep covers 1 year(s)." Explicit operator action.
+- **Caption below the chart** ([src/web/trends.py:269-273](src/web/trends.py#L269-L273)) cross-references the upcoming sister chart AND the §10 step 4 reasoning: "Sister chart below (win-rate + sample size) helps distinguish real drift from thin-sample noise per DESIGN_SPEC §10 step 4." **Cross-doc-aware UX**: operator knows there's more context coming below.
+- **5 new tests** covering: single-year → empty-state (no chart); 2 years → line with correct (x, y); thin years suppressed → falls back to single-year empty-state; hover customdata + template references N; empty df / missing pair routes through empty-state.
+- **464/464 full suite** (was 459 + 5).
+
+**Live-tested:**
+
+```
+Test 1 (verify-set, Q1-2024 only):
+  figs=0, render_empty('trends_yoy_single_year', n_years=1) called ✓
+
+Test 2 (synthetic 2-year — 2023 weakened to 70% of 2024):
+  figs=1
+  x=[2023, 2024], y=[173.5, 247.9]  ← 173.5 ≈ 247.9 × 0.7 ✓
+  customdata=[[18], [18]]
+  hovertemplate: <b>%{x}</b><br>Median ROI/yr: %{y:+.1f}%<br>N: %{customdata[0]}<extra></extra>
+  line color: rgb(0, 100, 0)
+  mode: lines+markers
+  caption: cross-references §10 step 4
+```
+All expected properties confirmed.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 `line=dict(color="rgb(0, 100, 0)", width=3)` — green line unconditionally** ([src/web/trends.py:239](src/web/trends.py#L239)). Commit body explains: "green line for 'positive territory' expectation". **But what if a future (strategy, symbol) pair has strongly NEGATIVE median ROI?** The green line on a negative-y chart reads "this is good!" to color-anchored intuition — but the operator's actually staring at losses. **The breakeven hline mitigates** (operator sees the line dips below 0), but a green line below zero still feels jarring.
+   
+   **Three options to consider**:
+   - **Keep green; trust the hline + y-axis to carry the truth** (current choice; defensible).
+   - **Neutral color** (gray / dark blue) — color-neutral; meaning lives in y-axis position.
+   - **Conditional color**: green if `mean(medians) > 0`, red if `< 0`. Or per-segment coloring of the line based on each year's sign.
+   
+   For the v1 short-vol-strategy universe (most pairs should be positive), green works. Worth a Phase-7 design decision when long-strategies + bearish-regimes start producing negative-ROI pairs. Cosmetic.
+
+2. **🔬 No `rangemode="tozero"` on the y-axis** — the breakeven hline at y=0 is ADDED as a shape, but Plotly's auto-zoom **doesn't necessarily extend the y-axis range** to include the hline. **Concrete concern**: if both years' medians are at +150% and +250%/yr (the synthetic test data), Plotly auto-zooms to ~[140, 260] and **the hline at y=0 isn't visible**. Operator sees the line + the title "breakeven" annotation but the actual gridline is off-screen.
+   
+   **Fix**: add `fig.update_yaxes(rangemode="tozero")` (forces y-axis to include 0). Or `fig.update_yaxes(range=[min(0, ymin)*1.1, ymax*1.1])` (explicit extending).
+   
+   **Worth visual-checking at `chore(p6.4.verify)`** to confirm whether the hline+annotation actually renders within frame on multi-year data. Cosmetic if Plotly's default DOES include the shape's y-coordinate; concerning if it doesn't.
+
+3. **`n_years < 2` empty-state passes `n_years=N` even when N=0** ([src/web/trends.py:226-228](src/web/trends.py#L226-L228)) — the `trends_yoy_single_year` reason key from empty_state.py renders "This sweep covers Y year(s)" where Y=0 reads as "0 year(s)". **Technically correct** (no years pass min_n) but jarring wording. Edge case: `min_n=100` with all years having N=18 → eligible is empty → `n_years=0` → message renders "0 year(s)". **Worth a tweak**: when `n_years == 0`, route to `leaderboard_all_below_min_n` instead (or add a new `trends_no_eligible_years` reason key). Cosmetic; only fires when min_n is set absurdly high.
+
+4. **`pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]` is repeated** across `render_headline` and `render_yoy` (and likely the upcoming `render_moy`). **Could DRY into `_filter_pair(df, strategy, symbol)`** helper. Cosmetic.
+
+5. **`Years with N ≥ {min_n}` caption** mentions the threshold + the sister chart but **doesn't tell the operator that thin years were SUPPRESSED** if any were. Compare to the leaderboard footer caption which surfaces "Showing X of Y pairs". A symmetric pattern here would be "Showing X of Y years with N ≥ {min_n}; thin years suppressed from the line plot." More transparent. Cosmetic.
+
+6. **Marker size = 10** — visible. **Could be larger on a sparse 2-year line** to make each year visually anchor more strongly. Cosmetic; visual-check at chore(p6.4.verify).
+
+7. **`mode="lines+markers"` is documented to "anchor each year visibly even on sparse data; line connects them so drift is obvious."** ✓ This is the right choice over pure-line (which on a 2-point line would be a single segment with no markers — operator might mistake for a degenerate render).
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ breakeven hline + N-per-year hover; single-year empty-state instead of misleading single-point line.
+- **§10 user-journey step 4 honored**: ✓ N in hover; sister-chart caption cross-references the next-commit's deeper diagnostic.
+- **§2.6 empty-state contract**: ✓ 3 of 4 empty paths use canonical render_empty; pair-empty uses inline st.info.
+- **Min_n discipline**: ✓ thin years suppressed from the line.
+- **Determinism**: ✓ sorted by year ASC; pivot output deterministic.
+
+**What I tried:**
+- Read [src/web/trends.py:195-273](src/web/trends.py#L195-L273) end-to-end.
+- Live-tested verify-set (single-year empty-state) and a synthesized 2-year dataset.
+- Confirmed customdata, hovertemplate, line color, mode, caption all as expected.
+- `pytest tests/test_web_trends.py -v` → 13/13.
+- `pytest tests/` → 464/464.
+
+**Sequencing observation:** Phase 6.4 progressing on plan. **The Q1-2024 verify set is the explicit dev-time empty-state exerciser** — every visualization commit in Phase 6.4 will hit the single-year branch on the verify data. Operator dev experience: "open the app on a fresh sweep, see honest empty-state messages everywhere, run a multi-year sweep, see the actual data". This is exactly DESIGN_SPEC §3.1's "design bugs surface on small data and force us to handle empty / thin cases gracefully" discipline operating as intended.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 20: **`feat(p6.4.yoy_n)`** — the sister chart with dual-y-axis: win-rate line + sample-size bars over years. **Critical design**: the win-rate line should align x-axis with the YoY line above so the operator can visually correlate "ROI went up — was it because win rate went up, or because losing trades got less bad?". The N bars are the sample-size diagnostic — a sparse year's bar is visibly smaller, so an operator sees "this year's high ROI is on N=2" before drawing conclusions.
+
+Then commit 21 (`feat(p6.4.moy)`): MoY bar chart, Jan-Dec. Verify-set will show 3 visible bars (Jan/Feb/Mar) with the rest empty (or absent depending on the implementation).
+
+**Opportunistic riders** for the inevitable `chore(p6.4.verify)` polish pass:
+- Add `rangemode="tozero"` to YoY y-axis (non-blocker #2 above).
+- Consider conditional line color (non-blocker #1).
+- DRY `_filter_pair` helper (non-blocker #4).
+- The 10+ outstanding non-blockers from prior reviews still catalogued.
+
+**Note**: at this point, the `chore(p6.4.verify)` would be a productive checkpoint to batch-close several pending flags. Recommend at Phase 6.4 close (after MoY commit 21).
+
+---
+
 ## Review of 0845230 — feat(p6.4.headline): Trends tab — strategy/symbol selectors + 4-card strip
 
 **Verdict:** ✅ accept
