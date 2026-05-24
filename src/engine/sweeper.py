@@ -36,6 +36,7 @@ import pandas as pd
 from src.config import RESULTS_DIR
 from src.data import spot_loader, trading_calendar
 from src.data.errors import MissingDataError
+from src.engine import results as _results
 from src.engine.pnl import price_trade
 from src.strategies.base import Trade
 from src.strategies.registry import STRATEGIES, get_strategy
@@ -80,7 +81,7 @@ def sweep_one(
     *,
     today_fn: Callable[[], date] = date.today,
     offline: bool = False,
-) -> dict | None:
+) -> dict | None | str:
     """Price ONE backtest cell: (strategy, symbol, expiry, offsets).
 
     Returns a SPECS §2.5 result dict augmented with sweep-specific
@@ -135,8 +136,10 @@ def sweep_one(
             strategy_offset_pct=strategy.recommended_strategy_offset_pct,
             today_fn=today_fn,
         )
-    except _SKIPPABLE_ERRORS:
-        return None
+    except _SKIPPABLE_ERRORS as e:
+        # Return the exception class name as a string so sweep_grid can
+        # log the reason. None would lose the diagnostic info.
+        return f"skip:{type(e).__name__}"
 
     # Sweep-specific decorations
     result["entry_offset_td"] = int(entry_offset_td)
@@ -205,19 +208,32 @@ def sweep_grid(
     ]
 
     rows: list[dict] = []
+    skipped: list[dict] = []
     for (s, sym, exp, eo, xo) in tasks:
         result = sweep_one(
             s, sym, exp, eo, xo,
             today_fn=today_fn, offline=offline,
         )
+        if isinstance(result, str) and result.startswith("skip:"):
+            skipped.append({
+                "run_id": run_id,
+                "strategy": s,
+                "symbol": sym,
+                "expiry": pd.Timestamp(exp),
+                "entry_offset_td": int(eo),
+                "exit_offset_td": int(xo),
+                "skip_reason": result[len("skip:"):],
+            })
+            continue
         if result is None:
             continue
         result["run_id"] = run_id
         rows.append(result)
 
     if not rows:
-        # Empty sweep — return an empty frame with the right columns
-        df = pd.DataFrame(rows)
+        # Empty sweep — preserve canonical column schema so downstream
+        # consumers don't trip on missing columns. (Reviewer flag from 185a9cb.)
+        df = _results.empty_results_frame()
     else:
         df = pd.DataFrame(rows)
         # Determinism: sort by canonical key tuple + reset_index
@@ -225,6 +241,6 @@ def sweep_grid(
             ["strategy", "symbol", "expiry", "entry_offset_td", "exit_offset_td"]
         ).reset_index(drop=True)
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
+    _results.write_results(df, run_id=run_id)
+    _results.write_skips(skipped, run_id=run_id)  # no-op if list empty
     return df

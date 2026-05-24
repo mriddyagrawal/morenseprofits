@@ -170,8 +170,9 @@ def test_sweep_one_rejects_inverted_window():
                   entry_offset_td=1, exit_offset_td=15)
 
 
-def test_sweep_one_skips_on_missing_data_returns_none(monkeypatch, tmp_path):
-    """MissingDataError → None (sweep_grid logs+continues)."""
+def test_sweep_one_skips_on_missing_data_returns_skip_marker(monkeypatch, tmp_path):
+    """MissingDataError → `skip:MissingDataError` (sweep_grid records
+    the reason in the skip log)."""
     _wire_mocks(monkeypatch)
     cache.CACHE_DIR = tmp_path
 
@@ -185,7 +186,7 @@ def test_sweep_one_skips_on_missing_data_returns_none(monkeypatch, tmp_path):
         entry_offset_td=15, exit_offset_td=1,
         today_fn=lambda: date(2026, 5, 24),
     )
-    assert out is None
+    assert out == "skip:MissingDataError"
 
 
 # ============================================================
@@ -384,9 +385,12 @@ def test_sweep_offline_cache_miss_propagates(monkeypatch, tmp_path):
         )
 
 
-def test_sweep_grid_empty_window_grid_returns_empty(monkeypatch, tmp_path):
+def test_sweep_grid_empty_window_grid_returns_empty_with_schema(monkeypatch, tmp_path):
     """Inverted entry/exit gets filtered out at the task-enumeration
-    level; no exception, just empty result."""
+    level. Result is an EMPTY frame WITH THE CANONICAL COLUMN SCHEMA —
+    downstream consumers don't trip on missing columns (reviewer flag
+    from 185a9cb addressed in p4.3)."""
+    from src.engine.results import RESULTS_COLUMNS
     _wire_mocks(monkeypatch)
     _redirect_results(monkeypatch, tmp_path)
     cache.CACHE_DIR = tmp_path
@@ -399,3 +403,50 @@ def test_sweep_grid_empty_window_grid_returns_empty(monkeypatch, tmp_path):
         today_fn=lambda: date(2026, 5, 24),
     )
     assert len(df) == 0
+    # Empty frame must still carry the canonical schema
+    assert set(df.columns) >= set(RESULTS_COLUMNS), (
+        f"empty frame missing canonical columns: "
+        f"{sorted(set(RESULTS_COLUMNS) - set(df.columns))}"
+    )
+
+
+def test_sweep_grid_persists_skip_log_when_skips_occur(monkeypatch, tmp_path):
+    """Reviewer flag from 185a9cb: skipped tasks should land in a
+    companion parquet so operators can see WHY 200 of 7500 cells
+    dropped without manually diffing row counts."""
+    from src.engine import results as _results
+    _wire_mocks(monkeypatch)
+    _redirect_results(monkeypatch, tmp_path)
+    cache.CACHE_DIR = tmp_path
+
+    # Make ONE cell raise; the other survives.
+    from src.data import options_loader
+    real_load = options_loader.load_option
+    call_count = {"n": 0}
+
+    def selective_boom(symbol, expiry, strike, option_type, fd, td, **kw):
+        # Boom on the very first call; let the rest through
+        if call_count["n"] == 0:
+            call_count["n"] += 1
+            raise MissingDataError("first call boom")
+        return real_load(symbol, expiry, strike, option_type, fd, td, **kw)
+    monkeypatch.setattr(options_loader, "load_option", selective_boom)
+
+    df = sweep_grid(
+        strategies=["short_straddle"], symbols=["RELIANCE"],
+        expiries=[date(2024, 1, 25)],
+        entry_offsets_td=[15, 5],
+        exit_offsets_td=[1],
+        today_fn=lambda: date(2026, 5, 24),
+    )
+    # One cell survived; one was skipped
+    assert len(df) == 1
+    # Skip log persisted as companion file
+    from src.engine.sweeper import _compute_run_id
+    run_id = _compute_run_id(
+        ["short_straddle"], ["RELIANCE"], [date(2024, 1, 25)], [15, 5], [1],
+    )
+    skips = _results.read_skips(run_id)
+    assert len(skips) == 1
+    assert skips.iloc[0]["skip_reason"] == "MissingDataError"
+    assert skips.iloc[0]["symbol"] == "RELIANCE"
