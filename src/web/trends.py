@@ -21,6 +21,7 @@ from typing import Optional
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 from src.analytics.aggregate import summarize_by_month, summarize_by_year
 from src.web._format import format_pct
@@ -270,3 +271,81 @@ def render_yoy(
         f"(win-rate + sample size) helps distinguish real drift from "
         f"thin-sample noise per DESIGN_SPEC §10 step 4."
     )
+
+
+# ============================================================
+# YoY sister chart — Phase 6.4 commit 20 (feat(p6.4.yoy_n))
+# ============================================================
+
+def render_yoy_n(
+    df: pd.DataFrame,
+    *,
+    strategy: Optional[str],
+    symbol: Optional[str],
+    min_n: int,
+) -> None:
+    """Sister chart to render_yoy: dual-axis Plotly with win-rate as a
+    line (left y, primary) and sample size as bars (right y, secondary).
+
+    Replaces the original `feat(p6.4.n_hover)` per DESIGN_SPEC §4 +
+    §10 step 4. Operator looks at the main YoY line to spot drift,
+    then checks this chart to see if (a) win-rate moved in the same
+    direction (real signal) and (b) sample size didn't collapse
+    (drift isn't an N-fluke).
+
+    Same eligible-years filter as render_yoy; same single-year
+    empty-state.
+    """
+    if len(df) == 0 or strategy is None or symbol is None:
+        return  # main yoy already rendered empty-state; sidecar silent
+    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    if len(pair) == 0:
+        return
+    yearly = summarize_by_year(pair)
+    eligible = yearly[yearly["n_trades"] >= min_n].sort_values("year")
+    if int(eligible["year"].nunique()) < 2:
+        return  # main yoy already rendered the empty-state for this
+
+    years = eligible["year"].astype(int).tolist()
+    win_rates = eligible["win_rate_pct"].astype(float).tolist()
+    n_per_year = eligible["n_trades"].astype(int).tolist()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # Bars first so the line draws on top (z-order matters in Plotly).
+    fig.add_trace(
+        go.Bar(
+            x=years,
+            y=n_per_year,
+            name="Sample size (N)",
+            marker_color="rgba(100, 149, 237, 0.5)",  # cornflower blue, translucent
+            hovertemplate="<b>%{x}</b><br>N: %{y}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=win_rates,
+            name="Win rate (%)",
+            mode="lines+markers",
+            line=dict(color="rgb(220, 100, 0)", width=3),   # orange — distinct from main yoy line
+            marker=dict(size=10),
+            hovertemplate="<b>%{x}</b><br>Win rate: %{y:.1f}%<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.update_layout(
+        title=f"YoY win-rate + sample size — {strategy} × {symbol}",
+        xaxis_title="Year",
+        height=380,
+        margin=dict(l=60, r=60, t=50, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        barmode="group",
+    )
+    fig.update_yaxes(title_text="Sample size (N)", secondary_y=False)
+    fig.update_yaxes(
+        title_text="Win rate (%)",
+        secondary_y=True,
+        range=[0, 100],   # win rate is bounded; pin so cross-year comparisons read right
+    )
+    st.plotly_chart(fig, use_container_width=True)

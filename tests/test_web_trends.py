@@ -8,7 +8,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.web.trends import render_headline, render_yoy
+from src.web.trends import render_headline, render_yoy, render_yoy_n
 
 
 @pytest.fixture
@@ -271,6 +271,83 @@ def test_yoy_empty_df_or_missing_pair_routes_through_empty_state(captured_charts
     kinds = [e["kind"] for e in captured_charts]
     assert "info" in kinds
     assert "plotly_chart" not in kinds
+
+
+# ============================================================
+# render_yoy_n — sister chart (win-rate line + N bars dual-axis)
+# ============================================================
+
+def test_yoy_n_silent_on_single_year(captured_charts):
+    """LOAD-BEARING: sister chart must NOT render anything on the
+    single-year branch — the main yoy already showed the empty-state
+    message; duplicating it via a second info box would be banner
+    blindness. yoy_n stays silent here per DESIGN_SPEC §10 reading."""
+    rows = [_row(year=2024, month=1, roi_pct_annualized=20.0)] * 6
+    render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    assert len(captured_charts) == 0
+
+
+def test_yoy_n_silent_on_empty_or_missing_pair(captured_charts):
+    """Same silent contract for empty df / missing pair."""
+    render_yoy_n(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "entry_offset_td": pd.Series(dtype="int64"),
+        "exit_offset_td": pd.Series(dtype="int64"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }), strategy=None, symbol=None, min_n=5)
+    assert len(captured_charts) == 0
+
+
+def test_yoy_n_renders_two_traces_on_multi_year_data(captured_charts):
+    """Two eligible years → exactly one Plotly figure with 2 traces:
+    Bar (sample size) + Scatter (win rate)."""
+    rows = (
+        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 8 +
+        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 12
+    )
+    render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
+    assert len(charts) == 1
+    fig = charts[0]["fig"]
+    assert len(fig.data) == 2
+    # Trace 0 = Bar (sample size); trace 1 = Scatter (win rate)
+    assert fig.data[0].type == "bar"
+    assert fig.data[1].type == "scatter"
+
+
+def test_yoy_n_win_rate_yaxis_bounded_0_100(captured_charts):
+    """LOAD-BEARING: win rate is a percentage bounded [0, 100]. Pin
+    the y-axis range so cross-year comparisons read correctly — a
+    Plotly auto-zoom on (95%, 100%) would mid-color a 4-pp difference
+    as visually dramatic."""
+    rows = (
+        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 8 +
+        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 12
+    )
+    render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    fig = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"]
+    # Find the secondary y-axis range (yaxis2 in subplots layout)
+    yaxis2 = fig.layout.yaxis2
+    assert tuple(yaxis2.range) == (0, 100)
+
+
+def test_yoy_n_bar_heights_match_sample_sizes(captured_charts):
+    """The bars MUST plot the actual n_trades per eligible year —
+    pin so a future refactor that swaps in mean_n_trades silently
+    is caught."""
+    rows = (
+        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 8 +
+        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 12
+    )
+    render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    fig = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"]
+    bar = fig.data[0]
+    assert list(bar.x) == [2023, 2024]
+    assert list(bar.y) == [8, 12]
 
 
 def test_naming_rule_pct_cards_have_percent_suffix(captured_metrics):

@@ -54,6 +54,7 @@ from src.web.trends import (  # noqa: E402
     _selector as render_trends_selector,
     render_headline as render_trends_headline,
     render_yoy as render_trends_yoy,
+    render_yoy_n as render_trends_yoy_n,
 )
 
 
@@ -266,10 +267,10 @@ def _render_trends_tab(df_filtered: pd.DataFrame) -> None:
     render_trends_yoy(
         df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
     )
-    _placeholder(
-        "YoY sister chart + MoY bars",
-        "feat(p6.4.yoy_n) + feat(p6.4.moy)",
+    render_trends_yoy_n(
+        df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
     )
+    _placeholder("MoY seasonality bars", "feat(p6.4.moy)")
 
 
 # ============================================================
