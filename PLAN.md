@@ -124,16 +124,21 @@ Exit criteria:
 ### Phase 3 — Single-strategy backtest engine (short straddle)
 **Goal:** Compute P&L for one well-defined trade end-to-end. The validation crucible — bugs caught here save us in Phase 4.
 
-Commits:
-1. `feat(p3): Trade + Leg dataclasses; per-trade P&L kernel`
-2. `feat(p3): ShortStraddle strategy — picks ATM CE+PE at entry_date for given expiry`
-3. `feat(p3): cost model — STT, brokerage, exchange txn fees (sell side STT only on options)`
-4. `feat(p3): single-trade smoke run — RELIANCE Jan 2024, entry T-15, exit T-1`
-5. `test(p3): hand-computed P&L verification on 2 fixtures`
+Steps (one commit each per nuclear doctrine):
+1. `chore(p3.0): SPECS for engine — Trade/Leg schemas, sign convention, no-lookahead rule, ATM selection`
+2. `feat(p3.1): src/strategies/base.py — Trade, Leg dataclasses + Strategy protocol`
+3. `feat(p3.2): src/engine/pnl.py — per-trade gross P&L kernel with no-lookahead + missing-data enforcement`
+4. `test(p3.2): gross P&L hand-checked on fixture (signs + arithmetic + no-lookahead trip)`
+5. `feat(p3.3): src/engine/costs.py — COST_MODEL_V1 (STT sell-side, brokerage, exchange, GST, stamp duty, SEBI)`
+6. `test(p3.3): cost model hand-checked on a few legs`
+7. `feat(p3.4): src/strategies/short_straddle.py — picks ATM CE+PE per SPECS §5`
+8. `test(p3.4): short_straddle.generate_trades schema + ATM rule`
+9. `chore(p3.verify): live short straddle on RELIANCE Jan-2024 (T-15 → T-1) — first real ₹P&L number`
 
 Exit criteria:
 - One hand-checked trade matches the engine output to within ₹1.
 - Engine refuses to price if any required data is missing (no silent interpolation).
+- No-look-ahead enforced by code: any access to `data[date > exit_date]` raises.
 
 ### Phase 4 — Parameter sweep + multi-strategy framework
 **Goal:** Run thousands of backtests across the cartesian grid; add 4 more strategies.

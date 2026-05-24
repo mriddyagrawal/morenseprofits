@@ -335,6 +335,46 @@ def run_backtest(
     ...
 ```
 
+## 3a. Trade / P&L sign convention (frozen)
+
+A trade is a bundle of legs. Each leg has a `side` ∈ {`"SELL"`, `"BUY"`}.
+The per-leg gross P&L is:
+
+```python
+side_sign = +1 if side == "SELL" else -1   # SELL profits from price falls
+gross_pnl_per_leg = (entry_price - exit_price) * side_sign * qty_lots * lot_size
+```
+
+A short straddle has two SELL legs (one CE, one PE) so `side_sign = +1`
+for both — if the option premiums fall to expiry, both entry > exit and
+P&L is positive (the seller keeps the decayed premium).
+
+Aggregate trade P&L:
+```
+gross_pnl = sum(gross_pnl_per_leg over all legs)
+net_pnl = gross_pnl - costs  # costs always positive — see §4
+```
+
+**This sign convention is load-bearing.** A single sign flip in the
+engine inverts every backtest result by 100%. The Phase-3.2 P&L test
+exercises a SELL leg with `entry > exit` and asserts `gross_pnl > 0`.
+
+## 3b. No-look-ahead enforcement (frozen)
+
+PLAN.md §4 hard rule #1 implemented at the engine layer: the trade
+pricing kernel for entry/exit dates `e, x` (with `e <= x`) MUST NOT
+consult any market data with `date > x`. Specifically:
+
+- `load_spot(symbol, entry_date, exit_date)` — fine; `to_date <= x`.
+- `load_option(..., from_date=entry_date, to_date=exit_date)` — fine.
+- Anything that even *could* read past `exit_date` is rejected at the
+  engine boundary with a `LookaheadError` (new entry in §8).
+
+Tests exercise the rule by constructing a fixture whose spot/option
+frames contain rows post-`exit_date`, monkeypatching the loaders to
+return them, and asserting the engine raises rather than silently
+including them.
+
 ## 4. Cost model (default — versioned in `src/engine/costs.py` as `COST_MODEL_V1`)
 
 For Indian equity options, per leg, per round trip:
@@ -456,6 +496,7 @@ class MissingDataError(DataError): ...            # leg/spot missing for require
 class NoLiquidStrikeError(DataError): ...         # no strikes traded on entry_date
 class CacheCorruptError(DataError): ...
 class BhavcopyFormatError(DataError): ...         # CSV header matches neither pre/post Jul-8-2024 schema
+class LookaheadError(DataError): ...              # engine consulted data past exit_date
 class StrategyConfigError(ValueError): ...        # bad params dict
 ```
 
