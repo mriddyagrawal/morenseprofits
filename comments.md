@@ -1438,3 +1438,44 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `chore(p1.7): cache-hit telemetry`. The simple shape: emit a one-line `warnings.warn(...)` at the moment a loader DECIDES to fetch (after offline-check passed, after cache-exists check failed). One warning per fetch, not per call. Keep it opt-in: another env var `MORENSE_WARN_ON_FETCH=1` so legitimate Phase-4 sweeps with 60 cold fetches don't spam by default. Mirror the offline `effective_*` helper pattern in `offline.py` (or a new `telemetry.py`). The load-bearing test: monkeypatch the actual fetch function, set the env var, call the loader on a cold cache, assert one warning emitted naming both the loader and the key. After 1.7 lands, **immediately move to Phase 2 (universe selection)** — the data layer is then both feature-complete AND auditable for accidental fetches in production runs.
 
 ---
+
+## Review of 702c1dc — feat(p1.7): cache-hit telemetry — opt-in fetch warnings via MORENSE_WARN_ON_FETCH
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Add opt-in telemetry that warns when a loader hits the network. Phase-4 sweeps can set `MORENSE_WARN_ON_FETCH=1` to surface accidental fetches without spamming legitimate cold-cache runs.
+
+**What works:**
+- **`src/data/telemetry.py` mirrors `offline.py`'s shape** — strict env-var pattern (only literal "1"), `warn_fetch(loader_name, key)` helper that's a no-op unless enabled.
+- **Module docstring frames the WHY precisely** ([src/data/telemetry.py:4-7](src/data/telemetry.py#L4-L7)): "an accidental refresh during a backtest can pull in rows dated after the backtest's nominal 'now'". That's the look-ahead-bias angle — the real reason this matters, not just performance.
+- **Three fetch-decision sites wired** with appropriate keys:
+  - `spot_loader._fetch_year` → "RELIANCE 2024"
+  - `bhavcopy_fo_loader._fetch_raw` → trade date
+  - `options_loader._fetch_contract_lifetime` → "RELIANCE 2024-01-25 2620-CE"
+- **expiry_calendar and trading_calendar inherit telemetry transitively** — they call the wired loaders, so any fetch they trigger surfaces. No separate wiring. Right design.
+- **`stacklevel=3`** so the warning points at the caller's caller, not at `warn_fetch` itself. Operators see where the fetch decision was made.
+- **Opt-in by default** — verified by the existing test suite running with mostly no warnings.
+- **Hot-call silent** — pinned via `test_cache_hit_after_cold_does_not_re_warn` per the commit message. Catches the per-call-spam regression class.
+- **112/112 pass** in 0.61s.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`warn_fetch` fires on fetch ATTEMPT, not on fetch SUCCESS.** If `_fetch_raw` is called and then raises `MissingDataError` (weekend, holiday), the warning fires for what looks like a "successful fetch attempt". That's semantically correct (the loader DID decide to hit the network), but could mislead an operator into thinking the cache was hit when really data is just missing. Worth a one-line docstring clarification.
+- **No process-level summary.** Phase-4 sweeps with `MORENSE_WARN_ON_FETCH=1` could log dozens of warnings in chronological order. A simple `telemetry.fetch_count` counter that summarizes at process exit (or via an explicit `dump_stats()`) would be useful when investigating "why did this sweep take 30 minutes". Defer; opt-in via the env var is enough for v1.
+- **No `warn_fetch` for the live verify scripts.** Running `MORENSE_WARN_ON_FETCH=1 python scripts/verify_phase1_integration.py` should produce 4-5 cold-cache warnings (one per fetch site) on a fresh cache, and zero on a warm cache. Verifying that interactively would tighten the contract; defer.
+- **`loader_name` is a free-form string.** A future typo like `"spot_loaders"` would silently produce inconsistent telemetry. A module-level constant per loader (`_TELEMETRY_NAME = "spot_loader"`) would lock the spelling. Cosmetic.
+
+**Domain / correctness checks:**
+- **jugaad-data usage / options math / stats:** N/A pure observability.
+- **Look-ahead bias:** the telemetry IS the bias-detection mechanism. A future-dated cache refresh during a backtest of past data would now emit a warning naming the loader + key. That's exactly the contract.
+
+**What I tried:**
+- `python -m pytest tests/` → 112/112 in 0.61s. The "1 warning" in pytest output is a test deliberately exercising the warning path with the env var set — not a leak.
+- Read [src/data/telemetry.py](src/data/telemetry.py) and verified the wire-in points in all three loaders.
+
+**Phase 1 status:** **TRULY DONE NOW.** 6 data-layer modules + 105 offline + 7 network-marked tests + 4 live verify scripts + offline-mode + cache-hit telemetry. Data layer is feature-complete, deterministic, auditable, and offline-capable.
+
+**Next-commit suggestion:** **Move to Phase 2 (universe selection).** The PLAN.md sequence is p2.1 `blue_chip` → p2.2 `momentum classifier` → p2.3 CLI → p2.4 tests. For **`feat(p2.1): blue_chip universe`**, the load-bearing design decision is **how to handle membership drift over time**. Nifty 50 has changed composition ~12 times since 2019, and a true reproducible backtest sweeping 2019→2024 must use the correct membership *as of each year*, not a 2024 snapshot retrospectively applied to 2019 prices (that's the classic *survivorship bias*). Two paths: **(a)** hardcoded `BLUE_CHIP_BY_QUARTER: dict[date, list[str]]` with explicit `as_of` keys and a source citation per snapshot; OR **(b)** a single `BLUE_CHIP_2024_07_01` snapshot with a SPECS callout that v1 ignores survivorship bias (and Phase 7 fixes it). I lean (b) for v1 simplicity, but the *survivorship caveat must be visible in every UI rendering of universe-rooted backtest results* — Phase 5/6 plumbing. Pin the choice + caveat in SPECS before writing the list.
+
+---
