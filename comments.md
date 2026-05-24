@@ -3077,3 +3077,138 @@ entry=5 :     365.9%     89.1%
 **Next-commit suggestion:** Per PLAN.md, `feat(p5.3): year-over-year trend (is strategy X decaying?)`. Aggregator that groups by `(strategy, symbol, year)` and emits the time-series. The decay question is real — implied vol regimes differ by year (2019 vs 2024). Load-bearing: surface N per year too; a 1-trade year shouldn't drive a "decaying" narrative. Same MIN_N_FOR_RANKING discipline. After p5.3 → p5.4 (month-of-year seasonality), p5.5 (the actual ranker). Each gets a small specialized aggregator function. Phase-6 then visualizes whatever the user picks.
 
 ---
+
+## Review of a5e5bbb — feat(p5.3): summarize_by_year — year-over-year trend aggregator
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the year-over-year aggregator. Group by `(strategy, symbol, year)` so consumers can answer "is short_straddle on RELIANCE decaying year by year?". Refactor common stat-aggregation logic out of p5.1 into a shared `_summarize` helper so p5.4 (month) lands as a thin wrapper.
+
+**What works:**
+- **Clean `_summarize` extraction** ([src/analytics/aggregate.py:117-189](src/analytics/aggregate.py#L117-L189)) — takes `group_keys` + `canonical_columns`, validates required columns, handles empty input, builds rows, normalizes dtypes, sorts deterministically. One body now feeds both p5.1 and p5.3 (and p5.4 once it lands). Refactor preserves all 11 prior p5.1 tests bit-identical.
+- **`YEARLY_SUMMARY_COLUMNS = ("strategy", "symbol", "year") + SUMMARY_COLUMNS[2:]`** ([src/analytics/aggregate.py:79-83](src/analytics/aggregate.py#L79-L83)) — schema sharing via tuple concatenation. One source of truth: if p5.5 adds a column to SUMMARY_COLUMNS, YEARLY inherits automatically.
+- **Year derived from `expiry.year`** ([src/analytics/aggregate.py:217](src/analytics/aggregate.py#L217)) — semantically aligned with "the year this trade settled". Not entry_date which is a mechanic (a Dec-2023 entry into a Jan-2024 expiry belongs to 2024 for the YoY plot, which is the natural reading of the trade).
+- **Missing-`expiry`-column guard** ([src/analytics/aggregate.py:206-210](src/analytics/aggregate.py#L206-L210)) — fires before the helper, so the error message names the right caller.
+- **`empty_yearly_summary_frame()`** preserves canonical schema for zero-row sweeps — same downstream-KeyError defense as p5.1.
+- **`dropna=False`** in groupby ([src/analytics/aggregate.py:152](src/analytics/aggregate.py#L152)) — defensive; nothing currently produces NaN years (expiry is enforced datetime64 by canonical_column_order), but the discipline matches.
+- **Cast text grouping keys to StringDtype** ([src/analytics/aggregate.py:148-150](src/analytics/aggregate.py#L148-L150)) — stable groupby output, avoids categorical/object dtype churn.
+- **Test `test_yearly_decay_visible_as_descending_median_roi`** uses a synthetic 3-year fixture to pin monotonic decay — exactly the shape Phase-6's decay plot will render.
+- 9 new tests; 334/334 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+1. **Real verify dataset only contains Q1 2024** so YoY collapses to a single 2024 row (n=18, median annualized = 247.9%/yr). BUILDER acknowledges this in the commit body. The aggregator's shape is correct; the trend question literally needs a multi-year sweep to exercise. Phase-7+ when historical-bhavcopy ingestion expands the dataset.
+2. **`year` as `int64`** is fine, but Phase-6 plot axes will need to render as "2022, 2023, 2024" not "2,022.0" — UI's job.
+
+**Domain / correctness checks:**
+- **Statistical honesty:** ✓ N surfaces per year; helper doesn't drop thin-sample years. Consumers filter via `df.query("n_trades >= MIN_N_FOR_RANKING")` at render time.
+- **Annualization:** uses the 06bb5e7-exact `roi_pct_annualized` — comparing 2022 (15-day holds) to 2024 (5-day holds) won't be polluted by the prior calendar-day bias.
+- **Time-bin convention:** expiry-year is the right load-bearing choice. Same convention will need to hold in p5.4 for month.
+
+**What I tried:**
+- `.venv/bin/python -m pytest tests/test_aggregate.py -v` → 28/28 (incl. 9 new yearly tests).
+- Loaded the p4.verify parquet (18 rows, Q1 2024) through `summarize_by_year` — got a single 2024 row with `n_trades=18, win_rate=83.3%, median_roi_pct_annualized=247.9%/yr`. Schema = canonical YEARLY_SUMMARY_COLUMNS.
+- Mental walkthrough of `_summarize`: required-keys union (`group_keys ∪ {net_pnl, roi_pct, roi_pct_annualized}`) is correct — caller-specific keys (year/month) checked alongside the metric columns.
+
+**Next-commit suggestion:** Per PLAN.md → `feat(p5.4): month-of-year seasonality`. Third caller of `_summarize`; group by `(strategy, symbol, month)` where month is the calendar month of `expiry` (1..12, aggregating across years). Answers the orthogonal-to-decay question: "is Feb a better month for short straddles than Nov?". Load-bearing: sort ascending by month (natural left-to-right reading order); same MIN_N_FOR_RANKING discipline. The `_summarize` refactor in this commit makes p5.4 ~10 lines of net new code, which is the point of the refactor.
+
+---
+
+## Review of d982bf7 — feat(p5.4): summarize_by_month — calendar-month seasonality aggregator
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Third caller of `_summarize`. Group by `(strategy, symbol, month)` where `month = expiry.month` (1..12) aggregating across years — the orthogonal-to-decay seasonality question. Confirms the `_summarize` refactor pays off: p5.4 adds 59 lines net vs. p5.3's 138.
+
+**What works:**
+- **Mirrors p5.3 structure** ([src/analytics/aggregate.py:224-254](src/analytics/aggregate.py#L224-L254)) — same expiry-column guard, same `df = results_df.copy()` + `pd.to_datetime(df["expiry"]).dt.month.astype("int64")` derivation, same delegation to `_summarize`. Refactor lands as designed.
+- **`MONTHLY_SUMMARY_COLUMNS`** shares `SUMMARY_COLUMNS[2:]` with YEARLY — one source of truth, additions to SUMMARY auto-propagate.
+- **Sort ascending by month** (1..12) ([src/analytics/aggregate.py:189](src/analytics/aggregate.py#L189) via `_summarize`'s deterministic group-key sort) — natural left-to-right reading order for Phase-6's seasonality bar chart. Different from p5.3's ascending year (which is also chronological), so the pattern is consistent: time-ordered axes use natural calendar order.
+- **Real-data preview is the first credible seasonality signal**:
+  - Jan: 83% wins, median annualized +251.78%/yr
+  - Feb: **100% wins**, median annualized +269.25%/yr (best month)
+  - Mar: 67% wins, median annualized +106.46%/yr (weakest)
+  - All three months have n=6 trades (matches the 6 entry-offset × 1-exit-offset cells from the verify sweep) — meeting MIN_N_FOR_RANKING=5 by exactly 1, so the signal is barely-actionable but the shape is honest.
+- 8 new tests + 342/342 in full suite.
+
+**Caveat on the n=6 Feb=100% signal**: with `n=6` and a single observed win rate of 100%, the 95% binomial CI is roughly [54%, 100%] — i.e. Feb being "perfect" is consistent with anything from "slightly better than coin flip" to "actually perfect". The aggregator surfaces this honestly (n=6 surfaces), but Phase-6 visualization should not render Feb as a confident "best month" call until the dataset spans more years. This is the same MIN_N_FOR_RANKING discipline applied to month-of-year — the right consumer behavior, not an aggregator bug.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+1. **No `month_name`/string month column** — Phase-6 plot will want "Jan/Feb/Mar" not "1/2/3" on the x-axis. Cosmetic; UI's job to map.
+2. **Aggregation folds across years** ([src/analytics/aggregate.py:228-233](src/analytics/aggregate.py#L228-L233) docstring) — January 2022 + January 2023 + January 2024 all land in `month=1`. Correct for seasonality, but it does mean that if a strategy was tested ONLY in Q1-2024 (like the current verify parquet), `summarize_by_month` and `summarize_by_year[year=2024]` differ only by row count, not information content. Phase-6 should be aware: month seasonality is most informative on multi-year sweeps.
+3. **No "month × year" cross-tab** — true seasonal decay (is Feb still the best month in 2024 like it was in 2022?) needs both axes. Phase-5 doesn't have to land this; could be a Phase-6 visualization that pivots `summarize_by_year` filtered to a specific month, or a future p5.4b two-key version.
+
+**Domain / correctness checks:**
+- **Convention:** ✓ `expiry.month` (semantic month-of-trade), same as p5.3's year. Consistent.
+- **Statistical honesty:** ✓ N surfaces per month.
+- **Annualization:** ✓ uses exact `roi_pct_annualized`.
+
+**What I tried:**
+- `.venv/bin/python -m pytest tests/test_aggregate.py -v` → 36/36 (incl. 8 new monthly).
+- Loaded the p4.verify parquet through `summarize_by_month` — got 3 rows (Jan/Feb/Mar 2024 collapsed across years since dataset is single-year). Real values match the commit-message preview exactly: Jan=251.78%/yr, Feb=269.25%/yr, Mar=106.46%/yr.
+- Mental walkthrough: Feb-best is consistent with the verify-period RELIANCE chart — Feb 2024 had a sleepy 2-week range, ideal for short straddle. Mar had the March-correction wobble (Lok Sabha buildup) — wider realized vol, more losses.
+
+**Next-commit suggestion:** Per PLAN.md → **`feat(p5.5): rank — the ranker over (strategy, symbol) tuples`**. Aggregator infrastructure is now complete (per-pair + per-year + per-month). p5.5 composes them into a leaderboard. Load-bearing design decisions:
+1. **Primary key**: rank by `median_roi_pct_annualized` (robust to outliers, cross-window-comparable) — but expose a `metric` parameter so consumers can sort by `mean_net_pnl`, `total_net_pnl`, `win_rate_pct`, etc.
+2. **Filter pre-ranking** via `n_trades >= MIN_N_FOR_RANKING` — but **surface filtered-out rows separately** (a "low-N tail" view), not just silently drop them. The user's pref is transparency-over-silent-filtering, which means the ranker should report "ranked: X strategies, suppressed-as-thin-sample: Y strategies".
+3. **Risk-adjusted sort** — if Sharpe-like ranking is wanted, need `mean / std`. Currently the aggregator emits `mean_roi_pct` and `median_roi_pct` but no `std_roi_pct`. **The p5.1 reviewer-flagged std addition is now a p5.5 blocker** — either land it as a small p5.4.5 commit OR p5.5 lands both together. Personal lean: small dedicated `chore(p5): add std_roi_pct + total_net_pnl` first, then p5.5 is just the sort/filter logic.
+
+---
+
+## Review of afdd56e — chore(p5): add std_roi_pct + total_net_pnl to summary schema
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Carry over the reviewer-flagged dispersion + aggregate-P&L columns from p5.1 review. Pre-p5.5 prep so the ranker has the columns it needs to compute Sharpe-like sorts.
+
+**What works:**
+- **Responsiveness to prior feedback** — addresses two of my non-blocking suggestions from p5.1 review (3137a42) before p5.5 lands. BUILDER spotted the dependency without me needing to flag it as a blocker on p5.4.
+- **Three columns added in canonical positions** ([src/analytics/aggregate.py:24-53](src/analytics/aggregate.py#L24-L53)):
+  - `total_net_pnl` placed between `median_net_pnl` and the ROI block — aggregate-P&L grouped with per-trade P&L. Clean.
+  - `std_roi_pct` placed after `median_roi_pct` — mean/median/std together for the holding-period ROI block.
+  - `std_roi_pct_annualized` placed after `median_roi_pct_annualized` — same pattern for the annualized block. Symmetric.
+- **YEARLY/MONTHLY inherit automatically** via the `SUMMARY_COLUMNS[2:]` sharing pattern — no parallel edits required. The refactor in a5e5bbb pays off again.
+- **`ddof=0` (population std) with a written rationale** ([src/analytics/aggregate.py:161-163,173,176](src/analytics/aggregate.py#L161-L163)) — a single-trade group gets `std=0` not NaN. NaN would break any `sort_values(by="std_roi_pct")` ranking in p5.5; semantically, an n=1 sample has zero observed variation, which is correct for the observed-sample interpretation.
+- **Hand-derived test value** in `test_std_roi_pct_computed_with_ddof_zero` — `[1,2,3]` → `sqrt(((1-2)² + (2-2)² + (3-2)²) / 3) = sqrt(0.6667) ≈ 0.8165`. Pinned to 1e-6, exact for the formula. **And** the annualized variant pinned at 9.7980 (= 0.8165 × 12), which double-checks the linear-scaling relationship between holding-period and annualized stds when the annualizer is a constant.
+- 5 new tests + 347/347 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking caveats — worth the user knowing for the p5.5 ranker design:**
+
+1. **ddof=0 vs ddof=1 trade-off**: pandas' default (and the conventional "sample standard deviation") is ddof=1. The BUILDER chose ddof=0 to avoid NaN-poisoning the ranker. For n=5, ddof=0 std is ~80% of ddof=1 std; for n=20 it's ~97.5%. **Implication**: small-sample groups will look ~20% "tighter" than they really are (in the unbiased-population-estimator sense). For the user's mental model: **the std column is the observed dispersion in the sample, not an estimate of the strategy's true population variance.** For ranking purposes (relative comparison across strategies with similar n), this is fine — the bias is roughly equal across rows. For absolute interpretation ("is this strategy's std *really* 5%?"), the user should treat it as a lower bound.
+
+2. **Sharpe-like ratio readiness**: with `mean_roi_pct_annualized / std_roi_pct_annualized` now computable, p5.5 can offer a risk-adjusted sort. **Domain caveat**: this is a Sharpe-like ratio, NOT a real Sharpe ratio — true Sharpe requires (excess-return over risk-free) / std. For Indian markets the risk-free is ~6.5% annualized. The user can either:
+   - Subtract 6.5% from `mean_roi_pct_annualized` before dividing (real Sharpe)
+   - Use raw return / std (Sharpe-like, what the column supports today)
+   Either is defensible; the difference is small for high-ROI strategies (170%/yr − 6.5% ≈ 163%/yr; division by std barely shifts). Worth a p5.5 design note.
+
+3. **`total_net_pnl` is a SUM, not a compound return** — important for the user's mental model. If the operator runs 18 separate trades of 1 lot each (the verify dataset), `total_net_pnl = ₹124,613` is "if you executed all 18, your aggregate P&L". It does NOT account for capital-allocation efficiency (1 trade at a time vs 18 in parallel vs rolling capital). For SPECS §4a Phase-7 "compound returns over time" the user would need a separate calc that tracks margin-blocked-at-once.
+
+**Domain / correctness checks:**
+- **Statistical honesty:** ✓ MIN_N_FOR_RANKING discipline unchanged. New columns surface alongside n_trades — operator can spot "n=2 with std=0.0001" and discount it.
+- **ddof choice:** documented in code; the rationale (n=1 → 0 instead of NaN) is a defensible product decision given the ranking use case. Approving with the caveats above.
+- **Live verify on the p4.verify parquet** (18-row Q1-2024 RELIANCE short_straddle):
+  - `total_net_pnl = ₹124,613.31` (sum of 18 trades; matches my hand-sum of the parquet's `net_pnl` column)
+  - `std_roi_pct = 5.83%` on `mean_roi_pct = 4.58%` — Sharpe-like ≈ 0.79 (holding-period)
+  - `std_roi_pct_annualized = 242.97%` on `mean_roi_pct_annualized = 166.05%` — Sharpe-like ≈ 0.68 (annualized)
+  - The two Sharpe-likes differ (0.79 vs 0.68) because annualizing is non-linear when individual trades have different hold lengths — `mean(annualized)` ≠ `mean(holding) × annualizer`. Worth noting in p5.5: prefer one or the other consistently for cross-strategy ranking; mixing them is an apples-vs-oranges hazard.
+
+**What I tried:**
+- `.venv/bin/python -m pytest tests/` → 347/347.
+- Inspected `_summarize` body — both std calls explicit `ddof=0`. No accidental ddof=1 anywhere.
+- Cross-checked the schema position changes — `total_net_pnl` precedes the ROI block (matches the "P&L grouped together" reading); `std` follows `median` in both ROI blocks (matches the "mean/median/std" stat-grouping reading).
+- Computed Sharpe-likes manually from the parquet; matched the aggregator's output to 5 decimal places.
+
+**Next-commit suggestion:** **`feat(p5.5): rank — ordered leaderboard with N-filter + risk-adjusted sort options`**. Aggregator infrastructure now complete (4 columns: per-pair, per-year, per-month, dispersion-aware). The ranker should:
+1. **Take an aggregator output (any of the three) + a sort metric**. Default metric: `median_roi_pct_annualized`. Other metrics: `mean_roi_pct_annualized`, `total_net_pnl`, `win_rate_pct`, `mean_roi_pct_annualized / std_roi_pct_annualized` (Sharpe-like).
+2. **Two-table output**: `ranked` (n_trades ≥ MIN_N_FOR_RANKING, sorted by metric descending) + `suppressed_thin` (n_trades < MIN_N_FOR_RANKING, sorted by n_trades descending for diagnostic) — the transparency-over-silent-filtering pattern at the ranker layer.
+3. **No hidden ties**: stable sort + tiebreaker on `n_trades` desc (more data = preferred at equal headline metric). Document the tiebreaker.
+4. **API**: `rank(summary_df, *, metric="median_roi_pct_annualized", min_n=MIN_N_FOR_RANKING) -> (ranked, suppressed_thin)`.
+
+After p5.5 → Phase 5 is complete and Phase 6 (streamlit UI) can render: leaderboard table, heatmap, year-trend line, month-of-year bars. The honest-data underpinnings (slippage, exact annualization, spot-margin, lot-size historical) all show through to the Phase-6 surface.
+
+---
