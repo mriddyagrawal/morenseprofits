@@ -2942,3 +2942,54 @@ For Jan-25 T-5→T-3, the formula doubles the apparent annualized return: **1395
 **Next-commit suggestion:** **`fix(p4.verify.a): hold_trading_days uses trading_calendar.trading_days() exact count, not 252/365 calendar approximation`**. The bias is small for hold ≥ 7 trading days but >2× for 1-3 day holds. Phase-5 will rank thousands of cells by `roi_pct_annualized`; a 2× bias on the short-window subset will pollute the leaderboard. Fix the formula now while it's contained to one module. After: Phase 5 (aggregation + trend analytics) is unblocked.
 
 ---
+
+## Review of 06bb5e7 — fix(p4.verify.a): hold_trading_days exact via offset_td subtraction
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the annualization bias I flagged on 9323936. Use exact trading-day hold (`entry_offset_td - exit_offset_td`) when the sweeper has it; preserve the 252/365 approximation for standalone callers.
+
+**What works:**
+- **Cleanest possible fix architecturally**: `entry_offset_td − exit_offset_td` IS exact by construction (both offsets measured against the same expiry's trading calendar). No new module imports; just thread one int through the kernel kwarg.
+- **Backward-compat preserved**: `hold_trading_days: int | None = None` keeps the approximation for ad-hoc callers; sweeper opts in to the exact value.
+- **Independent verify reproduced exactly**:
+  | Cell | Before | After | Reason |
+  |---|---|---|---|
+  | Jan-25 T-5→T-3 | 1395.81 %/yr | **697.91 %/yr** | Approx gave 1 td; exact 2 td → halved |
+  | Feb-29 T-5→T-3 | 243.95 %/yr | **365.92 %/yr** | Approx OVER-estimated (3 td); exact 2 td → goes UP |
+  | Mar-28 T-5→T-3 | 198.91 %/yr | **99.45 %/yr** | Halved |
+  | Mar-28 T-5→T-1 | -418.84 %/yr | **-523.55 %/yr** | Approx 5 td; exact 4 td → worse |
+  | Jan-25 T-15→T-1 (canonical) | 5.47 %/yr | **5.47 %/yr** | Unchanged — 14-td approximation was already exact for 20-calendar-day hold |
+- **Bias was both-directional** — the approximation could either round up or down vs true. Some cells got better, some worse. Now correct everywhere via the offset arithmetic.
+- 2 new tests pin the contract: `test_hold_trading_days_kwarg_overrides_calendar_approximation` in test_pnl shows the 2× inflation directly (kwarg=2 vs approx=1 on Wed→Fri); `test_sweep_one_hold_trading_days_is_exact_offset_difference` pins that the sweeper threads the exact value through.
+- 299/299 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **The 18-cell verify output shifted across the board** (not just decreases on short windows). Worth a one-line note in the verify script: "Note: roi_pct_annualized values shifted from the prior run after fix(p4.verify.a). This is correction of the calendar-day approximation bias, not regression." For someone diffing run-to-run the difference would otherwise look like silent drift.
+- **`entry_offset_td > exit_offset_td` validation** is already in sweep_one ([src/engine/sweeper.py:94-101](src/engine/sweeper.py#L94-L101)), so `entry_offset_td - exit_offset_td` is always positive. Safe.
+- **Standalone callers still get the biased approximation** by default. Defensible (backward compat) but a future Phase-5 ranker that bypasses sweep_one and calls price_trade directly would be silently biased. Worth either: (a) flipping the default to require `hold_trading_days` and let standalone callers pass `None` explicitly for the approximation; OR (b) a SPECS §4a callout that standalone callers SHOULD pass the kwarg. Cosmetic.
+
+**Domain / correctness checks:**
+- **Annualization arithmetic** is now exact wherever the sweeper drives the pipeline (= every production code path).
+- **`max(1, int(hold_trading_days))`** clamps to 1 — protects against pathological 0 input. Defensive.
+- **Phase-5 ranker** can now sort by `roi_pct_annualized` without short-window inflation.
+
+**What I tried:**
+- `python -m pytest tests/` → 299/299.
+- `python scripts/verify_p4.py` → reproduced byte-identical output, walked the math for 4 representative cells to confirm both directions of bias correction.
+
+**Caveat status summary (Phase 4 closes):**
+- ✅ #1 (strike-vs-spot margin) — closed in 85cbc0e, exercised at IronCondor in a4aa27c
+- ✅ #2 (annualized ROI) — closed in 169c7d6 + b4fea19 (formula), now exact in 06bb5e7 (no approximation bias)
+- ✅ #3 (uniform 20% margin) — closed in Tier-B cluster
+- ✅ #4 (multi-leg conservatism) — closed in Tier-B cluster
+- ✅ Slippage gap — closed in 45541e0
+- ✅ Lot-size hardcoding — closed in bdcdf2c
+
+**All Phase 3.5 + Phase 4 grilling-surfaced caveats now closed in code.** Phase 5 ranker can trust the dataset.
+
+**Next-commit suggestion:** **Phase 5 — `feat(p5.1): per-stock × strategy summary stats (mean, median, win-rate, max-DD, sample N)`**. The aggregation + ranking layer. Now that the underlying data is honest (slippage applied, margin spot-based, ROI exactly annualized, lot-size historical), the ranker can produce reliable cross-strategy comparisons. Load-bearing concerns: (1) **Statistical honesty** — surface sample N alongside every percentile; refuse to rank a strategy with N<5 (the user wanted "no cherry-picked windows"); (2) **Survivorship-bias disclaimer** still load-bearing from §6b.3; (3) **The annualization fix matters most here** — Phase-5 will sort/filter by `roi_pct_annualized` and the now-exact values will produce trustworthy rankings.
+
+---
