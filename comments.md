@@ -2454,3 +2454,76 @@ The 2 informational flags (performance arithmetic, per-strategy offset for asymm
 **Next-commit suggestion:** Unchanged from 481c566 — `feat(p4.2): src/engine/sweeper.py`. The contracts are all pinned now. Implementation is mechanical.
 
 ---
+
+## Review of 185a9cb — feat(p4.2): src/engine/sweeper.py — single-threaded sweep_one + sweep_grid
+
+**Verdict:** ⚠️ accept-with-followups — **REAL BUG: hardcoded lot_size=250 in `notional_at_entry`**
+
+**Phase / commit goal (as I understood it):** Land the single-threaded sweeper that turns the Phase-3 pricer into a research dataset producer. Determinism via sort-before-persist; pure-function tasks; skip-on-cached-parquet re-run policy.
+
+**What works:**
+- **221/221 in full suite.** Determinism contract structurally enforced (sorted iteration + sort_values + reset_index + hash-based run_id).
+- **`_compute_run_id`** ([src/engine/sweeper.py:51-70](src/engine/sweeper.py#L51-L70)) — SHA-256 of sorted-tuple of (strategies, symbols, expiries, entry_offsets, exit_offsets). Excludes operational kwargs. Implements SPECS §6c.3.
+- **`sweep_one` is genuinely pure**: only reads cache, returns one dict, no globals.
+- **Skip policy correct**: `MissingDataError` / `NoLiquidStrikeError` → return `None`; `OfflineCacheMiss` propagates (per §6a class distinction).
+- **`entry_offset_td <= exit_offset_td` → ValueError** keeps callers honest about offset convention (larger = further back in time).
+- **Re-run policy** ([src/engine/sweeper.py:186-187](src/engine/sweeper.py#L186-L187)) — `path.exists() and not force` short-circuits to `pd.read_parquet(path)`. Skip-on-cache + force-override symmetric with `spot_loader.load_spot`.
+- **`pnl.py` lazy-resolve fix for `load_option_fn` default** — necessary so monkeypatching `options_loader.load_option` works during sweep_one tests. Production behavior unchanged.
+- 10 tests cover: run_id determinism, schema, inverted-window rejection, skip behavior, sort order, force=True, partial-failure resilience.
+
+**BLOCKING ISSUE (must fix before Phase-4 multi-stock sweeps land):**
+
+**Hardcoded `lot_size=250` in `notional_at_entry`** ([src/engine/sweeper.py:146-151](src/engine/sweeper.py#L146-L151)):
+
+```python
+total_share_exposure = sum(
+    leg.qty_lots * 250  # lot_size approximated from typical NSE; real
+                        # values are per-row in legs_json
+    for leg in trade.legs
+)
+```
+
+**This violates PLAN §4 hard rule #3 explicitly**: "Historical lot size per trade. Read from `MARKET LOT` column of the derivatives row, not from a constant." The rule was set in stone at the start of the project.
+
+**Verified live**:
+| Symbol | Real 2024 lot | Sweeper computes notional with | Error |
+|---|---|---|---|
+| RELIANCE | 250 | 250 (hardcoded) | 0% (lucky coincidence) |
+| HDFCBANK | 550 | 250 | **-55%** |
+| INFY | 400 | 250 | -37% |
+| ADANIENT | 200 | 250 | +25% |
+| ICICIBANK | 700 | 250 | -64% |
+
+For a Phase-4 sweep across the 40-name blue_chip universe, only ~3-5 stocks have lot=250. The other ~35 will have **systematically wrong notional** — and ROI normalization (Phase 5 ranking) depends on notional. The whole point of the strategy_offset/symbol_margin Tier-B accuracy work is undermined if notional itself is wrong.
+
+**The fix is 3 lines** — `legs_json` already has the correct per-leg lot_size:
+```python
+import json
+legs_results = json.loads(result["legs_json"])
+total_shares = sum(int(l["qty_lots"]) * int(l["lot_size"]) for l in legs_results)
+result["notional_at_entry"] = spot_at_entry * total_shares
+```
+
+The BUILDER even noted in the inline comment that "real values are per-row in legs_json" — they knew, but shipped the approximation anyway. Per the user's "we need to get this right" + "grill it if you think it's wrong", this is exactly the kind of bug that should land as a `fix(p4.2.a)` BEFORE any multi-stock sweep runs.
+
+**Non-blocking suggestions:**
+- **No skip log persisted** ([src/engine/sweeper.py:208-209](src/engine/sweeper.py#L208-L209)) — skipped tasks return `None` and silently disappear. SPECS §6c.2 says: "skip task, record reason in a separate skip log". If a Phase-4 sweep silently drops 200 of 7500 tasks due to MissingData, the user has no way to know. Suggest a `data/results/sweep_{run_id}_skipped.parquet` companion file with (strategy, symbol, expiry, entry_off, exit_off, reason) rows. Defer if not urgent — the empty cells will still be visible by their absence from the result row count.
+- **Empty sweep returns empty `pd.DataFrame()` with NO columns** ([src/engine/sweeper.py:213-215](src/engine/sweeper.py#L213-L215)). Downstream consumers expecting columns will trip. Construct an empty frame with the SPECS §2.5 + sweep-decoration columns explicitly. Cosmetic.
+- **`notional_at_entry` semantic for multi-leg strategies**: SPECS §2.5 says "underlying spot × total lot exposure". For a short straddle (1 CE + 1 PE) this sums to 2 × lot_size × spot — meaningful for "total option notional", less meaningful as "underlying exposure" (net delta ≈ 0 at ATM). For iron condor (4 legs) the sum is even less informative. Phase 5 ranker may want a different "capital deployed" metric (= margin_at_entry, already in the dict). Defer.
+
+**Domain / correctness checks:**
+- **Sign convention:** unchanged from p3.2. Still correct.
+- **No look-ahead:** sweep_one's spot/option calls bounded by entry_date / exit_date. No leak.
+- **Lot size:** ❌ **VIOLATES PLAN §4 rule #3.** See above.
+- **Statistical claims:** N/A (this is one trade at a time).
+
+**What I tried:**
+- `python -m pytest tests/` → 221/221.
+- Ran `sweep_one` live on RELIANCE → confirmed hardcoded 250 happens to match real lot for RELIANCE.
+- Computed the % bias for 4 other common NSE lots (550, 400, 200, 700) — all materially wrong.
+
+**Next-commit suggestion:** **`fix(p4.2.a): notional_at_entry uses per-leg lot_size from legs_json`** as the immediate next commit. ~3 lines + 1 test asserting that two stocks with different lots (RELIANCE 250 + a synthetic 550-lot symbol) produce notional values that differ by the lot ratio. This **must land before `feat(p4.3): results store` or any multi-stock sweep** — otherwise the entire Phase-4 dataset will have biased notional for ~88% of the universe.
+
+After that fix → `feat(p4.3): results.py` (results store module) → `feat(p4.4.a..d)` (4 new strategies) → `perf(p4.5)` + `test(p4.5)` (parallelize + determinism) → `chore(p4.verify)` (live small sweep).
+
+---
