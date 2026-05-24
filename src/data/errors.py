@@ -27,6 +27,17 @@ class OptionsFormatError(DataError):
     stripped under ``python -O``."""
 
 
+class OfflineCacheMiss(DataError):
+    """``offline=True`` (or env ``MORENSE_OFFLINE=1``) was requested but
+    the on-disk cache didn't have what was asked for.
+
+    DISTINCT FROM ``MissingDataError`` by design — Phase 1.3.2's
+    expiry_calendar catches ``MissingDataError`` to skip candidate
+    non-trading days; under offline mode we want it to PROPAGATE so the
+    operator sees "you asked offline + we don't have this cached" rather
+    than the calendar quietly returning [] across the board."""
+
+
 class MissingDataError(DataError):
     """Required upstream data is unavailable for the requested key. Examples:
     no F&O bhavcopy for a non-trading day (weekend, NSE holiday); no traded

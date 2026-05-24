@@ -35,7 +35,8 @@ import requests
 from jugaad_data.nse.archives import NSEArchives
 
 from src.data import cache
-from src.data.errors import BhavcopyFormatError, MissingDataError
+from src.data.errors import BhavcopyFormatError, MissingDataError, OfflineCacheMiss
+from src.data.offline import effective_offline
 
 
 # Match the discovered post-Jul-8 archive URL pattern (verified live on 4
@@ -280,17 +281,32 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
 # Public entry point
 # ============================================================
 
-def load_bhavcopy_fo(trade_date: date, *, force_refresh: bool = False) -> pd.DataFrame:
+def load_bhavcopy_fo(
+    trade_date: date,
+    *,
+    force_refresh: bool = False,
+    offline: bool = False,
+) -> pd.DataFrame:
     """Returns the SPECS §2.4-shaped F&O bhavcopy frame for ``trade_date``.
 
     Cache hit → load parquet (unless ``force_refresh=True``).
     Cache miss or ``force_refresh`` → fetch + parse + cache + return.
 
+    `offline=True` (or env MORENSE_OFFLINE=1): cache miss raises
+    OfflineCacheMiss; never touches network. Takes precedence over
+    force_refresh.
+
     Mirrors ``spot_loader.load_spot``'s ``force_refresh`` semantics.
     """
+    offline = effective_offline(offline)
     path = cache.bhavcopy_fo_path(trade_date)
     if cache.exists(path) and not force_refresh:
         return cache.read(path)
+    if offline:
+        raise OfflineCacheMiss(
+            f"bhavcopy_fo for {trade_date} not in cache and offline mode "
+            f"requested (offline=True or MORENSE_OFFLINE=1)"
+        )
     raw, fmt = _fetch_raw(trade_date)
     parser = parse_legacy if fmt == "legacy" else parse_udiff
     df = parser(raw, trade_date)

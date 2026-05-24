@@ -25,7 +25,8 @@ def _redirect_cache(monkeypatch, tmp_path):
 def _patch_load_spot(monkeypatch, trading_dates: Sequence[date]):
     """Replace spot_loader.load_spot to return a synthetic frame whose
     `date` column is exactly the given trading_dates."""
-    def fake(symbol, from_date, to_date, *, force_refresh=False, today_fn=date.today):
+    def fake(symbol, from_date, to_date, *, force_refresh=False,
+             today_fn=date.today, offline=False, **kw):
         in_window = [d for d in trading_dates if from_date <= d <= to_date]
         return pd.DataFrame({
             "date": pd.Series(

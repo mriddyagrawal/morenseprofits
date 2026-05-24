@@ -25,6 +25,7 @@ from typing import Callable
 
 from src.config import CALENDAR_SYMBOL
 from src.data import spot_loader
+from src.data.offline import effective_offline
 
 
 # Initial calendar-day buffer when searching backwards. n=N trading days
@@ -41,13 +42,18 @@ def trading_days(
     to_date: date,
     *,
     today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
 ) -> list[date]:
     """Return sorted unique trading days in ``[from_date, to_date]``
-    inclusive. Bootstrapped from ``load_spot(CALENDAR_SYMBOL, ...)``."""
+    inclusive. Bootstrapped from ``load_spot(CALENDAR_SYMBOL, ...)``.
+
+    `offline=True` (or env MORENSE_OFFLINE=1): cache miss raises
+    OfflineCacheMiss via the underlying load_spot."""
     if from_date > to_date:
         raise ValueError(f"from_date {from_date} > to_date {to_date}")
+    offline = effective_offline(offline)
     df = spot_loader.load_spot(
-        CALENDAR_SYMBOL, from_date, to_date, today_fn=today_fn
+        CALENDAR_SYMBOL, from_date, to_date, today_fn=today_fn, offline=offline,
     )
     return sorted(df["date"].dt.date.unique().tolist())
 
@@ -57,6 +63,7 @@ def offset_trading_days(
     n: int,
     *,
     today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
 ) -> date:
     """Return the date that is ``n`` trading days BEFORE ``anchor`` (n>=0).
 
@@ -72,12 +79,13 @@ def offset_trading_days(
     if n < 0:
         raise ValueError(f"n must be >= 0, got {n}")
 
+    offline = effective_offline(offline)
     buffer_days = max(n * _BUFFER_MULTIPLIER + _BUFFER_HEADROOM, _INITIAL_BUFFER_DAYS)
     while True:
         start = anchor - timedelta(days=buffer_days)
         # Cap end at today_fn — load_spot won't return data past today.
         end = min(anchor, today_fn())
-        days = trading_days(start, end, today_fn=today_fn)
+        days = trading_days(start, end, today_fn=today_fn, offline=offline)
         days_le = [d for d in days if d <= anchor]
         if len(days_le) >= n + 1:
             return days_le[-(n + 1)]

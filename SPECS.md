@@ -349,7 +349,11 @@ If `available_strikes` is empty (illiquid contract), engine raises `NoLiquidStri
 
 ## 6a. Offline mode (cache-only enforcement)
 
-Loaders accept an optional `offline: bool = False` keyword (default off). When True, a cache miss raises `MissingDataError` rather than falling back to network. Equivalent env-var override: `MORENSE_OFFLINE=1`. Phase 1.5 wires this and adds telemetry that prints a one-line warning whenever a loader hits the network (regardless of offline mode) so sweep runs surface accidental fetches.
+Every public loader (`load_spot`, `load_bhavcopy_fo`, `load_option`, `monthly_expiries`, `trading_days`, `offset_trading_days`) accepts an optional `offline: bool = False` keyword. When True (or env `MORENSE_OFFLINE=1`), a cache miss raises **`OfflineCacheMiss`** (NOT `MissingDataError`) and never touches the network.
+
+**Why a distinct class.** Phase 1.3.2's `expiry_calendar` catches `MissingDataError` to skip candidate non-trading days. If offline-mode raised `MissingDataError`, every sampled day on a cold cache would be silently treated as "non-trading" and the calendar would return `[]` with no signal. `OfflineCacheMiss` is a separate `DataError` subclass — `expiry_calendar`'s `except MissingDataError:` block ignores it, so offline + cold cache propagates loudly.
+
+`offline=True` AND `force_refresh=True` are contradictory; **offline takes precedence**. For an open-expiry contract whose cache is stale relative to today, offline returns the stale cache rather than raising (still valid data, just not up-to-the-minute).
 
 ## 7. Cache invalidation
 

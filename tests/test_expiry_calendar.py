@@ -45,7 +45,7 @@ def _make_fake_loader(per_month_frames: dict[tuple[int, int], pd.DataFrame],
     """
     non_trading_days = non_trading_days or set()
 
-    def fake(td: date) -> pd.DataFrame:
+    def fake(td: date, **kw) -> pd.DataFrame:
         if call_log is not None:
             call_log.append(td)
         if td in non_trading_days:

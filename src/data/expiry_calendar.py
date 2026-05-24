@@ -41,6 +41,7 @@ import pandas as pd
 
 from src.data import bhavcopy_fo_loader, cache
 from src.data.errors import MissingDataError
+from src.data.offline import effective_offline
 
 
 _CANDIDATE_SAMPLE_DAYS: tuple[int, ...] = tuple(range(1, 8))  # days 1..7
@@ -61,18 +62,25 @@ def _month_anchors(from_date: date, to_date: date) -> list[date]:
     return out
 
 
-def _sample_expiries_for_month(symbol: str, anchor: date) -> list[date]:
+def _sample_expiries_for_month(
+    symbol: str, anchor: date, *, offline: bool = False
+) -> list[date]:
     """Find a usable bhavcopy in the month, return that symbol's OPTSTK
     expiry list. Empty list if no usable day in days 1..7 (very rare —
-    NSE has not had a 7-day continuous closure on record)."""
+    NSE has not had a 7-day continuous closure on record).
+
+    Passes `offline` through to the underlying loader; OfflineCacheMiss
+    (distinct from MissingDataError) propagates so the caller sees
+    "offline + nothing cached" loudly rather than as a quiet skip."""
     symbol = symbol.upper()
     bc: pd.DataFrame | None = None
     for day in _CANDIDATE_SAMPLE_DAYS:
         candidate = date(anchor.year, anchor.month, day)
         try:
-            bc = bhavcopy_fo_loader.load_bhavcopy_fo(candidate)
+            bc = bhavcopy_fo_loader.load_bhavcopy_fo(candidate, offline=offline)
             break
         except MissingDataError:
+            # OfflineCacheMiss is NOT a MissingDataError — it propagates.
             continue
     if bc is None:
         warnings.warn(
@@ -105,10 +113,12 @@ def _read_cached(symbol: str) -> pd.DataFrame:
     return _empty_calendar_frame()
 
 
-def _build_new_rows(symbol: str, anchors: Iterable[date]) -> pd.DataFrame:
+def _build_new_rows(
+    symbol: str, anchors: Iterable[date], *, offline: bool = False
+) -> pd.DataFrame:
     rows = []
     for anchor in anchors:
-        for expiry in _sample_expiries_for_month(symbol, anchor):
+        for expiry in _sample_expiries_for_month(symbol, anchor, offline=offline):
             rows.append({
                 "symbol": symbol.upper(),
                 "expiry_date": pd.Timestamp(expiry),
@@ -123,15 +133,21 @@ def _build_new_rows(symbol: str, anchors: Iterable[date]) -> pd.DataFrame:
     return df
 
 
-def monthly_expiries(symbol: str, from_date: date, to_date: date) -> list[date]:
+def monthly_expiries(
+    symbol: str, from_date: date, to_date: date, *, offline: bool = False
+) -> list[date]:
     """Sorted unique list of OPTSTK expiry dates for ``symbol`` whose
     ``expiry_date`` falls in ``[from_date, to_date]`` inclusive.
+
+    `offline=True` (or env MORENSE_OFFLINE=1): cache miss on any sampled
+    bhavcopy raises OfflineCacheMiss; never touches network.
 
     See module docstring for the sampling strategy and SPECS §2.3 for the
     cache shape. Determinism is contract — bytes-identical across calls.
     """
     if from_date > to_date:
         raise ValueError(f"from_date {from_date} > to_date {to_date}")
+    offline = effective_offline(offline)
     symbol_u = symbol.upper()
     needed_anchors = _month_anchors(from_date, to_date)
     cached = _read_cached(symbol_u)
@@ -143,7 +159,7 @@ def monthly_expiries(symbol: str, from_date: date, to_date: date) -> list[date]:
     missing_anchors = [a for a in needed_anchors if a not in cached_anchors]
 
     if missing_anchors:
-        new_rows = _build_new_rows(symbol_u, missing_anchors)
+        new_rows = _build_new_rows(symbol_u, missing_anchors, offline=offline)
         if not new_rows.empty:
             combined = pd.concat([cached, new_rows], ignore_index=True)
             # Dedupe on the full key — same expiry observed in multiple

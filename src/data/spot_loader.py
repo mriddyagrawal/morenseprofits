@@ -30,6 +30,8 @@ import pandas as pd
 from jugaad_data.nse import stock_df
 
 from src.data import cache
+from src.data.errors import OfflineCacheMiss
+from src.data.offline import effective_offline
 
 
 # jugaad column -> SPECS §2.1 column
@@ -95,6 +97,7 @@ def _load_year(
     *,
     force_refresh: bool,
     today_fn: Callable[[], date],
+    offline: bool = False,
 ) -> pd.DataFrame:
     today = today_fn()
     path = cache.spot_path(symbol, year)
@@ -110,6 +113,10 @@ def _load_year(
             cached["date"].max().date() if not cached.empty else None
         )
         if max_cached is not None and max_cached >= today:
+            return cached
+        # Want to refetch — but if offline, return stale cache (don't
+        # raise; cached data is still valid, just not up-to-the-minute).
+        if offline:
             return cached
         fresh = _fetch_year(symbol, year, today_fn)
         # Subset check: every date currently in the cache must still be
@@ -130,6 +137,12 @@ def _load_year(
         cache.write(path, fresh, overwrite=True)
         return fresh
 
+    # Cache miss path
+    if offline:
+        raise OfflineCacheMiss(
+            f"spot {symbol.upper()} {year} not in cache and offline mode "
+            f"requested (offline=True or MORENSE_OFFLINE=1)"
+        )
     fresh = _fetch_year(symbol, year, today_fn)
     cache.write(path, fresh, overwrite=force_refresh)
     return fresh
@@ -142,14 +155,20 @@ def load_spot(
     *,
     force_refresh: bool = False,
     today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
 ) -> pd.DataFrame:
     """Return spot OHLC for ``symbol`` between ``from_date`` and ``to_date``
-    inclusive. See module docstring for the four frozen invariants."""
+    inclusive. See module docstring for the four frozen invariants.
+
+    `offline=True` (or env MORENSE_OFFLINE=1): cache miss raises
+    OfflineCacheMiss; never touches network. Takes precedence over
+    force_refresh."""
     if from_date > to_date:
         raise ValueError(f"from_date {from_date} > to_date {to_date}")
+    offline = effective_offline(offline)
     years = range(from_date.year, to_date.year + 1)
     parts = [
-        _load_year(symbol, y, force_refresh=force_refresh, today_fn=today_fn)
+        _load_year(symbol, y, force_refresh=force_refresh, today_fn=today_fn, offline=offline)
         for y in years
     ]
     full = pd.concat(parts, ignore_index=True)

@@ -35,7 +35,8 @@ import requests
 from jugaad_data.nse import derivatives_df
 
 from src.data import cache
-from src.data.errors import MissingDataError, OptionsFormatError
+from src.data.errors import MissingDataError, OfflineCacheMiss, OptionsFormatError
+from src.data.offline import effective_offline
 
 
 # NSE lists stock options ~3 months ahead. 120 days covers every
@@ -174,6 +175,7 @@ def load_option(
     *,
     force_refresh: bool = False,
     today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
 ) -> pd.DataFrame:
     """Return SPECS §2.2-shaped frame for the option contract's
     [from_date, to_date] inclusive window.
@@ -205,6 +207,7 @@ def load_option(
     if option_type not in ("CE", "PE"):
         raise ValueError(f"option_type must be 'CE' or 'PE', got {option_type!r}")
 
+    offline = effective_offline(offline)
     path = cache.option_path(symbol, expiry, strike, option_type)
     today = today_fn()
     is_closed = expiry < today
@@ -220,6 +223,11 @@ def load_option(
         )
         deadline = min(today, expiry)
         if max_cached is not None and max_cached >= deadline:
+            return _filter_window(cached, from_date, to_date)
+        # Want to refetch — but offline says no network. Return stale cache
+        # rather than raising; for an open expiry that just means "we're
+        # showing yesterday's prices, not today's", which is fine.
+        if offline:
             return _filter_window(cached, from_date, to_date)
         try:
             fresh = _fetch_contract_lifetime(
@@ -244,6 +252,12 @@ def load_option(
         return _filter_window(fresh, from_date, to_date)
 
     # Cache miss OR force_refresh
+    if offline:
+        raise OfflineCacheMiss(
+            f"option {symbol.upper()} {expiry} {int(strike)}-{option_type} "
+            f"not in cache and offline mode requested "
+            f"(offline=True or MORENSE_OFFLINE=1)"
+        )
     fresh = _fetch_contract_lifetime(
         symbol, expiry, strike, option_type, today_fn
     )

@@ -64,7 +64,7 @@ def _patch_jugaad(monkeypatch, factory):
     """Replace stock_df as seen by spot_loader. `factory(symbol, from, to, series)` returns a frame."""
     calls = []
 
-    def fake(symbol, from_date, to_date, series="EQ"):
+    def fake(symbol, from_date, to_date, series="EQ", **kw):
         calls.append((symbol, from_date, to_date, series))
         return factory(symbol, from_date, to_date, series)
 

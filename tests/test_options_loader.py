@@ -75,7 +75,7 @@ def _patch_derivatives(monkeypatch, factory):
     calls = []
 
     def fake(symbol, from_date, to_date, expiry_date, instrument_type,
-             strike_price=None, option_type=None):
+             strike_price=None, option_type=None, **kw):
         calls.append({
             "symbol": symbol, "from_date": from_date, "to_date": to_date,
             "expiry_date": expiry_date, "instrument_type": instrument_type,
