@@ -179,8 +179,9 @@ Exit criteria:
 ### Phase 7 — Polish, docs, perf audit
 Commits:
 1. `chore(p7): README — quickstart, data refresh, how to add a strategy`
-2. `chore(p7): cache-hit telemetry; flag any uncached data fetches`
-3. `chore(p7): final commit — Phase 7 complete — project final`
+2. `feat(p7): user-curated-universe skill — operator supplies their own stock list per session, overriding blue_chip(); satisfies SPECS §6b.3 mitigation #2 (point-in-time membership) at the source. Deferred per change-log 2026-05-24.`
+3. `feat(p7): BLUE_CHIP_BY_QUARTER point-in-time membership for true survivorship-bias-free backtests.`
+4. `chore(p7): final commit — Phase 7 complete — project final`
 
 ## 4. Hard correctness rules (engine must enforce, not just hope)
 
@@ -206,3 +207,5 @@ Anything not explicitly nailed down above — schema field order, internal helpe
 
 - 2026-05-24 — Scope expanded mid-Phase-0 from "short straddle only" to "multi-strategy research platform". Architecture and Phase 4 updated; Phase 3 still uses short straddle as the validation strategy.
 - 2026-05-24 — Reviewer flagged that `jugaad_data.nse.expiry_dates` returns `list(set(dts))` — non-deterministic iteration order across runs. This is why the Phase-0 smoke test printed different "first expiry" values on different invocations (Jan-25 vs Feb-29 vs Mar-28) — set iteration, not NSE. Every loader that consumes a set/dict-derived collection from jugaad must `sorted(...)` before caching or returning. Phase 1.2's spot_loader bakes in `sort_values("date")` + monotonicity assertion at the data-layer boundary so this class of bug dies once.
+- 2026-05-24 — Phase-2 blue-chip universe sized down from 50 to **40** per user direction ("just kinda good is fine; reporting/analysis quality matters more than exact composition"). The 10 dropped members were the lower-options-liquidity tail of Nifty 50. Survivorship-bias caveat in SPECS §6b.3 still applies and is unchanged.
+- 2026-05-24 — Deferred Phase-7 item added per user request: **user-curated-universe skill**. End-of-project, lets the operator feed in their own stock list per session (e.g. "run the same report on this 30-stock watchlist"). Until then v1 ships the hardcoded blue-chip 40.

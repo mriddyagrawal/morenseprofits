@@ -377,10 +377,12 @@ Every public loader (`load_spot`, `load_bhavcopy_fo`, `load_option`, `monthly_ex
 
 ### 6b.1 Blue-chip (v1)
 
-Single hardcoded list: **Nifty 50 constituents as of 2024-07-01**, with
-the source citation embedded in `src/universe/blue_chip.py` (an NSE
-press release / index methodology document; URL recorded in the file
-header).
+Single hardcoded list: **40 large-cap NSE names** derived from the
+~2024-07-01 Nifty 50 snapshot, with the 10 lower-options-liquidity
+members trimmed. Source citation embedded in
+`src/universe/blue_chip.py`. Sized down from 50→40 per change-log
+2026-05-24 — exact composition is a v1 shortcut, the reporting and
+analysis quality is what matters.
 
 The `as_of: date` argument to every universe function exists for
 *future-proofing* — v1 returns the same list regardless of `as_of`,
