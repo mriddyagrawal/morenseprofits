@@ -18,9 +18,13 @@ import pandas as pd
 import pytest
 
 from src.web.leaderboard import (
+    MODE_ACROSS,
+    MODE_WITHIN,
+    TOGGLE_KEY,
     render_headline,
     render_rank_table,
     render_thin_samples,
+    render_within_stock_rank,
 )
 
 
@@ -367,6 +371,94 @@ def test_thin_samples_column_config_omits_rank(captured_table):
     render_thin_samples(pd.DataFrame(rows), min_n=5)
     df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
     assert "rank" not in df.columns
+
+
+# ============================================================
+# render_within_stock_rank — per-symbol leaderboard
+# ============================================================
+
+def test_within_stock_resets_rank_at_each_symbol(captured_table):
+    """LOAD-BEARING: per-symbol rank means rank=1 appears once per
+    SYMBOL, not once total. Two symbols × 2 strategies each → 4
+    rows, with #=1 appearing twice (one per symbol)."""
+    rows = (
+        # RELIANCE: A and B, A has higher median ann ROI
+        [_row(strategy="A", symbol="RELIANCE", roi_pct_annualized=30.0)] * 6 +
+        [_row(strategy="B", symbol="RELIANCE", roi_pct_annualized=10.0)] * 6 +
+        # INFY: B and C, C wins
+        [_row(strategy="B", symbol="INFY", roi_pct_annualized=20.0)] * 6 +
+        [_row(strategy="C", symbol="INFY", roi_pct_annualized=40.0)] * 6
+    )
+    render_within_stock_rank(pd.DataFrame(rows), min_n=5)
+    df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
+    # 4 rows
+    assert len(df) == 4
+    # Each symbol has a rank=1 (best strategy per symbol)
+    rank_ones = df[df["rank_within_symbol"] == 1]
+    assert len(rank_ones) == 2
+    # RELIANCE rank=1 = A (30 > 10); INFY rank=1 = C (40 > 20)
+    reliance_top = rank_ones[rank_ones["symbol"] == "RELIANCE"].iloc[0]
+    infy_top = rank_ones[rank_ones["symbol"] == "INFY"].iloc[0]
+    assert reliance_top["strategy"] == "A"
+    assert infy_top["strategy"] == "C"
+
+
+def test_within_stock_sorted_symbol_then_rank(captured_table):
+    """Final table sort: symbol ASC, then rank ASC within each.
+    Operator reads row-by-row and sees each symbol's full ladder
+    contiguously."""
+    rows = (
+        [_row(strategy="Z", symbol="ZEEL", roi_pct_annualized=10.0)] * 6 +
+        [_row(strategy="A", symbol="ACC",  roi_pct_annualized=20.0)] * 6 +
+        [_row(strategy="B", symbol="ACC",  roi_pct_annualized=5.0)] * 6
+    )
+    render_within_stock_rank(pd.DataFrame(rows), min_n=5)
+    df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
+    # Symbol ASC: ACC twice then ZEEL
+    assert list(df["symbol"]) == ["ACC", "ACC", "ZEEL"]
+    # Within ACC, A (20) ranks before B (5)
+    acc_rows = df[df["symbol"] == "ACC"]
+    assert list(acc_rows["strategy"]) == ["A", "B"]
+    assert list(acc_rows["rank_within_symbol"]) == [1, 2]
+
+
+def test_within_stock_empty_routes_through_empty_state(captured_table):
+    """0 rows → leaderboard_no_rows_after_filters via render_empty.
+    Same contract as render_rank_table."""
+    render_within_stock_rank(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }), min_n=5)
+    kinds = [e["kind"] for e in captured_table]
+    assert "info" in kinds
+    assert "dataframe" not in kinds
+
+
+def test_within_stock_all_below_min_n_routes_through_empty_state(captured_table):
+    """All pairs below min_n → leaderboard_all_below_min_n with
+    interpolated counts. render_within_stock_rank filters via
+    pandas .query(), NOT via rank_strategies(), so the analytics-
+    layer suppression warning does NOT fire here — different from
+    render_rank_table's path. That's intentional: per-symbol grouping
+    doesn't need the rank-level dispatch."""
+    rows = [_row(strategy="S", symbol="X")] * 2  # n=2 < min_n=5
+    render_within_stock_rank(pd.DataFrame(rows), min_n=5)
+    kinds = [e["kind"] for e in captured_table]
+    assert "info" in kinds
+    info_msg = next(e for e in captured_table if e["kind"] == "info")["msg"]
+    assert "min_n=5" in info_msg
+
+
+def test_mode_toggle_strings_pinned():
+    """Pin MODE_ACROSS / MODE_WITHIN as visible-text constants. Future
+    rename should be intentional (visible in test diff)."""
+    assert MODE_ACROSS == "Across stocks"
+    assert MODE_WITHIN == "Within stock"
+    assert TOGGLE_KEY == "mp_leaderboard_mode"
+    assert TOGGLE_KEY.startswith("mp_")  # SPECS §11.4 namespace
 
 
 def test_nan_safety_in_aggregates(captured_metrics):

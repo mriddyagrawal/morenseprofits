@@ -37,9 +37,13 @@ from src.strategies.registry import list_strategies  # noqa: E402
 from src.web.caveats import render_caveats  # noqa: E402
 from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E402
 from src.web.leaderboard import (  # noqa: E402
+    MODE_ACROSS,
+    MODE_WITHIN,
     render_headline as render_leaderboard_headline,
+    render_mode_toggle,
     render_rank_table,
     render_thin_samples,
+    render_within_stock_rank,
 )
 
 
@@ -211,10 +215,13 @@ def _render_leaderboard_tab(df_filtered: pd.DataFrame) -> None:
     min_n = int(st.session_state["mp_min_n"])
     render_leaderboard_headline(df_filtered, min_n=min_n)
     st.markdown("---")
-    render_rank_table(df_filtered, min_n=min_n)
+    mode = render_mode_toggle()
+    if mode == MODE_WITHIN:
+        render_within_stock_rank(df_filtered, min_n=min_n)
+    else:
+        render_rank_table(df_filtered, min_n=min_n)
     st.markdown("---")
     render_thin_samples(df_filtered, min_n=min_n)
-    _placeholder("Within-stock vs across-stocks toggle", "feat(p6.2.toggle)")
 
 
 def _render_per_stock_tab(df_filtered: pd.DataFrame) -> None:

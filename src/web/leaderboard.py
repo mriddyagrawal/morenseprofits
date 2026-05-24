@@ -217,6 +217,140 @@ def render_rank_table(df: pd.DataFrame, *, min_n: int) -> None:
 
 
 # ============================================================
+# Within-stock rank — Phase 6.2 commit 14 (feat(p6.2.toggle))
+# ============================================================
+
+# Session-state key + canonical mode strings for the within/across toggle.
+TOGGLE_KEY: str = "mp_leaderboard_mode"
+MODE_ACROSS: str = "Across stocks"
+MODE_WITHIN: str = "Within stock"
+
+
+def render_mode_toggle() -> str:
+    """Render the across/within toggle at the top of the leaderboard
+    table area. Returns the selected mode string; persists to
+    ``st.session_state[TOGGLE_KEY]``.
+
+    Mode semantics:
+      Across stocks (default) — rank every (strategy, symbol) pair
+                                 against every other; rank=1 = best
+                                 pair in the sweep.
+      Within stock           — rank strategies per symbol; rank=1 =
+                                 best strategy ON THIS SYMBOL. Answers
+                                 the "which window for stock X?" view
+                                 per DESIGN_SPEC §5.2.
+    """
+    if TOGGLE_KEY not in st.session_state:
+        st.session_state[TOGGLE_KEY] = MODE_ACROSS
+    mode = st.radio(
+        "Rank grouping",
+        options=[MODE_ACROSS, MODE_WITHIN],
+        index=[MODE_ACROSS, MODE_WITHIN].index(st.session_state[TOGGLE_KEY]),
+        horizontal=True,
+        key=TOGGLE_KEY,
+        help=(
+            "Across stocks → one big rank table across every "
+            "(strategy, symbol) pair. Within stock → strategies "
+            "ranked per symbol; the rank column resets at each new "
+            "symbol."
+        ),
+    )
+    return mode
+
+
+def render_within_stock_rank(df: pd.DataFrame, *, min_n: int) -> None:
+    """Per-symbol leaderboard: group by symbol, rank strategies inside
+    each group. One table; symbol becomes a leading column, and the
+    `#` rank resets to 1 at each symbol boundary.
+
+    Empty-state paths mirror render_rank_table:
+      - 0 rows → leaderboard_no_rows_after_filters
+      - all-below-min_n → leaderboard_all_below_min_n
+    """
+    if len(df) == 0:
+        render_empty("leaderboard_no_rows_after_filters")
+        return
+
+    summary = summarize_by_stock_strategy(df)
+    n_pairs_total = int(len(summary))
+    # min_n filter first, then per-symbol rank
+    eligible = summary[summary["n_trades"] >= min_n].copy()
+    if len(eligible) == 0:
+        render_empty(
+            "leaderboard_all_below_min_n",
+            n_pairs=n_pairs_total, min_n=min_n,
+        )
+        return
+
+    # Per-symbol rank by median_roi_pct_annualized DESC.
+    # Sort + cumulative rank within group; final sort is by (symbol,
+    # rank_within_symbol) so the table reads naturally.
+    eligible = eligible.sort_values(
+        ["symbol", "median_roi_pct_annualized"],
+        ascending=[True, False],
+    )
+    eligible["rank_within_symbol"] = (
+        eligible.groupby("symbol").cumcount() + 1
+    )
+    eligible = eligible.sort_values(
+        ["symbol", "rank_within_symbol"]
+    ).reset_index(drop=True)
+
+    display_cols = [
+        "symbol", "rank_within_symbol", "strategy", "n_trades",
+        "win_rate_pct",
+        "median_roi_pct_annualized",
+        "mean_roi_pct_annualized",
+        "std_roi_pct_annualized",
+        "total_net_pnl",
+    ]
+    table = eligible[display_cols]
+
+    st.dataframe(
+        table,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "symbol": st.column_config.TextColumn(
+                "Symbol", width="small",
+            ),
+            "rank_within_symbol": st.column_config.NumberColumn(
+                "#", format="%d", width="small",
+                help="Rank WITHIN this symbol; 1 = best strategy on this stock.",
+            ),
+            "strategy": st.column_config.TextColumn(
+                "Strategy", width="medium",
+            ),
+            "n_trades": st.column_config.NumberColumn(
+                "N", format="%d", width="small",
+            ),
+            "win_rate_pct": st.column_config.ProgressColumn(
+                "Win %", format="%.1f%%",
+                min_value=0.0, max_value=100.0, width="small",
+            ),
+            "median_roi_pct_annualized": st.column_config.NumberColumn(
+                "Median ROI/yr", format="%+.1f%%",
+            ),
+            "mean_roi_pct_annualized": st.column_config.NumberColumn(
+                "Mean ROI/yr", format="%+.1f%%",
+            ),
+            "std_roi_pct_annualized": st.column_config.NumberColumn(
+                "Std ROI/yr", format="±%.1f%%",
+            ),
+            "total_net_pnl": st.column_config.NumberColumn(
+                "Net P&L (₹)", format="₹%,.0f",
+            ),
+        },
+    )
+    st.caption(
+        f"Showing {len(eligible)} of {n_pairs_total} (strategy, "
+        f"symbol) pair(s) across {eligible['symbol'].nunique()} "
+        f"symbol(s) — min_n={min_n} from sidebar. Rank resets per "
+        f"symbol; thin samples in sidecar below."
+    )
+
+
+# ============================================================
 # Thin samples sidecar — Phase 6.2 commit 13 (feat(p6.2.thin))
 # ============================================================
 
