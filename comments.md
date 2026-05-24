@@ -3306,6 +3306,109 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 9dc2f1e — feat(p6.2.thin): leaderboard "Thin samples — not ranked" sidecar
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the silent-thin-suppression concern at the UI layer (my p5.5 review's load-bearing flag). The ranker drops rows with `n_trades < min_n` from the main table; the sidecar re-surfaces them with an explanatory caption + operator-action wording. Two-layer statistical-honesty: analytics-curated, UI-transparent.
+
+**What works:**
+
+- **Three-state branching** ([src/web/leaderboard.py](src/web/leaderboard.py)):
+  - 0 filtered rows → silent no-op (main table already rendered the empty-state message; avoids duplicate "no data" messaging).
+  - All pairs clear `min_n` → passive italic caption ("_All N pair(s) clear min_n=K — no thin samples to surface._") + no table — operator gets quiet acknowledgement.
+  - ≥1 thin pair → labeled `#### Thin samples — not ranked` section + descriptive caption + dataframe.
+- **Sort order pinned by test** ([tests/test_web_leaderboard.py](tests/test_web_leaderboard.py), `test_thin_samples_sorted_by_n_desc_then_roi_desc`): `n_trades` DESC, then `median_roi_pct_annualized` DESC. **The "biggest, best thin samples" come first** — operator scans for pairs worth lowering min_n to inspect. Smart heuristic; pinned.
+- **Column set intentionally LEANER than the main table** ([src/web/leaderboard.py](src/web/leaderboard.py), `test_thin_samples_column_config_omits_rank`):
+  - `rank` column omitted — these aren't ranked.
+  - `mean_roi_pct_annualized` omitted — at thin-N, mean is even less reliable than median; the simpler column set discourages over-interpretation.
+  Pinned via test.
+- **Caption gives operator action** ([src/web/leaderboard.py](src/web/leaderboard.py)): "The leaderboard ranker suppresses these per the statistical-honesty contract; lower min_n to inspect anyway." Matches DESIGN_SPEC §2.6 contract — every empty/edge state names the operator's next move.
+- **Italic-markdown passive-caption format** for the all-pass case (`"_..."`) — visually subordinate to the active caption; signals "nothing to do here" without taking real estate.
+- **Same column_config conventions as the main rank table** — consistency in formatting (Win %, Net P&L (₹), Median ROI/yr with `+` sign, Std ROI/yr with `±` prefix). Operator's eye trains on the format pattern once.
+- **5 new tests** covering: empty-when-all-clear, only-below-threshold rendered, sort order, empty-frame no-op, column-set-omits-rank.
+- **431/431 full suite** (was 426 + 5).
+
+**Live-tested all three branches:**
+```
+Test 1: min_n=5 (n=18 > threshold, no thin samples)
+  caption: "_All 1 (strategy, symbol) pair(s) clear min_n=5 — no thin samples to surface._"
+  
+Test 2: min_n=100 (n=18 < 100, all suppressed → sidecar surfaces it)
+  markdown: "#### Thin samples — not ranked"
+  caption: "1 (strategy, symbol) pair(s) with N below the sidebar threshold (100). ..."
+  dataframe: 1 row
+
+Test 3: empty df → 0 emissions (silent)
+```
+All branches behave per spec.
+
+**Closes my p5.5 + p6.2.table flags:**
+
+| Originating review | Concern | Now closed by |
+|---|---|---|
+| 955d0f3 (p5.5) #2 | "Single-table ranker silently drops thin samples unless consumer composes" | Sidecar IS the consumer-composition that re-surfaces them |
+| 452b503 (p6.2.headline) #1 | "RANKED PAIRS card surfaces suppression count but doesn't show WHAT was suppressed" | Sidecar shows the suppressed rows themselves |
+
+**Two-layer honest-disclosure now operational**:
+- Headline RANKED PAIRS card: "1/1 (min_n=5)" — operator sees the count.
+- Main table: rank-eligible pairs sorted.
+- Sidecar: suppressed pairs with explanatory caption.
+- Main table empty-state message: directs operator to lower min_n.
+
+Operator can't ACCIDENTALLY miss what's there.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **Both main-table empty-state AND sidecar render when all-below-min-n** — when min_n filters everything, the main table renders `render_empty("leaderboard_all_below_min_n", ...)` message AND the sidecar surfaces the suppressed rows. **Two messages, same data, double the screen real estate.** Defensible (the messages complement each other: "main table is empty because..." + "...here's what was suppressed"), but a future iteration might want to suppress the sidecar's heading when the main table is empty (since the operator already sees the explanation). Cosmetic; visible only at extreme min_n values.
+
+2. **`underscore-italic` passive caption** — `"_All 1 pair(s) clear min_n=5 — no thin samples to surface._"`. Renders as italic markdown in Streamlit. Reads slightly awkward in a literal terminal output context (the underscores appear as literal characters) but Streamlit converts them to italic CSS. Verified via the Streamlit rendering convention. Cosmetic.
+
+3. **Sort stable-tiebreaker after `(n_trades DESC, median_roi_pct_annualized DESC)`** — pandas sort_values is stable, so the input order from `summarize_by_stock_strategy` (which sorts by strategy then symbol ASC) is the implicit third tie-breaker. ✓ Deterministic. Worth a docstring note: "tiebreaker on third axis is the input frame's stable order — (strategy, symbol) ASC from `summarize_by_stock_strategy`." Cosmetic.
+
+4. **The same `min_n` is read TWICE per render**: once in `render_rank_table` (for the main ranking) and once in `render_thin_samples` (for the threshold). Currently `app.py` passes `int(st.session_state["mp_min_n"])` to both. If the user moves the slider between the two calls (technically impossible within one Streamlit render cycle, but defensively worth noting), the values would diverge. **Not a real concern** — Streamlit renders top-to-bottom within a single execution; both reads happen on the same value. Defensive observation only.
+
+5. **No "click-to-lower-min_n" action button** in the sidecar — operator has to manually move the sidebar slider. A "Lower min_n to 4" button next to the caption could be a Phase-7 ergonomic upgrade. Not blocking; just noting.
+
+**Domain / correctness checks:**
+
+- **Statistical-honesty contract**: ✓ two-layer (analytics curated, UI transparent) operational; operator sees both the rank-eligible pairs AND what was suppressed.
+- **§2.6 contract**: ✓ all 3 states have explicit messaging — no blank panels.
+- **Sort determinism**: ✓ n_trades DESC, median ROI DESC, then stable input order.
+- **No silent filtering at the UI layer**: ✓ sidecar is the explicit re-surface mechanism.
+- **Operator action in every caption**: ✓ "lower min_n to inspect anyway".
+
+**What I tried:**
+- Read the diff via `git show 9dc2f1e`.
+- Read the new `render_thin_samples` function I observed pre-commit in the working tree.
+- Live-tested all 3 branches (no-thin-samples / all-suppressed-1-pair / empty-frame).
+- `pytest tests/test_web_leaderboard.py -v` → 18/18 (5 new for thin samples + 13 pre-existing).
+- `pytest tests/` → 431/431.
+- Cross-checked the sort order test pins the (N DESC, ROI DESC) heuristic.
+
+**Sequencing observation:** This commit closes 2 of my outstanding reviewer flags from p5.5 + p6.2.headline (silent thin-suppression). The reviewer-loop is converging — concerns I raised at the analytics layer (Phase 5) and the headline layer (Phase 6.2.headline) are systematically being addressed as their UI surfaces land. **The architecture supports this trace-through**: Phase-5 ranker stays curated; Phase-6 UI explicitly does the transparency re-surfacing. **Better than retrofitting transparency at the ranker would have been** — keeps the analytics API simple (one-table return).
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 14: **`feat(p6.2.toggle)`** — `st.radio` at the top of the Leaderboard tab toggling "Within stock" (group by symbol, rank strategies per symbol) vs "Across stocks" (rank all pairs together, current default). This is Phase 5.2 of the design — both views are first-class research questions. After p6.2.toggle, Phase 6.2 closes and Phase 6.3 (Heatmap) starts.
+
+**Outstanding flags status (still open from prior reviews):**
+
+| Origin | Concern | Status |
+|---|---|---|
+| 8a07859 #5 | §2.2 "n_trades immediately right of rank" vs implementation order | Open — revisit at chore(p6.2.verify) |
+| 8a07859 #1 | rank_strategies UserWarning leaks to Streamlit logs | Open — cosmetic |
+| 452b503 #3 | "across N rank-eligible" vs "total" subtitle wording | Open — spec touch-up |
+| c6e3684 #1 | `get_message` "streamlit-free" docstring claim | Open — Phase-7 export-buttons followup |
+| 334bada+5c801dd #1 | `results_mod.RESULTS_DIR + importlib.reload` pattern | Open — opportunistic |
+| 7b12228 #1 | `render_caveats` missing from __all__ | Open — cosmetic |
+| 7b12228 #2 | "~10% discount" claim in MARGIN_TIER_B_CAVEAT unsupported | Open — soften or back |
+| DESIGN §1.5 | mtime picker dependency on 617878b not documented | Open — lowest priority |
+
+Several of these would naturally close in `chore(p6.2.verify)` if BUILDER takes a doc-touch pass. None blocking.
+
+---
+
 ## Review of 8a07859 — feat(p6.2.table): leaderboard rank table — st.dataframe with column config
 
 **Verdict:** ✅ accept
