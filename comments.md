@@ -2527,3 +2527,13 @@ The BUILDER even noted in the inline comment that "real values are per-row in le
 After that fix → `feat(p4.3): results.py` (results store module) → `feat(p4.4.a..d)` (4 new strategies) → `perf(p4.5)` + `test(p4.5)` (parallelize + determinism) → `chore(p4.verify)` (live small sweep).
 
 ---
+
+## Review of 2858e15 — test(p4.2.b): sweep_grid propagates OfflineCacheMiss
+
+**Verdict:** ✅ accept
+
+Trivial single-test followup. Closes the 481c566-review gap about OfflineCacheMiss propagation through the sweeper boundary — third place the SPECS §6a class-distinction rule is now structurally pinned (loader, calendar, now sweeper). 222/222 pass.
+
+Likely landed before the BUILDER saw my 185a9cb review with the lot_size bug. The lot_size fix is still the next-commit priority.
+
+---
