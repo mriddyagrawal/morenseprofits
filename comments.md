@@ -3306,6 +3306,110 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of d643aef + 588e42f — feat(p6.0.format) + test(p6.0.format) — Indian rupee + percentage formatters
+
+**Verdict:** ✅ accept (both commits as a pair)
+
+**Phase / commit goal (as I understood it):** Implement DESIGN_SPEC §2.7 number-formatting contract. Two pure helpers (`format_inr`, `format_pct`) that structurally prevent the "AVG ROI ₹25.76 L" mockup bug — rupees go through one callable, percentages through another. 17 boundary tests pin every threshold + sign + NaN path. Pure functions; no streamlit imports; testable in regular pytest.
+
+### d643aef — `src/web/_format.py`
+
+**What works:**
+
+- **Two callables, two quantity types**: `format_inr(x: float | int) -> str` vs `format_pct(x: float | int, *, signed=False, annualized=False) -> str`. **Code-enforced separation** — a developer who tries to render rupees as a percentage has to explicitly call the wrong function, which a code review catches. Per the commit message: "the mockup bug 'AVG ROI ₹25.76 L' becomes a code-enforced contract".
+- **Indian lakhs/crores convention correctly implemented** ([src/web/_format.py:30-31](src/web/_format.py#L30-L31)):
+  ```python
+  _LAKH: int = 100_000           # 1 L = 10^5
+  _CRORE: int = 10_000_000       # 1 Cr = 10^7 = 100 lakh
+  ```
+  Named constants instead of magic numbers. ✓
+- **Branch order**: sub-lakh → L (lakh) → Cr (crore). Strict `>=` boundary at each tier — `format_inr(99_999) == "₹99,999"`; `format_inr(100_000) == "₹1.00 L"`. **Live-verified both sides**.
+- **Negative sign placement** ([src/web/_format.py:66-74](src/web/_format.py#L66-L74)) — `sign = "-" if x < 0 else ""`, then `f"{sign}₹..."`. Minus PREFIXES the ₹ glyph (not after). **Critical for columnar tables**: rows align on the ₹ symbol; `-₹1.25 L` aligns with `₹6,923` cleanly, while `₹-1.25 L` would visually disconnect the minus from the magnitude.
+- **NaN detection via `x != x`** ([src/web/_format.py:58, 109](src/web/_format.py#L58)) — clever Python idiom that avoids `import math`. NaN is the only float not equal to itself; the comparison short-circuits before the format string would crash on a NaN.
+- **`try/except TypeError`** wrapper around the NaN check — defensive against unhashable / non-numeric inputs (e.g., if pandas passes a `pd.NA` object). Returns `str(x)` as a safe fallback.
+- **`format_pct` kwargs-only design** (`signed`, `annualized` after `*`) — prevents positional-argument confusion. `format_pct(4.6, True)` would error rather than silently doing the wrong thing.
+- **Scaling convention pinned in docstring** ([src/web/_format.py:86-88](src/web/_format.py#L86-L88)): "x=4.6 means 4.6%, NOT 0.046. Matches roi_pct + win_rate_pct semantics across the codebase." Cross-references the existing dataset convention; protects against the silent 100× bug.
+- **Module-level docstring explains the "sub-lakh comma" choice** ([src/web/_format.py:18-25](src/web/_format.py#L18-L25)) — acknowledges that Indian convention is `₹1,25,000` (8-digit grouping) but uses western thousands grouping at sub-lakh scale for monospace-table readability, AND notes that lakh notation kicks in at the exact point where 8-digit grouping starts to matter. Defensible engineering choice with a documented rationale.
+- **No streamlit import** — `from __future__ import annotations` + pure Python. Testable in regular pytest per SPECS §11.1.
+
+**Live-tested:**
+```
+rupees: ₹25.76 L    (= 2,576,000)
+pct:    +264.1%/yr  (annualized + signed)
+₹99,999 → ₹99,999
+₹100,000 → ₹1.00 L
+₹9,999,999 → ₹100.00 L
+₹10,000,000 → ₹1.00 Cr
+negative: -₹6,923
+NaN: — / —
+sign: +4.6% / -3.2%
+```
+All boundaries match the test fixtures + commit-message preview.
+
+### 588e42f — `tests/test_web_format.py`
+
+**What works:**
+
+- **17 tests covering every documented behavior:**
+  - Zero → "₹0" (bare; no decimals); rounded to nearest rupee at sub-lakh; comma grouping
+  - Boundary tests at both ₹1 L and ₹1 Cr — pins both sides of each transition
+  - Negative sign placement explicitly (3 cases across sub-lakh/L/Cr)
+  - None → "—"; NaN → "—" for both formatters
+  - format_pct base / signed / annualized toggles independently
+  - **`test_pct_already_scaled_to_100`** — pins the convention that `x=4.6` means 4.6% NOT 0.046. **Catches the silent 100× regression that would dwarf every percentage display in the UI** — this is THE most load-bearing convention test.
+  - Cross-formatter NaN consistency test.
+- **Test docstrings explicitly cite the LOAD-BEARING reason** for each non-obvious pin (boundary tests, negative-sign placement, scaling-convention). Future contributors who break a test see WHY it matters before deciding whether to update.
+- **17 + 387 = 404/404** full suite passes.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 `format_inr(9_999_999) → "₹100.00 L"`** instead of `"₹1.00 Cr"`. Technically correct (9.999...M < 10M = 1 Cr), but reads as "100 lakh" which IS 1 crore — the operator does the conversion mentally and wonders why it isn't Cr-notation. The current behavior is documented + tested ([tests/test_web_format.py:53, 59](tests/test_web_format.py#L53-L59)); just noting that **"100.00 L" is at the perceptual boundary of confusion**. A real ₹100 L (10 million) IS 1 crore. **Fix would be**: trigger Cr notation when the L-formatted value rounds up to 100.00 (or equivalently, when `mag >= _CRORE - 0.005 * _LAKH ≈ 9_999_500`). Minor; only matters at exact ₹9.99-9.999M values. Cosmetic.
+
+2. **`format_pct(0.001) → "0.0%"`** — sub-decimal precision is lost. For ROI percentages in the dataset's range (5%, 10%, 247%), this is fine. **But**: if someone passes a near-zero value (e.g., a 0.05% win rate or a per-trade ROI of 0.001%), it renders as `0.0%` indistinguishably from real zero. **Mitigation**: add a `precision: int = 1` kwarg defaulting to 1, but allowing callers to bump for high-precision contexts. Or document that "small percentages may round to 0.0% by design — use net_pnl rupee values for sub-decimal precision". Not blocking; just noting the precision floor.
+
+3. **`format_pct(0.0, signed=True) → "0.0%"`** ([tests/test_web_format.py:106](tests/test_web_format.py#L106) pinned). Zero is unsigned even when `signed=True`. **Defensible choice** — a "+0.0%" reads as positive, "-0.0%" as negative, and the unsigned "0.0%" is the natural neutral. Worth noting; the test pins this so a future contributor doesn't "fix" it. ✓
+
+4. **`format_pct(1) → "1.0%"`** ([tests/test_web_format.py:128](tests/test_web_format.py#L128)) — integer input handled correctly (1 → "1.0%", not "100.0%"). Pinned by `test_pct_already_scaled_to_100`. ✓ This is the silent-100x-bug guard I called out as load-bearing.
+
+5. **No `__all__`** in `_format.py`. Convention elsewhere in `src/web/` is to have explicit `__all__` (caveats.py does). Cosmetic; consumer imports work without it. Could add `__all__ = ["format_inr", "format_pct"]` for consistency.
+
+6. **Lakhs/crores conversion uses naive division** ([src/web/_format.py:70, 72](src/web/_format.py#L70-L72)) — `mag / _CRORE`, `mag / _LAKH`. Python 3 float division; no FloatingPointError risk at the magnitudes involved. ✓
+
+**Domain / correctness checks:**
+- **Mockup-bug prevention**: ✓ structural separation; rupees and percentages have distinct callables. "AVG ROI ₹25.76 L" is now a code review smell (`avg_roi = format_inr(...)` mismatches the variable name).
+- **Indian convention**: ✓ 1 L = 10^5, 1 Cr = 10^7. Boundary values + division correct.
+- **Scaling convention**: ✓ pinned by `test_pct_already_scaled_to_100`.
+- **No silent failures**: ✓ None/NaN → "—"; non-numeric → `str(x)` fallback.
+- **Streamlit isolation**: ✓ pure Python; testable in regular pytest.
+
+**What I tried:**
+- Read `src/web/_format.py` end-to-end.
+- Read `tests/test_web_format.py` end-to-end.
+- Live-tested: ₹2,576,000 → "₹25.76 L"; +264.1 annualized signed → "+264.1%/yr". Boundaries at ₹99,999 / ₹100,000 / ₹9,999,999 / ₹10,000,000 — all match commit-message preview.
+- `pytest tests/test_web_format.py` → 17/17. Full suite → 404/404.
+
+**Sequencing observation:** d643aef + 588e42f land as an impl+test pair, 67 seconds apart. **This catches up with the §4 sequence deviation I flagged in 334bada review** — the format helpers were originally scheduled to land before `feat(p6.1.discover)`, but ended up landing AFTER `feat(p6.1.caveats)` and concurrent with the fix commit. **Net effect: no harm done**, because `_format.py` isn't a dependency of caveats or discover. The deviation is now closed.
+
+**Phase 6.0 + 6.1 status after this commit:**
+- ✅ `chore(p6.0.spec)` (b7fe7e5 + 1c00f69 reconciliation)
+- ✅ `chore(p6.0.deps)` (d9f2cb2)
+- ✅ `feat(p6.0.format)` + `test(p6.0.format)` (d643aef + 588e42f)
+- ✅ `feat(p6.1.discover)` + `test(p6.1.discover)` (334bada + 5c801dd)
+- ✅ `feat(p6.1.caveats)` + tests (7b12228 + 79d50d8 fix)
+- ✅ `feat(p6.1.app)` (efe1c73)
+- 🔄 `feat(p6.1.empty)` — `src/web/empty_state.py` per DESIGN_SPEC §2.6 (NOT YET LANDED)
+- 🔄 `chore(p6.1.verify)` — `streamlit run app.py` smoke + screenshots (NOT YET LANDED)
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 sequence the remaining Phase-6.1 items are:
+1. `feat(p6.1.empty)` — 6 pre-written `st.info` messages per §2.6 table; pure data + a render helper.
+2. `chore(p6.1.verify)` — visual smoke; should land AFTER p6.1.empty so the empty-state paths are actually exercisable.
+
+After `chore(p6.1.verify)` Phase 6.1 closes and Phase 6.2 starts with `feat(p6.2.headline)` — the first commit that USES `format_inr` + `format_pct` to render the leaderboard headline cards.
+
+---
+
 ## Review of 79d50d8 — fix(p6.1.caveats): correct survivorship snapshot date 2026-07-01 → 2024-07-01
 
 **Verdict:** ✅ accept
