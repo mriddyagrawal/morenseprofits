@@ -1115,3 +1115,39 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `test(p1.4)` — the **load-bearing test is `test_cross_layer_handcheck_reliance_aug29`**: build a synthetic frame matching `derivatives_df`'s shape (15 jugaad cols, descending date order, OI as float64 with one NaN to exercise the Int64 cast) for the RELIANCE Aug-29 2840 CE contract; monkeypatch `derivatives_df` to return it; assert `load_option(...)` returns the same 5 values the bhavcopy_fo test pins (`close=201.7, oi=41500, oi_change=-1500, volume=6500, lot_size=250`). If the two layers ever diverge, the test names which one regressed. Beyond that, mirror the spot_loader test layout: separate tests for **(a) midnight assertion fires** on a synthetic frame with 18:30:00 timestamps (catches a future jugaad change), **(b) sort-ascending invariant** by feeding shuffled rows, **(c) closed-expiry cache immutability** + open-expiry subset-checked refetch (use today_fn to flip the branch), **(d) all four loud-rejection paths** (datetime expiry, bad option_type, from > to, non-int strike) — these I already exercised live but tests pin them offline. Skip the live-NSE verification commit until p1.5 lands; the cross-layer test against the recorded bhavcopy_fo values is enough for p1.4.
 
 ---
+
+## Review of 488deae — test(p1.4): options_loader — 13 tests with cross-layer hand-check as load-bearing
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin every contract from `options_loader` with the cross-layer hand-check as the FIRST test in the file. 74/74 pass.
+
+**What works:**
+- `test_cross_layer_hand_check_matches_bhavcopy_fo` ([tests/test_options_loader.py:95-142](tests/test_options_loader.py#L95-L142)) is FIRST. Synthetic frame uses the RELIANCE Aug-29 2840 CE values verified in the prep commit. Asserts the 5 cross-layer numbers (`close=201.70, oi=41500, oi_change=-1500, lot_size=250, volume=6500 = 26 contracts × 250 lot`). Comment names what regression this catches.
+- `test_returned_schema_matches_specs_2_2` ([tests/test_options_loader.py:149-175](tests/test_options_loader.py#L149-L175)) — explicit dtype assertions per SPECS §2.2: `StringDtype()`, `is_datetime64_any_dtype` (per §2.0), plain `int64` for lot_size/volume, nullable `Int64` for oi/oi_change.
+- `test_first_fetch_pulls_full_contract_lifetime` ([tests/test_options_loader.py:182-209](tests/test_options_loader.py#L182-L209)) — captures the `from_date` passed to `derivatives_df` and asserts ≥100 days back. Pins the lifetime-not-window-fetch invariant.
+- `test_closed_expiry_cache_hit_skips_refetch` ([tests/test_options_loader.py:216-241](tests/test_options_loader.py#L216-L241)) — re-monkeypatches `derivatives_df` to RAISE after the cold fetch, second call must succeed from cache. Same regression-block pattern as the other loaders.
+- `test_non_midnight_date_fails_loud` ([tests/test_options_loader.py:409-428](tests/test_options_loader.py#L409-L428)) — injects 18:30:00 (mimicking a future jugaad change to match stock_df's behavior), asserts the midnight assertion fires. The exact regression class my last review named.
+- `test_open_expiry_refetches_when_stale` ([tests/test_options_loader.py:365-402](tests/test_options_loader.py#L365-L402)) — clever state-tracking factory that simulates "today" advancing past the cache's max date; verifies the open-expiry refresh policy.
+- `_fake_derivatives` helper ([tests/test_options_loader.py:32-64](tests/test_options_loader.py#L32-L64)) and `_patch_derivatives` ([tests/test_options_loader.py:67-84](tests/test_options_loader.py#L67-L84)) are clean reusables; the call-log allows fetch-count assertions in multiple tests.
+- **74/74 pass** in 0.53s.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Subset-based partial-response check is implemented but untested.** `options_loader._load_year`'s subset path ([src/data/options_loader.py:195-208](src/data/options_loader.py#L195-L208)) mirrors spot_loader's `test_partial_response_with_dropped_dates` — but no analogous test for options. A same-length-but-content-shifted fresh response should keep cache + warn; without a test, the next refactor can regress the subset upgrade silently.
+- **`test_non_midnight_date_fails_loud` catches `AssertionError`** — works under default Python, but `python -O` strips asserts → loader becomes silent again on stale jugaad. My prior non-blocking flag (use `raise OptionsFormatError(...)` instead of `assert`) is still open; once addressed, this test catches the new exception type too.
+- **Network-error wrap symmetry still missing** ([src/data/options_loader.py:103-113](src/data/options_loader.py#L103-L113)) — `derivatives_df`'s HTTPError/BadZipFile propagates raw; bhavcopy_fo_loader wraps. Phase 3 will have to catch both error families. Re-flagging from 95175dd review.
+- **No "no-duplicate-dates" assertion**. If `derivatives_df` ever returns two rows for the same date, they survive into cache silently. One-line check in `_normalize` would close it.
+
+**Domain / correctness checks:**
+- **jugaad-data usage / options math / look-ahead / stats:** N/A this commit (pure tests).
+- **Schema/dtype contract:** every dtype mandated by SPECS §2.2 has a test assertion.
+
+**What I tried:**
+- `python -m pytest tests/ -v` → 74/74 in 0.53s.
+- Read the full test file (442 lines); cross-checked the load-bearing test's values against the bhavcopy_fo test file's pinned numbers.
+
+**Next-commit suggestion:** `chore(p1.4.verify)` — the **highest-de-risking single call** is a runtime cross-layer comparison that triangulates real NSE truth: `load_option("RELIANCE", date(2024, 8, 29), 2840, "CE", date(2024, 8, 29), date(2024, 8, 29))` AND `load_bhavcopy_fo(date(2024, 8, 29))` on the same row; assert close/oi/oi_change/lot_size are equal across the two layers. **Bonus**: run a SECOND comparison on a pre-cutover contract — `RELIANCE 2024-01-25 2620 CE` (matches the legacy fixture's expiry). That exercises (a) the legacy bhavcopy path under bhavcopy_fo_loader, (b) `derivatives_df` for a pre-Jul-8-2024 contract, and confirms both data sources agree across the cutover boundary. Cross-layer agreement on both sides of the cutover is the strongest end-to-end guarantee the data layer can offer before Phase 1.5 lands.
+
+---
