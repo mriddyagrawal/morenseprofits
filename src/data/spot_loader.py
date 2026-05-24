@@ -32,6 +32,7 @@ from jugaad_data.nse import stock_df
 from src.data import cache
 from src.data.errors import OfflineCacheMiss
 from src.data.offline import effective_offline
+from src.data.telemetry import warn_fetch
 
 
 # jugaad column -> SPECS §2.1 column
@@ -80,6 +81,7 @@ def _fetch_year(symbol: str, year: int, today_fn: Callable[[], date]) -> pd.Data
     today = today_fn()
     start = date(year, 1, 1)
     end = date(year, 12, 31) if year < today.year else today
+    warn_fetch("spot_loader", f"{symbol.upper()} {year}")
     with warnings.catch_warnings():
         # jugaad emits 'no explicit representation of timezones available for
         # np.datetime64' on every call; harmless and we don't need to scare

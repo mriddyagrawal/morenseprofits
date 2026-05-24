@@ -37,6 +37,7 @@ from jugaad_data.nse.archives import NSEArchives
 from src.data import cache
 from src.data.errors import BhavcopyFormatError, MissingDataError, OfflineCacheMiss
 from src.data.offline import effective_offline
+from src.data.telemetry import warn_fetch
 
 
 # Match the discovered post-Jul-8 archive URL pattern (verified live on 4
@@ -143,6 +144,7 @@ def _fetch_udiff(trade_date: date) -> str:
 
 
 def _fetch_raw(trade_date: date) -> tuple[str, FormatTag]:
+    warn_fetch("bhavcopy_fo_loader", str(trade_date))
     if trade_date < _udiff_start_date():
         return _fetch_legacy(trade_date), "legacy"
     return _fetch_udiff(trade_date), "udiff"

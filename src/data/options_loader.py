@@ -37,6 +37,7 @@ from jugaad_data.nse import derivatives_df
 from src.data import cache
 from src.data.errors import MissingDataError, OfflineCacheMiss, OptionsFormatError
 from src.data.offline import effective_offline
+from src.data.telemetry import warn_fetch
 
 
 # NSE lists stock options ~3 months ahead. 120 days covers every
@@ -118,6 +119,10 @@ def _fetch_contract_lifetime(
     today = today_fn()
     start = expiry - timedelta(days=_LIFETIME_DAYS_BACK)
     end = min(expiry, today)
+    warn_fetch(
+        "options_loader",
+        f"{symbol.upper()} {expiry} {int(strike)}-{option_type}",
+    )
     # Symmetry with bhavcopy_fo_loader's wrap policy: "no data" failure
     # modes (404, 410, BadZipFile from HTML response) → MissingDataError;
     # transient network errors (403/5xx/ConnectionError) propagate raw.
