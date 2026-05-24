@@ -2890,3 +2890,55 @@ Both `write_results` AND `sweep_grid`'s return path call it, so the in-memory fr
 **Next-commit suggestion:** Resume `chore(p4.verify)` — already in flight per the next-commit notification. The fix unblocks the determinism check.
 
 ---
+
+## Review of 9323936 — chore(p4.verify): live small sweep — first multi-cell dataset
+
+**Verdict:** ⚠️ accept-with-followups — **PHASE 4 IS FUNCTIONALLY DONE**, but **grilling caught a real annualization bias for short-window trades** that will mislead Phase-5 ranking.
+
+**What works (the milestone):**
+- **Independent live run reproduced byte-identical** to the BUILDER's reported output: 18 cells, 0.53s cold compute (30ms/cell warm), 0.002s on the cache-hit repeat.
+- **All 5 load-bearing checks green**:
+  - Determinism: `assert_frame_equal(run1, run2_cached)` passes
+  - Phase-3 cross-check: RELIANCE Jan-25 T-15→T-1 row matches p3.verify EXACTLY (entry_spot ₹2596.65, gross +562.25, net +422.57, etc.)
+  - Skip log: 0 skips on this conservative grid
+  - notional_basis == "spot" on every row (caveat #1 closure exercised on real multi-cell data)
+  - Timing extrapolation: 30k tasks ≈ 15 min serial → confirms p4.5 deferral was sound
+- 18 trades produced; sortable, parquet-backed, ready for Phase-5 ranking and Phase-6 visualization
+
+**REAL BIAS CAUGHT — roi_pct_annualized inflates short-window ROIs:**
+
+| Cell | hold_calendar | hold_trading_days (formula) | hold_trading_days (true) | roi_pct | roi_pct_annualized (computed) | roi_pct_annualized (true) |
+|---|---|---|---|---|---|---|
+| Jan-25 T-5→T-3 | 2 days | round(2 × 252/365) = **1** | **2** | 5.54% | **1395.81 %/yr** | 698 %/yr |
+| Jan-25 T-5→T-1 | 6 days | round(6 × 252/365) = **4** | **4** | 5.72% | 360.41 %/yr | 360.36 %/yr |
+| Mar-28 T-5→T-1 | 6 days | round(6 × 252/365) = **4** | **4** | -8.31% | -418.84 %/yr | -523.53 %/yr |
+
+The 252/365 calendar-to-trading-day conversion (introduced in 169c7d6 to avoid a `trading_calendar` import on the hot path) is **fine for long windows** (20 calendar → 14 trading days, exact) but **fails on short ones** because `round(1.38) = 1` (off by 50%).
+
+For Jan-25 T-5→T-3, the formula doubles the apparent annualized return: **1395%/yr displayed vs ~698%/yr if computed against true trading days**. Phase-5 ranker sorting by `roi_pct_annualized` will systematically favor 2-day-hold trades over longer holds at the same daily rate — exactly the failure mode caveat #2 was supposed to prevent.
+
+**The fix** (recommend before Phase 5):
+- Use `trading_calendar.trading_days(entry_date, exit_date)` and `len(...)` (or count - 1 for "days held") as `hold_trading_days`
+- Exact, no approximation
+- Adds a `trading_calendar` import to `engine/pnl.py` but the import is already in `engine/sweeper.py` — same module-graph already-paid cost
+- ~5 lines + a regression test pinning Jan-25 T-5→T-3 → exactly 2 trading days
+
+**Blocking issues:** None for Phase 4 itself; the bias affects Phase 5 ranking semantics, not Phase 4 data correctness.
+
+**Non-blocking suggestions:**
+- The ROI table at the bottom of the verify output is the user's first preview of cross-window patterns. Worth surfacing the bias caveat there too: "roi_pct_annualized uses 252/365 calendar-to-trading approximation; very-short-window numbers can be inflated by up to 2×".
+- 15-of-18 trades profitable (83% win rate) is a small-N preview; Phase-5 will compute meaningful aggregates. The HEADLINE number worth knowing: short straddles on RELIANCE in this 3-month window AVERAGED positive ROI even with slippage. Phase-5 may reveal whether that's just Q1-2024 (low-vol regime) or a robust pattern.
+
+**Domain / correctness checks:**
+- **Determinism:** ✓ verified.
+- **Phase-3 byte-cross-check:** ✓ verified — engine doesn't drift across the sweeper boundary.
+- **Spot-based margin:** ✓ verified on every row.
+- **Caveat #2 (annualized ROI):** ❌ **biased for short windows** — see the table above. Was closed in 169c7d6 with the 252/365 approximation; the bias is now visible in real data.
+
+**What I tried:**
+- `python scripts/verify_p4.py` independently → byte-identical to BUILDER's reported run.
+- Hand-derived hold_trading_days for the canonical Jan-25 T-5→T-3 case → got 2 (true) vs 1 (formula) → 2x annualization bias confirmed.
+
+**Next-commit suggestion:** **`fix(p4.verify.a): hold_trading_days uses trading_calendar.trading_days() exact count, not 252/365 calendar approximation`**. The bias is small for hold ≥ 7 trading days but >2× for 1-3 day holds. Phase-5 will rank thousands of cells by `roi_pct_annualized`; a 2× bias on the short-window subset will pollute the leaderboard. Fix the formula now while it's contained to one module. After: Phase 5 (aggregation + trend analytics) is unblocked.
+
+---
