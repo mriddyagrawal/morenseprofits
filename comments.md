@@ -485,3 +485,32 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Per the plan, `test(p1.3.0)`. Mirror the existing `test_path_builders` shape; mandatory cases: (a) `date(2024,1,2)` resolves to `bhavcopy_fo/20240102.parquet`; (b) a `datetime` with non-midnight time produces the same path as the equivalent `date` (so the duck-typed acceptance is *documented*, not accidental); (c) the parent dir is `bhavcopy_fo`. Then move to `feat(p1.3.1)` where the real work lives — and per b0ef46a's commitment, capture **byte-for-byte recorded fixtures** for one pre-Jul-8-2024 and one ≥Jul-8-2024 bhavcopy NOW so the test can be written against them, not deferred.
 
 ---
+
+## Review of 5f9cdeb — test(p1.3.0): cache.bhavcopy_fo_path — path shape + symbol-agnostic API
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Lock in the new path helper with shape + idempotence + structural assertion that the API stays symbol-agnostic.
+
+**What works:**
+- `test_bhavcopy_fo_path` ([tests/test_cache.py:46-62](tests/test_cache.py#L46-L62)) covers: filename `YYYYMMDD.parquet`, parent dir `bhavcopy_fo`, idempotent re-builds, distinct dates → distinct paths.
+- **`inspect.signature` regression-blocker** ([tests/test_cache.py:60-62](tests/test_cache.py#L60-L62)): asserts the signature is exactly `["trade_date"]`. Structurally pins the "one file per date, no symbol axis" contract — a future drive-by addition of a `symbol` kwarg trips this test rather than silently turning a 60-fetch sweep into a 300-fetch one. Clean.
+- Uses `date(2024, 2, 29)` as one of the test dates — happens to cover the leap-day path too.
+- 23/23 pass via `python -m pytest tests/` in 0.25s.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- The `datetime` duck-typing I flagged on 13dacbd is still **structurally accepted but not tested or documented**. Add one assertion: `cache.bhavcopy_fo_path(datetime(2024,1,2,9,30)) == cache.bhavcopy_fo_path(date(2024,1,2))`. Either pins it as supported behavior, or — if the BUILDER prefers — replace with an `isinstance(trade_date, datetime)` rejection. Either way, *document it*. Currently a caller passing a tz-aware `datetime` would get an unknown-tz silent truncation.
+- The `inspect.signature` assertion would break if a defensive kwarg ever gets added (e.g. `*, _force_root_check: bool = False` for testing). Brittleness is acceptable here given the structural-contract intent; just noting.
+
+**Domain / correctness checks:**
+- **jugaad-data usage / options math / look-ahead / stats:** N/A this commit.
+
+**What I tried:**
+- `python -m pytest tests/` → 23/23 pass, 0.25s.
+- Read the diff in full.
+
+**Next-commit suggestion:** `feat(p1.3.1): data/bhavcopy_fo_loader.py` is where every Phase-1.3 bet pays off — start with **capturing the two recorded fixtures** as the very first sub-step. A small `scripts/capture_bhavcopy_fixtures.py` that fetches one pre-Jul-8-2024 and one ≥Jul-8-2024 bhavcopy via `bhavcopy_fo_raw`, prints byte length + first/last 200 chars to stderr (so we can sanity-check), and saves both to `tests/fixtures/bhavcopy_fo_*.csv`. Write the parser against those fixtures rather than against an assumption about column layout — the two formats almost certainly have different columns, and parser-first-then-debug burns a half-day. **Pin the column-name mapping by NAME** (jugaad's `expiry_dates` accesses column index 10 — that's brittle across formats). The load-bearing test in `test_bhavcopy_fo_loader`: feed each recorded fixture through the loader, assert the SPECS §2.4 schema exactly (column names, dtypes including the `datetime64[us]` rule and `option_type` as pd.StringDtype with `<NA>` for futures rows).
+
+---
