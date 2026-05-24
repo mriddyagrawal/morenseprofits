@@ -2251,3 +2251,51 @@ After that the live verify produces the first defensible end-to-end number on re
 **Next-commit suggestion:** Per the BUILDER's own note, `feat(p3.5.h): roi_pct_annualized + hold_trading_days columns` is next — already in flight. Then Phase 4 (sweeper). The Phase-4 sweep will now produce **honest, conservative, ranking-comparable** numbers across (entry_offset, exit_offset) × symbol × month — exactly what the project was built for.
 
 ---
+
+## Review of 169c7d6 — feat(p3.5.h): roi_pct_annualized + hold_trading_days columns
+
+**Verdict:** ⚠️ accept-with-followups (code is correct; **commit message has wrong arithmetic**)
+
+**Phase / commit goal (as I understood it):** Close caveat #2 from the Tier-B cluster — add annualized ROI so Phase-5 ranker can compare different-hold-length strategies fairly.
+
+**What works:**
+- `_annualize_roi(roi_pct, hold_trading_days) -> float | None`: pure function, `roi × 252 / hold_days`, None-guards on both inputs ([src/engine/pnl.py:152-163](src/engine/pnl.py#L152-L163)).
+- `hold_trading_days = max(1, round(calendar_days × 252/365))` — calendar-to-trading-day approximation avoiding a `trading_calendar` dependency on the hot path. Defensible: relative ranking ORDER is what matters, the 252/365 vs 252/365.25 nit is noise.
+- Result dict gains `hold_trading_days` + `roi_pct_annualized` keys. Schema test extended.
+- 203/203 in full suite.
+
+**Independent verification of the code's actual output** (the canonical RELIANCE Jan-2024 short straddle):
+
+| | code output | commit-message claim |
+|---|---|---|
+| roi_pct | 0.3033% | "0.30%" ✓ |
+| hold_trading_days | **14** | "20 trading days" ✗ |
+| roi_pct_annualized | **5.46%** | "3.78% per year" ✗ |
+
+**The CODE is right**: `Jan-4 → Jan-24 = 20 calendar days; round(20 × 252/365) = 14 trading days; 0.3033 × 252/14 = 5.4595%`. **The commit message used `0.30 × 252/20 = 3.78%`** — divides by calendar days as if they were trading days. The commit message's mental model contradicts the code it's documenting.
+
+This matters because a user reading the commit message expects 3.78%/year and would be confused by a 5.46% number in any subsequent run.
+
+**Blocking issues:** None for the code. **Commit-message hygiene issue** — the BUILDER should either amend (if allowed) or note the correction in the next commit's message.
+
+**Non-blocking suggestions:**
+- **Verify script doesn't print the new columns**. Same flag I raised on 45541e0 (slippage). The verify is the user-facing demonstration. 5 lines to add: print hold_trading_days + roi_pct_annualized in the breakdown box.
+- **Test annualization assertion is tautological**: `roi_pct × 252 / hold_days == roi_pct_annualized` — yes by definition. Better: pin the canonical RELIANCE output: `assert 5.0 < out["roi_pct_annualized"] < 6.0` (catches a 252→365 confusion AND catches the BUILDER's-commit-message-style 0.30/20 confusion).
+- **Same-day trade edge case**: entry==exit → `max(1, ...)` floors to 1 → annualized = roi × 252 (huge magnifier). For daily-bars backtest this won't fire (entry < exit pinned by Trade validation), but worth a one-line guard or assertion. Defer.
+
+**Domain / correctness checks:**
+- **Math:** code is correct. 0.3033 × 252 / 14 = 5.4595. Verified by manual computation.
+- **Approximation rationale:** 252/365 conversion is defensible for ranking purposes; for absolute precision a `trading_calendar.trading_days(entry, exit)` call would be exact but adds dependency. Acceptable v1 trade-off.
+- **Caveat #1 (strike-vs-spot margin)** explicitly deferred by the BUILDER as Phase-4+ concern. Doesn't bite ATM short straddle. Acceptable.
+
+**What I tried:**
+- Ran `price_trade` directly on the canonical RELIANCE trade. Got `hold_trading_days=14, roi_pct_annualized=5.4595`. Hand-checked the arithmetic both ways (252/14 = 18; 0.3033 × 18 = 5.46 ✓).
+- Cross-checked against the commit message's claim of "3.78% over 20 trading days" — that's `0.30 × 252/20 = 3.78`, using calendar days as the divisor. **Code does NOT do this; commit message documents an incorrect mental model.**
+
+**Next-commit suggestion:** Two clean-up items before Phase 4 launches:
+1. **Amend or note the 3.78%→5.46% commit-message correction** in any next commit. Otherwise future readers parsing the git log will see two conflicting numbers for the same trade.
+2. **Update `verify_p3.py` to print all the new columns** — hold_trading_days, roi_pct_annualized, the slippage haircut breakdown from 45541e0. The verify script is the user-facing demonstration; it should surface every Phase-3 deliverable in one breath. ~10 lines.
+
+Then **Phase 4: parameter sweep + multi-strategy framework**. The data + universe + engine are now honestly conservative, ranking-comparable, and live-verified. Phase 4 multiplies that across (strategy × stock × month × entry_offset × exit_offset) to find historical edges.
+
+---
