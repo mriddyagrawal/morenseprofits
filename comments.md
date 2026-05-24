@@ -1201,3 +1201,43 @@ Trivial followup. Two tiny things closed from the 02e3644 review:
 **Next-commit suggestion:** Unchanged — proceed with `chore(p1.4.verify)`, the dual cross-layer cutover-spanning live run.
 
 ---
+
+## Review of 5689cff — chore(p1.4.verify): cross-layer live verify BOTH sides of cutover — ALL GREEN
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Cross-layer triangulation against real NSE data on both sides of the 2024-07-08 cutover.
+
+**What works:**
+- **I ran the script independently → ALL GREEN, byte-for-byte match** with the BUILDER's reported values:
+
+  | Side | close | oi | oi_change | volume | contracts |
+  |---|---|---|---|---|---|
+  | POST (Aug-29 2840 CE) | 201.7 | 41500 | -1500 | 6500 | 26 = 6500/250 ✓ |
+  | PRE (Jan-25 2620 CE) | 83.7 | 838000 | -17500 | 59000 | 236 = 59000/250 ✓ |
+
+- The **pre-cutover comparison is the strongest cross-validation in the project so far**: legacy bhavcopy parser AND `derivatives_df` for a pre-Jul-8-2024 contract both surface the SAME numbers as a real NSE record. If either layer regressed on the legacy path, this would catch it.
+- Script architecture: dataclass-based `Case`, per-case `verify()` returning bool, single `main()` aggregator. Clean.
+- Asserts the **contracts↔volume/lot relationship** ([scripts/verify_p1_4.py:106-110](scripts/verify_p1_4.py#L106-L110)) — the SPECS §2.4 documented unit invariant is now empirically corroborated on two real contracts (250 lot in both cases, 26 contracts and 236 contracts respectively).
+- `today_fn=lambda: date(2026,5,24)` forces closed-contract regime for both cases — the `is_closed` branch in options_loader is exercised. Smart.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- The verify doesn't exercise the **open-contract refetch path** of options_loader — both cases are closed contracts. The offline `test_open_expiry_refetches_when_stale` covers it offline; live coverage would require a fresh contract whose expiry hasn't passed. Defer to phase-7 verify expansion, if ever.
+- No cold/hot timing print like `verify_p1_3.py` had. Less essential here since the focus is correctness equality, not performance. Cosmetic.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** both endpoints exercised live; both work.
+- **Options math:** lot_size + volume + contracts triangle holds across two completely different upstreams. Phase 3 backtester can use either column without ambiguity.
+- **Look-ahead bias:** `today_fn` forces closed regime; no leak.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- `python scripts/verify_p1_4.py` cold → both cases green, byte-for-byte match.
+
+**Phase 1.4 status:** **DONE.** 80 offline tests + 1 live cross-layer verification on both cutover sides. The data layer's contracts (spot + bhavcopy + expiries + options) are provably consistent end-to-end.
+
+**Next-commit suggestion:** `feat(p1.5): data/trading_calendar.py` — implement `trading_days(from, to)` and `offset_trading_days(anchor, n)`. The **load-bearing test is `offset_trading_days` correctness**: every Phase-3 backtest's entry/exit date depends on it; a single off-by-one breaks every backtest's prices silently. Concrete hand-check: `offset_trading_days(date(2024,1,25), 15) == date(2024,1,4)` (Jan-25 expiry → 15 trading days back, skipping weekends + Jan-1 Republic Day-adjacent holidays = Jan-4). Bake in three invariants from commit 1: (a) bootstrap trading-day calendar from `load_spot("RELIANCE", ...)` per SPECS §6 — don't introduce a separate data source; (b) **cross-validate against `jugaad_data.holidays`** as a sanity check (any date returned by `trading_days` that's also in the holidays list is a bug); (c) `offset_trading_days(holiday, 0)` semantics — pin the behavior explicitly (raise? round to next trading day? round to previous?). My recommendation: round-down to previous trading day, since that's what "T+0 means same day" really means when T-itself isn't a trading day.
+
+---
