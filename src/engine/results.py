@@ -87,8 +87,15 @@ def empty_skips_frame() -> pd.DataFrame:
 def _inferred_dtype(col: str) -> str:
     """Best-effort dtype per column name. Datetime cols become
     datetime64[us] (matches §2.0 convention); known-int cols become
-    int64; everything else object/string. Empty frames cast to these
-    so a future concat with real data doesn't trigger dtype coercion."""
+    int64; string-like cols become StringDtype (matches §2.1 — upstream
+    loaders emit pd.StringDtype, so empty frames should too to avoid
+    object/string mixing on pd.concat); everything else float64.
+
+    The StringDtype mapping closes the 1a5cf01 review flag: previously
+    text columns defaulted to ``"object"``, which meant a concat of
+    an empty results frame with a real-data frame could yield either
+    object or string dtype depending on pandas version. Consistency-
+    over-version-drift is the right discipline."""
     if col in ("expiry", "entry_date", "exit_date"):
         return "datetime64[us]"
     if col in ("entry_offset_td", "exit_offset_td", "hold_trading_days"):
@@ -97,7 +104,9 @@ def _inferred_dtype(col: str) -> str:
                "roi_pct", "roi_pct_annualized", "entry_spot", "exit_spot",
                "notional_at_entry"):
         return "float64"
-    return "object"
+    # Text columns — strategy, symbol, run_id, params_json, legs_json,
+    # *_breakdown_json, skip_reason. All pd.StringDtype upstream.
+    return "string"
 
 
 # ============================================================

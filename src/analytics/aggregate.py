@@ -36,7 +36,13 @@ SUMMARY_COLUMNS: tuple[str, ...] = (
     # Aggregate strategy P&L across the sample (= mean × n) — operator's
     # "did this strategy make money overall on this stock?" headline.
     "total_net_pnl",
-    # Holding-period ROI (% on margin) — the headline number
+    # Holding-period ROI (% on margin) — the headline number.
+    # std_* columns use population std (ddof=0) so an n=1 group gets
+    # std=0 (not NaN, which would break sort_values rankings). The
+    # consequence: this is OBSERVED-SAMPLE DISPERSION, not an unbiased
+    # estimate of population variance. For n=5 the bias vs ddof=1 is
+    # ~20%, for n=20 it's ~2.5%; treat the column as a LOWER BOUND on
+    # true population spread. Reviewer flag from afdd56e.
     "mean_roi_pct",
     "median_roi_pct",
     "std_roi_pct",

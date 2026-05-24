@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -116,10 +117,17 @@ def main() -> int:
         print(values.to_string(float_format=lambda x: f"{x:>9.1f}"))
         print(f"  counts per cell:")
         print(counts.to_string())
-        # Masking pattern Phase-6 will use
+        # Masking pattern Phase-6 will use — render BOTH the count and
+        # the masked view itself so the operator sees exactly what
+        # Phase-6's heatmap will display (typically a mostly-NaN grid
+        # on small sweeps until the dataset thickens up).
         masked = values.where(counts >= MIN_N_FOR_RANKING)
         n_masked = int(values.notna().sum().sum() - masked.notna().sum().sum())
         print(f"  cells masked at MIN_N_FOR_RANKING={MIN_N_FOR_RANKING}: {n_masked}")
+        if n_masked > 0:
+            print(f"  masked view (Phase-6 will render this — NaN cells "
+                  f"shown as blank):")
+            print(masked.to_string(float_format=lambda x: f"{x:>9.1f}"))
 
     # === (c) year-over-year ============================================
     _h("(c) summarize_by_year — YoY trend (degenerate on Q1-only data)")
@@ -157,8 +165,6 @@ def main() -> int:
     # === (f) caveats banner ============================================
     _h("(f) MULTIPLE_COMPARISONS_CAVEAT — Phase-6 banner content")
     print(f"  (verbatim text — Phase-6 will render this alongside leaderboard)")
-    # Wrap to ~70 chars for readability
-    import textwrap
     for line in textwrap.wrap(MULTIPLE_COMPARISONS_CAVEAT, width=72):
         print(f"  │ {line}")
 

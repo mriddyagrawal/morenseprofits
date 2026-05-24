@@ -134,8 +134,11 @@ def test_min_n_zero_disables_suppression():
 def test_min_n_default_is_5():
     """Pin the default convention. Same MIN_N_FOR_RANKING as
     aggregate.py."""
-    rows = [_trade("S", "X")] * 4  # n=4, just below the threshold
-    out = rank_strategies(_summary_from(rows))
+    # n=4 → fully suppressed. Triggers the all-suppressed warning
+    # (separately tested below); silence it here to keep this test
+    # focused on the threshold semantic.
+    with pytest.warns(UserWarning, match="suppressed"):
+        out = rank_strategies(_summary_from([_trade("S", "X")] * 4))
     assert len(out) == 0
     rows = [_trade("S", "X")] * 5  # n=5, exactly at threshold
     out = rank_strategies(_summary_from(rows))
@@ -236,6 +239,33 @@ def test_empty_input_returns_empty_with_rank_column():
 # ============================================================
 # Multiple-comparisons caveat
 # ============================================================
+
+def test_all_rows_suppressed_emits_warning():
+    """LOAD-BEARING: when min_n filters out every input row, emit a
+    UserWarning so consumer code (UI / CLI) can render an explicit
+    'all samples below threshold' message instead of silent blank.
+    p5.5 reviewer flag."""
+    rows = [_trade("S", "X")] * 4  # all n=1 each, well below min_n=5
+    with pytest.warns(UserWarning, match="all .* input rows suppressed"):
+        out = rank_strategies(_summary_from(rows))
+    assert len(out) == 0
+
+
+def test_empty_input_no_warning():
+    """Empty input → empty output, but NO warning (operator passed
+    no rows; nothing was 'suppressed', the dataset was just empty)."""
+    import warnings as _w
+    empty = pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "n_trades": pd.Series(dtype="int64"),
+        "median_roi_pct_annualized": pd.Series(dtype="float64"),
+    })
+    with _w.catch_warnings():
+        _w.simplefilter("error")  # Promote any warning to an exception
+        out = rank_strategies(empty)
+    assert len(out) == 0
+
 
 def test_multiple_comparisons_caveat_is_real_string():
     """Pin the caveat as a non-empty string Phase-6 UI can render

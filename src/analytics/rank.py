@@ -16,6 +16,8 @@ Statistical-honesty contract (continued from aggregate.py):
 """
 from __future__ import annotations
 
+import warnings
+
 import pandas as pd
 
 from src.analytics.aggregate import MIN_N_FOR_RANKING
@@ -76,6 +78,30 @@ def rank_strategies(
     sorted by ``by`` (then by tiebreaker = first grouping key for
     determinism). Empty input → empty frame with ``rank`` column.
 
+    **Tied-rank semantics**: ranks are dense integers 1..N regardless of
+    metric ties — "competition ranking", not "shared-rank" (1, 1, 3).
+    Lex tiebreaker on (strategy, symbol) means ties are broken
+    deterministically across reruns but NOT by sample size. If two rows
+    tie on the headline metric and one has N=50 vs the other N=5, the
+    statistically thicker row may rank below the thinner one purely on
+    alphabetic strategy name. Consumers (Phase-6 UI) should render
+    ``n_trades`` prominently alongside ``rank`` so the operator can spot
+    this. ``rank_strategies`` is the ranker, not a quality-weighted
+    sorter.
+
+    **Sharpe-like ranking**: passing
+    ``by="mean_roi_pct_annualized / std_roi_pct_annualized"`` (after
+    synthesizing the column on the input) gives a *Sharpe-LIKE* metric,
+    NOT a real Sharpe ratio. True Sharpe subtracts a risk-free rate
+    (~6.5% annualized for Indian markets). For ranking purposes the
+    difference is small at high-ROI strategies; for absolute
+    interpretation use ``(mean − rf) / std``.
+
+    **All-suppressed warning**: if every input row has
+    ``n_trades < min_n`` the function emits a ``warnings.warn(...)``
+    so consumers can render an explicit "all samples below threshold"
+    message rather than silent blank output.
+
     Caveat: see ``MULTIPLE_COMPARISONS_CAVEAT`` — top-K selection from
     a multi-hypothesis search inflates the apparent edge.
     """
@@ -93,8 +119,20 @@ def rank_strategies(
         raise ValueError(f"min_n must be >= 0, got {min_n}")
 
     df = summary_df.copy()
-    # Thin-sample suppression
+    # Thin-sample suppression.
+    n_input = len(df)
     df = df[df["n_trades"] >= min_n]
+    if n_input > 0 and len(df) == 0:
+        # All rows suppressed — operator would otherwise see an empty
+        # leaderboard and wonder if the input was empty. Loud warning so
+        # the UI / CLI consumer can render a "all samples below threshold"
+        # message instead of silent blank. p5.5 reviewer flag (955d0f3).
+        warnings.warn(
+            f"rank_strategies: all {n_input} input rows suppressed by "
+            f"min_n={min_n}. Consider lowering the threshold or expanding "
+            f"the sweep grid.",
+            stacklevel=2,
+        )
 
     # Deterministic tiebreaker: first non-stat grouping column (strategy
     # by canonical convention), then symbol if present. Ties on ``by``
