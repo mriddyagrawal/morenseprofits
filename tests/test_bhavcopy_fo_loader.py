@@ -382,6 +382,38 @@ def test_udiff_fetch_wraps_badzipfile_as_missing_data(monkeypatch):
         bfo._fetch_udiff(date(2024, 7, 13))
 
 
+def test_udiff_403_propagates_not_wrapped(monkeypatch):
+    """403 means the WAF blocked us (likely stale UA). Wrapping as
+    MissingDataError would let a calendar-build silently skip every
+    sampled day without surfacing why. Must propagate raw HTTPError."""
+    class _FakeResp:
+        status_code = 403
+        def raise_for_status(self):
+            err = _requests.HTTPError("403 Forbidden")
+            err.response = self
+            raise err
+
+    monkeypatch.setattr(bfo.requests, "get", lambda *a, **kw: _FakeResp())
+    with pytest.raises(_requests.HTTPError, match="403"):
+        bfo._fetch_udiff(date(2024, 8, 29))
+
+
+def test_udiff_5xx_propagates_not_wrapped(monkeypatch):
+    """5xx is NSE flaking transiently — retryable, not 'no data'.
+    Mapping to MissingDataError during a calendar build would mask a
+    real outage as a quiet skip."""
+    class _FakeResp:
+        status_code = 503
+        def raise_for_status(self):
+            err = _requests.HTTPError("503 Service Unavailable")
+            err.response = self
+            raise err
+
+    monkeypatch.setattr(bfo.requests, "get", lambda *a, **kw: _FakeResp())
+    with pytest.raises(_requests.HTTPError, match="503"):
+        bfo._fetch_udiff(date(2024, 8, 29))
+
+
 def test_network_errors_are_not_wrapped(monkeypatch):
     """A connection-level RequestException is retryable, not 'no data';
     must propagate unchanged so caller can decide how to handle it."""

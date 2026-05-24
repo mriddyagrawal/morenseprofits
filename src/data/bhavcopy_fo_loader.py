@@ -80,26 +80,35 @@ def _udiff_start_date() -> date:
     return NSEArchives.udiff_start_date
 
 
+# Status codes that mean "this URL has no content for this date"
+# (cleanly wrapped as MissingDataError). Everything else propagates:
+#  - 403 → WAF blocked (likely stale browser UA); operator must fix
+#  - 5xx → NSE flaking transiently; caller decides retry policy
+#  - other 4xx → genuine bad request, indicates a code bug
+_NO_DATA_STATUSES = frozenset({404, 410})
+
+
 def _fetch_legacy(trade_date: date) -> str:
-    """Returns CSV text. Raises MissingDataError if NSE has no bhavcopy
-    for this date (typically: weekend, NSE holiday, post-cutover date —
-    BadZipFile fires because NSE serves an HTML 'not found' page).
-    Network-level errors (connection reset, timeout) propagate as
-    requests.RequestException — those are retryable, not "no data"."""
+    """Returns CSV text. Raises MissingDataError when NSE has no bhavcopy
+    for this date (weekend or NSE holiday → NSE serves HTML → jugaad's
+    @unzip decorator raises BadZipFile). Network-level errors
+    (RequestException) propagate — those are retryable, not 'no data'."""
     try:
         return NSEArchives().bhavcopy_fo_raw(trade_date)
     except zipfile.BadZipFile as e:
         raise MissingDataError(
             f"no legacy F&O bhavcopy for {trade_date} (BadZipFile — typically "
-            f"a non-trading day or NSE-returned HTML)"
+            f"a non-trading day; NSE returns HTML instead of the ZIP)"
         ) from e
 
 
 def _fetch_udiff(trade_date: date) -> str:
-    """Returns CSV text. Raises MissingDataError on 404 (no bhavcopy for
-    this date) or BadZipFile (NSE returned an HTML body instead of a ZIP).
-    Connection-level requests.RequestException is NOT wrapped — those are
-    retryable."""
+    """Returns CSV text. MissingDataError ONLY on 404/410 (no content for
+    this date) or BadZipFile (200 with HTML body — NSE does both in the
+    wild for missing dates). HTTP 403 (WAF block) and 5xx (transient
+    flake) propagate unchanged so the operator sees them clearly — a
+    calendar build silently skipping every date because the UA went
+    stale would be the worst kind of quiet failure."""
     url = _UDIFF_URL_TPL.format(ymd=trade_date.strftime("%Y%m%d"))
     try:
         r = requests.get(url, headers=_NSE_HEADERS, timeout=60)
@@ -109,10 +118,12 @@ def _fetch_udiff(trade_date: date) -> str:
             with zf.open(name) as fp:
                 return fp.read().decode("utf-8")
     except requests.HTTPError as e:
-        raise MissingDataError(
-            f"no UDiff F&O bhavcopy for {trade_date} "
-            f"(HTTP {e.response.status_code if e.response is not None else '?'})"
-        ) from e
+        status = e.response.status_code if e.response is not None else None
+        if status in _NO_DATA_STATUSES:
+            raise MissingDataError(
+                f"no UDiff F&O bhavcopy for {trade_date} (HTTP {status})"
+            ) from e
+        raise  # 403 / 5xx / other 4xx propagate
     except zipfile.BadZipFile as e:
         raise MissingDataError(
             f"no UDiff F&O bhavcopy for {trade_date} (BadZipFile — NSE "
