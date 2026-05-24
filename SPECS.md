@@ -144,11 +144,25 @@ normalized lowercase; raw upstream uses uppercase):
 consumers that join bhavcopy rows into a backtest **must** filter
 `trade_date ≤ entry_date` at use time — Phase 3's backtester enforces this.
 
-**Format compatibility note.** Per jugaad-data docs `bhavcopy_fo_raw` handles
-both pre-Jul-8-2024 (BHAVDATA-FULL CSV) and ≥Jul-8-2024 (UDiff) formats
-transparently. p1.3.1 tests verify this against **recorded byte-for-byte
-fixtures** on each side of the cutover, not live calls (live tests are
-skipped by default per `pytest.ini`).
+**Format compatibility (verified empirically — see `scripts/capture_bhavcopy_fixtures.py`).**
+
+The §2.4 normalized schema above is the *internal* shape exposed by
+`src/data/bhavcopy_fo_loader.py`. Upstream NSE serves two completely
+different schemas on either side of 2024-07-08 and `bhavcopy_fo_raw`
+covers only the legacy side — so the loader has to dispatch:
+
+| upstream | source | when |
+|---|---|---|
+| Legacy ZIP | `jugaad_data.nse.archives.bhavcopy_fo_raw(dt)` | `dt < 2024-07-08` |
+| UDiff direct URL | `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{YYYYMMDD}_F_0000.csv.zip` | `dt ≥ 2024-07-08` (NSE's `NSEDailyReports` API exposes UDiff for today/yesterday only; historical requires direct URL construction) |
+
+Legacy columns: `INSTRUMENT,SYMBOL,EXPIRY_DT,STRIKE_PR,OPTION_TYP,OPEN,HIGH,LOW,CLOSE,SETTLE_PR,CONTRACTS,VAL_INLAKH,OPEN_INT,CHG_IN_OI,TIMESTAMP`. `INSTRUMENT` codes: `OPTSTK`, `OPTIDX`, `FUTSTK`, `FUTIDX`.
+
+UDiff columns: `TradDt,BizDt,Sgmt,Src,FinInstrmTp,FinInstrmId,ISIN,TckrSymb,SctySrs,XpryDt,FininstrmActlXpryDt,StrkPric,OptnTp,FinInstrmNm,OpnPric,HghPric,LwPric,ClsPric,LastPric,PrvsClsgPric,UndrlygPric,SttlmPric,OpnIntrst,ChngInOpnIntrst,TtlTradgVol,TtlTrfVal,TtlNbOfTxsExctd,SsnId,NewBrdLotQty,Rmks,Rsvd1,Rsvd2,Rsvd3,Rsvd4`. `FinInstrmTp` codes: `STO` (stock option), `IDO` (index option), `STF` (stock future), `IDF` (index future). Maps to legacy `OPTSTK`/`OPTIDX`/`FUTSTK`/`FUTIDX` 1:1.
+
+The loader normalizes both → §2.4 schema; downstream callers (`expiry_calendar`, Phase 1.4 options_loader) see one shape.
+
+**Tests use recorded byte-for-byte fixtures** at `tests/fixtures/bhavcopy_fo_legacy_*.csv` and `tests/fixtures/bhavcopy_fo_udiff_*.csv` — live tests are skipped by default per `pytest.ini`, so regression value lives in the recordings.
 
 ### 2.5 Results — `data/results/{strategy}_{run_id}.parquet`
 One row per closed trade.
