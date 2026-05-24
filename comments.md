@@ -3306,6 +3306,128 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 7b12228 — feat(p6.1.caveats): src/web/caveats.py — 3 caveat constants + 2 render helpers
+
+**Verdict:** ⚠ **accept-with-blocker — `SURVIVORSHIP_CAVEAT` has a 2-year date typo (2026-07-01 instead of 2024-07-01). MUST be fixed before any Phase-6 UI renders this constant to an operator.**
+
+**Phase / commit goal (as I understood it):** Implement SPECS §11.3 + DESIGN_SPEC §1.4 contract. Three caveat constants + two render helpers + a top-level dispatcher that picks strip-vs-collapsed based on session state. Tests pin the constants' structural properties (length, key terms, re-export identity, dismiss-key namespace).
+
+### 🔴 BLOCKING BUG — date typo in SURVIVORSHIP_CAVEAT
+
+**[src/web/caveats.py:52](src/web/caveats.py#L52)** reads:
+> "The blue-chip universe is a **2026-07-01** snapshot. Stocks that..."
+
+**Every other reference in the project says 2024-07-01:**
+- `src/universe/blue_chip.py:11` — "time snapshot (~mid-2024)"
+- `src/universe/blue_chip.py:22` — "retrieval date ~2024-07-01"
+- `SPECS.md:279` — "a single **2024-07-01** snapshot regardless of as_of"
+- `SPECS.md:595` — "~**2024-07-01** Nifty 50 snapshot"
+- `SPECS.md:638, 640, 808` — "**2024-07-01** Nifty 50"
+- `DESIGN/DESIGN_SPEC.md:70` — "v1 blue-chip is a **2024-07-01** snapshot"
+- **SPECS §11.3** (this commit's authoring contract) — "Notes the v1 blue-chip universe is a **2024-07-01** snapshot"
+
+**Today's date is 2026-05-25.** The string "2026-07-01 snapshot" describes a snapshot **2 months in the future**, which is structurally impossible (you cannot have a survived-stocks list for a future date).
+
+**Why this is blocking, not just a typo:**
+
+1. **Asymmetric-conservatism violation.** The whole point of `SURVIVORSHIP_CAVEAT` is to render an honest disclosure. A wrong date in the disclosure undermines the entire honest-disclosure layer. An operator who notices the impossible date assumes the rest of the UI is similarly unreliable; an operator who doesn't notice acts on a wrong fact (thinking the universe is current when it's 2 years old).
+
+2. **The constant is verbatim-rendered.** Per SPECS §11.3 the wording lives in this constant; tabs MUST NOT inline-substitute. There is no second source of truth that could correct this — operators see exactly what's in the string.
+
+3. **Tests pass.** Existing tests check length + key-term grep but NOT the actual date. The bug is undetected by the suite (verified — 6/6 pass).
+
+4. **The next commit (efe1c73 — `feat(p6.1.app)`) just mounted this** in the app shell. If/when the user runs `streamlit run app.py`, they will SEE the wrong date in the caveats card.
+
+**Fix (1-character correction, ~30-second commit):**
+
+```python
+# Before
+SURVIVORSHIP_CAVEAT = (
+    "The blue-chip universe is a 2026-07-01 snapshot. Stocks that "
+    ...
+
+# After
+SURVIVORSHIP_CAVEAT = (
+    "The blue-chip universe is a 2024-07-01 snapshot. Stocks that "
+    ...
+```
+
+**Plus a regression test** to prevent recurrence:
+
+```python
+def test_survivorship_caveat_cites_correct_snapshot_date():
+    """The universe snapshot is 2024-07-01 per SPECS §6b.3 + blue_chip.py.
+    Pin this so a future copy-edit doesn't drift the date again."""
+    assert "2024-07-01" in SURVIVORSHIP_CAVEAT
+    assert "2026-07-01" not in SURVIVORSHIP_CAVEAT  # explicit anti-regression
+```
+
+Recommend `fix(p6.1.caveats): correct survivorship snapshot date 2026-07-01 → 2024-07-01` lands NOW, before `chore(p6.1.verify)` screenshots the UI. The verify screenshots would otherwise immortalize the wrong date in committed documentation.
+
+---
+
+### What works (everything else):
+
+- **Three caveat constants** correctly structured. `MULTIPLE_COMPARISONS_CAVEAT` re-exported from `src.analytics.rank` ([src/web/caveats.py:30](src/web/caveats.py#L30)) — **one source of truth at the strongest level** (the same object, not just equal-string). Verified by `test_multiple_comparisons_caveat_re_exported_identical`.
+- **`MARGIN_TIER_B_CAVEAT` ([src/web/caveats.py:66-78](src/web/caveats.py#L66-L78)) names the bias direction explicitly** — "HIGH-VOL symbols and LOW-OFFSET strategies (short straddle 0.60, iron condor 0.35) look BETTER here than on production margin". Includes the actual SPECS-calibrated offset values (0.60 / 0.35). **This is the right asymmetric-conservatism wording**: vague "this is approximate" would let the operator wave it away; this names which strategies are over-promised.
+- **`DISMISS_KEY = "mp_caveats_dismissed"`** ([src/web/caveats.py:46](src/web/caveats.py#L46)) — follows the SPECS §11.4 `mp_` namespace convention. Pinned by `test_dismiss_key_uses_mp_namespace_prefix`.
+- **Render helpers correctly idiomatic Streamlit**:
+  - `render_caveats_strip()` ([src/web/caveats.py:87-118](src/web/caveats.py#L87-L118)) — `st.columns(3)` for the cards, `st.button` triggers `st.session_state[DISMISS_KEY] = True` + `st.rerun()` for immediate re-render.
+  - `render_caveats_collapsed()` ([src/web/caveats.py:121-140](src/web/caveats.py#L121-L140)) — slim `st.warning` banner + expand button using `[6, 1]` column ratio.
+  - `render_caveats()` ([src/web/caveats.py:143-152](src/web/caveats.py#L143-L152)) — top-level dispatcher; always renders one or the other (satisfies the "caveats always visible" PLAN Phase-6.5 exit criterion).
+- **`_maybe_init_state()` idempotency** ([src/web/caveats.py:81-84](src/web/caveats.py#L81-L84)) — checks `if DISMISS_KEY not in st.session_state` before initializing, so stale state from prior session isn't clobbered.
+- **Module docstring correctly notes "this module DOES import streamlit (it's the renderer)"** ([src/web/caveats.py:21-24](src/web/caveats.py#L21-L24)) — explicitly defends the §11.1 exemption. Anti-pattern guard.
+- **`__all__` exported list** ([src/web/caveats.py:34-41](src/web/caveats.py#L34-L41)) — 6 names pinned. Consumers know the public API.
+- **Tests:**
+  - `test_multiple_comparisons_caveat_re_exported_identical` uses `is` (identity), not `==` (equal). **Strongest possible re-export check** — would catch a future "convenience copy".
+  - `test_all_three_caveats_are_distinct_strings` catches a copy-paste regression where one constant accidentally aliases another. Defensive.
+  - `test_caveats_module_exports_expected_names` uses `expected.issubset(set(caveats.__all__))` — allows future additions without breaking the test.
+- **6/6 tests pass; 386/386 full suite (was 380 + 6 new)**.
+
+**Non-blocking observations (other than the blocker):**
+
+1. **`render_caveats()` is the top-level helper called by every tab per its docstring, BUT it's NOT in `__all__`.** Tests check that `MULTIPLE_COMPARISONS_CAVEAT`, `SURVIVORSHIP_CAVEAT`, `MARGIN_TIER_B_CAVEAT`, `render_caveats_strip`, `render_caveats_collapsed`, `DISMISS_KEY` are exported — but `render_caveats` itself is missing from both `__all__` and the expected set. Either:
+   - **Intent was for tabs to call `render_caveats_strip` / `render_caveats_collapsed` directly** based on tab-local state checks — but then the docstring on `render_caveats` should be removed or marked private (`_render_caveats`).
+   - **Intent was for `render_caveats` to be public** — add it to `__all__` and the test's expected set.
+   The docstring claims the latter; the export list claims the former. **Pick one.** Cosmetic non-blocker.
+
+2. **`MARGIN_TIER_B_CAVEAT` claims "absolute ROI numbers should be discounted by ~10% before treating any pair as 'production-ready'."** This is a *quantitative* recommendation. I don't see this ~10% figure backed by any analysis elsewhere in the project — it appears to be engineering judgment, not an empirically derived number. **Worth softening to "should be treated with skepticism" or "discount by a margin you're comfortable with" UNLESS you've actually measured the Tier-B-vs-real-SPAN gap on a calibration sample.** Asymmetric-conservatism would prefer "round-up the uncertainty" wording over a specific point estimate that might be overconfident. Non-blocking; consider for `chore(p6.1.verify)` content polish.
+
+3. **`render_caveats_strip` uses `st.caption(...)`** for the body text ([src/web/caveats.py:103, 106, 109](src/web/caveats.py#L103-L109)). Caption renders smaller/lighter than body text. With ~400-character paragraphs, this may be too dense to read. **Worth visual-checking in `chore(p6.1.verify)`** — if the cards are unreadable at default font size, switch to `st.markdown(text)` or `st.write(text)`. Streamlit doesn't have a "small body" style that's larger than caption; default body might be better.
+
+4. **No test for the dismiss flow** — flipping `st.session_state[DISMISS_KEY] = True` then asserting that `render_caveats()` calls `render_caveats_collapsed()`. The commit body acknowledges renderers are visually verified in `chore(p6.1.verify)`. Acceptable in v1; rendering tests in pytest are heavy. Just noting.
+
+5. **`SURVIVORSHIP_CAVEAT` says "Phase-7 BLUE_CHIP_BY_QUARTER membership lands the structural fix"** — matches PLAN §3 Phase 7 commit list ✓ and DESIGN_SPEC §1.4. Cross-doc consistency maintained.
+
+**Domain / correctness checks:**
+
+- **One-source-of-truth for caveats**: ✓ MULTIPLE_COMPARISONS re-exported via `is`; SURVIVORSHIP + MARGIN_TIER_B authored here per SPECS §11.3.
+- **Asymmetric-conservatism**: ✓ (bias-direction explicit in MARGIN_TIER_B; survivorship "OVERSTATE" wording in SURVIVORSHIP) — **but the survivorship date typo undermines it.**
+- **Streamlit isolation**: ✓ caveats module is exempt per §11.1; module docstring explicitly defends this.
+- **Test coverage**: 6 tests cover constant properties + namespace; **but the 2026 date bug slipped through because there's no date assertion**.
+
+**What I tried:**
+- Read [src/web/caveats.py](src/web/caveats.py) end-to-end.
+- Read [tests/test_web_caveats.py](tests/test_web_caveats.py) end-to-end.
+- `grep -rn "2024-07-01\|2026-07-01" src/ SPECS.md PROJECT_DESCRIPTION.md DESIGN/` — confirmed every other reference is 2024; only `caveats.py:52` is 2026.
+- `pytest tests/test_web_caveats.py` → 6/6 pass (none catch the date).
+- `pytest tests/` → 386/386.
+
+**Next-commit suggestion (revised order, given the blocker):**
+
+1. **🔴 `fix(p6.1.caveats): correct survivorship snapshot date 2026-07-01 → 2024-07-01` — IMMEDIATE.** Single-character fix; add a regression test asserting "2024-07-01" in SURVIVORSHIP_CAVEAT AND "2026" not in. ~30-second commit.
+
+2. Then `feat(p6.1.empty)` — `src/web/empty_state.py` per DESIGN_SPEC §2.6 (6 pre-written degenerate-data messages).
+
+3. Then `feat(p6.1.app)` — but per the latest task notification, this **already landed (efe1c73) before my caveats review**. That means the bad date is already in the running app shell. **Even more reason to land the date fix immediately.** I'll address efe1c73 separately.
+
+**Opportunistic rider** for the date-fix commit:
+- Decide on `render_caveats` __all__ inclusion (non-blocker #1).
+- Soften the "discount by ~10%" claim in MARGIN_TIER_B_CAVEAT OR back it with a SPECS reference (non-blocker #2).
+- Add the missing test for the date (already part of the fix).
+
+---
+
 ## Review of 334bada + 5c801dd — feat(p6.1.discover) + test(p6.1.discover) — first Phase-6 code
 
 **Verdict:** ✅ accept (both commits as a pair)
