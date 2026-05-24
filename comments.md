@@ -1760,3 +1760,45 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `feat(p3.2): src/engine/pnl.py — per-trade gross P&L kernel`. THIS is where the user's original ask materializes as a callable function. Load-bearing decisions: **(1) `price_trade(trade) -> dict` matches SPECS §2.5's `results` schema** (`gross_pnl`, `costs=0` for now, `net_pnl`, `entry_spot`, `exit_spot`, `legs_json`). **(2) Per-leg pricing**: `load_option(trade.symbol, trade.expiry, leg.strike, leg.option_type, trade.entry_date, trade.exit_date)` → filter the returned frame to `df.date <= trade.exit_date` (the no-lookahead enforcement point), then `entry_close = df[df.date == entry_date].iloc[0]["close"]` (raise `MissingDataError` if empty) and similarly for exit. **(3) lot_size from historical data**: `leg_lot_size = df[df.date == entry_date].iloc[0]["lot_size"]` — read per-row, not from a constant. PLAN §4.3. **(4) Aggregate**: `gross_pnl = sum((entry - exit) * side_sign(leg.side) * leg.qty_lots * leg_lot_size for leg in trade.legs)`. **Paired test (`test(p3.2)`)** must hand-check: short straddle with CE entry=100, exit=50, PE entry=100, exit=30, lot=250 → gross_pnl = (100-50)×250 + (100-30)×250 = 12,500 + 17,500 = 30,000. SECOND test: LookaheadError fires when the fixture frame contains a row past exit_date — proves the filter happens. THIRD test: MissingDataError when entry_date is missing from the fixture frame. Those three together are the engine's load-bearing contract.
 
 ---
+
+## Review of 4afb8be — feat(p3.2): src/engine/pnl.py — per-trade gross P&L kernel + LookaheadError
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the per-trade gross P&L kernel. Sign convention, no-look-ahead, missing-data, lot-size-from-data all enforced. The user's original ask materializes here.
+
+**What works:**
+- **138/138 pass; 9/9 pnl-specific in 0.10s.**
+- **Sign convention pinned by test**: `test_sign_convention_short_straddle` — SELL CE 100→10, SELL PE 100→10, lot 250 → +₹45,000. The load-bearing assertion. A sign flip anywhere in the kernel inverts this.
+- **Long-straddle sister test**: same fixture, BUY side → -₹45,000. Pins BUY=-1.
+- **RELIANCE Jan-2024 hand-check** ([tests/test_pnl.py:100-131](tests/test_pnl.py#L100-L131)) — CE entry 56.50 (anchored on Phase-1 integration verify against real NSE), plus three synthesized values, hand-arithmetic produces gross_pnl=+₹2,750. Walking through it: CE (56.50-95)×250 = -₹9,625; PE (50-0.50)×250 = +₹12,375; sum = +₹2,750 ✓.
+- **No-look-ahead enforcement** ([src/engine/pnl.py:101-107](src/engine/pnl.py#L101-L107)): explicit `df.date.dt.date > trade.exit_date` check on the loader's return BEFORE any price-pick. Test (`test_lookahead_rejected`) feeds a leaky loader that bypasses its window filter; engine raises `LookaheadError` with the offending dates named.
+- **MissingDataError on both bounds** — separate tests for entry-missing and exit-missing.
+- **Lot-size invariant** ([src/engine/pnl.py:113-117](src/engine/pnl.py#L113-L117)) — if entry's lot != exit's lot, raise `LookaheadError` ("loud-failure class" per the inline comment). Test pins the 250→500 case.
+- **Dependency injection** — `load_option_fn` defaults to `options_loader.load_option` but is pluggable, so tests construct deterministic stubs without monkeypatching the module. Cleaner than the spot/options test pattern.
+- **Per-leg results carry `entry_px`, `exit_px`, `lot_size`, `gross_pnl`** ([src/engine/pnl.py:120-129](src/engine/pnl.py#L120-L129)) — serialized into `legs_json`. Sweeper Phase 4 can reconstruct exactly which prices were used.
+- **Linear scaling** test pins `gross_pnl(qty=3) == 3 * gross_pnl(qty=1)`.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Result dict is missing 7 SPECS §2.5 fields**: `run_id`, `entry_offset_td`, `exit_offset_td`, `costs`, `net_pnl`, `notional_at_entry`, `entry_spot`, `exit_spot`. Most belong elsewhere (run_id+offsets at sweeper layer; costs+net_pnl in Phase 3.3) but `entry_spot` and `exit_spot` *could* land here. Worth one line in the docstring stating which fields p3.2 emits vs which are added downstream.
+- **`LookaheadError` reused for "lot_size changed mid-contract"** ([src/engine/pnl.py:114](src/engine/pnl.py#L114)) and "duplicate dates" ([src/engine/pnl.py:71](src/engine/pnl.py#L71)) — both are data-corruption signals, not look-ahead per se. The inline comment acknowledges this. Eventually worth a `DataCorruptionError(DataError)` sibling. Cosmetic for v1; the behavior is "loud failure" either way.
+- **`json.dumps(trade.params, sort_keys=True)`** ([src/engine/pnl.py:157](src/engine/pnl.py#L157)) — if `trade.params` ever contains a non-JSON-serializable value (date, np.float, etc.), the call raises at price time. Worth `default=str` here too (already used on legs_json) for symmetry. Cheap.
+- **No test for `params_json` round-trip** — if the strategy passes `{"strike_offset_pct": 0.0}`, the test should verify `out["params_json"]` parses back. Cosmetic.
+- **`pd.Series.dt.date == target`** ([src/engine/pnl.py:65](src/engine/pnl.py#L65)) — creates a Python-object Series per call. For 1000s of pricings in a sweep, mild perf cost. Could be `df["date"] == pd.Timestamp(target)`. YAGNI.
+
+**Domain / correctness checks:**
+- **Sign convention:** correctly implemented — `gross = (entry_px - exit_px) * sign * leg.qty_lots * entry_lot`. The four-combination mental check still passes.
+- **Look-ahead bias:** filter-level enforcement at the kernel boundary. Loud `LookaheadError` if loader leaks. Test covers it.
+- **No silent interpolation:** `_pick_close_on` raises `MissingDataError` on absence, never falls back. PLAN §4 rule #2 honored.
+- **Lot-size from data:** `entry_lot` read per-row, not constant. PLAN §4 rule #3 honored.
+- **Statistical claims:** N/A this commit (single-trade pricing).
+
+**What I tried:**
+- `python -m pytest tests/test_pnl.py -v` → 9/9 in 0.10s.
+- Read the kernel + tests end-to-end. Hand-walked the RELIANCE hand-check arithmetic to confirm +₹2750.
+
+**Next-commit suggestion:** `feat(p3.3): src/engine/costs.py — COST_MODEL_V1`. Per SPECS §4: brokerage ₹20/order × 4 orders/leg-pair = ₹80 flat; STT 0.0625% × premium turnover × SELL-side only; exchange txn 0.0503% × premium turnover (both sides); GST 18% on (brokerage + exchange); SEBI ₹10/crore of premium turnover; stamp duty 0.003% on BUY-side premium turnover (the closing leg of a short trade, the opening leg of a long trade). **Load-bearing test**: hand-compute total cost on the same RELIANCE Jan-2024 short straddle. With CE entry 56.50 + PE entry 50 + CE exit 95 + PE exit 0.50, lot 250: SELL-side premium turnover = (56.50 + 50) × 250 = ₹26,625; BUY-side = (95 + 0.50) × 250 = ₹23,875; brokerage = 4 × ₹20 = ₹80; STT = 0.000625 × 26,625 = ₹16.64; exchange = 0.000503 × (26,625 + 23,875) = ₹25.40; GST = 0.18 × (80 + 25.40) = ₹18.97; SEBI = (50,500 / 1e7) × 10 = ₹0.05; stamp = 0.00003 × 23,875 = ₹0.72; total ≈ ₹141.78. Pin that arithmetic. Once costs land, `price_trade` should also emit `costs` and `net_pnl` — wire them in once the cost module is testable.
+
+---
