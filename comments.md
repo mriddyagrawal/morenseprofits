@@ -3306,6 +3306,108 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 8a07859 — feat(p6.2.table): leaderboard rank table — st.dataframe with column config
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Render the main leaderboard rank table below the headline strip. `st.dataframe` of `rank_strategies(summarize_by_stock_strategy(df), min_n=sidebar_min_n)` with `column_config` for each visible column. Empty-state paths route through `src/web/empty_state.render_empty()` (closes the dead-import flag from my 452b503 review block). Footer caption surfaces the eligibility ratio.
+
+**What works:**
+
+- **9-column canonical order honored** ([src/web/leaderboard.py:147-154](src/web/leaderboard.py#L147-L154)): rank, strategy, symbol, n_trades, win_rate_pct, median_roi_pct_annualized, mean_roi_pct_annualized, std_roi_pct_annualized, total_net_pnl. **Matches DESIGN_SPEC §4 commit 12 column list verbatim.**
+- **§2.5 naming rule honored**:
+  - "Net P&L (₹)" label explicitly includes `₹` — rupee unit visible in the column header.
+  - "Median ROI/yr" / "Mean ROI/yr" / "Std ROI/yr" suffixes include "/yr" — annualized ROI is visibly distinguished from holding-period ROI.
+  - "Win %" / progress-bar column — percentage explicit.
+- **`st.column_config` cleanly typed per column type**:
+  - `NumberColumn` for rank/n_trades with `format="%d"`.
+  - `ProgressColumn` for win_rate_pct ([src/web/leaderboard.py:179-182](src/web/leaderboard.py#L179-L182)) — **visual bar! Clean.** The 0-100 range matches the win_rate_pct values directly.
+  - `NumberColumn` with `format="%+.1f%%"` for median/mean ROI — **`+` sign included in the format spec**, so positive returns visually signal as positive. Asymmetric-conservatism through visual cue.
+  - `NumberColumn` with `format="±%.1f%%"` for std — `±` prefix makes the dispersion semantic explicit (always-positive, always-bidirectional).
+  - `NumberColumn` with `format="₹%,.0f"` for total_net_pnl — comma-grouped rupees, no decimals.
+- **`std_roi_pct_annualized` column tooltip** ([src/web/leaderboard.py:196-201](src/web/leaderboard.py#L196-L201)) — **exactly the DESIGN_SPEC §2.2 tooltip copy that landed in aae03c0** ("Observed-sample dispersion (ddof=0). Treat as LOWER BOUND on true population spread; small-N groups understate spread by ~11% at n=5, ~5% at n=10, ~2.5% at n=20.") **Closes the std-tooltip surfacing requirement.** The corrected ~11% number (not ~20%) is rendered.
+- **`median_roi_pct_annualized` column tooltip** ([src/web/leaderboard.py:185-189](src/web/leaderboard.py#L185-L189)) — names the SPECS §4a caveat #2 (252-day annualization) + the median's robustness rationale.
+- **Empty-state routing via `render_empty`** ([src/web/leaderboard.py:130-142](src/web/leaderboard.py#L130-L142)):
+  - 0 rows after filters → `render_empty("leaderboard_no_rows_after_filters")`
+  - 0 rows pass min_n + ≥1 pair → `render_empty("leaderboard_all_below_min_n", n_pairs=..., min_n=...)`. **Closes the dead-import flag from my 452b503 review #1** — `render_empty` is now used.
+- **Footer caption surfaces eligibility ratio** ([src/web/leaderboard.py:212-217](src/web/leaderboard.py#L212-L217)) — "Showing X of Y (strategy, symbol) pair(s) — min_n=K from sidebar." **Sample-N transparency per SPECS §11.5** — the operator cannot accidentally assume the leaderboard shows everything.
+- **`hide_index=True`** ([src/web/leaderboard.py:159](src/web/leaderboard.py#L159)) — hides the pandas auto-index; rank column IS the de-facto index. Clean.
+- **`use_container_width=True`** ([src/web/leaderboard.py:160](src/web/leaderboard.py#L160)) — table expands to fill the tab body, not constrained to a default narrow width.
+- **5 new tests** covering: empty-frame routing, all-below-min-n routing with interpolated counts, populated-frame canonical column shape, column_config naming-rule inspection, footer caption eligibility ratio. **426/426 full suite.**
+
+**Live-tested** ([rank_table render against verify parquet, mocked st.dataframe]):
+```
+rendered 1 rows × 9 cols
+columns: ['rank', 'strategy', 'symbol', 'n_trades', 'win_rate_pct',
+          'median_roi_pct_annualized', 'mean_roi_pct_annualized',
+          'std_roi_pct_annualized', 'total_net_pnl']
+row 1: rank=1, short_straddle, RELIANCE, n=18, win=83.33,
+       median_ann=247.92, mean_ann=166.05, std_ann=242.97,
+       total_pnl=124613.31
+caption: "Showing 1 of 1 (strategy, symbol) pair(s) — min_n=5..."
+```
+Cross-checked the std=242.97% against my own afdd56e review (matches). All 9 columns wired with column_config.
+
+**Empty-state branch live-tested**: `min_n=100` (all 18 trades < 100 threshold) → `render_empty("leaderboard_all_below_min_n", n_pairs=1, min_n=100)` called; `st.dataframe` NOT called. ✓ Correct routing.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **`rank_strategies(summary, min_n=min_n)` emits the all-suppressed UserWarning** when min_n is too high — the warning is correct analytics-layer behavior (per 8893b81), but it surfaces in Streamlit's logs alongside the UI render. The test silences it with `pytest.warns(...)`. **Worth a quick check**: the warning shouldn't appear in the Streamlit app's user-visible log either. Run `streamlit run app.py` with min_n slider at max + spot-check the terminal output. Non-blocking; cosmetic-to-minor.
+
+2. **`win_rate_pct` ProgressColumn min/max hardcoded to 0/100.** This is the correct range for percentages, but **what if a future column wants to render as a progress bar with a different range** (e.g., a Sharpe-like ratio with values in [0, 2.0])? The current hardcoding doesn't preclude future flexibility; just noting that the convention works for percentages only.
+
+3. **`median_roi_pct_annualized` and `mean_roi_pct_annualized` BOTH default to `width=<unspecified>` (Streamlit auto).** With longer values like "+1456.7%" (1395.81%/yr was the pre-bias-fix max from my Phase-4 grilling) the columns might wrap or truncate. Worth visual-checking in `chore(p6.2.verify)`. Cosmetic.
+
+4. **The all-below-min-n test silences a UserWarning** — the commit body documents this explicitly. The choice is correct: the analytics-layer warning IS what's expected; the UI tier surfaces the same intent via `render_empty`. **Double-layered honesty**: log warning (developer-visible) + UI message (operator-visible). ✓
+
+5. **`n_trades` column placed 4th** (rank, strategy, symbol, n_trades, ...). This **honors DESIGN_SPEC §0.1 row 2** ("rank_strategies lex tiebreaker is defensible only if n_trades is visually prominent") AND §2.2 ("n_trades its own column, immediately right of rank"). **Wait — actually n_trades is the 4th column (after rank/strategy/symbol), not "immediately right of rank" (which would be 2nd).** Let me re-check.
+
+   The §2.2 spec line says: "Leaderboard: n_trades is its own column, immediately right of rank. Same visual weight as rank (no bold/large styling on either; both are columns, not headlines)."
+   
+   "Immediately right of rank" would suggest column 2 (just after rank). But the implementation puts it at column 4 (after rank/strategy/symbol). **This is a minor spec-vs-implementation drift.** Is it material?
+   
+   The §2.2 wording is ambiguous: "immediately right of rank" could mean "in the rank-adjacent visual region" OR "literally column 2". The implementation's order (rank, strategy, symbol, n_trades, ...) is the conventional leaderboard reading order — you see WHO and WHAT first (strategy × symbol), then HOW MANY OBSERVATIONS. Putting n_trades at column 2 would be unusual ("rank, n=18, short_straddle, RELIANCE, ...").
+   
+   **My lean**: the implementation's order is correct for operator readability; the spec wording could be sharpened to "n_trades visually prominent (≤4th column)". Worth flagging during chore(p6.2.verify) as a spec touch-up. Non-blocking.
+
+6. **The DESIGN_SPEC §2.2 spec also says** "Cells with `n < min_n` are masked in the value heatmap via `pivot_window.where(pivot_counts >= min_n)`. Two clean visuals beat one cluttered one." — this is about heatmap, not table. ✓ Implementation is consistent.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ std tooltip names "LOWER BOUND" and the corrected ~11%/~5%/~2.5% numbers; min_n suppression routed through render_empty when thin.
+- **Mockup-bug prevention**: ✓ Net P&L (₹) label visibly has ₹; ROI columns visibly have /yr.
+- **Sample-N transparency**: ✓ footer caption surfaces eligibility ratio; std tooltip explicit on bias direction; n_trades column visible.
+- **Empty-state routing**: ✓ both branches (0 rows, all-below-min_n) route through canonical render_empty messages.
+- **§2.6 contract**: ✓ uses canonical reason keys; no inline empty messages.
+- **Footer caption mentions the upcoming p6.2.thin sidecar** — operator knows there's a place to find suppressed rows.
+
+**What I tried:**
+- Read [src/web/leaderboard.py:107-218](src/web/leaderboard.py#L107-L218) end-to-end.
+- Cross-checked all 9 column_config entries.
+- Live-tested rank table render against verify parquet → 1 row × 9 cols with expected values.
+- Live-tested empty-state branches (0 rows → no_rows_after_filters; min_n=100 → all_below_min_n with n_pairs=1, min_n=100).
+- `pytest tests/test_web_leaderboard.py -v` → 13/13.
+- `pytest tests/` → 426/426.
+
+**Sequencing observation:** This is the largest Phase-6 commit so far (105 lines added in leaderboard.py + 126 in tests = 231 LOC). Still nuclear-sized — single tab, single function, well-scoped. The §4 commit-list `feat(p6.2.table)` is now done; next per spec is `feat(p6.2.thin)` (the sidecar), which I observe is already in flight in BUILDER's working tree (unstaged changes to leaderboard.py + tests + app.py). **I observed but did not stage/commit these changes** per discipline; they'll land in the next BUILDER commit.
+
+**Next-commit suggestion:** **`feat(p6.2.thin)`** per DESIGN_SPEC §4 commit 13 — already in progress per the working-tree observation. The sidecar renders `summary[summary["n_trades"] < min_n]` as a separate table below the main rank table, addressing the silent-thin-suppression concern from my p5.5 review (and explicitly resurfacing the suppressed rows). Should:
+1. Sort thin samples deterministically (n_trades DESC + median ROI DESC seems like the right order — biggest-best thin samples first as candidates for inspection).
+2. Use a clearly-different visual heading from the main table ("**Thin samples — not ranked**").
+3. Include the same column_config conventions (Win %, Net P&L (₹), etc.) for consistency.
+4. Render NOTHING (no header, no caption) when zero thin samples exist — operator doesn't need to see an empty sidecar.
+
+After that → `feat(p6.2.toggle)` (within-stock vs across-stocks).
+
+**Opportunistic riders for the next commit:**
+- Verify the all-suppressed UserWarning doesn't leak to the Streamlit user log (non-blocker #1).
+- Visual-check column widths in `chore(p6.2.verify)` (non-blocker #3).
+- Decide on §2.2 "immediately right of rank" wording vs implementation order (non-blocker #5).
+
+---
+
 ## Review of 452b503 — feat(p6.2.headline): leaderboard 4-card headline strip + wire into app.py
 
 **Verdict:** ✅ accept (with one §4 sequence-deviation flag, non-blocking)
