@@ -3306,6 +3306,122 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 334bada + 5c801dd — feat(p6.1.discover) + test(p6.1.discover) — first Phase-6 code
+
+**Verdict:** ✅ accept (both commits as a pair)
+
+**Phase / commit goal (as I understood it):** First real Phase-6 code. `src/web/discover.py` implements SPECS §11.2 contract (sweep-parquet discovery + reading). `tests/test_web_discover.py` pins 13 cases covering every branch + the §11.1 streamlit-isolation rule. Impl + test landed as a pair, ~80 seconds apart — exactly the cadence I recommended in aae03c0 review.
+
+**🔬 BUILDER skipped `feat(p6.0.format)` + `test(p6.0.format)` from the DESIGN_SPEC §4 sequence and went straight to p6.1.discover.** Defensible — discover.py is pure-data/pure-pathlib; it doesn't need format helpers. The format module isn't load-bearing until a tab actually renders something. **Worth flagging the order deviation so DESIGN_SPEC §4 + change log catches up** — non-blocker; revisit in the format-helper commit.
+
+### 334bada — `src/web/discover.py`
+
+**What works:**
+
+- **SPECS §11.2 contract honored exactly**:
+  - `find_latest_sweep(results_dir=RESULTS_DIR) -> Path | None` ([src/web/discover.py:34-53](src/web/discover.py#L34-L53))
+  - `read_sweep_with_skips(parquet_path) -> tuple[DataFrame, DataFrame]` ([src/web/discover.py:56-91](src/web/discover.py#L56-L91))
+- **SPECS §11.1 module-isolation guarantee**: no `import streamlit` at module-time. Pure pandas + pathlib + canonical helpers from `src.engine.results`.
+- **`find_latest_sweep` defensive missing-dir handling** ([src/web/discover.py:42-43](src/web/discover.py#L42-L43)): if `results_dir` doesn't exist (fresh checkout, no sweeps run yet), returns `None` instead of raising `FileNotFoundError`. Right call for the "no sweeps yet" UI state.
+- **Sort key `(-mtime, name)`** ([src/web/discover.py:52](src/web/discover.py#L52)): **freshest mtime first; deterministic name-ASC tiebreak**. Same-second writes (rare but possible) don't produce non-deterministic re-listings. **This is the right discipline** — the existing project pattern (deterministic sort + reset_index everywhere) extended to file discovery.
+- **`*_skipped.parquet` exclusion filter** ([src/web/discover.py:46](src/web/discover.py#L46)): `"_skipped" not in p.name` is loose-but-safe given run_ids are 12-char hex hashes that can't contain "_skipped" substrings. Defensive.
+- **Run-id recovery via stem prefix-stripping** ([src/web/discover.py:80-86](src/web/discover.py#L80-L86)): canonical `sweep_<run_id>.parquet` filename → strip `sweep_` prefix → use `skips_path(run_id, name="sweep")` to build companion path. Non-canonical filename (no `sweep_` prefix) → falls back to `empty_skips_frame()` without guessing. **Closes the §11.2 contract gap I flagged in b7fe7e5 review** (non-blocker #2).
+- **`FileNotFoundError` raised on missing results parquet** ([src/web/discover.py:70-73](src/web/discover.py#L70-L73)): defensive raise for callers bypassing `find_latest_sweep`. Loud-failure consistent with the rest of the project.
+
+**Live-verified (smoke tests):**
+- `find_latest_sweep()` against real `data/results/` → `sweep_bde92aef8573.parquet` (correct).
+- `read_sweep_with_skips(latest)` → 18 rows + 0-row canonical skips frame.
+- `FileNotFoundError` raised on `/nonexistent/sweep.parquet`.
+- `find_latest_sweep(empty_dir)` → `None`.
+- `find_latest_sweep(missing_dir)` → `None`.
+- Non-canonical filename → empty skips with full canonical 7-column schema.
+
+### 5c801dd — `tests/test_web_discover.py`
+
+**What works:**
+
+- **13 tests covering every branch** of discover.py:
+  - 3 empty/missing-dir cases (each returns `None`).
+  - 4 multiple-parquet cases (single returned, newest-mtime wins, mtime-tied name-ASC, skipped-excluded-even-when-newer-mtime).
+  - 4 read cases (missing → FileNotFoundError; missing companion → empty canonical skips; populated companion → returned with data; non-canonical filename → empty skips fallback).
+  - 1 corrupt-parquet loud-failure case.
+  - 1 streamlit-isolation source-level grep.
+- **`test_mtime_ties_broken_by_name_ascending`** ([tests/test_web_discover.py:96-108](tests/test_web_discover.py#L96-L108)) — uses `os.utime(file, (t, t))` to force identical mtimes, then asserts the name-ASC tiebreaker wins. Right way to test a deterministic-tiebreak rule.
+- **`test_skipped_parquet_excluded_alongside_real_sweep`** ([tests/test_web_discover.py:111-121](tests/test_web_discover.py#L111-L121)) — forces the skipped companion to be NEWER mtime via `os.utime`, then asserts the real sweep still wins. Catches the case where a future contributor "fixes" the skipped-filter by removing the `_skipped` check + relying on mtime alone.
+- **`test_corrupt_parquet_raises_on_read`** ([tests/test_web_discover.py:207-217](tests/test_web_discover.py#L207-L217)) — pins the loud-failure path. **Important contract**: `find_latest_sweep` is metadata-only (it just stat's the file) and happily returns a corrupt parquet's path; the failure surfaces in `read_sweep_with_skips`. This is the right split (discovery cheap, read possibly-expensive) but the test pins it so a future refactor doesn't accidentally make discovery validate the file content.
+- **`test_discover_module_imports_without_streamlit`** ([tests/test_web_discover.py:224-244](tests/test_web_discover.py#L224-L244)) — source-level grep for `"import streamlit"` + `"from streamlit"` in `src/web/discover.py`. **Compile-time check, not runtime.** Defends the §11.1 contract against future contributors. The comment notes the test would be silent if streamlit were already imported by an earlier test — the grep workaround is the right pragmatic choice.
+- **Tests are pytest-fixture clean** (use `tmp_path` for isolation); no real data is touched.
+
+**Live-verified:**
+- `.venv/bin/python -m pytest tests/test_web_discover.py -v` → 13/13 in 0.10s.
+- `.venv/bin/python -m pytest tests/` → **380/380** in 1.34s (was 367 + 13 new = matches).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 RESULTS_DIR patching pattern in tests is inconsistent with the project convention.** Tests #136-160 + #163-188 use `results_mod.RESULTS_DIR = tmp_path` + `importlib.reload(results_mod)` in `finally`. **The existing convention (established in 617878b)** is `monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)` — fixture-driven, auto-cleanup, idiomatic pytest. **Both work**, but the project already has the monkeypatch pattern documented in `tests/test_sweeper.py:_redirect_results` and `tests/test_iron_condor.py`. The new tests introduce a third pattern (direct assignment + reload) that adds:
+   - Potential cross-module state leakage if a subsequent test in the same process imports things from `results_mod` before the `finally` runs.
+   - `importlib.reload(results_mod)` triggers an `_inferred_dtype` re-execution that's unnecessary if the test just needed to swap `RESULTS_DIR`.
+   - Inconsistency that future contributors will pattern-match against the wrong example.
+   **Recommended improvement** (5-min refactor, no behavior change):
+   ```python
+   def test_read_returns_empty_skips_when_companion_missing(monkeypatch, tmp_path: Path):
+       from src.engine import results as results_mod
+       monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)
+       p = _write_parquet(tmp_path / "sweep_xyz.parquet")
+       df, skips = read_sweep_with_skips(p)
+       # assertions...
+   ```
+   No `try/finally`, no `importlib.reload`. **Same fixture style as the existing test_sweeper.py / test_iron_condor.py.** Worth a small followup commit OR opportunistic fix during the next test-touching commit.
+
+2. **DESIGN_SPEC §4 sequence deviation (p6.0.format skipped).** Two paths forward:
+   - **Land `feat(p6.0.format)` + `test(p6.0.format)` next** before any rendering commits — keeps the §4 order intact.
+   - **Reorder §4** to land format after discover with a §11 change-log entry acknowledging the swap.
+   Either works; the first is less doc-touchy. The format helpers will be needed before any tab actually renders (Phase 6.2+), so they have to land before `feat(p6.2.headline)` at the latest.
+
+3. **`test_corrupt_parquet_raises_on_read` uses bare `pytest.raises(Exception)`** ([tests/test_web_discover.py:216](tests/test_web_discover.py#L216)). Too broad — would silently pass even if pyarrow started raising a different error type (e.g., `ValueError` instead of `ArrowInvalid`). **Recommended tighten**: `pytest.raises((pa.lib.ArrowInvalid, OSError))` or whatever the actual error class is. Catching `Exception` defeats the purpose of pinning behavior. Cosmetic; very low-stakes.
+
+4. **`test_discover_module_imports_without_streamlit` is a source-level grep, not an actual import-time check.** The test comment acknowledges this. **Alternative for stronger guarantee**: spawn a `subprocess.run([sys.executable, "-c", "import src.web.discover; import sys; assert 'streamlit' not in sys.modules"])` to actually verify the import doesn't pull streamlit into the process. Heavier; not worth it unless the grep starts producing false negatives. Stick with the grep.
+
+5. **`_write_parquet` helper** ([tests/test_web_discover.py:62-75](tests/test_web_discover.py#L62-L75)) writes minimal 4-column data, not the canonical 22-column results schema. Fine for `find_latest_sweep` tests (which only stat files), but `test_read_returns_populated_skips` reads the result and could break if a future test asserts column presence. **Minor**: not a current blocker; just noting the test fixture would need a canonical-schema upgrade if assertions on results_df columns are added later.
+
+**Domain / correctness checks:**
+
+- **Determinism**: ✓ `(-mtime, name)` sort key gives stable output across re-listings.
+- **Streamlit isolation**: ✓ source-level enforced.
+- **Loud-failure discipline**: ✓ FileNotFoundError on missing results; pyarrow exception on corrupt; no silent fallbacks.
+- **Canonical-schema preservation**: ✓ empty skips frame uses `empty_skips_frame()` (verified in smoke test — 7 canonical columns).
+- **§11.2 contract literal**: every requirement in the SPECS §11.2 paragraph is exercised by a test (the test docstrings cross-reference the spec). Audit trail intact.
+
+**What I tried:**
+- Read `src/web/discover.py` end-to-end.
+- Read `tests/test_web_discover.py` end-to-end.
+- Live smoke-tested `find_latest_sweep()` and `read_sweep_with_skips()` against the real `data/results/` parquet.
+- Live-tested 5 edge cases (missing path, empty dir, nonexistent dir, non-canonical filename, FileNotFoundError).
+- Ran the discover test file → 13/13. Full suite → 380/380.
+- Cross-checked the SPECS §11.2 contract literal against the implementation — every requirement honored.
+
+**Sequencing observation:** First Phase-6 code lands cleanly. The impl + test pair is the right granularity — neither commit is reviewable in isolation (impl without test is unverified; test without impl is empty). BUILDER landed them ~80 seconds apart with the test commit explicitly named `test(p6.1.discover)` so the pair-relationship is captured in the log. Good shape.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4, the remaining Phase 6.1 commits are:
+1. `feat(p6.1.caveats)` — `src/web/caveats.py` per the reconciled SPECS §11.3 (three constants + `render_caveats_strip()` + `render_caveats_collapsed()`).
+2. `feat(p6.1.empty)` — `src/web/empty_state.py` per DESIGN_SPEC §2.6 (6 pre-written degenerate-data messages).
+3. `feat(p6.1.app)` — `app.py` (sidebar + 4 placeholder tabs + caveats strip).
+4. `chore(p6.1.verify)` — `streamlit run app.py` against the verify parquet; screenshot every tab.
+
+**My lean**: `feat(p6.1.caveats)` next. Two reasons:
+- Caveats are content-driven (just constants + render helpers); no rendering choices yet.
+- The §11.3 reconciliation already pinned the helper names + the dismiss-state-key — implementing against a fully-frozen contract is easier than implementing against the open `empty_state.py` design (which has 6 message strings still to author).
+
+**Either of these is also defensible**:
+- `feat(p6.0.format)` first to catch up with the §4 sequence (per my non-blocker #2).
+- `feat(p6.1.empty)` first — it's pure data (6 strings) and lands without rendering.
+
+**Opportunistic rider** for whichever commit next touches a test file: convert the `results_mod.RESULTS_DIR = ...` + `importlib.reload(...)` pattern in `test_web_discover.py` to the `monkeypatch.setattr` convention per non-blocker #1.
+
+---
+
 ## Review of fd72b85 — docs(plan): Phase 6 scope freeze + Phase 7 expansion
 
 **Verdict:** ✅ accept
