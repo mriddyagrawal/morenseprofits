@@ -421,3 +421,34 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** `feat(p1.3.0): cache.bhavcopy_fo_path` is going to be trivial (symmetric with `spot_path`/`option_path`). The interesting decision is **what dtype `trade_date`/`expiry` take on disk** — pin that BEFORE writing the path helper, so p1.3.1's parser doesn't have to revisit. Concretely: store as `datetime64[us]` (matches the spot loader's de-facto post-roundtrip dtype), expose via `.dt.date` in any public API that promises a `date`. Add one line to SPECS §2.4 saying so. Without this, the parser in p1.3.1 will choose silently and we'll catch a third dtype variant in tests.
 
 ---
+
+## Review of b0ef46a — chore(p1.3.plan.b): pin bhavcopy date dtype + look-ahead caveat + CACHE_VERSION rule
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the five non-blocking flags from the 22d3da2 review before p1.3.0 lands, so the p1.3.1 parser inherits unambiguous contracts.
+
+**What works:**
+- **Date dtype contract pinned** ([SPECS.md:133-137](SPECS.md#L133-L137)): `datetime64[us]` on disk, `.dt.date` at any API boundary that promises Python `date`. Exactly what I suggested.
+- **Look-ahead caveat for bhavcopy** ([SPECS.md:139-141](SPECS.md#L139-L141)): consumers must filter `trade_date ≤ entry_date`. Names Phase 3 as the enforcement point — ties the SPECS contract to PLAN §4.1's hard rule.
+- **Format-compat test now explicit about recorded fixtures, not live calls** ([SPECS.md:143-146](SPECS.md#L143-L146)). That's the only way the network-skipped test lane has regression value.
+- **CACHE_VERSION additive rule** ([SPECS.md:282](SPECS.md#L282)): adding §2.4 doesn't bump; only existing-schema changes do. Closes the obvious ambiguity from the prior commit.
+- **Step 16 split into 16 + 17** ([PLAN.md:101-102](PLAN.md#L101-L102)): offline-mode contract first, telemetry second. Clean ordering.
+
+**Blocking issues (must fix before next phase):** None — docs-only.
+
+**Non-blocking suggestions:**
+- **The `datetime64[us]` rule is scoped to §2.4 only.** §2.2 options schema has `expiry: date` and §2.3 expiry calendar has `expiry_date: date` and `month_anchor: date` — same ambiguity, not updated. When p1.3.2 builds the calendar from the bhavcopy, the column passed through will be `datetime64[us]` per §2.4 but the §2.3 spec still says `date`. Either generalize the dtype rule globally or replicate in §2.2/§2.3. Otherwise a future reader will read §2.3 and try to store as Python `date` — won't survive parquet round-trip.
+- The look-ahead caveat ([SPECS.md:139](SPECS.md#L139)) is good but only on §2.4. PLAN §4.1's hard rule is also currently spot-centric ("Strategy receives only `market_data[market_data.date <= entry_date]`"). Worth a small refactor of PLAN §4.1 in Phase 3 to cover bhavcopy/expiries explicitly — but that's Phase 3's problem, not this commit's.
+
+**Domain / correctness checks:**
+- **Look-ahead bias:** the bhavcopy `trade_date` filter rule is the right primitive — it generalizes to any future point-in-time-correct join.
+- **jugaad-data usage:** N/A this commit.
+- **Options math / stats:** N/A.
+
+**What I tried:**
+- Read the diff in full. Cross-checked §2.4's `datetime64[us]` choice against the spot loader's actual on-disk dtype I observed in 8d34626's verification grid — matches.
+
+**Next-commit suggestion:** `feat(p1.3.0): cache.bhavcopy_fo_path` — the one micro-decision that matters here is **the parameter type**. Take `dt: date`, not `dt: datetime`. A `datetime(2024,1,2,9,30)` would format to `"20240102"` and feel correct, but `datetime(2024,1,2,23,59,59)` interpreted as UTC for a sweep running just before midnight IST could silently round to the wrong day. Pinning to `date` removes the class. Test should pass a `date` and either a `datetime` (assert raises or normalizes — pick one and document) so the contract is enforced from commit one.
+
+---
