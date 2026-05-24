@@ -224,3 +224,40 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** `test(p1.1.a): cache.py guards — strike-int, overwrite-protect, true atomicity` — and the load-bearing one is the **true atomicity test**: monkeypatch `pd.DataFrame.to_parquet` (or `Path.replace`) to raise mid-write, then assert (1) the final destination file does not exist and (2) no `.tmp` remains. That's the property the commit message claims; until a test pins it, the next refactor can break it silently. Also pin `WouldOverwriteError` on a second `write()` to the same path, and a memoization test (mock `Path.read_text`, assert called once after N path-builds).
 
 ---
+
+## Review of 6c94296 — test(p1.1.b): cache.py guards — atomicity, overwrite, strike-int, memo, dtypes
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Lock in the contracts introduced in fix(p1.1.a) with tests for every flag I'd raised — and pin the dtype contract so silent type drift can never sneak in.
+
+**What works:**
+- `test_true_atomicity_on_failure` ([tests/test_cache.py:71-85](tests/test_cache.py#L71-L85)) — monkeypatches `pd.DataFrame.to_parquet` to raise, asserts dest does not exist AND no `.tmp` lingers. This is **exactly** the load-bearing property I called out; it's now real.
+- `test_overwrite_protect` ([tests/test_cache.py:88-97](tests/test_cache.py#L88-L97)) covers both the raise and the explicit-opt-in path.
+- `test_strike_integer_guard` ([tests/test_cache.py:100-112](tests/test_cache.py#L100-L112)) — int + integer-float resolve identically, fractional raises. Good belt-and-suspenders.
+- `test_version_mismatch_message_is_informative` ([tests/test_cache.py:115-123](tests/test_cache.py#L115-L123)) — checks the message contains the on-disk version, expected version, and "SPECS" pointer. Loud failure is now also *useful* failure.
+- `test_root_verification_memoized` ([tests/test_cache.py:126-148](tests/test_cache.py#L126-L148)) — actually counts `.cache_version` reads after a primer; asserts zero across 100 path builds. The O(1) claim is now property-tested.
+- `test_round_trip_pins_dtypes` ([tests/test_cache.py:151-176](tests/test_cache.py#L151-L176)) **surfaced a real silent drift**: pandas 3.0 + pyarrow 24 round-trips `datetime64[ns]` → `datetime64[us]`. The BUILDER caught it via the test (not me), then patched SPECS §2.1 to document the unit-float. That's the test paying for itself on the very first run.
+- `tests/conftest.py` autouse fixture ([tests/conftest.py:16-20](tests/conftest.py#L16-L20)) closes the cross-contamination risk I flagged on ab4e423. Belt + suspenders (reset before *and* after each test).
+- 11/11 pass via `python -m pytest tests/test_cache.py -v` in 0.08s.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- The SPECS §2.1 relaxation to "datetime64 (any unit)" is correct for storage but means **downstream engine code must NEVER compare dtypes string-equal to `'datetime64[ns]'`**. Worth a SPECS note in §8 (error taxonomy) or wherever the engine contract lives, before Phase 3.
+- `test_round_trip_pins_dtypes` covers the **spot** schema fields (date / symbol / open / volume). The options schema (SPECS §2.2 — has `lot_size: int64`, `oi: int64`, `option_type: string`, `expiry: date`) isn't covered. Land a sister test when the options_loader does (Phase 1.4) — `expiry: date` is the worrying one since parquet may turn `date` into `datetime64`.
+- The atomicity test uses `RuntimeError("simulated")` and pytest.raises. Good. If you ever add `BaseException`-level cleanup paths (KeyboardInterrupt), they won't be covered — probably fine to defer.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** N/A this commit.
+- **Options math:** N/A.
+- **Look-ahead bias:** N/A.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- `python -m pytest tests/test_cache.py -v` → 11/11 pass, 0.08s.
+- Read the full diff for [tests/test_cache.py](tests/test_cache.py), [tests/conftest.py](tests/conftest.py), and the [SPECS.md](SPECS.md) dtype note.
+
+**Next-commit suggestion:** `feat(p1.2): data/spot_loader.py` — bake **three** invariants from commit-one. (1) The previous two I called out: sort by `date` asc + monotonicity assert (PLAN.md change-log mandates it); force-refresh policy where closed years are immutable. (2) **NEW** — commit to **"one parquet per year contains the ENTIRE year, not just the days a caller asked for"**. Sparse year-caches lead to silent gaps when a later sweep widens the request: the union of "Jan 2–Jan 5" + "Jan 2–Dec 31" looks fine but actually missed Jan 6–Jan 31 if the first call cached only its 4 days. Easiest: every miss fetches the whole year (closed years) or the whole-year-up-to-today (current year). (3) Inject `today()` (or `today_fn: Callable[[], date] = date.today`) so tests can freeze time without monkeypatching the stdlib.
+
+---
