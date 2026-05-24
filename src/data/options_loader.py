@@ -23,16 +23,19 @@ commit for the discovery). No IST shift needed; ``_normalize`` asserts
 """
 from __future__ import annotations
 
+import io
 import warnings
+import zipfile
 from datetime import date, datetime, timedelta
 from typing import Callable, Literal
 
 import pandas as pd
+import requests
 
 from jugaad_data.nse import derivatives_df
 
 from src.data import cache
-from src.data.errors import MissingDataError
+from src.data.errors import MissingDataError, OptionsFormatError
 
 
 # NSE lists stock options ~3 months ahead. 120 days covers every
@@ -74,19 +77,33 @@ def _normalize(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df["oi"] = df["oi"].astype("Int64")
     df["oi_change"] = df["oi_change"].astype("Int64")
 
-    # Assert every date is at midnight naive — derivatives_df should
+    # Verify every date is at midnight naive — derivatives_df should
     # return 00:00:00, unlike stock_df's 18:30 UTC. If a future jugaad
-    # change starts returning offsets, we want a loud failure here
-    # rather than silently mis-aligning entry/exit dates downstream.
+    # change starts returning offsets, fail loud rather than silently
+    # mis-aligning entry/exit dates downstream. Plain `raise` instead of
+    # `assert` so the check survives `python -O`.
     times = df["date"].dt.time
     midnight = pd.Timestamp("00:00:00").time()
-    assert (times == midnight).all(), (
-        f"derivatives_df DATE column unexpectedly has non-midnight times: "
-        f"first few: {df.loc[times != midnight, 'date'].head().tolist()}"
-    )
+    if not (times == midnight).all():
+        non_midnight = df.loc[times != midnight, "date"].head().tolist()
+        raise OptionsFormatError(
+            f"derivatives_df DATE column has non-midnight times "
+            f"(first few: {non_midnight}); a future jugaad change may have "
+            f"altered the date convention — investigate before trusting prices"
+        )
 
     df = df.sort_values("date").reset_index(drop=True)
-    assert df["date"].is_monotonic_increasing
+
+    # Duplicate trading dates would silently corrupt entry/exit lookups —
+    # NSE bhavcopies shouldn't produce them but guard anyway.
+    dup_mask = df["date"].duplicated()
+    if dup_mask.any():
+        dups = sorted(set(df.loc[dup_mask, "date"].tolist()))
+        raise OptionsFormatError(
+            f"derivatives_df returned duplicate trading dates: "
+            f"{[str(d) for d in dups[:3]]} (n={int(dup_mask.sum())})"
+        )
+
     return df
 
 
@@ -100,17 +117,36 @@ def _fetch_contract_lifetime(
     today = today_fn()
     start = expiry - timedelta(days=_LIFETIME_DAYS_BACK)
     end = min(expiry, today)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=r".*timezones available.*")
-        raw = derivatives_df(
-            symbol=symbol.upper(),
-            from_date=start,
-            to_date=end,
-            expiry_date=expiry,
-            instrument_type="OPTSTK",
-            strike_price=strike,
-            option_type=option_type,
-        )
+    # Symmetry with bhavcopy_fo_loader's wrap policy: "no data" failure
+    # modes (404, 410, BadZipFile from HTML response) → MissingDataError;
+    # transient network errors (403/5xx/ConnectionError) propagate raw.
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r".*timezones available.*")
+            raw = derivatives_df(
+                symbol=symbol.upper(),
+                from_date=start,
+                to_date=end,
+                expiry_date=expiry,
+                instrument_type="OPTSTK",
+                strike_price=strike,
+                option_type=option_type,
+            )
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status in (404, 410):
+            raise MissingDataError(
+                f"no derivatives data for {symbol.upper()} {expiry} "
+                f"{int(strike)}-{option_type}: HTTP {status}"
+            ) from e
+        raise  # 403/5xx/other → caller's problem (WAF or transient)
+    except zipfile.BadZipFile as e:
+        raise MissingDataError(
+            f"no derivatives data for {symbol.upper()} {expiry} "
+            f"{int(strike)}-{option_type}: BadZipFile — NSE likely "
+            f"returned HTML for an unlisted contract"
+        ) from e
+
     if raw.empty:
         raise MissingDataError(
             f"no derivatives data for {symbol.upper()} {expiry} "

@@ -14,8 +14,12 @@ from typing import Sequence
 import pandas as pd
 import pytest
 
+import zipfile as _zipfile
+
+import requests as _requests
+
 from src.data import cache, options_loader
-from src.data.errors import MissingDataError
+from src.data.errors import MissingDataError, OptionsFormatError
 
 
 # === fake derivatives_df builder ===
@@ -408,8 +412,9 @@ def test_open_expiry_refetches_when_stale(monkeypatch, tmp_path):
 
 def test_non_midnight_date_fails_loud(monkeypatch, tmp_path):
     """If a future jugaad rev starts returning DATE at non-midnight
-    (e.g. 18:30:00 like stock_df), we want a loud AssertionError, NOT
-    silent date drift downstream."""
+    (e.g. 18:30:00 like stock_df), we want a loud OptionsFormatError,
+    NOT silent date drift downstream. Plain `raise` (not `assert`) so
+    the check survives `python -O`."""
     _redirect_cache(monkeypatch, tmp_path)
     expiry = date(2024, 1, 25)
 
@@ -420,12 +425,165 @@ def test_non_midnight_date_fails_loud(monkeypatch, tmp_path):
         return df
 
     _patch_derivatives(monkeypatch, factory)
-    with pytest.raises(AssertionError, match="non-midnight"):
+    with pytest.raises(OptionsFormatError, match="non-midnight"):
         options_loader.load_option(
             "RELIANCE", expiry, 2620, "CE",
             date(2024, 1, 25), date(2024, 1, 25),
             today_fn=lambda: date(2026, 5, 24),
         )
+
+
+def test_duplicate_dates_fail_loud(monkeypatch, tmp_path):
+    """If derivatives_df ever returns two rows for the same date, they'd
+    silently end up in cache and corrupt entry/exit lookups. Loud check."""
+    _redirect_cache(monkeypatch, tmp_path)
+    expiry = date(2024, 1, 25)
+
+    def factory(*args, **kw):
+        # Two rows on the same date — pathological but possible
+        return _fake_derivatives(
+            "RELIANCE", expiry, 2620, "CE",
+            [date(2024, 1, 24), date(2024, 1, 24)],
+        )
+
+    _patch_derivatives(monkeypatch, factory)
+    with pytest.raises(OptionsFormatError, match="duplicate"):
+        options_loader.load_option(
+            "RELIANCE", expiry, 2620, "CE",
+            date(2024, 1, 24), date(2024, 1, 24),
+            today_fn=lambda: date(2026, 5, 24),
+        )
+
+
+def test_404_wraps_as_missing_data(monkeypatch, tmp_path):
+    """Network errors for "no data here" must surface as MissingDataError
+    so Phase 3 can catch one error family across all loaders."""
+    _redirect_cache(monkeypatch, tmp_path)
+
+    class _FakeResp:
+        status_code = 404
+        def raise_for_status(self):
+            err = _requests.HTTPError("404 Not Found")
+            err.response = self
+            raise err
+
+    def raiser(*args, **kw):
+        err = _requests.HTTPError("404 Not Found")
+        err.response = _FakeResp()
+        raise err
+
+    monkeypatch.setattr(options_loader, "derivatives_df", raiser)
+    with pytest.raises(MissingDataError, match="404"):
+        options_loader.load_option(
+            "RELIANCE", date(2024, 1, 25), 9999, "CE",
+            date(2024, 1, 25), date(2024, 1, 25),
+            today_fn=lambda: date(2026, 5, 24),
+        )
+
+
+def test_403_propagates_not_wrapped(monkeypatch, tmp_path):
+    """403 (WAF block) must NOT be wrapped — matches bhavcopy_fo's
+    fix(p1.3.1.b.1) wrap policy. Otherwise a UA staleness would silently
+    skip every contract in a Phase-4 sweep."""
+    _redirect_cache(monkeypatch, tmp_path)
+
+    class _FakeResp:
+        status_code = 403
+        def raise_for_status(self):
+            err = _requests.HTTPError("403 Forbidden")
+            err.response = self
+            raise err
+
+    def raiser(*args, **kw):
+        err = _requests.HTTPError("403 Forbidden")
+        err.response = _FakeResp()
+        raise err
+
+    monkeypatch.setattr(options_loader, "derivatives_df", raiser)
+    with pytest.raises(_requests.HTTPError, match="403"):
+        options_loader.load_option(
+            "RELIANCE", date(2024, 1, 25), 2620, "CE",
+            date(2024, 1, 25), date(2024, 1, 25),
+            today_fn=lambda: date(2026, 5, 24),
+        )
+
+
+def test_badzipfile_wraps_as_missing_data(monkeypatch, tmp_path):
+    """jugaad's internal unzip raises BadZipFile when NSE returns HTML
+    for an unlisted contract. Wrap as MissingDataError."""
+    _redirect_cache(monkeypatch, tmp_path)
+
+    def raiser(*args, **kw):
+        raise _zipfile.BadZipFile("not a zip")
+
+    monkeypatch.setattr(options_loader, "derivatives_df", raiser)
+    with pytest.raises(MissingDataError, match="BadZipFile"):
+        options_loader.load_option(
+            "RELIANCE", date(2024, 1, 25), 9999, "CE",
+            date(2024, 1, 25), date(2024, 1, 25),
+            today_fn=lambda: date(2026, 5, 24),
+        )
+
+
+def test_partial_response_with_dropped_dates(monkeypatch, tmp_path):
+    """LOAD-BEARING for the subset partial-response check. Same pattern
+    as spot_loader's test_partial_response_with_dropped_dates: same-length
+    fresh response with one middle date dropped + one spurious date
+    inserted MUST keep the cache and warn — length-only check would let
+    this through silently."""
+    _redirect_cache(monkeypatch, tmp_path)
+    expiry = date(2026, 6, 26)  # open-expiry (future) so refetch path fires
+    initial_dates = [date(2026, 5, 1) - timedelta(days=i) for i in range(20, -1, -1)]
+
+    state = {"phase": "full"}
+
+    def factory(*args, **kw):
+        if state["phase"] == "full":
+            return _fake_derivatives("RELIANCE", expiry, 2620, "CE", initial_dates)
+        # phase "shifted": same length, drop middle date, add spurious far-future date
+        shifted = (
+            initial_dates[: len(initial_dates) // 2]
+            + initial_dates[len(initial_dates) // 2 + 1 :]
+            + [date(2026, 5, 25)]  # spurious
+        )
+        assert len(shifted) == len(initial_dates)
+        return _fake_derivatives("RELIANCE", expiry, 2620, "CE", shifted)
+
+    _patch_derivatives(monkeypatch, factory)
+
+    today_fn_state = {"today": date(2026, 5, 1)}
+    today_fn = lambda: today_fn_state["today"]
+
+    options_loader.load_option(
+        "RELIANCE", expiry, 2620, "CE",
+        date(2026, 4, 1), date(2026, 5, 1),
+        today_fn=today_fn,
+    )
+    cached_before = cache.read(cache.option_path("RELIANCE", expiry, 2620, "CE"))
+    middle_date = initial_dates[len(initial_dates) // 2]
+    assert pd.Timestamp(middle_date) in cached_before["date"].tolist()
+
+    # Advance today and switch upstream to the shifted response
+    today_fn_state["today"] = date(2026, 5, 5)
+    state["phase"] = "shifted"
+    import warnings as _w
+    with _w.catch_warnings(record=True) as wlog:
+        _w.simplefilter("always")
+        options_loader.load_option(
+            "RELIANCE", expiry, 2620, "CE",
+            date(2026, 4, 1), date(2026, 5, 5),
+            today_fn=today_fn,
+        )
+
+    cached_after = cache.read(cache.option_path("RELIANCE", expiry, 2620, "CE"))
+    # Cache must NOT have shrunk or lost the middle date
+    assert pd.Timestamp(middle_date) in cached_after["date"].tolist(), (
+        "subset check failed — dropped date got removed from cache"
+    )
+    assert pd.Timestamp("2026-05-25") not in cached_after["date"].tolist(), (
+        "spurious date leaked into cache"
+    )
+    assert any("partial NSE response" in str(w.message) for w in wlog)
 
 
 # ============================================================

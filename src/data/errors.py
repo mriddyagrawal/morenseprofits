@@ -20,6 +20,13 @@ class BhavcopyFormatError(DataError):
     silent partial-fill."""
 
 
+class OptionsFormatError(DataError):
+    """`derivatives_df` returned a frame whose shape or content violates the
+    options_loader's invariants (non-midnight DATE, duplicate trading dates,
+    etc.). Loud-failure replacement for `assert` statements that would be
+    stripped under ``python -O``."""
+
+
 class MissingDataError(DataError):
     """Required upstream data is unavailable for the requested key. Examples:
     no F&O bhavcopy for a non-trading day (weekend, NSE holiday); no traded

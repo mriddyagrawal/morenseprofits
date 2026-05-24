@@ -99,6 +99,10 @@ fetch, the loader pulls the **full lifetime** of the contract (~120
 calendar days back from expiry, or up to ``today_fn()`` if expiry is
 in the future) — so narrow-window callers later don't re-fetch.
 
+> Caller's ``[from_date, to_date]`` only filters the *return* — the
+> *fetch* always spans full contract lifetime. The 120-day buffer
+> comfortably covers NSE's ~90-day listing window for stock options.
+
 | col | dtype | notes |
 |---|---|---|
 | `date` | `date` (see §2.0) | trading date. *No IST shift needed* — unlike `stock_df`, `derivatives_df` returns DATE at `00:00:00` naive (already midnight IST). |
