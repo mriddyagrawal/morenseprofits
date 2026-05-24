@@ -1992,3 +1992,99 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `feat(p3.4): src/strategies/short_straddle.py — picks ATM CE+PE per SPECS §5`. The strategy is mechanical given everything pinned. Three implementation decisions: **(1) Where does the strike-grid come from?** — call `load_bhavcopy_fo(entry_date)` and filter to `(symbol, expiry, OPTSTK)` to get available strikes; pick `argmin(|K - spot_at_entry|)` with tiebreaker = lower strike per SPECS §5. **(2) The returned Trade has two `SELL` legs at the same ATM strike**, one CE one PE, qty_lots=1 (or `params.get("qty_lots", 1)`). **(3) The strategy.name is `"short_straddle"` — matches the `Trade.strategy` string the kernel already supports. The load-bearing test: hand-check `ShortStraddle().generate_trades("RELIANCE", date(2024,1,25), date(2024,1,4), date(2024,1,24), spot_at_entry=2596.65, params={})` → returns one Trade with legs `(Leg("CE",2600,"SELL",1), Leg("PE",2600,"SELL",1))`. Plus the tiebreaker test: spot exactly between two strikes (e.g. 2610 with strikes at 2600 and 2620) → picks 2600 (lower). After p3.4 → `chore(p3.verify): live short straddle on RELIANCE Jan-2024 (T-15 → T-1) — first real ₹P&L number`. THAT is when the user's original ask materializes end-to-end with real NSE numbers.
 
 ---
+
+## Review of f8f3720 — chore(p3.5.c): SPECS + PLAN for Tier-B margin (strategy_offset + vol-aware)
+
+**Verdict:** ✅ accept
+
+Part of the Tier-B margin cluster (f8f3720 → 4d6a6f33 → 93af1fb → 8d81e8c). Full assessment in the 8d81e8c review below.
+
+**What works:**
+- Three-tier accuracy ladder framing (Tier A sum-of-legs → Tier B strategy_offset+vol → Tier C real SPAN file) is sharp.
+- **Key insight**: Tier C is impossible for historical backtests because NSE doesn't archive SPAN files. So Tier B IS the realistic ceiling for backtest accuracy. This dissolves my Phase-7 deferral worry on caveats #3 + #4.
+- Strategy_offset table values are accurate against real NSE SPAN: short straddle 0.60 matches my prior grilling math; iron condor 0.35 matches risk-limited offset.
+- Calibration table (HDFCBANK ~14% real / ADANIENT ~22% real) checks out.
+
+---
+
+## Review of 4d6a6f33 — feat(p3.5.d): MarginModelV1 gains strategy_offset_pct + symbol_margin_pct kwargs
+
+**Verdict:** ✅ accept
+
+Part of the Tier-B cluster. Implementation is mechanical:
+- Both kwargs are keyword-only with backward-compatible defaults (so 16/16 existing margin tests don't break).
+- `strategy_offset_pct` validation: ∈ (0, 1], rejects 0.0 / >1.0.
+- Result dict adds `sell_leg_margin_raw` (pre-offset), `strategy_offset_pct` (what was used), `symbol_margin_pct` (what was used) — transparency.
+- Hand-check at Tier-B: short straddle 0.60 → sell_leg_margin = ₹1.56L (drops from ₹2.6L). Matches real broker ~₹1.5L.
+- 16 margin tests / 168 total pass.
+
+---
+
+## Review of 93af1fba — feat(p3.5.e): src/engine/vol.py — realized vol + vol_to_margin_pct
+
+**Verdict:** ✅ accept
+
+Part of the Tier-B cluster. Pure-Python vol calc from the existing spot cache (no new data dependency):
+- `realized_vol`: annualized stdev of daily log-returns. Lookback via `offset_trading_days` (same holiday-trap dodge as momentum classifier).
+- Returns `0.0` on <20 rows (safer than noisy estimate) — caller gets the floor margin pct (0.10).
+- `vol_to_margin_pct`: `clamp(0.10 + 0.40 × vol, 0.10, 0.30)` — linear with hard bounds. Calibration pinned by `test_vol_to_margin_pct_calibration` against the SPECS §4a table.
+- 11 vol tests / 179 total pass.
+
+---
+
+## Review of 8d81e8c — fix(p3.5.f): wire strategy_offset_pct + auto-vol symbol_margin_pct through price_trade
+
+**Verdict:** ⚠️ accept-with-followups
+
+**Phase / commit goal (as I understood it):** Final commit of the Tier-B cluster. `price_trade` now produces margin estimates ~10-15% off real (vs ~60% off with original Tier-A v1).
+
+**What works (the Tier-B cluster as a whole):**
+- **Two of my four caveats from the 3f975ae grilling are now FIXED IN CODE, not just documented**:
+  - ✅ **Caveat #3 (uniform 20%)** — `symbol_margin_pct` derived from realized vol per symbol. ADANIENT gets 24%, HDFCBANK 16%, RELIANCE 19%. Calibrated against real NSE SPAN. Ranking bias by symbol vol → eliminated.
+  - ✅ **Caveat #4 (multi-leg conservatism)** — `strategy_offset_pct` per strategy. Short straddle 0.60, iron condor 0.35. The canonical short straddle drops from ₹2.6L → ~₹1.5L (matches real broker SPAN). Cross-strategy ranking bias → from ~60% to ~10-15%.
+- **Auto-vol fallback is sensible**: `_symbol_margin_pct(symbol, entry_date)` is called when caller doesn't pass `symbol_margin_pct`; failures fall back to the uniform default rather than breaking the trade pricing. ✓
+- 181/181 pass in 0.77s. Tier-A baseline tests preserved via explicit `symbol_margin_pct=0.20` arg.
+- The "Tier C is literally impossible for historical" insight in f8f3720 means Tier B isn't a placeholder — it's the realistic ceiling for backtest accuracy.
+
+**Blocking issues:** None.
+
+**STILL OPEN — the items I grilled that are STILL only documented, not code-fixed:**
+
+1. **Caveat #1 (strike-vs-spot basis) — UNRESOLVED.** Tier-B still uses `0.20 × leg.strike × shares` as the SELL-leg base. Symbol_margin_pct now varies, but the strike-base remains. For symmetric short-vol strategies (short straddle, symmetric strangle) this cancels because put_strike < spot < call_strike. For asymmetric (single-leg, iron condor with uneven wings, ratio spreads, etc.) the 20-25% bias persists. Phase-4 multi-strategy sweeps will hit this.
+   - **Fixable now**: change `MarginModelV1.estimate(legs, *, ..., spot_at_entry: float | None = None)` and substitute `spot_at_entry × shares` when provided. Strategy classes already have `spot_at_entry`; the kernel does too. ~10 lines.
+
+2. **Caveat #2 (`roi_pct` non-annualized) — UNRESOLVED.** A 30-day-hold strategy still looks 6× better than a 5-day strategy at the same daily rate. Phase-5 ranker is documented to "normalize", but if it forgets, every leaderboard quietly favors longer holds.
+   - **Fixable now**: add `roi_pct_annualized = roi_pct × 252 / hold_trading_days` to the result dict in `price_trade`. `hold_trading_days` = `len(trading_calendar.trading_days(entry_date, exit_date))`. ~5 lines.
+
+**NEW — separate concern surfaced by the user's "asymmetric conservatism" question:**
+
+3. **Slippage modeling absent.** The user explicitly wants asymmetric conservatism: backtest should under-promise gains AND over-warn about losses. Margin overstate is **symmetric** (smaller wins AND smaller losses in %) so it can't deliver this. The right tool is **slippage on prices**:
+   - At SELL entry: realized = `close × (1 - slippage_pct)` (you got less than close — sold at bid)
+   - At BUY exit: realized = `close × (1 + slippage_pct)` (you paid more — bought at ask)
+   - Result: winning trades' gross_pnl is REDUCED, losing trades' gross_pnl is REDUCED MORE. **Asymmetric** in the direction the user wants.
+   - For NSE liquid blue-chip options, real bid-ask spread is ~1-2% of premium. 1% slippage_pct is a reasonable default.
+   - Add `src/engine/slippage.py` with `SlippageModelV1(slippage_pct=0.01)` + an injectable kwarg on `price_trade`. Mirrors the `CostModelV1` / `MarginModelV1` pattern.
+   - Result dict adds `slippage`, `net_pnl_after_slippage` columns.
+   - Phase-5 sensitivity test: 0.5% / 1.0% / 2.0% slippage tier shows how rankings shift. Strategies with thin profit margins (iron condors at 0.3% expected return) collapse first.
+
+**Domain / correctness checks:**
+- **Margin direction**: Tier-B is slightly conservative (margin overstated → ROI understated). Right direction for paper-to-live.
+- **Vol estimation**: realized vol over 126 trading days is a standard 6-month proxy. Defensible.
+- **Auto-vol fallback**: failure-soft is correct (vol calc can fail on cold-history symbols; that's not a pricing failure).
+- **Sign convention**: unchanged from p3.2. Still correct.
+
+**What I tried:**
+- `python -m pytest tests/` → 181/181 in 0.77s.
+- Read all three p3.5.d/e/f diffs end-to-end + the SPECS §4a updates.
+
+**Next-commit suggestion:** Three options, ranked by what I think the user values most given their "we need to get this right" + "asymmetric conservatism" directives:
+
+**Option A (recommended)**: `feat(p3.5.g): src/engine/slippage.py — asymmetric conservatism via realized-price haircut`. Implements the user-requested asymmetric conservatism. Single new module, ~50 lines, mirrors CostModel pattern. Default 1% slippage_pct. Updates `price_trade` to apply slippage BEFORE the sign convention so winning trades shrink AND losing trades grow. This is the highest-priority fix because it's what the user explicitly asked for in the cost/margin thread.
+
+**Option B**: Fix caveats #1 + #2 in code (the two "STILL OPEN" items above). Both are <15 lines total. Eliminates the strike-vs-spot bias on asymmetric strategies AND gives Phase-5 a properly-annualized ROI column to rank on. Less impactful than slippage but cheap.
+
+**Option C**: Move on to `feat(p3.4): ShortStraddle` per the original PLAN.md sequence. Acceptable if the user is happy with Tier-B accuracy + documented caveats for #1/#2 + no slippage. But the user's question about asymmetric conservatism suggests they're not.
+
+My strong recommendation: **Option A**. The slippage model is the only thing in the project that gives the user the asymmetric conservatism they explicitly asked for. Without it, even with perfect margin, the project will silently mislead them on borderline-profitable trades.
+
+---
