@@ -1071,3 +1071,47 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `feat(p1.4): options_loader` — the spot_loader pattern transplants almost directly with one structural change because of the new findings: **(1) `_normalize` does NOT add +5h30m** (derivatives_df is already midnight IST — verified). **(2) `_normalize` MUST sort ascending** (derivatives_df returns descending — also verified). **(3) Cast `OPEN INTEREST` / `CHANGE IN OI` from float64 → Int64** (jugaad emits float with NaN; SPECS says nullable Int64). **(4) Hand-check test pins the Aug-29 cross-layer agreement**: `load_option("RELIANCE", date(2024,8,29), 2840, "CE", date(2024,8,29), date(2024,8,29))` must return one row with `close=201.7, oi=41500, oi_change=-1500, volume=6500, lot_size=250` — same numbers as the bhavcopy_fo test. If the two layers ever disagree, ONE of them is wrong, and the test tells you which by name. **(5) `isinstance(expiry, datetime)` rejection at the load_option API boundary** mirrors the bhavcopy_fo_path discipline.
 
 ---
+
+## Review of 95175dd — feat(p1.4): data/options_loader.py — cached per-contract option-price loader
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the options loader mirroring spot_loader's frozen-invariants pattern, adapted to per-contract granularity. Cross-layer hand-check is the canonical regression block.
+
+**What works:**
+- **Cross-layer hand-check verified LIVE on my run**: `load_option("RELIANCE", date(2024,8,29), 2840, "CE", ...)` returned `close=201.7, oi=41500, oi_change=-1500, volume=6500, lot_size=250` — every number matches the bhavcopy_fo fixture exactly. Two completely different upstream channels surfacing the same NSE truth.
+- **All 15 SPECS §2.2 dtypes correct** in my run: `date/expiry=datetime64[us]`, `symbol/option_type=string`, `oi/oi_change=Int64`, `lot_size/volume=int64`, OHLC/strike/ltp/settle_price=float64.
+- **Frozen invariants 1–5 implemented** ([src/data/options_loader.py:7-17](src/data/options_loader.py#L7-L17)):
+  - Full-lifetime first fetch ([src/data/options_loader.py:93-122](src/data/options_loader.py#L93-L122)) — verified: 62 rows from 2024-05-31 to 2024-08-29 on the canonical contract (~90 days = NSE's actual 3-month listing window).
+  - Closed-expiry immutability via `is_closed = expiry < today` branch ([src/data/options_loader.py:174-180](src/data/options_loader.py#L174-L180)).
+  - Open-expiry subset-checked refetch ([src/data/options_loader.py:188-208](src/data/options_loader.py#L188-L208)) mirrors the fix(p1.2.b) policy from spot_loader.
+  - Sort + monotonicity assert ([src/data/options_loader.py:88-89](src/data/options_loader.py#L88-L89)).
+  - MissingDataError on empty raw ([src/data/options_loader.py:114-120](src/data/options_loader.py#L114-L120)) with an informative diagnostic message.
+- **Midnight assertion** ([src/data/options_loader.py:81-86](src/data/options_loader.py#L81-L86)) — catches the case where a future jugaad change starts emitting offset timestamps. Loud failure mode is correct.
+- **Input guards loud, not silent**: datetime expiry → TypeError, bad option_type → ValueError, from > to → ValueError, non-int strike → StrikeNotIntegerError (via cache.option_path). All four verified live.
+- Narrow window (Aug 25–29) returned 4 trading days (Mon–Thu) correctly, with the full lifetime still cached.
+- Hot read: 2ms (true cache hit — `_filter_window` on a 62-row frame).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Network errors not wrapped as MissingDataError** in `_fetch_contract_lifetime`. `derivatives_df`'s internal HTTPError / BadZipFile / connection-reset propagates raw, breaking the symmetry bhavcopy_fo_loader has via `_fetch_legacy` / `_fetch_udiff`. If a weekend `load_option` call gets a different exception type than a weekend `load_bhavcopy_fo` call, Phase 3 backtester code will have to catch two error families. Wrap the empty-result path AND the upstream-failure path under one MissingDataError.
+- **Midnight assertion uses `assert`** ([src/data/options_loader.py:83](src/data/options_loader.py#L83)) — disabled with `python -O`. Convert to `if not (times == midnight).all(): raise BhavcopyFormatError(...)` (or a new `OptionsFormatError`) so the invariant holds regardless of optimization flags.
+- **`_normalize` doesn't assert "no duplicate dates"**. If `derivatives_df` ever returns two rows for the same date (NSE bhavcopy quirk?), they'd both end up in the cache silently. One-line `assert not df["date"].duplicated().any()` before write would close that gap.
+- **First-fetch lifetime is calendar-days-based** (`expiry - timedelta(days=120)`). Trading-day-based would be more semantic but requires the trading_calendar from p1.5 — defer; the 120-day buffer comfortably covers NSE's ~90-day listing window.
+- **Caller's `from_date` doesn't reduce the network fetch**. The full lifetime is fetched regardless of how narrow the caller's request is. By design (first-fetch policy), but worth a one-line SPECS §2.2 callout: "Caller's [from_date, to_date] only filters the *return*; the *fetch* always spans full contract lifetime."
+- My "cold" 30ms is suspiciously fast → jugaad's pickle cache was warm from the Phase-1.3 verify run. The actual cold-network behavior wasn't measured here. Worth a `--clean-jugaad-cache` flag on the verify script later, or noting in the eventual verify commit that jugaad's `~/Library/Caches/nsehistory-stock/` should be wiped to measure true cold.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct — `derivatives_df` with all the right args; no IST shift (per the prep-commit empirical finding); descending order → ascending via sort.
+- **Options math:** `lot_size=250, volume=6500, contracts=volume/lot=26` cleanly reconciles with bhavcopy_fo's reported `contracts=26`. Phase 3 backtest can use either column.
+- **Look-ahead bias:** `today_fn` injection works; `is_closed = expiry < today_fn()` is the right branch for the immutability optimization. The fetch's `end = min(expiry, today)` also respects the boundary.
+- **Statistical claims:** N/A this commit.
+
+**What I tried:**
+- 9 scenarios end-to-end against live NSE, all green. Cross-layer hand-check passes byte-for-byte against the existing bhavcopy_fo pinned values.
+- Read [src/data/options_loader.py](src/data/options_loader.py) line by line.
+
+**Next-commit suggestion:** `test(p1.4)` — the **load-bearing test is `test_cross_layer_handcheck_reliance_aug29`**: build a synthetic frame matching `derivatives_df`'s shape (15 jugaad cols, descending date order, OI as float64 with one NaN to exercise the Int64 cast) for the RELIANCE Aug-29 2840 CE contract; monkeypatch `derivatives_df` to return it; assert `load_option(...)` returns the same 5 values the bhavcopy_fo test pins (`close=201.7, oi=41500, oi_change=-1500, volume=6500, lot_size=250`). If the two layers ever diverge, the test names which one regressed. Beyond that, mirror the spot_loader test layout: separate tests for **(a) midnight assertion fires** on a synthetic frame with 18:30:00 timestamps (catches a future jugaad change), **(b) sort-ascending invariant** by feeding shuffled rows, **(c) closed-expiry cache immutability** + open-expiry subset-checked refetch (use today_fn to flip the branch), **(d) all four loud-rejection paths** (datetime expiry, bad option_type, from > to, non-int strike) — these I already exercised live but tests pin them offline. Skip the live-NSE verification commit until p1.5 lands; the cross-layer test against the recorded bhavcopy_fo values is enough for p1.4.
+
+---
