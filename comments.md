@@ -1186,3 +1186,18 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Stay on `chore(p1.4.verify)` — the cross-layer cutover-spanning live verification I suggested last time. Concretely: a single `scripts/verify_p1_4.py` that runs **two cross-layer comparisons** — RELIANCE Aug-29 2840 CE (post-cutover, `load_option` ↔ `load_bhavcopy_fo` UDiff path) AND RELIANCE Jan-25 2620 CE (pre-cutover, `load_option` ↔ `load_bhavcopy_fo` legacy path). Each comparison loads the same row via both loaders and asserts close/oi/oi_change/lot_size match. Print results to stderr. If both pre-cutover and post-cutover agree byte-for-byte across loaders, Phase 1.4 is provably correct end-to-end and the data layer is ready for Phase 1.5.
 
 ---
+
+## Review of eef66cd — test(p1.4.c): mirror options_loader 5xx propagation + future-date comment
+
+**Verdict:** ✅ accept
+
+Trivial followup. Two tiny things closed from the 02e3644 review:
+
+- `test_5xx_propagates_not_wrapped` ([tests/test_options_loader.py:511-538](tests/test_options_loader.py#L511-L538)) mirrors bhavcopy_fo's 503 test. Now both loaders symmetrically guard against the `status >= 400` shortcut regression.
+- Comment on `test_partial_response_with_dropped_dates` ([tests/test_options_loader.py:563-566](tests/test_options_loader.py#L563-L566)) explains why the future-dated expiry is deliberate.
+
+80/80 pass in 0.54s. No new flags.
+
+**Next-commit suggestion:** Unchanged — proceed with `chore(p1.4.verify)`, the dual cross-layer cutover-spanning live run.
+
+---
