@@ -165,7 +165,7 @@ def _annualize_roi(roi_pct: float | None, hold_trading_days: int) -> float | Non
 def price_trade(
     trade: Trade,
     *,
-    load_option_fn: LoadOptionFn = options_loader.load_option,
+    load_option_fn: LoadOptionFn | None = None,
     cost_model: CostModelV1 = COST_MODEL_V1,
     margin_model: MarginModelV1 = MARGIN_MODEL_V1,
     slippage_model: SlippageModelV1 = SLIPPAGE_MODEL_V1,
@@ -191,6 +191,11 @@ def price_trade(
       (useful for tests and sensitivity analysis). Falls back to
       the margin model's uniform default if computation fails.
     """
+    # Resolve load_option_fn lazily so monkeypatch.setattr on
+    # options_loader.load_option takes effect (defaults are evaluated
+    # at function-def time, not call time).
+    if load_option_fn is None:
+        load_option_fn = options_loader.load_option
     leg_results = [
         _price_one_leg(
             trade, leg,
