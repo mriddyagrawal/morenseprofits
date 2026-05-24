@@ -2351,3 +2351,44 @@ This is the answer to the user's exact question from the cost/margin thread. A n
 **Next-commit suggestion:** **Phase 4 — `feat(p4.1): Strategy protocol + registry`** kicks off. PLAN.md sequence is registry → sweeper → multi-strategy → results store → parallelize → determinism test. The single most load-bearing concern for the WHOLE PHASE 4 is **determinism under multiprocessing.Pool**: byte-identical results regardless of worker count / scheduling. Achieved by (a) each task being a pure function of `(strategy, stock, expiry, entry_offset, exit_offset)`; (b) no shared mutable state across workers; (c) sort + reset_index before persisting any sweep result parquet. Caveat #1 (strike-vs-spot) becomes relevant the moment `IronCondor` lands as a strategy — fix it at that point (~10 lines: add `spot_at_entry` param to `MarginModelV1.estimate`, default to using strike if None). The honest groundwork from Phase 3 means Phase 4 sweep results can be trusted as conservative-but-realistic.
 
 ---
+
+## Review of 65c7d73 — chore(p4.0): SPECS §6c for sweep + 11-step PLAN decomposition
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pre-pin every Phase-4 contract — registry shape, sweep signature, determinism rule, results store layout — BEFORE any code lands. Sweeper implementation then becomes mechanical.
+
+**What works:**
+- **§6c.1 Strategy registry** ([SPECS.md:664-672](SPECS.md#L664-L672)) uses `recommended_strategy_offset_pct` as a **class attribute** on each strategy. Sweeper reads it generically (no per-strategy if-tree). This is the cleaner alternative I suggested in the 3b035d8 review — the BUILDER picked it up.
+- **§6c.2 sweep_grid signature pinned** ([SPECS.md:676-696](SPECS.md#L676-L696)) — kwargs include `parallel: bool = True`, `n_workers: int = 0` (cpu_count default), `offline: bool = False`, `run_id` default deterministic-hash. Per-task path documented step-by-step (entry/exit dates → spot → trade → price → decorate).
+- **§6c.3 Determinism contract is LOAD-BEARING** ([SPECS.md:705-720](SPECS.md#L705-L720)). Four ingredients spelled out: (1) pure-function tasks, (2) no shared mutable state, (3) sort-then-reset_index-before-persist, (4) deterministic-hash run_id. Test pattern named: `test_byte_identical_under_parallelization` runs n_workers=1 vs 4, asserts parquets hash-equal. **This is exactly the load-bearing concern I flagged for Phase 4.**
+- **§6c.4 Results store path** ([SPECS.md:722-724](SPECS.md#L722-L724)) — `data/results/{strategy_name_or_sweep}_{run_id}.parquet` with sweep-specific decorations (entry_offset_td, exit_offset_td, notional_at_entry, entry_spot, exit_spot).
+- **Skip policy explicit** ([SPECS.md:702](SPECS.md#L702)): `MissingDataError`/`NoLiquidStrikeError` → skip + log reason; `OfflineCacheMiss` → propagate. The class-distinction rule from SPECS §6a continues to pay off.
+- **11-step PLAN decomposition** ([PLAN.md:146-156](PLAN.md#L146-L156)) — each strategy gets its own nuclear commit. p4.4.d (IronCondor) explicitly names it as the **caveat #1 fix point** (strike-vs-spot margin) — exactly what I suggested.
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+
+1. **`recommended_strategy_offset_pct` as class attribute** means **`ShortStraddle` currently exposes `SHORT_STRADDLE_MARGIN_OFFSET` as a module constant** (per 3b035d8). The registry pattern wants `ShortStraddle.recommended_strategy_offset_pct = 0.60`. Worth a tiny `chore` before p4.2 lands to align ShortStraddle with the new contract — OR p4.1 (registry) can include this rename. Otherwise the sweeper's "look up class attribute" pattern won't find anything on ShortStraddle.
+
+2. **`run_id` "deterministic hash of inputs"** doesn't spell out which inputs are in the hash. Critical: must EXCLUDE `today_fn` (a callable doesn't hash deterministically), `parallel`/`n_workers` (operational), and `offline` (mode). Must INCLUDE strategies+symbols+expiries+entry_offsets+exit_offsets. Add one sentence: "hash inputs are the sorted-tuple of `(strategies, symbols, expiries, entry_offsets_td, exit_offsets_td)`; operational kwargs (today_fn, parallel, n_workers, offline) are excluded."
+
+3. **`test_byte_identical_under_parallelization` uses "hash-equal" parquet bytes** — pyarrow's default writer doesn't include file-creation timestamps so this works today. If a future pyarrow rev starts including them, the test breaks for an unrelated reason. Safer: `pd.testing.assert_frame_equal(pd.read_parquet(a), pd.read_parquet(b))`. Semantic equality, not byte equality. Same concern from Phase 1.3's byte-stability test.
+
+4. **"Append-only" results store** ([SPECS.md:724](SPECS.md#L724)) — but `cache.write` raises `WouldOverwriteError` on existing files. Same `run_id` re-run → either: (a) skip the whole sweep ("already computed"), (b) re-fetch with `overwrite=True`, or (c) fail loud. Pin the rule. My recommendation: `(a)` for cache-warmth + reproducibility (re-running yields the same `run_id` so the parquet is the canonical answer; redoing work is wasteful). With a `--force` CLI escape.
+
+5. **Performance target arithmetic**: 5 stocks × 12 months × 5 entries × 5 exits × 5 strategies = 7500 trades. At ~10ms each (warm cache + parquet read), ~75s sequential. The "< 10 min" target is generous. ~10× faster with parallel=True on 8 cores. Achievable.
+
+6. **`recommended_strategy_offset_pct` is a strategy-level constant**, but for asymmetric strategies (iron condor) the offset depends on the legs' relative positions. Acceptable v1 simplification — pin per-strategy averages until Phase 7.
+
+**Domain / correctness checks:**
+- **Determinism contract:** sound. Pure functions + sort-before-persist is the textbook recipe.
+- **Skip policy:** correctly leverages the SPECS §6a class distinction; OfflineCacheMiss propagation prevents the silent-empty-results trap.
+- **Look-ahead bias:** not exercised this commit; sweeper-layer concern is that each task's load_spot/load_option respect their respective windows. Already pinned at the loader layer.
+
+**What I tried:** Read the SPECS diff in full; cross-checked the per-task pricing path against `price_trade`'s signature.
+
+**Next-commit suggestion:** `feat(p4.1): src/strategies/registry.py — name → Strategy mapping`. Should land as **one combined commit** with the small rename `SHORT_STRADDLE_MARGIN_OFFSET` (module constant) → `ShortStraddle.recommended_strategy_offset_pct` (class attribute) per the new §6c.1 contract — otherwise the registry will reference an attribute that doesn't exist yet. ~30 lines total. Then the load-bearing tests for the registry: (a) `STRATEGIES["short_straddle"]` returns a Strategy instance, (b) every registered strategy has the class attribute, (c) every registered strategy implements `generate_trades` (Protocol conformance check via `hasattr` or `isinstance(.., Strategy)` if you make it a runtime-checkable Protocol). After registry → p4.2 sweeper, which is where the determinism contract starts to matter.
+
+---
