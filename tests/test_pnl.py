@@ -253,6 +253,31 @@ def test_returned_schema_matches_results_2_5_subset():
     assert out["roi_pct_annualized"] == pytest.approx(expected_ann, abs=1e-9)
 
 
+def test_hold_trading_days_calendar_to_trading_conversion():
+    """Pin the calendar→trading-day approximation explicitly so a future
+    "let's switch to actual trading_calendar lookup" change is visible
+    as a test diff, not silently shifts annualized rankings.
+
+    20 calendar days × 252/365 = 13.8 → round to 14 trading days. (My
+    own commit-message in 169c7d6 wrongly claimed "20 trading days";
+    the code rounds to 14. Pin the truth.)"""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)  # 20 calendar days
+    df = _option_frame([(entry, 100.0, 250), (exit_, 50.0, 250)])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),), strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    assert out["hold_trading_days"] == 14, (
+        f"20 calendar days should convert to 14 trading days, got "
+        f"{out['hold_trading_days']}"
+    )
+
+
 def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():
     """LOAD-BEARING for the full financial picture: all THREE layers
     tied together on the canonical RELIANCE Jan-2024 short straddle.

@@ -95,23 +95,27 @@ def main() -> int:
         today_fn=TODAY_FN,
     )
 
-    # Per-leg breakdown for human inspection
+    # Per-leg breakdown — RAW (loader) AND REALIZED (post-slippage)
     import json
     legs_breakdown = json.loads(result["legs_json"])
-    print(f"  Per-leg breakdown:")
+    print(f"  Per-leg (raw close → realized post-slippage):")
     for r in legs_breakdown:
         print(f"    {r['option_type']:>2} {int(r['strike']):>5} {r['side']:>4}  "
-              f"entry={r['entry_px']:>7.2f}  exit={r['exit_px']:>7.2f}  "
-              f"gross_pnl={r['gross_pnl']:>+10.2f}")
+              f"entry: {r['entry_px']:>7.2f} → {r['entry_px_realized']:>7.4f}   "
+              f"exit: {r['exit_px']:>7.2f} → {r['exit_px_realized']:>7.4f}   "
+              f"gross={r['gross_pnl']:>+10.2f}")
 
-    print(f"\n  ┌─────────────────────────────────────────────────────────┐")
-    print(f"  │ Gross P&L          : ₹{result['gross_pnl']:>+12.2f}             │")
-    print(f"  │ Costs              :  ₹{result['costs']:>11.2f}              │")
-    print(f"  │ NET P&L            : ₹{result['net_pnl']:>+12.2f}             │")
-    print(f"  │ Margin at entry    :  ₹{result['margin_at_entry']:>11.0f}              │")
+    print(f"\n  ┌──────────────────────────────────────────────────────────────┐")
+    print(f"  │ Gross P&L (post-slippage)  : ₹{result['gross_pnl']:>+12.2f}                │")
+    print(f"  │ Costs (Zerodha-style)      :  ₹{result['costs']:>11.2f}                 │")
+    print(f"  │ NET P&L                    : ₹{result['net_pnl']:>+12.2f}                │")
+    print(f"  │ Margin at entry (Tier-B)   :  ₹{result['margin_at_entry']:>11.0f}                 │")
     if result['roi_pct'] is not None:
-        print(f"  │ ROI (holding period): {result['roi_pct']:>+9.2f} %               │")
-    print(f"  └─────────────────────────────────────────────────────────┘")
+        print(f"  │ ROI (holding-period)       : {result['roi_pct']:>+9.2f} %                  │")
+    if result.get('roi_pct_annualized') is not None:
+        print(f"  │ ROI (annualized, {result['hold_trading_days']:>2} td)     : "
+              f"{result['roi_pct_annualized']:>+9.2f} %  ← cross-window-rankable │")
+    print(f"  └──────────────────────────────────────────────────────────────┘")
 
     margin_breakdown = json.loads(result["margin_breakdown_json"])
     print(f"\n  Margin breakdown:")
@@ -127,6 +131,21 @@ def main() -> int:
             print(f"    {k:>12s} = ₹{v:.4f}")
         else:
             print(f"    {k:>12s} = ₹{v:.4f}")
+
+    # Show without-slippage comparison so the user sees the haircut
+    _h("WITHOUT-SLIPPAGE COMPARISON (what a naive backtester would show)")
+    from src.engine.slippage import SlippageModelV1
+    naive = price_trade(
+        trade, strategy_offset_pct=SHORT_STRADDLE_MARGIN_OFFSET,
+        slippage_model=SlippageModelV1(slippage_pct=0.0),
+        today_fn=TODAY_FN,
+    )
+    print(f"  Without slippage : Gross ₹{naive['gross_pnl']:>+8.2f}  Net ₹{naive['net_pnl']:>+8.2f}  "
+          f"ROI {naive['roi_pct']:>+5.2f}% ({naive['roi_pct_annualized']:>+5.2f}%/yr)")
+    print(f"  With 1% slippage : Gross ₹{result['gross_pnl']:>+8.2f}  Net ₹{result['net_pnl']:>+8.2f}  "
+          f"ROI {result['roi_pct']:>+5.2f}% ({result['roi_pct_annualized']:>+5.2f}%/yr)")
+    haircut = naive['net_pnl'] - result['net_pnl']
+    print(f"  Haircut          : ₹{haircut:.2f} (= {100 * haircut / max(naive['net_pnl'], 1):.1f}% of naive net)")
 
     _h("INTERPRETATION")
     if result['net_pnl'] > 0:
