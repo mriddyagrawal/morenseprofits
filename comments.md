@@ -2740,3 +2740,44 @@ Load-bearing tests: **(a)** spot-based margin reduces notional bias vs strike-ba
 Load-bearing tests: **(a)** 4 legs with correct sides + correct order in `legs_json`; **(b)** `inner_offset < outer_offset` enforced; **(c)** **MAX LOSS BOUNDED** — for a 1-lot iron condor on RELIANCE with inner=2%, outer=5%, the max loss at expiry is bounded by `(outer_strike - inner_strike - net_premium_received) × lot_size` per spread side. Test this by simulating a scenario where spot at exit is FAR outside both wings, assert the loss doesn't exceed the bound. **(d)** Margin uses spot-based notional via the now-default sweeper path — assert `margin_breakdown["notional_basis"] == "spot"` when called through `sweep_one`. **(e)** Sign convention: net P&L positive when spot stays between inner strikes at exit. The 4-leg P&L summation is the kernel's job, not the strategy's — but the strategy emits legs in correct sides so the kernel produces the right signed result.
 
 ---
+
+## Review of a4aa27c — feat(p4.4.d.ii): IronCondor 4-leg strategy + max-loss-bounded pin
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land IronCondor as the 5th and most complex v1 strategy. 4 legs, two tunable params, bounded max loss is the defining property to pin in code.
+
+**What works:**
+- **All 5 load-bearing tests I asked for are present**: 4 legs in canonical order, `outer > inner` enforced (both strict-equal and degenerate-zero rejected), max-loss bounded, sweeper passes spot-based margin, credit-collected on the in-range exit.
+- **Max-loss bound math correct**: ₹100 wing × 250 shares − ₹14,250 net credit = -₹10,750 max realized loss. The defining property of iron condor — capped tail — pinned in code via the far-OTM-blow-through scenario.
+- **Sweeper integration test** (`test_sweep_one_iron_condor_uses_spot_based_margin`) pins `notional_basis == "spot"` end-to-end. **Caveat #1 fix is now exercised at the asymmetric-strategy layer where it bites.** Without this test, a future regression to strike-based could slip through unnoticed.
+- **Canonical leg order** ([src/strategies/iron_condor.py:98-103](src/strategies/iron_condor.py#L98-L103)) — call spread (SELL inner + BUY outer) then put spread (SELL inner + BUY outer). Phase-5 can rely on `legs_json[0]` being the inner-call-SELL.
+- **`recommended_strategy_offset_pct = 0.35`** per SPECS §4a — biggest offset benefit of any v1 strategy.
+- **`out_params` records the both offsets** for Phase-5 filtering.
+- 14 tests + 285/285 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Bhavcopy-query code duplicated for the FOURTH time** ([src/strategies/iron_condor.py:131-138](src/strategies/iron_condor.py#L131-L138)). Now urgent: `chore(p4.4.refactor): src/strategies/_strikes.py` should land before any further strategy work. The pattern is `(bhavcopy + symbol + expiry + CE/PE filter → sorted unique strike list)` repeated in short_straddle, short_strangle, long_straddle, long_strangle, iron_condor. Single helper takes (symbol, expiry, entry_date) and returns the strike list; pick_nearest() takes (strikes, target) and returns the strike. ~30 lines net savings.
+- **Sparse-grid degenerate case** — when only ONE strike exists above spot, `inner_call == outer_call`. The call spread becomes "SELL X, BUY X" = zero P&L instead of a spread. Test passes (4 legs, correct sides), but the strategy silently degenerates. Worth one line: `if inner_call == outer_call: warnings.warn(...)` so an operator running on illiquid contracts sees the collapse rather than getting a confusing P&L.
+- **`out_params = {"inner_offset_pct": inner, "outer_offset_pct": outer}`** drops other caller-supplied params — same issue noted on adc7290 and 64775a9. `{**params, "inner_offset_pct": inner, "outer_offset_pct": outer}` would preserve everything. Cosmetic.
+- **No `recommended_inner_offset_pct` / `recommended_outer_offset_pct`** as class attributes — Phase-5 ranker can't query "what defaults does this strategy use?" without parsing the source. But strategy-specific tunables vary, so this isn't a registry-contract concern. Defer.
+
+**Domain / correctness checks:**
+- **Max loss math**: `(outer_strike - inner_strike) × shares − net_credit` is correct for a single-side blow-through. Both-sides blow-through (rare, requires gap moves) realizes the same bound on whichever side gets hit. ✓
+- **Net credit** (received at entry): comes from SELL inner premiums > BUY outer premiums (closer-to-ATM = more premium). The strategy collects this credit; the kernel records it via the signed gross P&L summed across legs. ✓
+- **Strike-vs-spot caveat #1**: now exercised. The 4 strikes flank spot at 4 different distances. With spot-based margin, all 4 legs use the same basis (spot × shares), eliminating the per-leg variation. Phase-5 ranking against other strategies is now apples-to-apples.
+- **Sign convention**: 2 SELL legs + 2 BUY legs → engine's `side_sign` ensures each leg's contribution is correctly signed. The credit-collected test pins the "all 4 legs decay to ~0 → net = +entry_credit" semantic.
+
+**What I tried:** `python -m pytest tests/test_iron_condor.py -v` → 14/14 pass. Read [src/strategies/iron_condor.py](src/strategies/iron_condor.py) end-to-end.
+
+**Next-commit suggestion:** Per PLAN.md p4.5, `perf(p4.5): multiprocessing.Pool — preserves determinism`. **THE load-bearing concern for the entire phase**: byte-identical results regardless of `n_workers=1` vs `n_workers=4`. Specific risks:
+1. **Pickling closures**: `today_fn=lambda: date(...)` won't survive `Pool.map`. Either bind today_fn at task-submission time (resolve to a date instance, not a callable), or document that the parallel path requires module-level functions for time-injection.
+2. **Worker scheduling affects completion order**: results return in whatever-finished-first order from `Pool.imap_unordered` or in submission order from `Pool.map`. The `sort_values + reset_index` after `pd.concat` is the determinism backstop. Test must use `imap_unordered` to surface scheduling effects.
+3. **Cache state per-process**: each worker process loads its own parquet on first touch — read-only, so safe. But the J_CACHE_DIR pickle cache from jugaad could have concurrent-write races if a worker hits a cache-miss; in practice cache should be warm before parallel runs.
+4. **Skip log aggregation**: per-worker skip rows must be collected and persisted via a single `write_skips` call from the parent. Currently sweep_grid collects in a list during the loop — the parallel impl needs to gather from workers analogously.
+
+The PAIRED `test(p4.5)` is: monkeypatch fetchers + load_spot + load_bhavcopy to deterministic fakes (so workers can't have non-deterministic data); run `sweep_grid(..., n_workers=1)` then `sweep_grid(..., n_workers=4, force=True)`; assert `pd.testing.assert_frame_equal(read1, read2)`. That single test is what proves SPECS §6c.3 determinism contract holds.
+
+---
