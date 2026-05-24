@@ -211,7 +211,98 @@ def render_rank_table(df: pd.DataFrame, *, min_n: int) -> None:
     # DESIGN_SPEC §2.2 (`n_trades` visually prominent next to `rank`).
     st.caption(
         f"Showing {len(ranked)} of {n_pairs_total} (strategy, symbol) "
-        f"pair(s) — min_n={min_n} from sidebar. Smaller N samples are "
-        f"available via the 'Thin samples — not ranked' sidecar below "
-        f"(p6.2.thin)."
+        f"pair(s) — min_n={min_n} from sidebar. Smaller-N pair(s) are "
+        f"available in the 'Thin samples — not ranked' sidecar below."
+    )
+
+
+# ============================================================
+# Thin samples sidecar — Phase 6.2 commit 13 (feat(p6.2.thin))
+# ============================================================
+
+def render_thin_samples(df: pd.DataFrame, *, min_n: int) -> None:
+    """Render rows with ``n_trades < min_n`` under a "Thin samples —
+    not ranked" sidecar (per DESIGN_SPEC §4 commit 13 +
+    statistical-honesty discipline at SPECS §11.5).
+
+    The ranker silently drops these rows from the leaderboard
+    (different from aggregate, which surfaces them); the UI tier
+    re-surfaces them so the operator sees what was suppressed and
+    can lower the threshold if a thin row looks promising. Two-layer
+    statistical-honesty: analytics is curated, UI is transparent.
+
+    No-op if every pair clears ``min_n`` — operator doesn't need to
+    see an empty sidecar.
+    """
+    if len(df) == 0:
+        # The empty-frame message already lives in the main rank-table
+        # path; sidecar stays silent.
+        return
+
+    summary = summarize_by_stock_strategy(df)
+    thin = summary[summary["n_trades"] < min_n].copy()
+    if len(thin) == 0:
+        # All pairs clear threshold — no sidecar needed.
+        st.caption(
+            f"_All {len(summary)} (strategy, symbol) pair(s) clear "
+            f"min_n={min_n} — no thin samples to surface._"
+        )
+        return
+
+    # Sort thin samples by n_trades DESC then by median ann ROI DESC
+    # so the operator sees the "biggest, best" thin samples first
+    # (the ones most worth investigating further by lowering min_n).
+    thin = thin.sort_values(
+        ["n_trades", "median_roi_pct_annualized"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    display_cols = [
+        "strategy", "symbol", "n_trades",
+        "win_rate_pct",
+        "median_roi_pct_annualized",
+        "std_roi_pct_annualized",
+        "total_net_pnl",
+    ]
+    table = thin[display_cols]
+
+    st.markdown("#### Thin samples — not ranked")
+    st.caption(
+        f"{len(thin)} (strategy, symbol) pair(s) with N below the "
+        f"sidebar threshold ({min_n}). The leaderboard ranker "
+        f"suppresses these per the statistical-honesty contract; "
+        f"lower min_n to inspect anyway."
+    )
+    st.dataframe(
+        table,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "strategy": st.column_config.TextColumn(
+                "Strategy", width="medium",
+            ),
+            "symbol": st.column_config.TextColumn(
+                "Symbol", width="small",
+            ),
+            "n_trades": st.column_config.NumberColumn(
+                "N", format="%d", width="small",
+                help=(
+                    f"Sample size — all rows here have N < {min_n}. "
+                    f"Median statistics are unreliable at this scale."
+                ),
+            ),
+            "win_rate_pct": st.column_config.ProgressColumn(
+                "Win %", format="%.1f%%",
+                min_value=0.0, max_value=100.0, width="small",
+            ),
+            "median_roi_pct_annualized": st.column_config.NumberColumn(
+                "Median ROI/yr", format="%+.1f%%",
+            ),
+            "std_roi_pct_annualized": st.column_config.NumberColumn(
+                "Std ROI/yr", format="±%.1f%%",
+            ),
+            "total_net_pnl": st.column_config.NumberColumn(
+                "Net P&L (₹)", format="₹%,.0f",
+            ),
+        },
     )

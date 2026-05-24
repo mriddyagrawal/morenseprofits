@@ -39,6 +39,7 @@ from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E
 from src.web.leaderboard import (  # noqa: E402
     render_headline as render_leaderboard_headline,
     render_rank_table,
+    render_thin_samples,
 )
 
 
@@ -211,10 +212,9 @@ def _render_leaderboard_tab(df_filtered: pd.DataFrame) -> None:
     render_leaderboard_headline(df_filtered, min_n=min_n)
     st.markdown("---")
     render_rank_table(df_filtered, min_n=min_n)
-    _placeholder(
-        "Thin-samples sidecar + within/across toggle",
-        "feat(p6.2.thin) + feat(p6.2.toggle)",
-    )
+    st.markdown("---")
+    render_thin_samples(df_filtered, min_n=min_n)
+    _placeholder("Within-stock vs across-stocks toggle", "feat(p6.2.toggle)")
 
 
 def _render_per_stock_tab(df_filtered: pd.DataFrame) -> None:

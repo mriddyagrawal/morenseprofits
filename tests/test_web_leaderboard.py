@@ -17,7 +17,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.web.leaderboard import render_headline, render_rank_table
+from src.web.leaderboard import (
+    render_headline,
+    render_rank_table,
+    render_thin_samples,
+)
 
 
 @pytest.fixture
@@ -286,6 +290,83 @@ def test_rank_table_caption_surfaces_eligibility_ratio(captured_table):
     caption = next(e for e in captured_table if e["kind"] == "caption")["msg"]
     assert "Showing 1 of 2" in caption
     assert "min_n=5" in caption
+
+
+# ============================================================
+# render_thin_samples — sidecar surfaces what the ranker suppressed
+# ============================================================
+
+def test_thin_samples_empty_when_every_pair_clears_threshold(captured_table):
+    """All pairs above min_n → sidecar renders a passive caption,
+    NOT an empty table."""
+    rows = [_row(strategy="A", symbol="X")] * 10  # n=10, well above 5
+    render_thin_samples(pd.DataFrame(rows), min_n=5)
+    kinds = [e["kind"] for e in captured_table]
+    # No dataframe rendered
+    assert "dataframe" not in kinds
+    # A caption reassures the operator nothing was suppressed
+    captions = [e for e in captured_table if e["kind"] == "caption"]
+    assert len(captions) == 1
+    assert "clear min_n=5" in captions[0]["msg"]
+
+
+def test_thin_samples_renders_only_below_min_n(captured_table):
+    """Mixed eligibility → only the below-min_n pairs appear in the
+    sidecar. The main rank table (in render_rank_table) gets the
+    eligible ones; no double-rendering."""
+    rows = (
+        [_row(strategy="A", symbol="X")] * 8 +   # n=8, eligible
+        [_row(strategy="B", symbol="Y")] * 3 +   # n=3, THIN
+        [_row(strategy="C", symbol="Z")] * 2     # n=2, THIN
+    )
+    render_thin_samples(pd.DataFrame(rows), min_n=5)
+    df_event = next(e for e in captured_table if e["kind"] == "dataframe")
+    df = df_event["df"]
+    # Should have 2 rows (B, C); A excluded
+    assert len(df) == 2
+    assert set(df["strategy"]) == {"B", "C"}
+    assert "A" not in df["strategy"].tolist()
+
+
+def test_thin_samples_sorted_by_n_desc_then_roi_desc(captured_table):
+    """Operator scans the sidecar to spot "biggest, best" thin pair
+    worth lowering min_n for. Sort: n_trades DESC, then ann ROI DESC.
+    Pinned so future refactor doesn't silently reorder."""
+    rows = (
+        [_row(strategy="A", symbol="X", roi_pct_annualized=10.0)] * 4 +
+        [_row(strategy="B", symbol="X", roi_pct_annualized=50.0)] * 4 +
+        [_row(strategy="A", symbol="Y", roi_pct_annualized=99.0)] * 2  # smaller N
+    )
+    render_thin_samples(pd.DataFrame(rows), min_n=5)
+    df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
+    # A,X (n=4, roi=10), B,X (n=4, roi=50), A,Y (n=2, roi=99)
+    # Sorted by (n DESC, roi DESC): B,X (4,50) → A,X (4,10) → A,Y (2,99)
+    rows_ord = list(zip(df["strategy"], df["symbol"]))
+    assert rows_ord == [("B", "X"), ("A", "X"), ("A", "Y")]
+
+
+def test_thin_samples_empty_frame_no_op(captured_table):
+    """Zero filtered rows → no st.info / st.dataframe / st.caption.
+    The main rank table already rendered the no-rows empty state;
+    the sidecar must stay silent to avoid duplicate messaging."""
+    render_thin_samples(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }), min_n=5)
+    assert len(captured_table) == 0  # Truly silent
+
+
+def test_thin_samples_column_config_omits_rank(captured_table):
+    """The sidecar is NOT a rank table — there's no `rank` column.
+    Pin so a future refactor that copy-pastes from render_rank_table
+    doesn't accidentally re-introduce a meaningless rank ordering."""
+    rows = [_row(strategy="S", symbol="X")] * 2  # n=2, thin at min_n=5
+    render_thin_samples(pd.DataFrame(rows), min_n=5)
+    df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
+    assert "rank" not in df.columns
 
 
 def test_nan_safety_in_aggregates(captured_metrics):
