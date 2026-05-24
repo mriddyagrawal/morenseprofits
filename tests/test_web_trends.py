@@ -8,7 +8,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.web.trends import render_headline
+from src.web.trends import render_headline, render_yoy
 
 
 @pytest.fixture
@@ -157,6 +157,120 @@ def test_all_months_below_min_n_dashes_for_month_cards(captured_metrics):
     latest = captured_metrics[3]
     assert latest["value"] != "—"
     assert "2024" in latest["delta"]
+
+
+# ============================================================
+# render_yoy — line chart of median ROI over years
+# ============================================================
+
+@pytest.fixture
+def captured_charts(monkeypatch):
+    events: list[dict] = []
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n_or_spec):
+        n = n_or_spec if isinstance(n_or_spec, int) else len(n_or_spec)
+        return [_NullCtx() for _ in range(n)]
+
+    def fake_plotly_chart(fig, **kw):
+        events.append({"kind": "plotly_chart", "fig": fig})
+
+    def fake_info(msg, **_):
+        events.append({"kind": "info", "msg": msg})
+
+    def fake_caption(msg, **_):
+        events.append({"kind": "caption", "msg": msg})
+
+    import src.web.trends as tr
+    monkeypatch.setattr(tr.st, "columns", fake_columns)
+    monkeypatch.setattr(tr.st, "plotly_chart", fake_plotly_chart)
+    monkeypatch.setattr(tr.st, "info", fake_info)
+    monkeypatch.setattr(tr.st, "caption", fake_caption)
+    import src.web.empty_state as es
+    monkeypatch.setattr(es.st, "info", fake_info)
+    return events
+
+
+def test_yoy_single_year_renders_empty_state(captured_charts):
+    """LOAD-BEARING per DESIGN_SPEC §2.6: <2 distinct eligible years
+    → trends_yoy_single_year message; NO plotly chart rendered (a
+    one-point "line" isn't a trend)."""
+    # 6 trades all in 2024 → 1 eligible year only
+    rows = [_row(year=2024, month=1, roi_pct_annualized=20.0)] * 6
+    render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    kinds = [e["kind"] for e in captured_charts]
+    assert "info" in kinds
+    assert "plotly_chart" not in kinds
+    info = next(e for e in captured_charts if e["kind"] == "info")["msg"]
+    assert "1 year" in info
+
+
+def test_yoy_two_years_renders_line(captured_charts):
+    """≥2 eligible years → real plotly_chart; line connects per-year
+    medians."""
+    rows = (
+        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 6 +
+        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 6
+    )
+    render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
+    assert len(charts) == 1
+    trace = charts[0]["fig"].data[0]
+    # x = years in order; y = medians
+    assert list(trace.x) == [2023, 2024]
+    assert list(trace.y) == [15.0, 30.0]
+
+
+def test_yoy_thin_years_suppressed(captured_charts):
+    """Years with N < min_n excluded BEFORE the eligibility check.
+    If only 1 year clears threshold, single-year empty-state fires."""
+    rows = (
+        # 2023 has N=2 (below min_n=5) — should be suppressed
+        [_row(year=2023, month=1, roi_pct_annualized=99.0)] * 2 +
+        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 6
+    )
+    render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    kinds = [e["kind"] for e in captured_charts]
+    # Only 2024 eligible → single year → empty-state, no chart
+    assert "info" in kinds
+    assert "plotly_chart" not in kinds
+
+
+def test_yoy_hover_surfaces_n_per_year(captured_charts):
+    """LOAD-BEARING per DESIGN_SPEC §10 user-journey step 4:
+    hover MUST surface N alongside the median so operator distinguishes
+    real drift from thin-sample noise."""
+    rows = (
+        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 6 +
+        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 24
+    )
+    render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    trace = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"].data[0]
+    # customdata carries N (Scatter wraps it as a tuple of rows)
+    cd = trace.customdata
+    assert len(cd) == 2
+    assert "N:" in trace.hovertemplate
+    assert "%{customdata[0]}" in trace.hovertemplate
+
+
+def test_yoy_empty_df_or_missing_pair_routes_through_empty_state(captured_charts):
+    """0 filtered rows OR no rows for selected pair → empty-state."""
+    render_yoy(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "entry_offset_td": pd.Series(dtype="int64"),
+        "exit_offset_td": pd.Series(dtype="int64"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }), strategy=None, symbol=None, min_n=5)
+    kinds = [e["kind"] for e in captured_charts]
+    assert "info" in kinds
+    assert "plotly_chart" not in kinds
 
 
 def test_naming_rule_pct_cards_have_percent_suffix(captured_metrics):

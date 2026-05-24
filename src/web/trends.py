@@ -189,3 +189,84 @@ def render_headline(
             st.metric("Latest year ROI", "—",
                       f"no years with N ≥ {min_n}",
                       delta_color="off")
+
+
+# ============================================================
+# YoY line chart — Phase 6.4 commit 19 (feat(p6.4.yoy))
+# ============================================================
+
+def render_yoy(
+    df: pd.DataFrame,
+    *,
+    strategy: Optional[str],
+    symbol: Optional[str],
+    min_n: int,
+) -> None:
+    """Plotly line chart: median_roi_pct_annualized over years for
+    one (strategy, symbol) pair. Years with N < min_n excluded.
+
+    Empty-state per DESIGN_SPEC §2.6: <2 distinct eligible years →
+    trends_yoy_single_year message ("YoY decay needs ≥2 years").
+    The current Q1-2024 verify set hits this branch on every
+    (strategy, symbol) — operator sees an explicit "this sweep
+    covers 1 year(s)" message, not an empty chart.
+    """
+    if len(df) == 0 or strategy is None or symbol is None:
+        render_empty("leaderboard_no_rows_after_filters")
+        return
+
+    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    if len(pair) == 0:
+        st.info(f"No trades for {strategy} × {symbol}.")
+        return
+
+    yearly = summarize_by_year(pair)
+    eligible = yearly[yearly["n_trades"] >= min_n].sort_values("year")
+    n_years = int(eligible["year"].nunique())
+    if n_years < 2:
+        render_empty("trends_yoy_single_year", n_years=n_years)
+        return
+
+    years = eligible["year"].astype(int).tolist()
+    medians = eligible["median_roi_pct_annualized"].astype(float).tolist()
+    n_per_year = eligible["n_trades"].astype(int).tolist()
+
+    fig = go.Figure(data=go.Scatter(
+        x=years,
+        y=medians,
+        mode="lines+markers",
+        line=dict(color="rgb(0, 100, 0)", width=3),
+        marker=dict(size=10),
+        # Custom hover: surface N alongside median so a "decay" call
+        # can be sanity-checked against sample size per the
+        # DESIGN_SPEC §10 user-journey step 4.
+        customdata=[[n] for n in n_per_year],
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Median ROI/yr: %{y:+.1f}%<br>"
+            "N: %{customdata[0]}"
+            "<extra></extra>"
+        ),
+    ))
+    # Anchor at zero so the line tells the truth — a small positive
+    # drift on a chart auto-zoomed to [40%, 60%] reads more dramatic
+    # than the underlying data warrants.
+    fig.update_layout(
+        title=f"YoY median ROI/yr — {strategy} × {symbol}",
+        xaxis_title="Year",
+        yaxis_title="Median ROI/yr (%)",
+        height=380,
+        margin=dict(l=60, r=40, t=50, b=50),
+        showlegend=False,
+    )
+    fig.add_hline(
+        y=0, line_dash="dot", line_color="gray",
+        annotation_text="breakeven",
+        annotation_position="bottom right",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"Years with N ≥ {min_n} included. Sister chart below "
+        f"(win-rate + sample size) helps distinguish real drift from "
+        f"thin-sample noise per DESIGN_SPEC §10 step 4."
+    )
