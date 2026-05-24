@@ -118,3 +118,36 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** Per the planned step list this is `test(p1.1)`. Make sure tests pin dtypes (date → datetime64, strike → float64, lot_size → int64) — that's the real value of writing tests next to the helper.
 
 ---
+
+## Review of 20279c5 — test(p1.1): cache.py — round-trip, path builders, version sentinel, atomic write
+
+**Verdict:** ⚠️ accept-with-followups
+
+**Phase / commit goal (as I understood it):** Lock in the p1.1 cache helpers with unit tests so future refactors can't silently break the persistence contract.
+
+**What works:**
+- 5/5 pass on my machine via `python -m pytest tests/test_cache.py -v` (0.38s).
+- `monkeypatch` cleanly redirects `cache.CACHE_DIR` per test ([tests/test_cache.py:12-14](tests/test_cache.py#L12-L14)) — no fixture cross-talk.
+- Tests assert symbol normalization (`reliance` → `RELIANCE`) and option_type uppercasing (`ce` → `CE`) ([tests/test_cache.py:27-39](tests/test_cache.py#L27-L39)) — good defensive coverage of the public API surface.
+- Sentinel-mismatch path covered ([tests/test_cache.py:50-55](tests/test_cache.py#L50-L55)).
+- Pytest now installed (9.0.3) — second 46ffe18 flag implicitly resolved.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions (carry into p1.2):**
+- **Round-trip test doesn't pin dtypes.** [tests/test_cache.py:19](tests/test_cache.py#L19) uses `{"x":[1,2,3],"y":["a","b","c"]}` — generic. The parquet schemas in SPECS §2 are precise about `datetime64[ns]`, `float64`, `int64`. Add one test with a SPECS §2.1-shaped frame and assert dtypes survive the round-trip; that's what protects the data layer from silent type drift.
+- **"Atomic write" test only checks the happy path.** [tests/test_cache.py:58-64](tests/test_cache.py#L58-L64) confirms no leftover `.tmp` *after a successful write* — which proves the rename completed, not that the write is crash-safe. To actually test the atomicity claim, `monkeypatch` `Path.replace` to raise, then assert the destination file does *not* exist. Currently the test name overpromises.
+- **Strike-collision case from b8de59 still untested.** `option_path("X", date(2024,1,1), 50.5, "CE")` and `..., 50, "CE")` resolve to the same file. Either assert/enforce integer strikes or add a test that documents the current behavior so a future change is loud.
+- **No test asserts `CacheVersionMismatch.__str__` is informative.** Loud failure is only loud if the message helps the user; one substring check (`"version"` in `str(exc)`) is enough.
+
+**Domain / correctness checks:**
+- **Lookahead / financial logic:** N/A — pure I/O tests.
+- **Network / caching hygiene:** No network. `@pytest.mark.network` not needed here. Good.
+
+**What I tried:**
+- `python -m pytest tests/test_cache.py -v` → 5 passed in 0.38s.
+- Confirmed pytest 9.0.3 is now in `.venv`.
+
+**Next-commit suggestion:** `feat(p1.2): data/spot_loader.py`. When you write it, decide the force-refresh policy first (SPECS §7) so `load_spot` knows whether to re-call NSE when a year-parquet exists. The cleanest answer is probably: `force=False` default, never re-fetch a *closed* year; always re-fetch the current year up to today's date.
+
+---
