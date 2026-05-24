@@ -1274,3 +1274,43 @@ Trivial followup. Two tiny things closed from the 02e3644 review:
 **Next-commit suggestion:** `feat(p1.5): trading_calendar.py` — implementation. Stay with the spot_loader pattern (pure functions, no global state); cache the trading-day list per-year-of-spot rather than its own parquet (the spot_loader cache already has all the dates we need — derived view, not new data source). **Crucial: include a `test_anchor_off_trading_day_compositional` that explicitly nails the n=1-from-Saturday case** so the rule-3 ambiguity gets resolved by code, not by re-reading SPECS. The Jan-25 → n=15 → Jan-4 hand-check is the canonical positive test; the Saturday-anchor case is the canonical edge test.
 
 ---
+
+## Review of 19e0657 — feat(p1.5): data/trading_calendar.py — trading_days + offset_trading_days
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement the trading-day calendar. Bootstrap from `load_spot(CALENDAR_SYMBOL, ...)` (not a holidays database), so unusual sessions like the 2024-01-20 Saturday special-trading-day are picked up automatically.
+
+**What works:**
+- **Architectural elegance**: bootstrap-from-spot rather than holidays-database. The 2024-01-20 Saturday special session (NSE compensating for closing Monday Jan 22 for Ram Mandir) would be MISSING from any pre-computed forward-holidays calendar. By trusting "if RELIANCE traded, it's a trading day", we get this kind of NSE weirdness for free. Commit message ([commit 19e0657](src/data/trading_calendar.py) docstring lines 1-9) calls this out explicitly.
+- **`offset_trading_days` chose the COMPOSITIONAL semantic** for non-trading anchors — exactly Definition A from my fee312f flag, resolved by code. The implementation `days_le[-(n+1)]` after filtering to `d <= anchor` automatically handles both cases (trading anchor: `[-1]` = anchor; non-trading anchor: `[-1]` = round-down). Clean.
+- **Verified live triple**:
+  - `offset_trading_days(2024-01-25, 15) == 2024-01-04` ✓ (the canonical hand-check)
+  - `offset_trading_days(2024-01-22, 0) == 2024-01-20` ✓ (Jan-22 was Ram Mandir closure → round-down lands on Sat-special-session)
+  - `offset_trading_days(2024-01-22, 1) == 2024-01-19` ✓ (Definition A: round-down then step back)
+- **Buffer expansion** ([src/data/trading_calendar.py:75-90](src/data/trading_calendar.py#L75-L90)) is robust — initial `max(n*2 + 14, 60)`, doubles on miss, capped at 1500 days. Beyond cap → ValueError naming the limit.
+- `today_fn` injection on both functions ([src/data/trading_calendar.py:43, 59](src/data/trading_calendar.py#L43)) — testable; mirrors spot_loader's pattern.
+- `end = min(anchor, today_fn())` ([src/data/trading_calendar.py:79](src/data/trading_calendar.py#L79)) — load_spot won't return future data.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Buffer double-and-retry discards the previous fetch.** Since `spot_loader` caches the whole year, the second pass is essentially free (parquet hit + filter), so the practical cost is zero. But algorithmically the inner `while True` could be tightened: load spot ONCE for `from_date = anchor - MAX_BUFFER`, count trading days <= anchor, fail loud if `len < n+1`. Single pass, no retry. Cosmetic — the current code works.
+- **Future-dated anchor semantics not documented.** `anchor = date(2030,1,1)` + n=0 → returns most recent trading day ≤ today (since `end = min(anchor, today)`). That's "n=0 from future date = today's last trading day", which is a reasonable round-down extension but not explicitly stated in the docstring. Add a one-liner: "if anchor is in the future, `today_fn()` is used as the upper bound" — Phase 3 sweepers iterating forward may hit this.
+- **`days_le = [d for d in days if d <= anchor]`** ([src/data/trading_calendar.py:81](src/data/trading_calendar.py#L81)) is defensive but redundant when `end = min(anchor, today)` already caps. Either keep as defense-in-depth (current) or drop and rely on the load_spot window. Minor.
+- **No caching of `trading_days` result itself.** Each call to `offset_trading_days` re-calls `load_spot` (which is parquet-cached, so fast). Across a Phase-4 sweep with thousands of `offset_trading_days` calls, an in-memory LRU cache could speed things up by ~10x. Defer until measured.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** indirect via spot_loader. Correct.
+- **Options math:** N/A this commit.
+- **Look-ahead bias:** `end = min(anchor, today_fn())` is the right guard — no leak.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- Read the implementation line by line.
+- Traced the algorithm for the three verified examples mentally — all check out.
+- Cross-referenced the Saturday Jan-20-2024 claim against my own NSE knowledge (yes, that was a real special trading session for Ram Mandir).
+
+**Next-commit suggestion:** `test(p1.5)` — make the **load-bearing test the Ram-Mandir-closure compositional case** (`offset_trading_days(2024-01-22, 0) == 2024-01-20` and `offset_trading_days(2024-01-22, 1) == 2024-01-19`). This single test proves THREE non-obvious things at once: (a) round-down semantics for non-trading anchors works; (b) the bootstrap-from-spot architecture captures Saturday special sessions that any pre-computed holidays database would have missed; (c) the Definition-A compositional interpretation of n=1 (my fee312f flag) is the one in code. Plus: the canonical hand-check (`Jan-25 → n=15 → Jan-4`), `n<0` raises ValueError, insufficient-history raises ValueError with the buffer-cap diagnostic, AND a **jugaad_data.holidays cross-check** (load `holidays(2024)`, intersect with `trading_days(2024-01-01, 2024-12-31)` — must be empty). That last one is the structural sanity check the SPECS mandates.
+
+---
