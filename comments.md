@@ -349,3 +349,39 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** Per the BUILDER's own note this is `fix(p1.2.b)` — bundle (1) the **subset-based partial-response check** (`if not set(cached["date"]).issubset(set(fresh["date"]))`) since that's the only one of the three followups with real correctness teeth, (2) explicit `symbol` dtype cast to `"string"` matching `series`, (3) narrow warning filter `warnings.filterwarnings("ignore", message=".*timezones available.*")`. **Crucial:** add a new `test_partial_response_with_dropped_dates` to `test_spot_loader.py` — feed a "fresh" frame of the SAME length as cached but with one date dropped and one added; assert the cache stays put. The length-only check passes this case silently today; without a test the subset upgrade can regress.
 
 ---
+
+## Review of 64227f1 — fix(p1.2.b): subset-based partial check + symbol dtype + narrow warning
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the three non-blocking flags from the 8d34626 review — and lock in the **subset** (not length) partial-response check with a regression test for the same-length-but-content-shifted case that length-only would pass silently.
+
+**What works:**
+- Subset check implemented at [src/data/spot_loader.py:114-127](src/data/spot_loader.py#L114-L127). The warning now identifies the **first 3 missing dates** explicitly — far more actionable than the old "rows fetched vs cache has" count.
+- `test_partial_response_with_dropped_dates` ([tests/test_spot_loader.py:191-243](tests/test_spot_loader.py#L191-L243)) is exactly the test I asked for: same-length fresh response, middle date dropped, spurious future date inserted; asserts (a) cache length unchanged, (b) **dropped date still in cache**, (c) **spurious date not in cache**, (d) warning emitted. The four assertions together close every angle.
+- Symbol dtype now via `pd.array([symbol.upper()] * len(df), dtype="string")` ([src/data/spot_loader.py:53-58](src/data/spot_loader.py#L53-L58)). `test_symbol_and_series_have_matching_dtype` ([tests/test_spot_loader.py:247-256](tests/test_spot_loader.py#L247-L256)) pins both columns to `pd.StringDtype()`.
+- Warning filter narrowed to `message=r".*timezones available.*"` ([src/data/spot_loader.py:87](src/data/spot_loader.py#L87)) — a future jugaad change emitting a meaningful UserWarning will now reach us.
+- `_fake_jugaad` DATE dtype cast to `datetime64[ms]` ([tests/test_spot_loader.py:43-45](tests/test_spot_loader.py#L43-L45)) — keeps the fake honest against my non-blocking note that real jugaad returns ms not ns.
+- **22/22 pass** in 0.25s via `python -m pytest tests/`.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- The subset check could be a one-liner against pandas `.isin`: `cached["date"].isin(fresh["date"]).all()` — slightly clearer than dual-set construction, and avoids materializing two Python sets per refetch. Cosmetic; skip.
+- If `cached` is ever empty (cold-fetch path can't reach this branch, but defensive), `set().issubset(anything) → True` and any fresh response is accepted. Not a real issue today; defer.
+- `assert out["symbol"].dtype == pd.StringDtype()` ([tests/test_spot_loader.py:255](tests/test_spot_loader.py#L255)) relies on `StringDtype.__eq__` being version-stable across pandas. Hasn't been an issue for many versions; flag if pandas 3.1 surfaces a `default_na_value` change.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct; warning filter narrower is good hygiene for catching future upstream changes.
+- **Options math:** N/A.
+- **Look-ahead bias:** N/A.
+- **Statistical claims:** N/A.
+- **Data integrity:** the dropped-date scenario this commit closes was the most realistic real-world failure mode (NSE returns a partial bhavcopy after a midday glitch). Now provably blocked.
+
+**What I tried:**
+- `python -m pytest tests/ -v` → 22/22 in 0.25s.
+- Read the diff line-by-line; verified the new test's logic against the implementation.
+
+**Next-commit suggestion:** Phase 1.1+1.2 are now well-locked. Next planned is `feat(p1.3): data/expiry_calendar.py`. Three things matter from commit one: **(1) determinism is the load-bearing invariant** — the calendar must return a sorted unique list of `date` (Python `date`, per SPECS §2.3, not `datetime64`); the first test must be "two calls with the same inputs return byte-identical lists" because the whole reason for this module is to escape the `list(set(...))` non-determinism we already logged. **(2) Source the expiries from `bhavcopy_fo`'s `EXPIRY_DT` column for OPTSTK rows of the symbol, NOT a computed "last Thursday of month"** — NSE shifts expiries when the scheduled Thursday is a holiday, and computed last-Thursday will be wrong on those months. Hand-check one known expiry as part of testing: `RELIANCE` January 2024 monthly = `2024-01-25` (last Thursday). **(3) Cache the bhavcopy itself per-date, separate from the per-symbol expiries**: one bhavcopy serves all symbols, so a 5-symbol × 5-year sweep should fetch 60 monthly bhavcopies once, not 300.
+
+---
