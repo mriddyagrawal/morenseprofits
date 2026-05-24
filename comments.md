@@ -3306,6 +3306,65 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 1c00f69 — fix(p6.0.spec): SPECS §11 reconciliation with DESIGN_SPEC §1.4 revised caveats
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the 3-line doc-reconciliation I flagged as blocking-`feat(p6.1.caveats)` in the b7fe7e5 review. Reconcile SPECS §11.3 with DESIGN_SPEC §1.4's revised three-card-with-dismiss caveats design. **Closes all 4 items I flagged** (1 blocking + 3 non-blocking) in a single docs-only commit.
+
+**What works (item-by-item closure of my b7fe7e5 review flags):**
+
+1. **🔬 Blocking §11.3 caveats reconciliation** — closed verbatim per my recommendation. `render_caveats_expander` → `render_caveats_strip` + `render_caveats_collapsed`. New wording cross-references DESIGN_SPEC §1.4 and explicitly notes "the original expander design which is now superseded" — leaves no ambiguity for a future contributor about which design wins. Session state key `mp_caveats_dismissed` follows the `mp_` namespace prefix from §11.4. **Dismiss is session-scoped, never persisted to disk** — exact wording from DESIGN_SPEC §1.4.
+
+2. **§11.3 caveat-string source-of-truth note (non-blocker #1)** — closed: "Exact wording is authored alongside the constants in `feat(p6.1.caveats)` — the verbatim string is the source of truth; this section pins only the existence + 'one paragraph each' length contract." Prevents SPECS-vs-code drift on the actual caveat text.
+
+3. **§11.2 empty_skips_frame() (NOT None) clarity (non-blocker #2)** — closed: "callers can `.groupby('skip_reason')` unconditionally without a truthy check". Saves every Phase-6.3+ consumer the same defensive `if skips is None` guard.
+
+4. **§11.1 `__init__.py` policy (non-blocker #3)** — closed: "stays empty; no package-level re-exports... would import every submodule including the streamlit-importing tab modules, defeating §11.1's test-isolation rule". Excellent rationale — captures WHY re-exports would break the test-isolation guarantee, not just "don't do it".
+
+**Live-verified:**
+- `.venv/bin/python -m pytest tests/` → **367/367** in 1.47s. Docs-only commit; no regression.
+- Read the entire diff. 4 hunks; all in SPECS.md §11; lines net.
+- Cross-checked the new §11.3 against DESIGN_SPEC §1.4 — wording matches; helper names match; session_state key matches.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The closure is clean enough that there's nothing else to flag in §11.** I re-read SPECS §11 in full after the fix; no remaining drift with DESIGN_SPEC. The contract is now self-consistent for `feat(p6.1.caveats)` to implement against.
+
+2. **Sequencing note**: this is the right pattern for the BUILDER↔REVIEWER loop. I flagged 4 items in the b7fe7e5 review (1 blocking + 3 non-blocking). BUILDER closed all 4 in one ~30-line follow-up commit before any code lands. **Total cost ≈ 5 minutes; alternative cost = a refactor of `src/web/caveats.py` once it's been built against the wrong contract.** This is the kind of pre-code doc reconciliation the nuclear-commits + reviewer-loop pattern is designed to surface.
+
+3. **Outstanding non-blockers from prior commits still open** (not regressed, just unaddressed — fine to bundle into a single doc-touchup whenever someone has DESIGN_SPEC.md open):
+   - DESIGN_SPEC §9.5 + §9.6 still describe deferred verify_p5 + StringDtype followups that 8893b81 closed (flagged in my 8a49165 + 3880d9d reviews).
+   - Mockup PNG filenames are still `image.png` / `image copy N.png` (flagged in my 3880d9d review).
+   - §1.5 mtime picker dependency on 617878b's test-fixture-leak fix is still undocumented (flagged in my 8a49165 + 3880d9d reviews).
+   These are low-stakes; opportunistic riders for whenever someone next touches `DESIGN/`.
+
+**Domain / correctness checks:**
+- **Cross-doc consistency**: ✓ §11.3 ↔ DESIGN_SPEC §1.4 reconciled.
+- **Asymmetric-conservatism**: ✓ the dismiss-to-banner pattern is now contract-pinned, not just design-described. Code-level honesty contract preserved.
+- **Test isolation**: ✓ the `__init__.py` empty-policy clarification protects the `MUST NOT import streamlit at module time` guarantee for unit tests.
+
+**What I tried:**
+- `git show 1c00f69` — 4 hunks, all docs, all in SPECS.md.
+- `.venv/bin/python -m pytest tests/` → 367/367.
+- Cross-checked new §11.3 wording against the recommendation block in my b7fe7e5 review — substantially matches the recommended fix. BUILDER also added the `mp_` namespace prefix for `mp_caveats_dismissed` (matching §11.4 convention) — that was implicit in my recommendation but BUILDER made it explicit. Small improvement on my suggestion.
+
+**Sequencing observation:** Three doc commits in a 12-minute span (3880d9d → b7fe7e5 → 1c00f69) — typical iteration cost for a design-heavy phase boundary. **Phase-6 code work is now properly gated by self-consistent contracts.** Going forward, `feat(p6.0.format)` + `feat(p6.1.discover)` + `feat(p6.1.caveats)` can all land without worrying about doc drift.
+
+**Reviewer-loop credit**: BUILDER also explicitly credited the review in the commit body ("Reviewer (b7fe7e5 review) caught a real drift") — this kind of attribution helps future contributors understand the WHY for the small-fix commit. The pattern is being internalized.
+
+**Next-commit suggestion:** Resume the Phase-6.0 sequence:
+1. `feat(p6.0.format)` — `src/web/_format.py` per DESIGN_SPEC §2.7 (Indian lakhs/crores `format_inr` + `format_pct`).
+2. `test(p6.0.format)` — boundary tests (₹1L threshold, ₹1Cr threshold, sign handling, ROI-without-sign vs P&L-with-sign).
+
+After that → `feat(p6.1.discover)` (sweep-discovery module per §11.2). The first real Phase-6 code lands at that point.
+
+**Opportunistic rider** for any subsequent doc-touching commit (still 5-minute total, prevents future "still pending" confusion): close the 3 outstanding non-blockers listed above (DESIGN_SPEC §9 staleness, mockup filenames, §1.5 mtime dependency note). All in `DESIGN/DESIGN_SPEC.md`; one commit; no SPECS interaction; no code touched.
+
+---
+
 ## Review of b7fe7e5 — chore(p6.0.spec): SPECS §11 — web layer contracts (Phase 6)
 
 **Verdict:** ⚠ accept-with-followup — **SPECS §11.3 drifts from DESIGN_SPEC §1.4 revised design**. Doc fix needed before `feat(p6.1.caveats)` lands.
