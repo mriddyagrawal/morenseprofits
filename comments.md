@@ -731,3 +731,40 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Per the BUILDER's note the **followup fix commit comes next**. The three followups have different urgency — **prioritize `MissingDataError` wrapping for weekend/holiday fetches** because the upcoming `feat(p1.3.2): expiry_calendar` will need to cleanly distinguish "this candidate date had no F&O bhavcopy" from "the fetch crashed". Concretely: `_fetch_legacy` wraps `BadZipFile`/`HTTPError` into `MissingDataError(f"no F&O bhavcopy for {trade_date}")`; same for `_fetch_udiff`'s 404/403 path. Then `feat(p1.3.2)` can `try: load_bhavcopy_fo(d) except MissingDataError: continue` while iterating candidate sample days per month — clean control flow without leaking network internals. `Int64Dtype()` + `force_refresh` can land in the same commit or follow, but the `MissingDataError` wrap is on the p1.3.2 critical path.
 
 ---
+
+## Review of bc1add4 — fix(p1.3.1.b): wrap fetch failures as MissingDataError + dispatch test
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the p1.3.2-critical-path piece — wrap "no upstream data" failures as `MissingDataError` while leaving network-level errors untouched. Plus close the dispatch-boundary test gap.
+
+**What works:**
+- **Wrap-policy boundary explicitly defined and tested.** [src/data/errors.py:21-30](src/data/errors.py#L21-L30) docstring says "callers iterating candidate dates use this to distinguish 'no data here' from 'the network blew up'"; `test_network_errors_are_not_wrapped` ([tests/test_bhavcopy_fo_loader.py:386-393](tests/test_bhavcopy_fo_loader.py#L386-L393)) pins the boundary by asserting `ConnectionError` propagates unchanged.
+- Three concrete wrap sites covered:
+  - Legacy `BadZipFile` → `MissingDataError` ([src/data/bhavcopy_fo_loader.py:82-95](src/data/bhavcopy_fo_loader.py#L82-L95)). NSE returns HTML for non-trading days; jugaad surfaces as BadZipFile. Test mocks NSEArchives to raise BadZipFile, asserts wrap.
+  - UDiff `HTTPError` (404) → `MissingDataError` with status code in the message. Test fakes a 404 response and asserts `match="no UDiff F&O bhavcopy.*404"`.
+  - UDiff `BadZipFile` (200 + HTML body, which NSE actually does in the wild) → `MissingDataError`. Test fakes a 200 with HTML content and asserts wrap. The fact that the BUILDER caught BOTH the 404 and the 200+HTML failure modes is the kind of attention real NSE gives back.
+- **Dispatch-boundary test** ([tests/test_bhavcopy_fo_loader.py:309-336](tests/test_bhavcopy_fo_loader.py#L309-L336)) closes the gap from the fca735a review — pins 2024-07-07 → legacy, 2024-07-08 → udiff, 2024-07-09 → udiff. A `<` → `<=` regression would now fire.
+- `raise X(...) from e` preserves the original traceback. `e.response.status_code if e.response is not None` is defensive.
+- 45/45 pass in 0.35s.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **HTTP 403 currently wraps to `MissingDataError` too** (any `HTTPError` does). Semantically 403 means "data exists, you're rejected" (likely a stale browser UA), not "no data". For p1.3.2's `except MissingDataError: continue` iteration, a 403 would be silently swallowed — every sample-day might 403 and the calendar would build empty without a hint why. Consider distinguishing: `if e.response and e.response.status_code == 403: raise` (let it propagate) or wrap as a separate `BhavcopyAccessDeniedError`. Cheap insurance against the WAF-update-on-friday surprise.
+- **`HTTPError` catch is broad.** A future 500/503 from NSE is genuinely "service flaking, retryable", not "no data". Mapping those to `MissingDataError` could turn a transient outage into a silent skip during a calendar build. Either narrow to 404/410 specifically, or keep `requests.HTTPError` propagating for 5xx and wrap only 4xx-with-no-data.
+- **Wrap docstring lists `weekend, holiday, post-cutover` as causes** ([src/data/bhavcopy_fo_loader.py:84-86](src/data/bhavcopy_fo_loader.py#L84-L86)) — but "post-cutover" for legacy and "pre-cutover" for udiff are *programmer* errors (mis-dispatch), not data-availability gaps. The fetchers wouldn't be called for those dates by `_fetch_raw`. Worth removing from the docstring causes list to avoid teaching the wrong mental model.
+- **`test_legacy_fetch_wraps_badzipfile_as_missing_data` uses `date(2024, 1, 6)` (Saturday)** as the requested date — fine, but the test doesn't actually verify it's a Saturday. The point of the test is the wrap, not the calendar logic. Cosmetic.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct — `NSEArchives()` is now monkey-patchable via the `bfo.NSEArchives` reference.
+- **Look-ahead bias:** N/A this commit.
+- **Options math / stats:** N/A.
+
+**What I tried:**
+- `python -m pytest tests/` → 45/45 in 0.35s.
+- Read the new tests + the docstrings on `MissingDataError`.
+
+**Next-commit suggestion:** Per the BUILDER's note, **`fix(p1.3.1.c): Int64Dtype + force_refresh`** is next. Two micro-decisions to pin BEFORE writing the code: **(1) For `Int64`, you need to update `_assert_specs_2_4_schema` from `dtype.name == "int64"` → accepting either `int64` or `Int64`, AND amend SPECS §2.4 to say "nullable integer (Int64) when upstream blanks are possible; plain int64 otherwise". The semantically right choice IMO is `Int64` for `oi` / `oi_change` (legitimately unknown is meaningful) and `int64` for `contracts` (an absent value means 0 traded, fillna(0) is the truth-preserving move). State this in SPECS so it's not a runtime surprise. (2) `force_refresh=True` must pass `cache.write(..., overwrite=True)` AND the test should assert that with cache present + `force_refresh=True`, `_fetch_raw` is called once (mirrors `spot_loader.test_force_refresh_refetches`). After those land, **immediately** kick off `feat(p1.3.2): expiry_calendar` — the MissingDataError wrap just made the calendar's iteration loop trivial; don't let the followup-bundle grow.
+
+---
