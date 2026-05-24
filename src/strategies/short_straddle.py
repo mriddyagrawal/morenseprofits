@@ -42,8 +42,15 @@ class ShortStraddle:
 
     No tunable params in v1 — always 1 lot per leg. Phase 4 will add
     `qty_lots` and `strike_offset_pct` (for short strangle, etc.).
+
+    `recommended_strategy_offset_pct` (SPECS §4a + §6c.1) is the
+    real-world SPAN portfolio-offset benefit for this strategy. The
+    sweeper reads this generically and forwards to
+    `price_trade(strategy_offset_pct=...)` so Tier-B margin math is
+    automatic — callers don't have to remember the constant.
     """
     name: str = "short_straddle"
+    recommended_strategy_offset_pct: float = SHORT_STRADDLE_MARGIN_OFFSET
 
     def generate_trades(
         self,
