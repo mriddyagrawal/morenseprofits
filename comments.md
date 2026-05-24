@@ -3306,6 +3306,57 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 617878b — fix(test-fixtures): redirect both sweeper.RESULTS_DIR and results.RESULTS_DIR
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Tests were silently leaking small parquets (0–1 rows) into the real `data/results/` directory because the fixture's `monkeypatch.setattr(sweeper_mod, "RESULTS_DIR", tmp_path)` only redirected the cache-hit short-circuit check — the actual write path went through `results.results_path()` which has its own `from src.config import RESULTS_DIR` binding. **Surfaced by the new p5.verify script itself**: it enumerates `sweep_*.parquet` and found 3 test-leaked artifacts (1, 0, 1 rows) alongside the real 18-row verify run — direct evidence the fixture wasn't redirecting all write paths.
+
+**What works:**
+- **Root cause correctly identified** ([tests/test_sweeper.py:97-103](tests/test_sweeper.py#L97-L103) docstring) — `from src.config import RESULTS_DIR` creates a NEW binding in each importing module. Patching `sweeper_mod.RESULTS_DIR` does NOT affect `results_mod.RESULTS_DIR` because they're independent module-level names pointing at the same path-object. Classic Python `from-import` patching gotcha.
+- **Minimal fix**: add `monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)` in two places (`tests/test_sweeper.py:_redirect_results` and `tests/test_iron_condor.py:test_sweep_one_iron_condor_uses_spot_based_margin`). 6 lines net.
+- **Docstring explains the gotcha** so future contributors don't re-introduce single-side patching.
+- **Live-verified the fix**: I ran `ls data/results/` (1 file: `sweep_bde92aef8573.parquet`) → `pytest tests/ -q` → 365/365 pass → `ls data/results/` (still 1 file). **Zero new test leaks after the fix.** The 3 pre-existing leaked parquets I saw earlier in this session must have been cleaned manually by BUILDER (not in this commit's diff, but the source of leaks is now plugged).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+
+1. **🔬 Call-site patching is fragile to future module additions** — I grepped all consumers of `RESULTS_DIR`:
+   ```
+   src/engine/results.py:19   from src.config import RESULTS_DIR
+   src/engine/sweeper.py:36   from src.config import RESULTS_DIR
+   scripts/verify_p4.py:41    from src.config import RESULTS_DIR
+   scripts/verify_p5.py:46    from src.config import RESULTS_DIR
+   ```
+   Currently 2 production modules + 2 scripts (scripts don't need patching). If a Phase-6 module or Phase-8 MCP server adds a third `from src.config import RESULTS_DIR`, **the test fixture will silently regress** to leaking parquets via the new module. **Structural fix options**:
+   - Replace `from src.config import RESULTS_DIR` with `from src import config` + `config.RESULTS_DIR` at call sites. Then `monkeypatch.setattr(config, "RESULTS_DIR", tmp_path)` fixes everyone at once. **Recommended** — Pythonic, robust to additions.
+   - OR wrap as `get_results_dir()` function so each call re-reads from config. Heavier refactor.
+   - OR add a `conftest.py` fixture that patches `src.config.RESULTS_DIR` AND walks `sys.modules` to re-patch any module that already imported the name. Hacky.
+   
+   Not blocking for v1; flag for Phase-6 when the third consumer lands.
+
+2. **`tests/test_results.py:16`** already patches `results.RESULTS_DIR` correctly — the fix establishes that pattern as the convention. Worth a CLAUDE.md note: "when patching `RESULTS_DIR` in a test fixture, patch BOTH `sweeper_mod` AND `results_mod`". Cosmetic but de-risks future contributors.
+
+3. **Pre-existing leaked parquets not deleted in this commit** — the BUILDER cleaned them manually (data/results/ now has 1 file), but that cleanup isn't in the diff. Not a problem (manual cleanup of test pollution is fine), but a `git clean -nx data/results/` check in CI would catch this class of issue going forward. Phase-7 concern.
+
+**Domain / correctness checks:**
+- **Determinism**: ✓ tests + production paths are now isolated. No cross-contamination.
+- **Test surface**: ✓ 365/365 pass identically before and after. No functional change to behavior, only to side-effect isolation.
+- **The fix is minimal and surgical**: no production code touched. Only test fixtures. Lowest-risk path.
+
+**What I tried:**
+- `git show 617878b` — diff is 2-file, 6-line, all in `tests/`. No production code touched.
+- `grep -rn "RESULTS_DIR" src/ tests/ scripts/` — confirmed only 2 production modules import via `from src.config import RESULTS_DIR`; both now patched.
+- `ls data/results/` → 1 file → `pytest tests/` → 365 pass → `ls data/results/` → still 1 file. **No new leakage.**
+- Read `tests/test_iron_condor.py:399-410` — fix applied identically to the iron-condor sweep fixture.
+
+**Sequencing note (interesting):** This fix and `chore(p5.verify)` share a commit timestamp (`Sun May 24 21:31:42 2026 +0530`). The fix landed FIRST in the log (617878b) immediately before 416719f. That's the right order — the verify script SURFACED the leak (by enumerating sweep_*.parquet and finding multiple candidates) and BUILDER fixed the test fixture so future verify-runs would only see the real parquet. **Good causality**: the verify script's "largest of N candidates" diagnostic is what made the previously-invisible test pollution visible. Phase-6 verify scripts should adopt the same pattern.
+
+**Next-commit suggestion:** Already covered in the 416719f review block below — `feat(p6.1): streamlit UI skeleton`. The fix here is a prerequisite cleanup; Phase-6 can now trust `data/results/` to contain only real sweep parquets.
+
+---
+
 ## Review of 416719f — chore(p5.verify): live aggregate → rank pipeline on the verify parquet
 
 **Verdict:** ✅ accept
