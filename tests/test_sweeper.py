@@ -282,6 +282,29 @@ def test_sweep_grid_skips_missing_data_without_dying(monkeypatch, tmp_path):
     assert 0 <= len(df) <= 2
 
 
+def test_sweep_offline_cache_miss_propagates(monkeypatch, tmp_path):
+    """LOAD-BEARING per SPECS §6a + §6c.2: OfflineCacheMiss must NOT
+    be swallowed by the MissingDataError skip-loop. Otherwise an
+    offline cold-cache sweep would silently return zero rows."""
+    from src.data.errors import OfflineCacheMiss
+    _wire_mocks(monkeypatch)
+    _redirect_results(monkeypatch, tmp_path)
+    cache.CACHE_DIR = tmp_path
+
+    def boom(*a, **kw):
+        raise OfflineCacheMiss("cold offline cache")
+
+    monkeypatch.setattr(trading_calendar, "offset_trading_days", boom)
+    with pytest.raises(OfflineCacheMiss):
+        sweep_grid(
+            strategies=["short_straddle"], symbols=["RELIANCE"],
+            expiries=[date(2024, 1, 25)],
+            entry_offsets_td=[15], exit_offsets_td=[1],
+            today_fn=lambda: date(2026, 5, 24),
+            offline=True,
+        )
+
+
 def test_sweep_grid_empty_window_grid_returns_empty(monkeypatch, tmp_path):
     """Inverted entry/exit gets filtered out at the task-enumeration
     level; no exception, just empty result."""
