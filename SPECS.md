@@ -712,12 +712,15 @@ Achieved by:
 2. No shared mutable state across workers — each worker reads cache (read-only) and returns one result dict.
 3. `pd.concat(results)` after Pool returns; **sort by `(strategy, symbol, expiry, entry_offset_td, exit_offset_td)` then `reset_index(drop=True)`** before persisting.
 4. `run_id` defaults to a deterministic hash of inputs (same grid → same run_id).
+   **Hash inputs**: the sorted tuple of `(strategies, symbols, expiries, entry_offsets_td, exit_offsets_td)`. **Hash EXCLUDES** operational kwargs (`today_fn`, `parallel`, `n_workers`, `offline`) so the same logical sweep maps to the same `run_id` regardless of how it was executed.
 
-Test pattern: `test_byte_identical_under_parallelization` runs the same sweep with `n_workers=1` AND `n_workers=4` on a small fixture grid; asserts the two parquets hash-equal.
+Test pattern: `test_byte_identical_under_parallelization` runs the same sweep with `n_workers=1` AND `n_workers=4` on a small fixture grid; asserts `pd.testing.assert_frame_equal(read(a), read(b))` — semantic equality, not raw-bytes (parquet metadata like writer-version timestamps would break a byte-level assertion for unrelated reasons; semantic frame equality is the actual determinism contract).
 
 ### 6c.4 Results store
 
-`data/results/{strategy_name_or_"sweep"}_{run_id}.parquet`. SPECS §2.5 columns + sweep-specific: `entry_offset_td`, `exit_offset_td`, `notional_at_entry`, `entry_spot`, `exit_spot`. Append-only; no CACHE_VERSION guard (results are derived from the input cache which IS versioned).
+`data/results/{strategy_name_or_"sweep"}_{run_id}.parquet`. SPECS §2.5 columns + sweep-specific: `entry_offset_td`, `exit_offset_td`, `notional_at_entry`, `entry_spot`, `exit_spot`. No CACHE_VERSION guard (results are derived from the input cache which IS versioned).
+
+**Re-run policy**: if `data/results/{name}_{run_id}.parquet` already exists, `sweep_grid` **skips the whole sweep and returns the cached frame** (the deterministic-hash `run_id` guarantees the on-disk file IS the answer for these exact inputs — redoing the work is wasteful). A `force: bool = False` kwarg overrides for the rare case where the user wants to rebuild (e.g. they refreshed the underlying cache and want the sweep to pick up new prices). The skip + force-refresh symmetry matches how `spot_loader.load_spot` already handles cached vs `force_refresh=True` paths.
 
 ## 8. Error taxonomy
 
