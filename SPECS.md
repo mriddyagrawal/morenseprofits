@@ -70,11 +70,21 @@ morenseprofits/
 
 ## 2. Cached data schemas (parquet on disk)
 
+### 2.0 Date-dtype convention (applies to every schema below)
+
+Every column documented as `date` in the schemas below is stored on disk as
+`datetime64[us]` (pandas 3.0 + pyarrow round-trip lands here) and exposed via
+`.dt.date` in any public API that promises a Python `date`. Microsecond
+precision is far more than daily data needs; tests assert
+`pd.api.types.is_datetime64_any_dtype(col)` rather than pinning a specific unit.
+
+Per-schema columns named below use `date` as shorthand for "follows §2.0".
+
 ### 2.1 Spot — `data/cache/spot/{SYMBOL}/{YEAR}.parquet`
 Columns (subset of jugaad `stock_df`, normalized):
 | col | dtype | notes |
 |---|---|---|
-| `date` | `datetime64` (any unit) | trading date, naive IST, midnight. *Note*: pandas 3.0 + pyarrow 24 round-trip parquet writes `datetime64[ns]` and reads back `datetime64[us]`. Microsecond precision is far more than daily data needs; we assert "is datetime64" and let the unit float per the library's behavior. |
+| `date` | `date` (see §2.0) | trading date, naive IST, midnight |
 | `symbol` | `string` | uppercase |
 | `series` | `string` | always `"EQ"` for v1 |
 | `open`, `high`, `low`, `close` | `float64` | INR |
@@ -129,12 +139,6 @@ normalized lowercase; raw upstream uses uppercase):
 | `oi` | `int64` | open interest |
 | `oi_change` | `int64` | change in OI |
 | `trade_date` | `date` | the date the bhavcopy represents (== the filename) |
-
-**Date dtype contract.** `expiry` and `trade_date` are stored on disk as
-`datetime64[us]` (matches the post-parquet-roundtrip dtype the spot loader
-already settled on per §2.1). Any public API that promises a `date` exposes
-these via `.dt.date`. Pinning this here so the p1.3.1 parser doesn't pick a
-third variant silently.
 
 **Look-ahead bias contract.** The bhavcopy is dated by `trade_date`. Engine
 consumers that join bhavcopy rows into a backtest **must** filter
