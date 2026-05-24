@@ -3306,6 +3306,89 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of b7fe7e5 — chore(p6.0.spec): SPECS §11 — web layer contracts (Phase 6)
+
+**Verdict:** ⚠ accept-with-followup — **SPECS §11.3 drifts from DESIGN_SPEC §1.4 revised design**. Doc fix needed before `feat(p6.1.caveats)` lands.
+
+**Phase / commit goal (as I understood it):** Pin the load-bearing contracts the `src/web/` package must honor. SPECS = contracts, DESIGN_SPEC = architecture. 6 subsections covering module layout, sweep discovery, caveat constants, session-state convention, min_n flow, universe shape. Docs-only; no code; 367/367 still passes.
+
+**What works:**
+
+- **Clear separation of concerns**: "DESIGN_SPEC.md owns the UI architecture; SPECS §11 pins the contracts" — the right split. Architecture can flex via the §11 change-log discipline; contracts are frozen so module signatures don't churn.
+- **§11.1 module layout** is correct: `app.py` thin entry, `src/web/{discover,caveats,leaderboard,heatmap,trends,per_stock}.py` separated. **The "MUST NOT import streamlit at module time"** discipline ([SPECS.md §11.1](SPECS.md#L760)) is exactly the right rule for unit-testability — `discover.py` will be tested without a Streamlit context.
+- **§11.2 sweep discovery contract** is fully specified: `find_latest_sweep(results_dir=RESULTS_DIR) -> Path | None`, `read_sweep_with_skips(parquet_path) -> tuple[DataFrame, DataFrame]`. **The `None` return on empty results_dir** is the right contract — forces the caller to render a "no sweeps yet" message instead of crashing. **The mtime rationale is cross-referenced** to DESIGN_SPEC §1.5 — single source of truth for the WHY.
+- **§11.2 explicitly rejects "largest by row count"** as a discovery rule, citing the stale-but-big silent-outranking concern. **Good documentation of the rejected alternative**: future contributors won't reintroduce verify_p5's logic into the UI by accident.
+- **§11.4 state-key prefix `mp_`** — namespace convention prevents accidental collision with other apps' session_state if the UI is ever embedded. Cheap discipline.
+- **§11.5 min_n single-source-of-truth** — sidebar slider drives BOTH leaderboard ranker AND heatmap masking. Pins the wiring constraint at the contract layer, not just the design layer.
+- **§11.6 universe as `list[str]` everywhere** — Phase-7 user-curated-universe becomes a sidebar text-area conversion. Forward-compatibility baked into the contract.
+- **No code; no tests; 367/367 still passes** — true docs-only commit.
+
+**🔬 Blocking issue (NON-CODE — doc reconciliation, but blocks `feat(p6.1.caveats)`):**
+
+**§11.3 describes the OLD expander design; DESIGN_SPEC §1.4 was revised in 3880d9d to use a NEW three-card-with-dismiss design.** Specifically:
+
+SPECS §11.3 (this commit):
+> `src.web.caveats.render_caveats_expander()` renders all three as labeled sub-sections inside a single `st.warning`-styled `st.expander` (per DESIGN_SPEC §1.4 — **one expander, open by default, banner-blindness mitigation**).
+
+DESIGN_SPEC §1.4 (revised in 3880d9d):
+> Render **three side-by-side cards** at the top of every tab, each holding one caveat. A "Read once, then dismiss" link collapses the row into a slim **single-line banner**...
+> `[REVISED 2026-05-25 — mockup alignment; stronger honesty contract than the original expander design]`
+
+**Helper-name drift too**:
+- SPECS §11.3 names it `render_caveats_expander()`.
+- DESIGN_SPEC §4 names it `render_caveats_strip()` (three cards) **+** `render_caveats_collapsed()` (slim banner).
+
+This is the same staleness pattern I flagged in 8a49165 (the change-log entry covering §§1-8 + §10 left §9 unaudited). Here, BUILDER apparently wrote SPECS §11.3 against the original (pre-3880d9d) DESIGN_SPEC §1.4 wording, missing the 2026-05-25 revision that landed ~4 minutes earlier in 3880d9d.
+
+**Recommended fix (lands in a tiny follow-up commit before `feat(p6.1.caveats)`)**:
+
+Replace SPECS §11.3's last paragraph with:
+
+> `src.web.caveats.render_caveats_strip()` renders all three as side-by-side cards at the top of every tab (per DESIGN_SPEC §1.4 — three always-visible cards, stronger honesty contract than an expander). Companion `render_caveats_collapsed()` renders the slim single-line "⚠ 3 active caveats — click to expand" banner used after `st.session_state["mp_caveats_dismissed"] = True`. Dismiss state is session-scoped (browser refresh re-expands).
+
+This is a 3-line edit. **It MUST happen before `feat(p6.1.caveats)` lands** — otherwise BUILDER will implement against the old contract and have to refactor in `feat(p6.1.app)` when the mockup-driven design surfaces. **Cheaper to fix the doc now (3 lines) than to refactor the code later (whole module).**
+
+(Bonus: while reconciling, also rename the session_state key in §11.4 to be consistent — `mp_caveats_dismissed` is the natural name once §11.3 commits to the dismiss-to-banner pattern.)
+
+**Non-blocking observations:**
+
+1. **§11.3 SURVIVORSHIP_CAVEAT + MARGIN_TIER_B_CAVEAT constants have no body text yet.** SPECS describes them ("paraphrases SPECS §6b.3"; "summarizes SPECS §4a caveats 1, 3, 4") but doesn't pin the actual string verbatim. The MULTIPLE_COMPARISONS_CAVEAT precedent (450-char specific text in `src.analytics.rank`) suggests these two should also be pinned in a constants module — probably during `feat(p6.1.caveats)` since that's the file that creates them. **Worth a SPECS §11.3 note**: "exact wording authored alongside the constants; verbatim string is the source of truth, this section pins only the existence + length-of-paragraph contract."
+
+2. **§11.2 doesn't pin the empty-state contract for `read_sweep_with_skips`** when the companion `*_skipped.parquet` is missing. The text says "Read the companion `*_skipped.parquet` if present; otherwise return `empty_skips_frame()`." — but is this an empty-canonical-schema frame or `None`? Body says `empty_skips_frame()` (from `src.engine.results`), which is the canonical-schema-empty version. ✓ Consistent with §11.2's "Both frames preserve their canonical schemas" — but worth one explicit sentence "missing skips → `empty_skips_frame()` (NOT `None`)" so the caller never branches on truthy checks.
+
+3. **No `__init__.py` policy** stated. Convention is empty `src/web/__init__.py`; should be made explicit ("public modules; no re-exports at the package level") so future contributors don't add a `from . import *` import that defeats §11.1's "no module-time streamlit imports" rule.
+
+**Domain / correctness checks:**
+- **Asymmetric-conservatism**: ✓ The contract for caveats (constants + helper + always-rendered) extends the honesty discipline to the UI. The dismiss-to-banner reconciliation is the only doc-drift gap, not a design regression.
+- **Cross-doc consistency**: ⚠ §11.3 vs DESIGN_SPEC §1.4 — flagged above.
+- **Module testability**: ✓ §11.1 forbids module-time streamlit imports in helpers; this is what enables `tests/test_discover.py` etc. to run in a regular pytest context.
+
+**What I tried:**
+- `git show b7fe7e5` — confirmed 1 file (SPECS.md), +84 lines.
+- Read SPECS §11 end-to-end; cross-checked against DESIGN/DESIGN_SPEC.md sections it references.
+- Confirmed the §11.3 vs §1.4 drift by side-by-side comparison of the two texts.
+- Confirmed §11.5 + §11.6 match DESIGN_SPEC §8 wiring constraints #4 + #1.
+- Read the §11.2 sweep-discovery contract against DESIGN_SPEC §1.5 — consistent (both mtime-based, both reject row-count-based).
+- Verified 367/367 still passes (`.venv/bin/python -m pytest tests/` → no change, no code touched).
+
+**Sequencing observation:** Two doc commits 3 minutes apart (00:41:51 → 00:44:49) — the drift opportunity was always there. Process suggestion: when DESIGN_SPEC.md and SPECS.md both touch the same architectural primitive (caveats, sweep-discovery, etc.), the second commit should re-read the first's relevant sections before authoring. The fix is 3 lines; the lesson is "design docs are a graph, not a list — when one node changes, audit incoming references."
+
+**Next-commit suggestion (revised order, given the drift):**
+
+**My lean — do the doc reconciliation FIRST, then proceed:**
+
+1. **`docs(p6.0.spec.fix): reconcile SPECS §11.3 with DESIGN_SPEC §1.4 revised caveats design`** — 3-line edit per the recommendation above. Renames helper to `render_caveats_strip` + `render_caveats_collapsed`, updates the paragraph, adds the dismiss-state-key naming for §11.4. **5-minute commit, prevents a 30-minute Phase-6.1 refactor.**
+2. `feat(p6.0.format)` — `src/web/_format.py` per DESIGN_SPEC §2.7 (Indian lakhs/crores helper + percent formatter).
+3. `test(p6.0.format)` — boundary tests.
+
+If BUILDER chooses to skip the doc reconciliation, **the next code commit's review will flag whichever doc the code matched and recommend updating the other one**. The drift WILL surface; deferring it just makes the surfacing commit messier.
+
+**Opportunistic riders** (same as 3880d9d / d9f2cb2 reviews; bundle into the doc-fix commit if doing one):
+- Mark DESIGN_SPEC §9.5 + §9.6 as `RESOLVED in 8893b81`.
+- `git mv` mockup PNGs to `leaderboard.png` / `per_stock.png` / `heatmap.png` / `trends.png`.
+
+---
+
 ## Review of d9f2cb2 — chore(p6.0.deps): add plotly, drop altair from requirements.txt
 
 **Verdict:** ✅ accept
