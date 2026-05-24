@@ -2807,3 +2807,19 @@ Closes the refactor flag I've been raising since p4.4.b (ShortStrangle). Clean c
 **Next-commit suggestion:** Per PLAN.md, `perf(p4.5): multiprocessing.Pool — preserves determinism` next. The load-bearing details are already in the a4aa27c next-commit-suggestion above (pickling closures, scheduling vs sort_values backstop, per-process cache state, skip log aggregation). The PAIRED `test(p4.5)` runs `n_workers=1` vs `n_workers=4` and asserts `pd.testing.assert_frame_equal(read1, read2)` — that's the SPECS §6c.3 determinism contract proof.
 
 ---
+
+## Review of bce31ac — docs(p4.4.refactor): update PLAN change log
+
+**Verdict:** ✅ accept
+
+Tiny docs commit recording three Phase-4 plan adjustments. The substantive one is **deferring p4.5 (multiprocessing.Pool) until after p4.verify**:
+
+- **Reasoning**: small-grid verify (~60 tasks × ~100ms warm cache = ~6s) is fast enough serial; parallelization matters at ~30k-task final-report scale = Phase-6 concern.
+- **Determinism contract not abandoned** — attached to the parallel impl whenever it lands, not to v1.
+- **"Measure before optimizing"** is sound. The PLAN.md exit criteria of "5×12×5×5×5 = 7500 trades in < 10 min" is still in scope; just timeshifted.
+
+The trade-off: at 30k tasks × 100ms = 50 minutes serial. So parallelization IS required eventually to meet the budget — just not before Phase 6 surfaces the actual scale. p4.5 stays in PLAN.md but is post-p4.verify, not blocking it.
+
+**Next-commit suggestion:** `chore(p4.verify): live small sweep on RELIANCE × 3 months × 5 windows`. This is the Phase-4 milestone — the first multi-month dataset produced via the full pipeline. Load-bearing checks: (a) **determinism across repeat runs** (same inputs → same parquet via the `run_id` skip-on-cache path); (b) **RELIANCE Jan-2024 short straddle row matches the p3.verify number** (gross/costs/net/margin/ROI byte-identical when filtered to that one trade — proves Phase 4 doesn't drift from Phase 3); (c) **skip log populated** if any cells fail (visible to operator); (d) **notional_basis == "spot"** across every row (caveat #1 closure exercised on real multi-strategy data); (e) **timing measurement** — surface the actual cache-warm latency per task so the p4.5 deferral decision can be revisited with data.
+
+---
