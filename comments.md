@@ -3035,3 +3035,45 @@ For Jan-25 T-5→T-3, the formula doubles the apparent annualized return: **1395
 **Next-commit suggestion:** Per PLAN.md, `feat(p5.2): entry/exit heatmap matrix — avg P&L by (entry_offset, exit_offset)`. This is the dataset that turns into Phase-6's visualization — for each `(strategy, symbol)`, pivot by `(entry_offset_td, exit_offset_td)`; cell values = mean (or median) of some metric (net_pnl, roi_pct, roi_pct_annualized). Load-bearing decisions: **(1)** pivot value should default to `median_roi_pct_annualized` (robust to outliers, cross-window-comparable); **(2)** NaN cells for missing combinations (no false implication of zero P&L); **(3)** same `MIN_N_FOR_RANKING` applies per-cell (a heatmap cell with N=1 should be visually distinguishable from N=10 in Phase-6's render); **(4)** API shape: `pivot_window(results_df, strategy, symbol, *, value_col="roi_pct_annualized", aggfunc="median") -> pd.DataFrame` (index=entry_offset_td desc, columns=exit_offset_td desc). Or one big multi-level frame the consumer can slice. Either works; the BUILDER's call.
 
 ---
+
+## Review of 5bd9145 — feat(p5.2): (entry_offset × exit_offset) heatmap pivot
+
+**Verdict:** ✅ accept
+
+**What works:**
+- **Dual-function pattern**: `pivot_window(value_col, aggfunc)` + `pivot_counts()`. Same shape. Consumers compose `v.where(n >= MIN_N_FOR_RANKING)` to mask thin-sample cells. Same transparency-over-silent-filtering pattern as p5.1.
+- **Defaults match my prior suggestion**: `value_col="roi_pct_annualized"` (cross-window-comparable) + `aggfunc="median"` (robust to outliers).
+- **Sort orientation**: T-15 at top, T-1 at bottom for rows; T-3 left, T-1 right for cols. Matches "furthest back at top, expiry at right" visual convention.
+- **Missing combos**: NaN in values (no false zero coloring), 0 in counts (accurate "no trades"). Both consistent with the SPECS schemas.
+- **`strategy`/`symbol` can be None** for aggregated views — useful for "all strategies on this stock" or "this strategy across the universe".
+- **Empty result returns empty DataFrame** (no fake zero-filled grid).
+- 15 new tests + 325/325 in full suite.
+
+**The Q1-2024 preview is the first real cross-window pattern surfaced**:
+```
+              exit=3    exit=1
+entry=15:     113.5%    253.6%   ← hold to expiry pays better
+entry=10:     253.4%    250.1%
+entry=5 :     365.9%     89.1%
+```
+**Critical**: that 365.9% at (entry=5, exit=3) would have been **1395.81%** before the 06bb5e7 annualization fix. Phase-5 visualizations are only trustworthy because the underlying caveats were closed. The grilling loop pays off here visibly.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No `pivot_dispersion` / `pivot_std`** — Phase-6 might want to visualize "consistency" (low-std cells more reliable than high-std at the same median). Same shape, ~10 lines. Adds Sharpe-readiness to the heatmap too.
+- **`MIN_N_FOR_RANKING` not re-exported** from heatmap.py — consumers must import from `aggregate.py`. Either re-export here OR move the constant to a shared `src/analytics/_constants.py`. Cosmetic.
+- **`aggfunc: str`** — pandas accepts callables too; type hint precludes. `Callable | str` for max flexibility. Cosmetic.
+
+**Domain / correctness checks:**
+- **Statistical honesty**: surfaced via `pivot_counts`. Phase-6 can render thin-sample cells differently (hatched / desaturated).
+- **Annualization**: uses the 06bb5e7-exact `roi_pct_annualized` — cross-window rankings now trustworthy.
+- **Per-cell aggregation**: median across multiple expiries for the same (entry, exit) window — natural smoothing.
+
+**What I tried:**
+- `python -m pytest tests/` → 325/325.
+- Mental walkthrough of the Q1-2024 preview — economically plausible (held to T-1 pays more because more time decay captured; short-hold + early-close was lucky; short-hold + held-to-expiry got caught by late move).
+
+**Next-commit suggestion:** Per PLAN.md, `feat(p5.3): year-over-year trend (is strategy X decaying?)`. Aggregator that groups by `(strategy, symbol, year)` and emits the time-series. The decay question is real — implied vol regimes differ by year (2019 vs 2024). Load-bearing: surface N per year too; a 1-trade year shouldn't drive a "decaying" narrative. Same MIN_N_FOR_RANKING discipline. After p5.3 → p5.4 (month-of-year seasonality), p5.5 (the actual ranker). Each gets a small specialized aggregator function. Phase-6 then visualizes whatever the user picks.
+
+---
