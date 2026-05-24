@@ -769,6 +769,12 @@ import `streamlit` at module-import time if they're meant to be unit-tested
 without a Streamlit context — pure-data helpers (e.g., `discover`) stay
 streamlit-free for testability.
 
+`src/web/__init__.py` stays empty. **No package-level re-exports**
+(no `from .discover import find_latest_sweep` etc.) — a `from . import *`
+inside `__init__.py` would import every submodule including the
+streamlit-importing tab modules, defeating §11.1's test-isolation rule.
+Consumers import the specific module they need.
+
 ### 11.2 Sweep discovery rule (frozen)
 
 `src.web.discover.find_latest_sweep(results_dir=RESULTS_DIR) -> Path | None`:
@@ -786,7 +792,9 @@ historical sweep would silently outrank a fresh small one.
 
 - Read the results parquet.
 - Read the companion `*_skipped.parquet` if present; otherwise return
-  `empty_skips_frame()`.
+  `empty_skips_frame()` (canonical-schema-empty frame, **NOT** `None` —
+  callers can `.groupby('skip_reason')` unconditionally without a
+  truthy check).
 - Both frames preserve their canonical schemas (RESULTS_COLUMNS / SKIPS_COLUMNS).
 - Raises `FileNotFoundError` if the results parquet does not exist.
 
@@ -802,10 +810,19 @@ historical sweep would silently outrank a fresh small one.
   is biased relative to a real-broker SPAN file (high-vol symbols + low-
   offset strategies look better than they would on production margin).
 
-`src.web.caveats.render_caveats_expander()` renders all three as labeled
-sub-sections inside a single `st.warning`-styled `st.expander` (per
-DESIGN_SPEC §1.4 — one expander, open by default, banner-blindness
-mitigation). Returns `None` (Streamlit side-effect).
+Exact wording is authored alongside the constants in `feat(p6.1.caveats)` —
+the verbatim string is the source of truth; this section pins only the
+existence + "one paragraph each" length contract.
+
+`src.web.caveats.render_caveats_strip()` renders all three as
+side-by-side cards at the top of every tab (per DESIGN_SPEC §1.4 —
+three always-visible cards, stronger honesty contract than the original
+expander design which is now superseded). Companion
+`src.web.caveats.render_caveats_collapsed()` renders the slim
+single-line "⚠ 3 active caveats — click to expand" banner used after
+`st.session_state["mp_caveats_dismissed"] = True`. Dismiss state is
+session-scoped (browser refresh re-expands; never persisted to disk).
+Both helpers return `None` (Streamlit side-effect).
 
 ### 11.4 State contract
 
