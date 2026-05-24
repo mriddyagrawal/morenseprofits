@@ -72,7 +72,7 @@ morenseprofits/
 Columns (subset of jugaad `stock_df`, normalized):
 | col | dtype | notes |
 |---|---|---|
-| `date` | `datetime64[ns]` | trading date, naive IST, midnight |
+| `date` | `datetime64` (any unit) | trading date, naive IST, midnight. *Note*: pandas 3.0 + pyarrow 24 round-trip parquet writes `datetime64[ns]` and reads back `datetime64[us]`. Microsecond precision is far more than daily data needs; we assert "is datetime64" and let the unit float per the library's behavior. |
 | `symbol` | `string` | uppercase |
 | `series` | `string` | always `"EQ"` for v1 |
 | `open`, `high`, `low`, `close` | `float64` | INR |
