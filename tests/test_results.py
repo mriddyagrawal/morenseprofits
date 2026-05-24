@@ -83,6 +83,33 @@ def test_write_then_read_round_trips():
     assert back.iloc[0]["net_pnl"] == 422.57
 
 
+def test_canonical_order_coerces_date_columns_to_datetime64_us():
+    """SPECS §2.0: date columns must be datetime64[us]. ``price_trade``
+    returns Python date objects (object dtype) which would round-trip
+    through parquet as object — breaking pd.Timestamp-based filters.
+    canonical_column_order normalizes this once so both the persisted
+    parquet AND the in-memory frame have the SPECS §2.0 schema."""
+    from datetime import date
+
+    raw = pd.DataFrame([{
+        **_full_row(),
+        # Override with date objects (what price_trade emits)
+        "expiry": date(2024, 1, 25),
+        "entry_date": date(2024, 1, 4),
+        "exit_date": date(2024, 1, 24),
+    }])
+    # Confirm object dtype going in
+    assert raw["expiry"].dtype == object
+
+    normalized = r.canonical_column_order(raw)
+    for col in ("expiry", "entry_date", "exit_date"):
+        assert str(normalized[col].dtype) == "datetime64[us]", (
+            f"{col} dtype should be datetime64[us], got {normalized[col].dtype}"
+        )
+    # And pd.Timestamp filters now work
+    assert (normalized["expiry"] == pd.Timestamp("2024-01-25")).sum() == 1
+
+
 def test_write_results_rejects_missing_columns():
     bad = pd.DataFrame([{"strategy": "x", "symbol": "y"}])  # missing most cols
     with pytest.raises(ValueError, match="missing required columns"):

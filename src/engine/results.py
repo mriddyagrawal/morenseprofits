@@ -116,6 +116,32 @@ def skips_path(run_id: str, name: str = "sweep") -> Path:
 # Write / read with schema validation
 # ============================================================
 
+def canonical_column_order(df: pd.DataFrame) -> pd.DataFrame:
+    """Reorder columns to RESULTS_COLUMNS first, extras (forward-compat)
+    at the tail, AND coerce date-typed columns (``expiry``, ``entry_date``,
+    ``exit_date``) to ``datetime64[us]`` per SPECS §2.0.
+
+    Pure — returns a new frame. Used both by ``write_results`` before
+    persist AND by the sweeper so the in-memory frame it returns has
+    the same shape as the parquet it writes (re-reading the file yields
+    ``assert_frame_equal``-clean output).
+
+    Why the dtype coercion: ``price_trade`` returns trade dates as
+    Python ``datetime.date`` objects; concatenating them via
+    ``pd.DataFrame(rows)`` produces object-typed columns that round-trip
+    through parquet as object, so a filter like
+    ``df["expiry"] == pd.Timestamp("2024-01-25")`` silently returns no
+    matches. Normalizing here is the single fix for both the in-memory
+    frame and the persisted parquet."""
+    reordered = df[
+        list(RESULTS_COLUMNS) + [c for c in df.columns if c not in RESULTS_COLUMNS]
+    ].copy()
+    for col in ("expiry", "entry_date", "exit_date"):
+        if col in reordered.columns and reordered[col].dtype == object:
+            reordered[col] = pd.to_datetime(reordered[col]).astype("datetime64[us]")
+    return reordered
+
+
 def write_results(df: pd.DataFrame, run_id: str, name: str = "sweep") -> Path:
     """Persist results frame to its canonical path. Asserts the frame
     has at least the RESULTS_COLUMNS schema before writing — better to
@@ -128,9 +154,7 @@ def write_results(df: pd.DataFrame, run_id: str, name: str = "sweep") -> Path:
         )
     path = results_path(run_id, name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Reorder to canonical column order; ignore extras (forward-compat).
-    df_ordered = df[list(RESULTS_COLUMNS) + [c for c in df.columns if c not in RESULTS_COLUMNS]]
-    df_ordered.to_parquet(path, index=False)
+    canonical_column_order(df).to_parquet(path, index=False)
     return path
 
 

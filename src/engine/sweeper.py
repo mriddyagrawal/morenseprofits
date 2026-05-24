@@ -241,6 +241,9 @@ def sweep_grid(
         df = df.sort_values(
             ["strategy", "symbol", "expiry", "entry_offset_td", "exit_offset_td"]
         ).reset_index(drop=True)
+        # Canonical column order so the returned in-memory frame is
+        # `assert_frame_equal`-clean against the parquet we just wrote.
+        df = _results.canonical_column_order(df)
 
     _results.write_results(df, run_id=run_id)
     _results.write_skips(skipped, run_id=run_id)  # no-op if list empty
