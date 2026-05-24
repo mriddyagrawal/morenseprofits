@@ -1550,3 +1550,34 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** Per the BUILDER's plan, `test(p2.1)` next. The module-level asserts already pin count/sort/dedup at import time, so test value is mostly **API contract** (regression-blocker against a future refactor that breaks the public surface). Recommended tests: (1) `blue_chip(any_date)` returns a `list` (not `tuple` — pin the return type since `_BLUE_CHIP_V1` is a tuple internally); (2) `blue_chip(date1) == blue_chip(date2)` for arbitrary date1, date2 (the as_of-ignored contract — pin it explicitly so a future Phase-7 upgrade has to deliberately UPDATE this test, not silently drift); (3) one spot-check `"RELIANCE" in blue_chip(any_date)` since RELIANCE drives every reference contract in the test suite; (4) `len(blue_chip(any_date)) == 40` — guards against the 40→50 (or any other count) regression. After that, **immediately move to `feat(p2.2): momentum classifier`**. The tercile-boundary + holiday-lookback flags from my d61b164 review still need resolving in SPECS §6b.2 before the impl lands.
 
 ---
+
+## Review of 019663e — test(p2.1): blue_chip — 8 tests pinning v1 universe contract
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin the v1 universe contract with focused regression-blockers; cover both the public API and the `python -O` strip risk on the module-level asserts.
+
+**What works:**
+- **120/120 pass** in 0.63s.
+- 8 tests that line up exactly with the contract surface:
+  - count=40, unique, sorted (the determinism trio)
+  - `as_of` independence across 3 wildly-different dates ([tests/test_blue_chip.py:30-37](tests/test_blue_chip.py#L30-L37)) — locks the v1 behavior so a Phase-7 upgrade requires deliberately changing this test, not silently drifting
+  - Canonical name presence (5 names: RELIANCE/HDFCBANK/INFY/TCS/ICICIBANK) — wider than I suggested (good)
+  - **Mutation safety** ([tests/test_blue_chip.py:48-54](tests/test_blue_chip.py#L48-L54)) — caller appends "HACKED", subsequent call doesn't see it. Implicitly pins the "returns a list copy, not the internal tuple cast" contract.
+  - **NSE spelling pins** ([tests/test_blue_chip.py:57-66](tests/test_blue_chip.py#L57-L66)) — BAJAJ-AUTO, M&M. A drive-by "clean up the punctuation" edit would break jugaad-data lookups silently; this test fires loud.
+  - **`python -O` defense** ([tests/test_blue_chip.py:69-73](tests/test_blue_chip.py#L69-L73)) — re-checks the module-level asserts so they hold even if `assert` gets stripped. Sister-pattern to the OptionsFormatError discussion.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No explicit `isinstance(out, list)` assertion.** Implicit via `.append("HACKED")` on the mutation test (tuples don't have append), but explicit type pin would be one extra line. Cosmetic.
+- **`pytest` import unused** ([tests/test_blue_chip.py:6](tests/test_blue_chip.py#L6)) — minor.
+- **NSE-spelling test pins only 2 names.** A "no-hyphen" name like BAJFINANCE could regress without firing this test. One more assertion (`"BAJFINANCE" in out` ensures the convention is "BAJFINANCE" not "BAJ-FINANCE") would tighten the regression net. Cosmetic.
+
+**Domain / correctness checks:** N/A — pure-data contract pin.
+
+**What I tried:** `python -m pytest tests/` → 120 passed in 0.63s.
+
+**Next-commit suggestion:** `feat(p2.2): src/universe/momentum.py`. BEFORE writing code, pin three loose ends from the d61b164 review in SPECS §6b.2: **(a) tercile boundary for n=40** → 40/3=13.33, so pick e.g. `bullish=14, neutral=13, non_bullish=13` (top-heavy gives the higher-conviction bucket the larger sample) — and write `len(out["bullish"]) >= len(out["non_bullish"])` into the test contract; **(b) holiday-aligned lookback** → `lookback_date = trading_calendar.offset_trading_days(as_of, lookback_trading_days)` where `lookback_trading_days ≈ 6 * 21` (avg trading days/month) — switching from "6 calendar months" to "126 trading days" sidesteps the Jan-1-is-holiday trap entirely AND makes the lookback determinable from the trading calendar without month-arithmetic; **(c) delisted-symbol policy** → if `load_spot` for a universe symbol raises `MissingDataError` (delisted/renamed), the classifier **must drop the symbol with a `warnings.warn(...)` listing which one** and continue with the rest, NOT propagate. Otherwise one stale name in `blue_chip` would break the whole classifier. Test for this: monkeypatch `load_spot` to raise for one symbol; assert the symbol is missing from all three output lists AND a warning was emitted. The load-bearing test for p2.2 is `test_classify_momentum_is_deterministic` (two calls → byte-identical splits) — same pattern as expiry_calendar.
+
+---
