@@ -36,7 +36,10 @@ from src.config import RESULTS_DIR  # noqa: E402
 from src.strategies.registry import list_strategies  # noqa: E402
 from src.web.caveats import render_caveats  # noqa: E402
 from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E402
-from src.web.leaderboard import render_headline as render_leaderboard_headline  # noqa: E402
+from src.web.leaderboard import (  # noqa: E402
+    render_headline as render_leaderboard_headline,
+    render_rank_table,
+)
 
 
 # ============================================================
@@ -204,10 +207,13 @@ def _placeholder(tab_name: str, next_commit: str) -> None:
 def _render_leaderboard_tab(df_filtered: pd.DataFrame) -> None:
     render_caveats()
     st.markdown("## Leaderboard")
-    render_leaderboard_headline(df_filtered, min_n=int(st.session_state["mp_min_n"]))
+    min_n = int(st.session_state["mp_min_n"])
+    render_leaderboard_headline(df_filtered, min_n=min_n)
+    st.markdown("---")
+    render_rank_table(df_filtered, min_n=min_n)
     _placeholder(
-        "Leaderboard table + thin-samples sidecar + within/across toggle",
-        "feat(p6.2.table) + feat(p6.2.thin) + feat(p6.2.toggle)",
+        "Thin-samples sidecar + within/across toggle",
+        "feat(p6.2.thin) + feat(p6.2.toggle)",
     )
 
 
