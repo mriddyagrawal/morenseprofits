@@ -514,3 +514,29 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `feat(p1.3.1): data/bhavcopy_fo_loader.py` is where every Phase-1.3 bet pays off — start with **capturing the two recorded fixtures** as the very first sub-step. A small `scripts/capture_bhavcopy_fixtures.py` that fetches one pre-Jul-8-2024 and one ≥Jul-8-2024 bhavcopy via `bhavcopy_fo_raw`, prints byte length + first/last 200 chars to stderr (so we can sanity-check), and saves both to `tests/fixtures/bhavcopy_fo_*.csv`. Write the parser against those fixtures rather than against an assumption about column layout — the two formats almost certainly have different columns, and parser-first-then-debug burns a half-day. **Pin the column-name mapping by NAME** (jugaad's `expiry_dates` accesses column index 10 — that's brittle across formats). The load-bearing test in `test_bhavcopy_fo_loader`: feed each recorded fixture through the loader, assert the SPECS §2.4 schema exactly (column names, dtypes including the `datetime64[us]` rule and `option_type` as pd.StringDtype with `<NA>` for futures rows).
 
 ---
+
+## Review of a359b80 — chore(specs): generalize datetime64[us] date-dtype rule across §2
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Promote the §2.4-only date dtype rule to a global §2.0 preamble that applies to every parquet schema (§2.1 spot, §2.2 options, §2.3 expiries, §2.4 bhavcopy, §2.5 results). Closes the b0ef46a flag about §2.2/§2.3 inheriting the same ambiguity silently.
+
+**What works:**
+- New §2.0 ([SPECS.md:73-81](SPECS.md#L73-L81)) gives one canonical answer: `datetime64[us]` on disk, `.dt.date` at the boundary, tests assert `is_datetime64_any_dtype`. Per-schema columns now use `date` as shorthand.
+- §2.1's verbose unit-float note collapsed to `(see §2.0)` — DRY.
+- §2.4's duplicate dtype paragraph removed; it inherits from §2.0 now.
+- Net +11/-7: spec got *shorter* AND more rigorous. Rare and good.
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- The shorthand `date` in column tables (e.g. `expiry: date` in §2.4) still reads as "Python `date`" to a first-time reader. Adding `(see §2.0)` *inside* every column-table cell would be noisy. Acceptable as-is, but if the test suite ever surfaces a misread, consider renaming the shorthand to e.g. `date†` with the dagger pointing to §2.0.
+- §2.0 says "Microsecond precision is far more than daily data needs" — true; just noting the precise units already vary between the parquet engines (some return `ns`). The `is_datetime64_any_dtype` test convention is the right way to absorb that.
+
+**Domain / correctness checks:** N/A — pure docs.
+
+**What I tried:** Read the diff, cross-checked §2.1/§2.4 hunks for consistency post-edit.
+
+**Next-commit suggestion:** Back on track for `feat(p1.3.1): bhavcopy_fo_loader`. The single concrete action that maximizes downstream velocity: **fetch one pre-Jul-8-2024 and one ≥Jul-8-2024 bhavcopy via `bhavcopy_fo_raw` RIGHT NOW** and inspect them side-by-side before writing any parser code. If the column headers are identical across formats (jugaad's transparent handling), the parser is a single code path with one CSV reader. If they differ, you need format detection (header sniff) + two parsers. Either way, knowing this BEFORE writing code beats writing-then-debugging. Save both raw blobs as `tests/fixtures/bhavcopy_fo_pre_udiff.csv` and `tests/fixtures/bhavcopy_fo_udiff.csv` so the parser tests are fixture-driven from commit one (per the recorded-fixtures commitment in b0ef46a). And map by column NAME — jugaad's `expiry_dates` indexes by position 10, which is exactly the kind of fragility the format change might break.
+
+---
