@@ -2823,3 +2823,31 @@ The trade-off: at 30k tasks × 100ms = 50 minutes serial. So parallelization IS 
 **Next-commit suggestion:** `chore(p4.verify): live small sweep on RELIANCE × 3 months × 5 windows`. This is the Phase-4 milestone — the first multi-month dataset produced via the full pipeline. Load-bearing checks: (a) **determinism across repeat runs** (same inputs → same parquet via the `run_id` skip-on-cache path); (b) **RELIANCE Jan-2024 short straddle row matches the p3.verify number** (gross/costs/net/margin/ROI byte-identical when filtered to that one trade — proves Phase 4 doesn't drift from Phase 3); (c) **skip log populated** if any cells fail (visible to operator); (d) **notional_basis == "spot"** across every row (caveat #1 closure exercised on real multi-strategy data); (e) **timing measurement** — surface the actual cache-warm latency per task so the p4.5 deferral decision can be revisited with data.
 
 ---
+
+## Review of f337208 — fix(bhavcopy_fo): bump NSEArchives timeout 4s → 30s
+
+**Verdict:** ✅ accept
+
+Small production-quality fix surfaced during the actual `chore(p4.verify)` run. jugaad's `NSEArchives` ships with `timeout=4s` — too aggressive for the archives endpoint at peak hours. Per-instance bump to 30s (matches the UDiff path's 60s order-of-magnitude budget).
+
+**What works:**
+- Per-instance override (`archives.timeout = 30`), NOT global monkeypatching of the class. Keeps the change scoped.
+- Comment explains both the WHAT and the WHY (NSE archive intermittency, ZIP download size context). Future-reader sees the rationale.
+- 30s is realistic-generous: ZIP is a few hundred KB; if it takes longer the network really is broken (legitimate failure).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Mutating `archives.timeout = 30` is a runtime side-effect**. If a future jugaad version makes `NSEArchives` a `frozen=True` dataclass, this silently breaks. Probably not — jugaad's pattern is regular classes — but worth one line of `assert hasattr(archives, "timeout")` as defense-in-depth. Cosmetic.
+- **No test** — hard to test without mocking the underlying HTTP and simulating slow responses. Defer; the verify run is the de-facto smoke test.
+- **`ReadTimeout` still propagates as `requests.RequestException`** (not wrapped in MissingDataError) per the wrap policy. Correct per the existing design — timeouts are transient/retryable, not "no data". Consistent.
+
+**Domain / correctness checks:**
+- **Wrap-policy boundary preserved**: timeouts still propagate to the caller, who decides retry semantics. Aligned with §6a class distinction.
+- **Production realism**: NSE archives endpoint has been known to spike to ~10s response times during market open. 30s is the right budget.
+
+**What I tried:** Read the diff. The fix is the minimal-correct change.
+
+**Next-commit suggestion:** Resume `chore(p4.verify)`. The timeout fix unblocks the verify itself. The 5 checks from the prior next-commit suggestion still apply (determinism / Phase-3-cross-check / skip log / spot-basis / timing measurement).
+
+---
