@@ -1689,3 +1689,38 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** **Phase 3 — short straddle engine.** This is the user's original ask actualized: a backtester that says "if you'd entered this trade on this day, you'd have made/lost ₹X." Per PLAN.md the first commit is `feat(p3): Trade + Leg dataclasses; per-trade P&L kernel`. The **load-bearing decision is the sign convention** — for a SELL leg, `pnl = (entry_price - exit_price) × qty × lot_size`; for BUY it's the opposite. A single sign flip and every backtest is wrong by 100%. Pin in SPECS §4: `pnl_per_leg = (entry - exit) × side_sign × qty × lot_size` where `side_sign("SELL")=+1, side_sign("BUY")=-1`. The **load-bearing test** is a two-leg short-straddle hand-check on the canonical RELIANCE Jan-2024 contract we already pinned in Phase 1: entry T-15 (= Jan-4, ATM 2600), exit T-1 (= Jan-24). CE entry 56.50 (Phase-1 verified), PE entry need-to-fetch; CE exit need-to-fetch (was deep ITM in the integration verify at 102.40 on Jan-25, so Jan-24 should be close), PE exit need-to-fetch. The engine output (gross P&L = (56.50 - CE_exit) + (PE_entry - PE_exit)) × 250 lot should match a hand-computed number. **No look-ahead enforcement**: the engine must reject if any code path inside the trade-pricing kernel reads data with `date > exit_date`. PLAN.md §4.1's hard rule from the start of the project; now we land it.
 
 ---
+
+## Review of 8aac2af — chore(p3.0): SPECS for engine — sign convention + no-lookahead + LookaheadError
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin the sign convention + no-look-ahead enforcement BEFORE the engine kernel lands. Decompose Phase 3 into 9 nuclear steps.
+
+**What works:**
+- **§3a Sign convention is now SPECS-canonical** ([SPECS.md:338-356](SPECS.md#L338-L356)) with the exact formula `gross_pnl_per_leg = (entry - exit) * side_sign * qty_lots * lot_size` where `side_sign = +1 if SELL else -1`. Verified by mental walk-through: all four combinations (SELL+drop=+, SELL+rise=-, BUY+rise=+, BUY+drop=-) are correct. Test rule pinned: "SELL leg with entry > exit ⇒ gross_pnl > 0".
+- **§3b No-look-ahead enforcement** ([SPECS.md:358-372](SPECS.md#L358-L372)) — PLAN §4 hard rule #1 now translated into a code requirement at the engine boundary. Tests pattern named: post-exit_date rows in the fixture + assert `LookaheadError`.
+- **`LookaheadError(DataError)`** added to §8 error taxonomy ([SPECS.md:499](SPECS.md#L499)).
+- **PLAN §3 Phase-3 decomposed into 9 nuclear steps** ([PLAN.md:127-135](PLAN.md#L127-L135)) — SPECS chore → Trade/Leg → P&L kernel → P&L tests → cost model → cost tests → ShortStraddle → strategy tests → live verify. Each step has a paired test commit where it makes sense.
+- **Exit criteria amended** ([PLAN.md:140](PLAN.md#L140)) to require no-look-ahead enforcement by code.
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- **"Consults" vs "loads"**: §3b says the kernel "MUST NOT consult any market data with `date > x`". But `load_option(..., from_date=e, to_date=x)` actually fetches the **full contract lifetime** into the parquet cache (per SPECS §2.2 — first-fetch policy). So the cache HAS data with `date > x` available; the kernel just mustn't USE it. Worth one line: "the cache may contain data past exit_date as a fetch artifact; the kernel's enforcement is at the DataFrame access boundary — filter to `df.date <= exit_date` before any aggregation, and the engine asserts the filter happened."
+- **`entry_date == exit_date` not addressed.** PLAN §4 doesn't reject it, but a zero-day trade has no economic meaning (same-day entry+exit at the same close = 0 P&L). Pin: `entry_date < exit_date` strictly, raise `ValueError` if not. Or explicitly allow same-day (intraday turnaround) for future-flexibility — pick one and document.
+- **Validation in Trade/Leg dataclasses not mentioned.** `Leg(option_type="XX")`, `Leg(qty_lots=0)`, `Trade(legs=())` — should they raise? Adding `__post_init__` validation in `frozen=True` dataclasses is straightforward. Pin in SPECS §3 or in the upcoming p3.1 commit.
+- **No `LookaheadError` test pattern** vs general `MissingDataError` test pattern. §3b says "tests assert the engine raises", but the test fixture construction is the load-bearing part — it has to include both pre- AND post-exit_date rows so a bug that includes ALL rows is caught (not just a bug that drops everything). Worth a one-line callout: "fixture must include at least one row past exit_date AND one row at/before exit_date, so the engine has something legitimate to use AND something illegitimate to reject."
+
+**Domain / correctness checks:**
+- **Sign convention:** correctly pinned. The four-combination mental check passes.
+- **Look-ahead bias:** the SPECS-canonical enforcement (loud `LookaheadError`) is the right abstraction.
+- **Options math:** `qty_lots * lot_size` = total shares; multiplied by price gives notional. Correct.
+- **Statistical claims:** N/A this commit.
+
+**What I tried:**
+- Read SPECS §3a + §3b diff in full; mentally walked through the four sign combinations.
+- Verified `LookaheadError` is the only addition to §8.
+
+**Next-commit suggestion:** `feat(p3.1): src/strategies/base.py — Trade, Leg, Strategy`. Three load-bearing decisions to pin in code: **(1)** `frozen=True` for both `Leg` and `Trade` (per SPECS §3) — immutability matters because a Trade is identity-equivalent to its legs+dates and accidental mutation during sweep iteration would silently shuffle results. **(2)** `__post_init__` validation: `Leg.option_type in ("CE", "PE")` raises ValueError; `Leg.side in ("BUY", "SELL")` raises; `Leg.qty_lots > 0` raises; `Trade.legs` is non-empty tuple; `Trade.entry_date < Trade.exit_date` raises (or `<=` — pin the same-day question in SPECS first). **(3)** `Strategy` is a `Protocol` (not ABC) so concrete strategies need only implement `name` + `generate_trades(...)` — duck-typed registration in Phase 4. Tests for p3.1 are tiny but mandatory: each `__post_init__` rule fires with the right ValueError. **After p3.1 lands, immediately move to `feat(p3.2): src/engine/pnl.py`** — that's where the load-bearing P&L+lookahead+missing-data logic actually lives.
+
+---
