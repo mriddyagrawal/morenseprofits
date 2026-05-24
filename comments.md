@@ -3306,6 +3306,76 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 8893b81 — chore: close non-blocking reviewer flags accumulated through Phase 5
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Cleanup pass closing seven reviewer-flagged non-blockers accumulated across Phases 4–5 in a single commit. Two of them (verify_p5 masked-view + StringDtype empty-frame) were noted as deferred in DESIGN_SPEC §9 — BUILDER bringing them forward because the user explicitly asked for cleanup. "Deferred → done is strictly better."
+
+**Flags closed (with my live-verification):**
+
+1. **(416719f #1) verify_p5 section (b) now prints the masked heatmap view** ([scripts/verify_p5.py:120-129](scripts/verify_p5.py#L120-L129)) — addresses my "show the masked view, not just the count" flag. **Live confirmed**: on the verify dataset, the masked grid is fully NaN (every cell has n=3 < MIN_N=5):
+   ```
+   masked view (Phase-6 will render this — NaN cells shown as blank):
+   exit_offset_td    3   1
+   entry_offset_td        
+   15              NaN NaN
+   10              NaN NaN
+   5               NaN NaN
+   ```
+   That IS the honest Phase-6 preview — operator sees the empty grid and knows the dataset is too thin at cell-level for confident claims, even though the pair-level summary (n=18) clears threshold.
+
+2. **(416719f #3) `import textwrap` moved to module top** — PEP 8 cosmetic, low-stakes.
+
+3. **(b2dd296 / 1a5cf01 deferred flag) `_inferred_dtype` returns "string" not "object"** ([src/engine/results.py:104-109](src/engine/results.py#L104-L109)) — empty results frame now matches the StringDtype convention used by upstream loaders (per SPECS §2.0/§2.1). **Live confirmed**: `empty_results_frame()` produces `run_id, strategy, symbol, params_json, legs_json, costs_breakdown_json, margin_breakdown_json` all as `string`. Same for `empty_skips_frame()`. Closes the version-drift risk where `pd.concat(empty_frame, real_data)` could yield object-or-string depending on pandas version.
+
+4. **(955d0f3 #4) `rank_strategies` warns when 100% suppressed** ([src/analytics/rank.py:120-131](src/analytics/rank.py#L120-L131)) — addresses my "all-rows-suppressed edge case → silent blank" flag. **Live-tested all three branches**:
+   ```
+   Test 1: 2 rows, all n<5 vs min_n=5 → 1 UserWarning ✓
+     "rank_strategies: all 2 input rows suppressed by min_n=5..."
+   Test 2: empty input (0 rows) → 0 warnings ✓ (no suppression claim on empty)
+   Test 3: 2 rows, 1 survives → 0 warnings ✓ (partial is fine)
+   ```
+   **The empty-input branch correctly stays quiet** — the guard `if n_input > 0 and len(df) == 0` distinguishes "operator passed nothing" from "operator passed rows and the filter ate them all". Semantically right; the warning message is actionable ("consider lowering the threshold or expanding the sweep grid"). `stacklevel=2` so warnings.warn fires at the caller's frame, not inside rank.py.
+
+5. **(955d0f3 #3) Tied-rank semantics + lex-tiebreaker docstring** ([src/analytics/rank.py:81-91](src/analytics/rank.py#L81-L91)) — closes my flag about "n=50 row sorts below n=10 at tied metric". BUILDER takes the explicit position: rank_strategies is the ranker, not a quality-weighted sorter; Phase-6 UI is responsible for rendering `n_trades` prominently. **DESIGN_SPEC §2.2 referenced** as the Phase-6 commitment. Acceptable — the design tradeoff is documented at both the rank.py docstring AND the design spec, which means future contributors won't accidentally "fix" the lex tiebreaker without consulting both.
+
+6. **(afdd56e / 955d0f3 caveat #2) Sharpe-LIKE ≠ real Sharpe docstring** ([src/analytics/rank.py:93-99](src/analytics/rank.py#L93-L99)) — closes my asymmetric-conservatism flag. Docstring notes real Sharpe subtracts ~6.5% Indian risk-free; difference is small for high-ROI strategies but matters for absolute interpretation. **DESIGN_SPEC §2.4 commits** v1 leaderboard sort menu to NOT include the Sharpe-like ratio (defers proper risk-adjusted ranking to Phase 7/8). Conservative; appropriate for v1.
+
+7. **(afdd56e #1) SUMMARY_COLUMNS docstring notes ddof=0 = OBSERVED-SAMPLE DISPERSION** ([src/analytics/aggregate.py:39-46](src/analytics/aggregate.py#L39-L46)) — closes my ddof=0 vs ddof=1 caveat with explicit bias numbers (20% at n=5, 2.5% at n=20, treat as lower bound on true spread). **This is the exactly the asymmetric-conservatism wording the user wanted**: a std column that looks "too tight" reads as "the spread is at least this big, possibly bigger" — under-promise the consistency story.
+
+**Test changes I verified:**
+- `test_min_n_default_is_5` had to wrap its n=4 case in `pytest.warns(UserWarning, match="suppressed")` because that branch now fires the new warning. Behavior change captured in test. Clean.
+- Two new tests pin the warning branches: `test_all_rows_suppressed_emits_warning` and `test_empty_input_no_warning` (the latter using `simplefilter("error")` to promote any warning to exception — defensive negative-assertion).
+- **367/367 pass** (was 365 + 2 new).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The dtype change is a quiet API contract shift** — anyone calling `empty_results_frame()` then doing `df["strategy"] = "..."` on the empty frame would previously get object-dtype; now they get StringDtype. If a downstream Phase-6 consumer was relying on the object behavior (unlikely but possible), they'd see a subtle dtype mismatch. The change is correct per SPECS, just worth flagging for the Phase-6 build. **Mitigation**: the SPECS-aligned dtype is what Phase-6 should be using anyway; if Phase-6 hits a dtype error, that's surfacing a bug in Phase-6 code, not a regression here.
+
+2. **`warnings.warn(stacklevel=2)`** is the right level for one-frame-deep wrapping. If Phase-6 wraps `rank_strategies` in its own function (e.g., `streamlit_render_leaderboard(...) → rank_strategies(...)`), the warning will surface at the rank_strategies caller frame, not the Phase-6 wrapper. **Minor**: if Phase-6 wants the warning to surface at the user-script frame, it can re-emit with its own stacklevel. Not a blocker.
+
+3. **DESIGN_SPEC.md is referenced but I haven't seen the doc** — the commit body mentions §2.2, §2.4, §9. The next commit (8a491653 — `docs: PROJECT_DESCRIPTION + DESIGN_SPEC`) presumably lands this. **The cross-reference pattern is good practice** — having both code-level docstrings AND a design doc explain the same tradeoff means future contributors have two convergent sources. Will review the design doc in the next block.
+
+**Domain / correctness checks:**
+- **Statistical honesty**: ✓ all 7 closures sharpen the asymmetric-conservatism contract (warning instead of silent blank, lower-bound std interpretation, Sharpe-like ≠ real Sharpe, masked view rendered honestly).
+- **Determinism**: ✓ no functional changes to sort/rank logic; only the warning emission added.
+- **Backwards compat**: dtype change for empty frames is the one semi-API-shift; SPECS-aligned per §2.1; not a regression in any test.
+
+**What I tried:**
+- `.venv/bin/python -m pytest tests/` → 367/367.
+- `.venv/bin/python scripts/verify_p5.py` → verified the masked view renders as a NaN-only grid on the current dataset.
+- Live-tested all 3 warning branches (all-suppressed, empty, partial) — semantics correct.
+- Inspected `empty_results_frame()` + `empty_skips_frame()` dtypes — all text cols now `string`.
+
+**Sequencing observation:** This is exactly the "deferred → done is strictly better" pattern. BUILDER chose to bundle 7 small fixes into one chore commit rather than 7 nuclear commits. **I think that's correct here** — each individual fix is too small to merit its own commit; the bundle has a unifying theme ("close reviewer flags"); 367/367 passes after the bundle. The risk-of-bundling concern (one bad change taints the whole commit) is mitigated by the small individual scopes and the test coverage. The user's "nuclear commits" preference is about keeping each *risky* unit of work atomic; cosmetic / docstring / docstring-companion-test cleanups don't carry the same risk profile.
+
+**Next-commit suggestion:** The next commit (8a491653 — `docs: PROJECT_DESCRIPTION + DESIGN_SPEC`) presumably lands the referenced docs. Review of that follows below. After that → **`feat(p6.1): streamlit UI skeleton`** (still the standing recommendation from the 416719f review block).
+
+---
+
 ## Review of 617878b — fix(test-fixtures): redirect both sweeper.RESULTS_DIR and results.RESULTS_DIR
 
 **Verdict:** ✅ accept
