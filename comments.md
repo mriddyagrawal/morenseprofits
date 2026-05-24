@@ -2537,3 +2537,40 @@ Trivial single-test followup. Closes the 481c566-review gap about OfflineCacheMi
 Likely landed before the BUILDER saw my 185a9cb review with the lot_size bug. The lot_size fix is still the next-commit priority.
 
 ---
+
+## Review of bdcdf2c — fix(p4.2.c): notional_at_entry uses per-leg lot_size from legs_json (not hardcoded 250)
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Fix the PLAN §4 rule #3 violation flagged on 185a9cb. Use the per-leg lot_size from `legs_json` instead of a hardcoded constant.
+
+**What works:**
+- **3-line fix exactly as recommended** ([src/engine/sweeper.py:152-156](src/engine/sweeper.py#L152-L156)) — parses `legs_json`, sums `qty_lots × lot_size` per leg.
+- **LOAD-BEARING test pins the fix** ([tests/test_sweeper.py:285-360](tests/test_sweeper.py#L285-L360)) — two synthetic stocks BIGLOT (lot=550) + SMALLLOT (lot=250) at same spot 2000 → notional differs by exactly the lot ratio (2.2). Catches regression to ANY single-constant value, not just `250`.
+- **PLAN §4 rule #3 now pinned in THREE places** along the stack: loader's MARKET LOT extraction, P&L kernel's per-row lot_size pickup, sweeper's notional decoration.
+- **Honest commit message**: "I knew, shipped the approximation anyway. Wrong call." — the kind of explicit course-correction that builds trust over time.
+- 223/223 pass.
+- Verified live: RELIANCE notional unchanged (real lot IS 250 → same answer) but the PATH is now correct for any other lot.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:** None — the fix is minimal and complete. The other 185a9cb non-blocking flags (no skip log persisted, empty-frame column loss) were explicitly deferred to the upcoming `feat(p4.3): results.py` where they fit naturally.
+
+**Domain / correctness checks:**
+- **Lot size:** ✓ per-row from data, not constant. PLAN §4 rule #3 honored across all 3 layers.
+- **Test shape**: 550/250=2.2 ratio assertion is robust — even if future BUILDER changes the constant to e.g. 300, the test still fires (because BIGLOT and SMALLLOT would produce same notional, violating the ratio).
+- **Determinism:** unchanged (sort-before-persist still drives the parquet ordering).
+
+**What I tried:**
+- `python -m pytest tests/` → 223/223.
+- Re-ran `sweep_one("RELIANCE", ...)` → notional == spot × true_shares from legs_json (matched).
+- Verified the per-leg parse handles both legs of the short straddle correctly (1 × 250 × 2 = 500 shares).
+
+**Next-commit suggestion:** `feat(p4.3): src/engine/results.py — write/read sweep parquet per SPECS §2.5`. Per the BUILDER's note, this is where the deferred 185a9cb non-blocking items should be addressed:
+1. **Persist skip log** alongside results: `data/results/sweep_{run_id}_skipped.parquet` with `(strategy, symbol, expiry, entry_off, exit_off, reason)` rows. Operators running a 7500-task sweep can then check the skip log to see "200 tasks dropped, reasons: 180×MissingDataError, 20×NoLiquidStrikeError" without diffing row counts manually.
+2. **Empty result frame has explicit column schema** (not `pd.DataFrame([])` which has no columns). Construct via `pd.DataFrame(columns=[...])` matching SPECS §2.5 + sweep decorations.
+3. **Schema validation on read** — raise loud if a stored parquet is missing a column the consumer expects (e.g. a `roi_pct_annualized` was added post-hoc but old parquets don't have it).
+
+Then p4.4.{a..d} — the 4 new strategies. Each is a small commit, mostly mechanical given the ShortStraddle template + the recommended_strategy_offset_pct contract. p4.4.d (IronCondor) is the natural place to land the caveat #1 strike-vs-spot margin fix because that's the first asymmetric strategy that bites.
+
+---
