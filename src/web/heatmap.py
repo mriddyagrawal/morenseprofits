@@ -25,6 +25,7 @@ bare number.
 from __future__ import annotations
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.analytics.aggregate import MIN_N_FOR_RANKING
@@ -155,4 +156,151 @@ def render_headline(
             format_pct(median_val, signed=True, annualized=True),
             f"across {n_visible_cells} visible cell(s)",
             delta_color="off",
+        )
+
+
+# ============================================================
+# Dual heatmaps — Phase 6.3 commit 16 (feat(p6.3.pivot))
+# ============================================================
+
+def _format_offset_label(prefix: str, value: int) -> str:
+    """Render an offset label like "T-15" for the axis tick labels.
+    Used uniformly on both heatmaps so coordinate hover matches the
+    axis titles."""
+    return f"{prefix}-{int(value)}"
+
+
+def render_heatmaps(
+    df: pd.DataFrame,
+    *,
+    strategy: str | None,
+    symbol: str | None,
+    min_n: int,
+) -> None:
+    """Dual Plotly heatmaps per DESIGN_SPEC §4 commit 16 + §2.3
+    colormap mandate:
+
+      Left pane  — MEDIAN ROI/yr per (entry, exit) cell
+                   Colormap: RdYlGn diverging with zmid=0 (red =
+                   loss, white = breakeven, green = profit). Per
+                   §2.3, NEVER sequential — a first-negative-cell
+                   on a later sweep would otherwise render mid-green
+                   and mislead.
+      Right pane — SAMPLE DENSITY (n_trades per cell). Sequential
+                   Blues colormap; 0 = white.
+
+    Both panes share orientation per DESIGN_SPEC §2.2: index =
+    entry_offset_td DESC (T-15 at top), columns = exit_offset_td
+    DESC (T-3 left, T-1 right).
+
+    Empty-state branches use src.web.empty_state per §2.6:
+      - 0 filtered rows                → no_rows_after_filters
+      - sweep has <2 entry OR <2 exit  → heatmap_single_axis
+      - every cell masked at min_n     → heatmap_all_masked
+    """
+    if len(df) == 0:
+        render_empty("leaderboard_no_rows_after_filters")
+        return
+    if strategy is None or symbol is None:
+        render_empty("leaderboard_no_rows_after_filters")
+        return
+
+    values = pivot_window(df, strategy=strategy, symbol=symbol)
+    counts = pivot_counts(df, strategy=strategy, symbol=symbol)
+    if values.empty:
+        st.info(
+            f"No (entry × exit) cells available for {strategy} × {symbol}. "
+            f"Pick another pair."
+        )
+        return
+
+    n_entry = int(values.shape[0])
+    n_exit = int(values.shape[1])
+    if n_entry < 2 or n_exit < 2:
+        render_empty(
+            "heatmap_single_axis",
+            n_entry=n_entry, n_exit=n_exit,
+        )
+        return
+
+    # Apply the min_n mask once; reused for both panes (the mask
+    # decides which value cells are visible; the density pane shows
+    # the raw counts so the operator sees WHY a cell was masked).
+    masked = values.where(counts >= min_n)
+    if masked.notna().sum().sum() == 0:
+        render_empty("heatmap_all_masked", min_n=min_n)
+        return
+
+    # Convert axis labels to "T-N" form once so both panes match.
+    entry_ticks = [_format_offset_label("T", v) for v in values.index]
+    exit_ticks = [_format_offset_label("T", v) for v in values.columns]
+
+    # === Left pane — median ROI/yr (diverging colormap) ====
+    value_z = masked.values  # NaN cells render as no-data
+    value_fig = go.Figure(data=go.Heatmap(
+        z=value_z,
+        x=exit_ticks,
+        y=entry_ticks,
+        colorscale="RdYlGn",      # diverging — see §2.3
+        zmid=0,                   # white at breakeven
+        # Annotate each visible cell with its rounded value.
+        # NaN cells (masked) get blank annotations naturally.
+        text=[[
+            f"{value_z[i][j]:.0f}%/yr" if value_z[i][j] == value_z[i][j] else ""
+            for j in range(value_z.shape[1])
+        ] for i in range(value_z.shape[0])],
+        texttemplate="%{text}",
+        textfont={"size": 12},
+        colorbar={"title": "%/yr", "x": 1.02},
+        hoverongaps=False,
+    ))
+    value_fig.update_layout(
+        title="Median ROI/yr",
+        xaxis_title="Exit offset",
+        yaxis_title="Entry offset",
+        height=400,
+        margin=dict(l=60, r=60, t=50, b=50),
+    )
+
+    # === Right pane — sample density (sequential blues) ====
+    density_z = counts.values
+    density_fig = go.Figure(data=go.Heatmap(
+        z=density_z,
+        x=exit_ticks,
+        y=entry_ticks,
+        colorscale="Blues",
+        zmin=0,
+        text=[[
+            str(int(density_z[i][j])) if density_z[i][j] > 0 else ""
+            for j in range(density_z.shape[1])
+        ] for i in range(density_z.shape[0])],
+        texttemplate="%{text}",
+        textfont={"size": 12},
+        colorbar={"title": "N", "x": 1.02},
+        hoverongaps=False,
+    ))
+    density_fig.update_layout(
+        title="Sample density (trades per cell)",
+        xaxis_title="Exit offset",
+        yaxis_title="Entry offset",
+        height=400,
+        margin=dict(l=60, r=60, t=50, b=50),
+    )
+
+    # Side-by-side render. Each chart claims its column.
+    cols = st.columns(2)
+    with cols[0]:
+        st.plotly_chart(value_fig, use_container_width=True)
+    with cols[1]:
+        st.plotly_chart(density_fig, use_container_width=True)
+
+    # Footer caption — reinforces the masking story.
+    n_masked = int(values.notna().sum().sum() -
+                   masked.notna().sum().sum())
+    if n_masked > 0:
+        st.caption(
+            f"{n_masked} cell(s) masked from the value pane at "
+            f"min_n={min_n} (still visible in the density pane). "
+            f"Lower the threshold via the sidebar slider to inspect "
+            f"thin cells."
         )

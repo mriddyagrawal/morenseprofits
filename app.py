@@ -37,8 +37,9 @@ from src.strategies.registry import list_strategies  # noqa: E402
 from src.web.caveats import render_caveats  # noqa: E402
 from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E402
 from src.web.heatmap import (  # noqa: E402
-    render_headline as render_heatmap_headline,
     _selector as render_heatmap_selector,
+    render_headline as render_heatmap_headline,
+    render_heatmaps,
 )
 from src.web.leaderboard import (  # noqa: E402
     MODE_ACROSS,
@@ -242,9 +243,13 @@ def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
     render_heatmap_headline(
         df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
     )
+    st.markdown("---")
+    render_heatmaps(
+        df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
+    )
     _placeholder(
-        "Dual Plotly heatmaps + customdata tooltips",
-        "feat(p6.3.pivot) + feat(p6.3.hover)",
+        "Customdata tooltips (replaces basic hover)",
+        "feat(p6.3.hover)",
     )
 
 
