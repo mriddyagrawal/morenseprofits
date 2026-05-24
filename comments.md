@@ -3306,6 +3306,81 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 8a49165 — docs: PROJECT_DESCRIPTION + DESIGN_SPEC
+
+**Verdict:** ✅ accept (docs-only; not exercising)
+
+**Phase / commit goal (as I understood it):** Two new top-level docs. PROJECT_DESCRIPTION.md is the README-grade overview for a fresh reader of the repo. DESIGN_SPEC.md (**authored by the user**, per commit body) is the Phase-6 UI architecture pinning 17 decisions so the next ~19 commits don't relitigate them. Neither file touches code.
+
+**What works — PROJECT_DESCRIPTION.md:**
+- **Clean four-tier explanation**: what it does → what's done (table form) → how structured → how built → tech stack → how to run. Reads top-to-bottom for a stranger.
+- **Phase-status table** with ✅/🚧/📋/🔒 — communicates "where we are" in one row scan.
+- **Verify-script CLI output included verbatim** — `rank=1 short_straddle × RELIANCE N=18 ... ~30ms` — gives a concrete number a fresh reader can grep for in `scripts/verify_p5.py` to anchor the abstract description.
+- **"How it's built" section** captures the dual-agent + nuclear-commit + no-silent-filtering + honest-data-first contract that this whole project hinges on. The reviewer→builder→comments.md loop is documented as a feature, not a side effect.
+- **Tone is honest**: "Phase 6 — Streamlit dashboard — 🚧 next", "MCP — 🔒 deferred". No overclaiming.
+
+**What works — DESIGN_SPEC.md (user-authored):**
+- **§0.1 cross-reference table** is the killer feature — maps each carry-over reviewer flag to the design section that resolves it. **Verifies that every Phase-5 review flag has a Phase-6 destination**:
+  - 416719f small-N → §1.2 sidebar slider + §2.2 masking ✓
+  - 955d0f3 lex tiebreaker → §2.2 leaderboard renders `n_trades` prominently ✓
+  - 955d0f3 silent thin-sample drop → §4 commit `feat(p6.2.thin)` sidecar ✓
+  - 416719f `min_n=0` verify-only → §1.2 defaults to 5 ✓
+  - afdd56e ddof=0 caveat → §2.2 tooltip copy ✓ (uses my exact wording from the afdd56e review block)
+  - afdd56e Sharpe-like ≠ real Sharpe → §2.4 excluded from v1 sort menu ✓
+  
+  **Every load-bearing reviewer concern has an architectural home.** This is the right discipline — reviewer flags become design constraints, not folklore.
+- **§1.1 tabs vs pages decision** with the right rationale (cross-page state loss with `pages/`). Streamlit veterans will agree; this catches a common rookie mistake.
+- **§1.4 single caveats expander** instead of three stacked banners — "banner blindness" rationale is correct UX intuition. PLAN.md §3 Phase 6.5 exit criterion still satisfied (the expander is always rendered).
+- **§2.1 Plotly for heatmaps** with explicit reason (hover tooltip composition). Includes the `chore(p6.0.deps)` action to add `plotly>=5.20`.
+- **§2.4 Sharpe-like excluded** — the three forward options (real Sharpe with sidebar, rename, leave out) are all valid; v1 picks "leave out". Conservative; appropriate. **My afdd56e review block flagged this exact concern** — the doc resolves it cleanly by deferring rather than half-implementing.
+- **§3 first-real-sweep dimensions** (5 stocks × 2 years × 3 strategies × 5 × 3 ≈ 5,400 cells) — concrete plan with cache-fetch budget (20-30 min). Avoids the legacy/UDiff pre-2024-07-08 boundary noise by sticking to 2023-2024. **Smart**: surfaces a Phase-6 dataset that exercises multi-pair/multi-year/multi-strategy without yet hitting the format-cutover edge.
+- **§4 nineteen-sub-commit decomposition** of Phase 6 — nuclear-commits discipline applied. Each commit fits in a small reviewable diff: discover module + tests, caveats module, app shell, leaderboard table, thin-samples sidecar, within/across toggle, dual heatmap, hover tooltips, YoY line, MoY bars, n_trades hover, per-stock dashboard, sweep run, screenshot verify, tag. Reviewable.
+- **§6 workflow decisions** in compact table form — stay on main, tag every phase, defer mypy, pin requirements. All defensible for solo-dev velocity.
+- **§8 wiring constraints** — call out the four design choices that prevent Phase-7 surgery: universe is `list[str]` everywhere, caveats are re-exported not duplicated, sweep discovery in its own module, min_n flows top-down. These are exactly the right places to apply the open-closed principle.
+- **§10 change log** — discipline matches PLAN.md §7. Same 2026-05-24 date for creation + the §0.1/§2.4 amendments captured.
+
+**Blocking issues:** None.
+
+**Non-blocking observations (the doc-vs-reality gaps I found):**
+
+1. **🔬 §9.5 and §9.6 are stale — describe followups that 8893b81 closed 17 seconds earlier**. §9.5: "verify_p5 prints unmasked heatmap + count instead of masked view... lands as `chore(p5.followup): verify_p5 prints masked heatmap` whenever someone touches the script next." — but 8893b81 lands exactly this fix at [scripts/verify_p5.py:120-129](scripts/verify_p5.py#L120-L129). §9.6: "Empty-frame StringDtype drifts to object via `_inferred_dtype` (1a5cf01). Cosmetic; deferred." — but 8893b81 closes this too at [src/engine/results.py:104-108](src/engine/results.py#L104-L108). **The doc was written before 8893b81 landed but committed 17 seconds after.** Both items should now read "RESOLVED in 8893b81" instead of "deferred". Cosmetic but a future reader picking through §9 would think these are still pending.
+
+2. **§0 says "5 sweep parquets exist on disk"** — at the time of writing this was likely true (3 test-leaked + verify_p5 small + 1 real). Currently `ls data/results/` shows ONLY `sweep_bde92aef8573.parquet`. The 3 leaked artifacts were cleaned manually before 617878b's test-fixture fix. **Cosmetic**; the doc is describing past state, not current. Acceptable since §0 is contextual.
+
+3. **🔬 §1.5 "newest by mtime" sweep picker has a hidden dependency on 617878b's test-fixture fix.** **The defensive alternative (verify_p5's "largest by row count")** was rejected with the reasoning "a stale-but-big historical sweep would silently outrank the one the operator just produced. mtime matches the mental model 'the sweep I just ran.'" — sound rationale. **BUT**: if a future test reintroduces a leak path (e.g., a new module imports `RESULTS_DIR` without the fixture being updated — see my 617878b review's non-blocker #1), the mtime picker silently degrades. Worth a note: §1.5 should reference the test-fixture-leak fix as a load-bearing prerequisite, OR §8 should add "all `RESULTS_DIR` consumers must be in `_redirect_results`" as a wiring constraint. Otherwise the picker is silently fragile to a future contributor's mistake.
+
+4. **§2.1 says "drop altair if a repo-wide grep shows no in-tree usage"** — I grepped: `requirements.txt:12: altair>=5.0.0` is the only mention. **Grep IS clean** — altair can be dropped per the conditional. Minor: the conditional could be hardened to "drop altair from requirements.txt" without the qualifier since the grep is verifiable now.
+
+5. **PROJECT_DESCRIPTION.md says "365/365 tests"** — currently 367 after 8893b81. Cosmetic; will drift with every test addition. Could be replaced with "365+ tests as of Phase 5" or just "~365 tests".
+
+**Domain / correctness checks:**
+- **Asymmetric-conservatism contract preserved**: ✓ §0.1 + §1.4 + §2.2 tooltip + §2.4 Sharpe exclusion all extend the asymmetric-conservatism mandate into the UI layer.
+- **No silent filtering claimed but not delivered**: ✓ §4 explicitly schedules `feat(p6.2.thin)` as a separate commit — the thin-samples sidecar is a first-class commit, not a footnote.
+- **Reviewer-flag traceability**: ✓ §0.1 is the audit trail; every flag has a destination section.
+- **No internal contradictions**: I cross-checked the table of contents against the section bodies. §1.2 sidebar's `min_n` default of 5 matches §0.1's `MIN_N_FOR_RANKING=5`. §2.2's "leaderboard renders `n_trades` as own column" matches §0.1's reference to 955d0f3 lex-tiebreaker mitigation. Consistent.
+
+**What I tried:**
+- `git show --stat 8a49165` — 384 lines added, 2 new files; no production code touched.
+- Read PROJECT_DESCRIPTION.md and DESIGN_SPEC.md end-to-end.
+- Cross-checked §0.1's reviewer-flag table against my own review history in comments.md — every cited flag matches.
+- Grep'd for `altair` usage to verify §2.1's drop-conditional — clean.
+- Listed `data/results/` to check §0's "5 sweep parquets" claim — currently 1 (the doc is stale).
+- Cross-checked §9.5 + §9.6 deferred items against 8893b81's diff — both are closed, so §9 is stale.
+
+**Sequencing observation:** The two-commit cluster (8893b81 closes flags → 8a49165 documents the design) is the right shape, BUT they landed within 17 seconds and BUILDER didn't update the doc to reflect 8893b81's closures. This is a small process gap. **Recommendation**: when closing flags AND landing a design doc that references them, sequence as (a) close flags, (b) update design doc to reflect closures, (c) commit doc. Or fold the doc into the same commit.
+
+**Doc-traceability call-out**: §0.1 cites reviewer commit SHAs verbatim (416719f, 955d0f3, afdd56e). **This is the right pattern** — design constraints traceable to specific reviewer flags means the constraint history is auditable. Future-me (or a future contributor) reading §0.1 can `git show 955d0f3` to understand WHY the leaderboard renders `n_trades` prominently. Reviewer→doc→code traceability closed.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4, the Phase-6 sequence starts with:
+1. `chore(p6.0.spec)` — SPECS §11 web contract (sweep-discovery rule + caveat constants); OR
+2. `chore(p6.0.deps)` — `requirements.txt` (add `plotly>=5.20`, drop `altair`).
+
+**My lean**: start with `chore(p6.0.deps)` since it's the smallest, most-mechanical commit — single-file edit, easy to verify, unblocks any commit that needs Plotly. SPECS §11 contract authoring can immediately follow. Both are quick wins before the first piece of new code (`feat(p6.1.discover)`).
+
+**Stale-doc followup suggestion** (non-blocking, opportunistic): in whichever commit next touches DESIGN_SPEC.md, mark §9.5 and §9.6 as RESOLVED (with the closing commit SHA = `8893b81`). Mark §0's "5 sweep parquets" as historical context if not removed. Total edit ~3 lines.
+
+---
+
 ## Review of 8893b81 — chore: close non-blocking reviewer flags accumulated through Phase 5
 
 **Verdict:** ✅ accept
