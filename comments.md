@@ -2851,3 +2851,42 @@ Small production-quality fix surfaced during the actual `chore(p4.verify)` run. 
 **Next-commit suggestion:** Resume `chore(p4.verify)`. The timeout fix unblocks the verify itself. The 5 checks from the prior next-commit suggestion still apply (determinism / Phase-3-cross-check / skip log / spot-basis / timing measurement).
 
 ---
+
+## Review of 187ee67 — fix(results): canonical_column_order coerces dates + sweep_grid returns canonical shape
+
+**Verdict:** ✅ accept
+
+**Two coupled bugs caught by the verify run, one fix.** Exactly what the grilling-against-real-data pattern is for.
+
+**Bug 1**: `sweep_grid`'s in-memory return frame had columns in `price_trade`'s dict-insertion order, but the persisted parquet had RESULTS_COLUMNS canonical order. So `assert_frame_equal(run_1_inmemory, run_2_cached_read)` would fail on column order — undermining the SPECS §6c.3 determinism contract at the read boundary.
+
+**Bug 2**: `price_trade` returns date columns (`expiry`, `entry_date`, `exit_date`) as Python `datetime.date` objects (object dtype). `pd.DataFrame(rows)` preserves object dtype; parquet round-trips as object. Then `df["expiry"] == pd.Timestamp("2024-01-25")` **silently returns False** even when the row matches — pandas can't compare datetime64 to object. Phase-5 ranker would have shown empty results for any date-filter query.
+
+**The fix**: new public `canonical_column_order(df)` in `src/engine/results.py` that:
+1. Reorders to RESULTS_COLUMNS-first + extras-at-tail
+2. Coerces the three date cols from object → `datetime64[us]` per SPECS §2.0
+
+Both `write_results` AND `sweep_grid`'s return path call it, so the in-memory frame is byte-identical-shape to the parquet.
+
+**What works:**
+- **Pure function** (`.copy()` first, doesn't mutate caller's frame)
+- **Coerces only object-dtyped date cols** — datetime64 columns pass through unchanged
+- **`pd.to_datetime(...).astype("datetime64[us]")`** preserves the §2.0 microsecond-unit convention
+- 1 new test pins the dtype invariant with the explicit `pd.Timestamp filter now matches 1 row` assertion — the test specifically catches the silent-filter-miss class.
+- 297/297 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- The fix is the minimal correct shape. No flags.
+
+**Domain / correctness checks:**
+- **Schema integrity**: in-memory frame and persisted parquet now byte-identical-shape. Determinism contract holds at the read-back boundary.
+- **Filter semantics**: `pd.Timestamp` filters now correctly match — load-bearing for Phase-5 ranker queries like "all RELIANCE Jan-2024 trades".
+- **SPECS §2.0 compliance**: date cols are now `datetime64[us]` consistently.
+
+**What I tried:** Read the diff. The test's explicit `(normalized["expiry"] == pd.Timestamp("2024-01-25")).sum() == 1` assertion is the right shape — pins the user-visible behavior, not just the dtype.
+
+**Next-commit suggestion:** Resume `chore(p4.verify)` — already in flight per the next-commit notification. The fix unblocks the determinism check.
+
+---
