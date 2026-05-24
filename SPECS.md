@@ -267,6 +267,24 @@ def offset_trading_days(anchor: date, n: int) -> date:
     — any date returned by `trading_days` that's also in `holidays()`
     is a bug somewhere upstream."""
 
+# src/universe/blue_chip.py
+def blue_chip(as_of: date) -> list[str]:
+    """Sorted list of blue-chip symbols as of the given date. v1 returns
+    a single 2024-07-01 snapshot regardless of as_of; see SPECS §6b."""
+
+# src/universe/momentum.py
+def classify_momentum(
+    as_of: date,
+    universe: list[str],
+    *,
+    lookback_months: int = 6,
+    today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
+) -> dict[str, list[str]]:
+    """Returns {"bullish": [...], "neutral": [...], "non_bullish": [...]}.
+    Each list sorted alphabetically. Splits by trailing-return terciles
+    per SPECS §6b.2."""
+
 # src/strategies/base.py
 @dataclass(frozen=True)
 class Leg:
@@ -355,7 +373,55 @@ Every public loader (`load_spot`, `load_bhavcopy_fo`, `load_option`, `monthly_ex
 
 `offline=True` AND `force_refresh=True` are contradictory; **offline takes precedence**. For an open-expiry contract whose cache is stale relative to today, offline returns the stale cache rather than raising (still valid data, just not up-to-the-minute).
 
-## 7. Cache invalidation
+## 6b. Universe selection (Phase 2)
+
+### 6b.1 Blue-chip (v1)
+
+Single hardcoded list: **Nifty 50 constituents as of 2024-07-01**, with
+the source citation embedded in `src/universe/blue_chip.py` (an NSE
+press release / index methodology document; URL recorded in the file
+header).
+
+The `as_of: date` argument to every universe function exists for
+*future-proofing* — v1 returns the same list regardless of `as_of`,
+but the parameter is required so backtests record "the list was
+evaluated as-of 2024-07-01" even when run later.
+
+### 6b.2 Momentum (v1)
+
+`classify_momentum(as_of, universe, lookback_months=6) -> dict`:
+
+  - For each symbol in `universe`, compute trailing return:
+    `(spot.close[as_of] - spot.close[as_of - lookback_months]) / spot.close[as_of - lookback_months]`
+  - Sort symbols by trailing return descending.
+  - Top third (terciles, ties broken by symbol name ascending) →
+    `"bullish"`; middle third → `"neutral"`; bottom third →
+    `"non_bullish"`.
+  - Returns `{"bullish": [...], "neutral": [...], "non_bullish": [...]}`,
+    each list sorted alphabetically for determinism.
+
+### 6b.3 SURVIVORSHIP BIAS (load-bearing caveat)
+
+v1's blue-chip list is **2024-07-01 Nifty 50**. Running a backtest
+against this list on 2019 prices means you've selected stocks that
+*survived to 2024-07-01*. Stocks that were Nifty 50 in 2019 and got
+dropped (e.g. underperformers, mergers, delistings) are absent. Returns
+will look better than reality.
+
+**Mitigations**:
+1. Every UI rendering of universe-rooted backtest results MUST display
+   a "Survivorship-bias note" disclaimer (Phase 5/6 plumbing).
+2. Phase 7 backlog item: replace v1's single snapshot with
+   `BLUE_CHIP_BY_QUARTER: dict[date, list[str]]` so backtests use the
+   correct membership *as of each backtest period*.
+3. Documenting this in §6b.3 itself so the limitation is impossible to
+   miss when reviewing the universe layer.
+
+### 6b.4 Cache
+
+Universe membership is pure-Python data (no NSE fetch). Momentum
+classifier uses `load_spot` for prices and inherits its parquet cache;
+the classifier's per-call computation runs in <100ms on a warm cache.
 
 - Caches are **append-mostly**. We never overwrite a parquet that contains real historical data unless `--force-refresh` is passed via CLI.
 - Schema changes bump a `CACHE_VERSION` constant in `src/data/cache.py`; on bump, the cache directory is moved to `data/cache.v{N-1}/` (manual cleanup, never automatic deletion).

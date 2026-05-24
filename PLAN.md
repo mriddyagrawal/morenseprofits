@@ -109,14 +109,16 @@ Exit criteria:
 ### Phase 2 — Universe selection
 **Goal:** Reproducible stock-category definitions.
 
-Commits:
-1. `feat(p2): blue_chip universe — Nifty 50 snapshot list with source citation`
-2. `feat(p2): momentum-based bullish / non-bullish classifier`
-3. `feat(p2): universe CLI — `python -m src.universe.cli --as-of 2024-01-01``
-4. `test(p2): universe membership stability + classifier determinism`
+Steps (one commit each per nuclear doctrine):
+1. `chore(p2.0): SPECS for universe — survivorship-bias policy + schema`
+2. `feat(p2.1): src/universe/blue_chip.py — single Nifty-50 snapshot`
+3. `test(p2.1): blue_chip determinism + as_of + count`
+4. `feat(p2.2): src/universe/momentum.py — trailing 6-month return classifier`
+5. `test(p2.2): momentum determinism + bullish/non-bullish split`
+6. `chore(p2.verify): live verify on a small universe slice (computes momentum on 5 stocks via load_spot)`
 
 Exit criteria:
-- Re-running classifier with the same `as_of` date yields identical membership.
+- Re-running classifier with the same `as_of` date yields byte-identical membership.
 - Membership snapshots cached so we can audit later runs.
 
 ### Phase 3 — Single-strategy backtest engine (short straddle)
