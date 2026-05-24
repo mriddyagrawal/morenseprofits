@@ -3212,3 +3212,96 @@ entry=5 :     365.9%     89.1%
 After p5.5 → Phase 5 is complete and Phase 6 (streamlit UI) can render: leaderboard table, heatmap, year-trend line, month-of-year bars. The honest-data underpinnings (slippage, exact annualization, spot-margin, lot-size historical) all show through to the Phase-6 surface.
 
 ---
+
+## Review of 38ce987 — feat(p5.5): rank_strategies — Phase-5 leaderboard layer
+
+**Verdict:** ✅ accept with two non-blocking tiebreaker / transparency notes for Phase-6
+
+**Phase / commit goal (as I understood it):** Final Phase-5 commit. Sort a summary frame by a configurable metric, filter thin samples by default, return a copy with a 1-indexed `rank` column. Phase-6 UI's leaderboard data source.
+
+**What works:**
+- **Clean API surface** ([src/analytics/rank.py:46-53](src/analytics/rank.py#L46-L53)): `rank_strategies(summary_df, *, by, ascending, min_n, top_n)`. All five knobs the leaderboard needs.
+- **Sensible defaults**: `by="median_roi_pct_annualized"` (robust + cross-window-comparable), `ascending=False` (higher = better), `min_n=MIN_N_FOR_RANKING=5` (statistical honesty), `top_n=None` (no truncation).
+- **`ascending=True` for "what should I AVOID"** — clever asymmetric use case. Worst-first leaderboard is useful for de-risking ("avoid these strategy×symbol pairs").
+- **`min_n=0` disables filter** — escape hatch documented "with eyes open".
+- **`top_n` truncation post-rank** — `df.head(top_n)` only after the full sort, so rank-numbering stays 1..top_n consistent.
+- **Determinism**: `sort_values + reset_index(drop=True)` + 1-indexed integer rank. Same pattern as sweep_grid.
+- **`MULTIPLE_COMPARISONS_CAVEAT`** ([src/analytics/rank.py:35-43](src/analytics/rank.py#L35-L43)) — 450-character v1 mitigation as a module constant. **This is exactly the right move for asymmetric conservatism**: when the user sees "rank=1 short_straddle × RELIANCE 247.9%/yr", they need to know the top-K of N selections inflates apparent edge. Phase-6 UI MUST render this verbatim. Defers formal Bonferroni/Holm to Phase 7/8 with the right reason (needs per-row p-values, not in v1).
+- **Input validation**: `n_trades` column required, `by` column required, `min_n >= 0`, `top_n >= 0` — all loud failures with helpful diagnostics. Same loud-failure pattern as `results.write_results` and `summarize_by_stock_strategy`.
+- **Compatible with all three aggregator outputs** (per-pair, per-year, per-month) — the input contract is just "any frame with `n_trades` and the `by` column", not specifically `SUMMARY_COLUMNS`. Composable. Phase-6 can rank-by-year for a YoY winners table.
+- 18 new tests + 365/365 in full suite. Phase 5 is **DONE**.
+
+**Real-data verify (single-row dataset)**: 
+```
+rank=1 short_straddle × RELIANCE  n=18  win%=83.3  median=247.9%/yr  total_net_pnl=₹124,613
+```
+With one (strategy, symbol) pair in the verify universe the ranker is a no-op, but the wiring is provably correct. Phase-7+ when more pairs land, the leaderboard will exercise.
+
+**I also live-verified composability with the std column from afdd56e**: synthesized a `sharpe_like_annualized = mean_roi / std_roi` column, called `rank_strategies(s2, by="sharpe_like_annualized")` — works (no special-casing needed). The p5.5 API decouples "what to rank by" from "what's in the schema", which is the right abstraction.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+
+1. **🔬 Tiebreaker is (strategy, symbol) lex order, NOT n_trades desc** — this departs from my p5.4 next-commit suggestion. **Live-grilled with a fake tie**:
+   ```
+   At tied 100%/yr annualized:
+     rank=1  A_strategy × XYZ  n=10
+     rank=2  B_strategy × ABC  n=50    ← LOSES TO N=10 ROW
+     rank=3  B_strategy × XYZ  n=5
+   ```
+   The n=50 row (more statistically reliable) ranks BELOW the n=10 row purely because of alphabetic strategy name. **Defensible argument**: lex order is deterministic across input shuffles AND across data growth (n_trades changes; lex doesn't). **Argument against**: at a tied headline metric, "more data = more reliable" is the canonical statistical-honesty tiebreaker; this design contradicts the rest of the project's MIN_N_FOR_RANKING ethos.
+   
+   **My read**: the BUILDER's choice prioritizes pure determinism over statistical-honesty-flavored ordering. Both are valid. The lex-order behavior is documented and tested ([src/analytics/rank.py:99-108](src/analytics/rank.py#L99-L108)).
+   
+   **Suggestion for Phase-6**: render `n_trades` prominently in the leaderboard column so a user sees "rank 1 (n=10)" above "rank 2 (n=50)" and can interpret accordingly. Or, optionally, p5.5b adds `tiebreaker="n_trades"` as a kwarg defaulting to `"lex"` for backwards-compat — opt-in upgrade.
+
+2. **⚠️ Single-table output silently drops thin samples** — I suggested a two-table return (`ranked, suppressed_thin`) in the p5.4 next-commit; the BUILDER took the single-table approach. The commit body acknowledges the divergence as a "different contract from aggregate.py — aggregate is transparent, rank is curated". **This works IF Phase-6 explicitly composes** `rank_strategies(s)` AND a parallel `s[s["n_trades"] < MIN_N_FOR_RANKING]` rendered as a "thin-samples-not-ranked" section. **If Phase-6 forgets that pair**, the operator sees only the ranked table and has no signal that 14 other strategies were tested but suppressed — silent filtering surfacing at the UI layer.
+   
+   **Mitigation**: add a docstring note on `rank_strategies` reminding consumers to also render the suppressed subset (or have a `return_suppressed=False` kwarg that flips it to tuple-return). Lightweight; non-blocking.
+
+3. **Tied-rank semantics**: two rows tied on `(by, strategy, symbol)` get consecutive integer ranks (1, 2, ...) NOT shared rank (1, 1, 3). This is "competition ranking" vs "standard ranking". Defensible for a UI leaderboard (integers are easier to render), but worth docstring clarification — "ranks are dense integers 1..N regardless of metric ties".
+
+4. **All-rows-suppressed edge case**: if every row has `n_trades < min_n`, the output is empty. No warning emitted. Operator might think the input was empty when actually 18 rows existed but were all thin. Phase-6 can detect this (`len(rank_output) == 0 and len(input) > 0`) and render a "all samples below threshold" message; or `rank_strategies` could emit a `warnings.warn(...)` when 100% are filtered. Non-blocking.
+
+**Domain / correctness checks:**
+- **Statistical honesty (continued)**: ✓ default `min_n=5`; ✓ multiple-comparisons caveat as a non-empty string. The two layers (aggregate-transparent + rank-curated) work TOGETHER for honesty, provided Phase-6 composes them.
+- **Determinism**: ✓ deterministic regardless of input row order (verified live by shuffling a 3-row fake frame; rank output stable).
+- **Annualization**: ✓ default metric is annualized, cross-window-rankable.
+- **MULTIPLE_COMPARISONS_CAVEAT is the right v1 mitigation**: documenting the selection-bias risk in plain English is more useful for the user than a half-implemented Bonferroni that pretends to be rigorous. The user's mental model (asymmetric conservatism) is well-served by the verbal caveat.
+
+**What I tried:**
+- `.venv/bin/python -m pytest tests/test_rank.py -v` → 18/18.
+- `.venv/bin/python -m pytest tests/` → 365/365.
+- Live ranker on the real verify parquet → single row, rank=1 short_straddle × RELIANCE.
+- Live composability test: built a `sharpe_like_annualized` column from afdd56e's std, ranked by it — works, no schema changes needed.
+- Live "avoid" use case: `ascending=True` returns worst-first.
+- Live tiebreaker grill: synthesized a 3-row fake frame with all metrics tied at 100%, confirmed lex-order behavior. Documented above as non-blocking #1.
+
+**Caveat status — Phase 5 closes:**
+- ✅ Aggregator infrastructure (p5.1 per-pair, p5.3 per-year, p5.4 per-month) — all share `_summarize` helper
+- ✅ Dispersion + aggregate-P&L columns (afdd56e) — p5.1 reviewer flags closed
+- ✅ Heatmap pivot (p5.2)
+- ✅ Ranker (p5.5)
+- ✅ Statistical-honesty contract through both layers
+- ✅ Multiple-comparisons caveat surfaced as constant
+
+**Phase 5 is DONE.** The honest-data underpinnings (Tier-B margin, exact annualization, spot-margin basis, 1% slippage gap, historical lot-size) all propagate through the aggregate/heatmap/rank layer into Phase-6's renderable shape.
+
+**Next-commit suggestion:** **`feat(p6.1): streamlit UI skeleton — page routing + parquet loader + leaderboard table`**. The first user-facing surface. Load-bearing design decisions for Phase-6 to honor the asymmetric-conservatism contract:
+
+1. **Single-page leaderboard layout**: top section = `rank_strategies(s)` ranked table with `n_trades` prominently shown (mitigates the lex-tiebreaker quirk); bottom section = thin-samples-not-ranked subset with explanatory copy ("these strategy×symbol pairs had N<5 trades and are not included in the ranking — N too small for reliable summary statistics").
+
+2. **MULTIPLE_COMPARISONS_CAVEAT rendered verbatim** at the top of the leaderboard page (a styled callout box). This is non-negotiable for asymmetric conservatism — the user needs to see "top-K of N selections inflates apparent edge — treat as a candidate list" alongside the ranking.
+
+3. **Heatmap render**: use `pivot_window` + `pivot_counts.where(n >= MIN_N_FOR_RANKING)` to mask thin-sample cells visually (hatched / desaturated, NOT silently NaN-out to "no data"). Phase-6's job is to show what's there honestly.
+
+4. **YoY decay + month-of-year seasonality charts**: line plot for `summarize_by_year`, bar chart for `summarize_by_month`. Both should render `n_trades` per bin as a hover/tooltip so a sparse bin is visually distinguishable from a dense one.
+
+5. **Survivorship-bias disclaimer (SPECS §6b.3)** still load-bearing — alongside the multiple-comparisons caveat. Two-sentence callout.
+
+6. **Parquet path discoverable** via `data/results/sweep_*.parquet` — the run_id hash is what Phase-6 should expose so the user can switch between historical sweeps without remembering filenames.
+
+After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strategy-detail drill-down. Each lands one page/component. Streamlit's hot-reload makes this iteration fast.
+
+---
