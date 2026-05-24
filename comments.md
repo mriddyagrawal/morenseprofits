@@ -3306,6 +3306,95 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of c6e3684 — feat(p6.1.empty): src/web/empty_state.py — 7 canonical thin-data messages
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement DESIGN_SPEC §2.6 thin-data UX contract. 7 pre-written `st.info` messages (one per row of the §2.6 table); each names a specific operator action ("Lower threshold", "Widen filter", "Pick another symbol"). Loud failure on unknown reason key — better to crash a Phase-6 commit than render a blank info box. Tests verify both context interpolation + operator-action verb presence.
+
+**Self-correction**: my 3880d9d review said "§2.6 NEW — Six pre-written `st.info` messages". The actual §2.6 table has **7 rows** (I miscounted at the time). BUILDER's 7 messages match the spec exactly — `Leaderboard×2 + Per-stock + Heatmap×2 + Trends-YoY + Trends-MoY = 7`. Apologies for the prior miscount.
+
+**What works:**
+
+- **`Reason = Literal[...]`** ([src/web/empty_state.py:29-37](src/web/empty_state.py#L29-L37)) — pinned set of 7 valid keys. **mypy/pyright catches typos at caller-site**, not just at render-time. The `# type: ignore[arg-type]` in `test_unknown_reason_raises_value_error` proves the type system is doing the right thing.
+- **Loud-failure on unknown reason** ([src/web/empty_state.py:97-98](src/web/empty_state.py#L97-L98)) — `raise ValueError(f"unknown empty-state reason: {reason!r}")`. Exactly the right discipline; a typo'd reason key crashes the page rather than silently rendering a blank `st.info`.
+- **Context interpolation with `?` fallback** ([src/web/empty_state.py:58-95](src/web/empty_state.py#L58-L95)) — `ctx.get("n_pairs", "?")` etc. If the caller forgets to pass a context var, the message reads "All ? pair(s) have fewer than min_n=?..." — visibly wrong, but no crash. Defensive without being silent.
+- **Two-API design**: `render_empty(reason, **ctx) -> None` (streamlit side-effect) + `get_message(reason, **ctx) -> str` (pure return). The `get_message` accessor enables:
+  - Unit-testing the formatting logic without a Streamlit context.
+  - Future Phase-7 CSV export buttons that may want to render the message in a non-Streamlit surface (per docstring intent).
+- **Module imports streamlit** at module-top ([src/web/empty_state.py:23](src/web/empty_state.py#L23)) — second renderer module exempt from SPECS §11.1 (the docstring explicitly notes this, same pattern as `caveats.py`).
+- **Tests pin operator-action verbs**: `test_leaderboard_no_rows_after_filters_names_sidebar_action` asserts `"widen" in msg or "pick" in msg`; `test_leaderboard_all_below_min_n_interpolates_counts` asserts `"lower" in msg`. **The action verb is the load-bearing UX property** — a "no data" message without an action leaves the operator stuck. Tests pin this.
+- **`test_render_empty_calls_st_info`** uses `monkeypatch.setattr(es.st, "info", fake_info)` — **proper pytest fixture pattern**, better than the inconsistent `results_mod.RESULTS_DIR = ... + importlib.reload(...)` pattern I flagged in test_web_discover.py review. **Recommended convention going forward**; this is the model to copy.
+- **9 new tests; 413/413 full suite** (was 404 + 9).
+
+**Live-verified:**
+- `pytest tests/test_web_empty_state.py -v` → 9/9 in 0.20s.
+- `pytest tests/` → 413/413 full suite.
+- Cross-referenced the 7 reason keys against DESIGN_SPEC §2.6 — every row maps to a key.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 `get_message` docstring claims "streamlit-free" but the MODULE imports streamlit at module-import time**. [src/web/empty_state.py:117-119](src/web/empty_state.py#L117-L119) says:
+   > "Streamlit-free accessor for the canonical message. Used by unit tests + by Phase-7 export buttons that may want to render the message in a non-Streamlit surface (e.g., a CSV header note)."
+   
+   **This is half-true**: the *function* doesn't use streamlit at runtime, but `from src.web.empty_state import get_message` requires streamlit to be installed (the module's first line is `import streamlit as st`). **For the Phase-7 CSV export use case in a non-streamlit context, this matters** — the caller can't import the module at all without streamlit. 
+   
+   **Fix options for Phase-7** (when the CSV export consumer lands):
+   - Split: move `_format_message` + `get_message` + the reason keys to `src/web/_empty_messages.py` (streamlit-free); keep `render_empty` here.
+   - Alternative: soften the docstring claim to "Streamlit-script-context-free; module still imports streamlit at load time".
+   
+   Non-blocking for v1 (no actual non-streamlit consumer exists yet); flag for `feat(p7.3)` export buttons.
+
+2. **`if/elif/elif/.../raise` chain in `_format_message`** ([src/web/empty_state.py:52-98](src/web/empty_state.py#L52-L98)) — ~50 lines, growing linearly with reason count. **Stylistic alternative**: a dict-of-lambdas keyed by reason. For 7 reasons the current shape is fine; if Phase-7 adds more reasons (e.g., per_stock empty after regime filter, diagnostics no skips, etc.), refactor at ~10 reasons. Cosmetic.
+
+3. **Commit body claims the Q1-2024 verify set hits "MoY-almost-degenerate at 3 months"** — but `trends_moy_single_month` triggers at n_months < 2, and the verify set has 3 months (Jan/Feb/Mar). **MoY does NOT trigger** the empty-state for the verify set. The phrase "almost-degenerate" is BUILDER's commentary, not a code claim — just noting the slight imprecision. The actual paths exercised on first render are `heatmap_all_masked` + `trends_yoy_single_year`.
+
+4. **`heatmap_single_axis` empty-state requires n_entry < 2 OR n_exit < 2** — the verify set has 3 entry offsets × 2 exit offsets, so this also does NOT trigger. The verify set hits 2 of the 7 paths on first render, not 3. Doesn't matter; just commit-body imprecision.
+
+5. **Reason keys are `snake_case` strings**, not enums. ([src/web/empty_state.py:29-37](src/web/empty_state.py#L29-L37)). `Literal[...]` gives the same type-safety as an enum at less ceremony; defensible. An enum would surface in IDE autocomplete more naturally, but `Literal` works fine.
+
+6. **No multi-reason composition** — if a tab is BOTH "all below min_n" AND "no rows after filters" (e.g., the operator filtered to a strategy that has only 2 trades, all below threshold), only one reason can be rendered. The current usage pattern is "tab module picks the most-load-bearing reason" — fine for v1; just noting the future case where stacked reasons might be useful. Cosmetic; could be Phase-7+ if it becomes a thing.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ every message names an operator action ("Lower threshold or run a larger sweep"). No vague "no data available" wording.
+- **Loud-failure discipline**: ✓ unknown reason raises ValueError.
+- **DESIGN_SPEC §2.6 contract literal**: every row of the §2.6 table has a matching reason key.
+- **§11.1 streamlit-isolation exemption**: ✓ `empty_state.py` is a renderer; module docstring explicitly notes the exemption.
+- **Test ergonomics**: ✓ proper monkeypatch pattern — the model for future renderer-module tests.
+
+**What I tried:**
+- Read [src/web/empty_state.py](src/web/empty_state.py) end-to-end.
+- Read [tests/test_web_empty_state.py](tests/test_web_empty_state.py) end-to-end.
+- Verified each `Reason` literal maps to a row of DESIGN_SPEC §2.6.
+- `pytest tests/test_web_empty_state.py -v` → 9/9.
+- `pytest tests/` → 413/413.
+
+**Phase 6.1 status after this commit:**
+- ✅ `feat(p6.1.discover)` + tests (334bada + 5c801dd)
+- ✅ `feat(p6.1.caveats)` + tests + date-fix (7b12228 + 79d50d8)
+- ✅ `feat(p6.1.app)` (efe1c73)
+- ✅ `feat(p6.1.empty)` + tests (c6e3684, this commit)
+- 🔄 `chore(p6.1.verify)` — visual smoke + screenshots (LAST Phase-6.1 commit; not yet landed)
+
+**Next-commit suggestion:** `chore(p6.1.verify)` per DESIGN_SPEC §4 commit 10. Should do:
+1. `streamlit run app.py --server.headless` boots cleanly against the verify parquet.
+2. **Confirm the date-fix made it to the rendered UI** (screenshot the caveats card; assert "2024-07-01" visible, "2026" not).
+3. **Screenshot every tab** against `DESIGN/leaderboard.png` / `per_stock.png` / `heatmap.png` / `trends.png`. Note any divergence; all 4 tabs are placeholders right now, so most of the visual delta is intentional (tab body says "implemented in feat(p6.X.Y)").
+4. **Exercise the empty-state paths** the verify set hits — should see `heatmap_all_masked` rendered on the Heatmap tab and `trends_yoy_single_year` on the Trends tab.
+5. Record screenshots somewhere (DESIGN/screenshots/p6.1/?). Or store as `chore(p6.1.verify): screenshots reference for Phase 6.1` followup-commit if not in this one.
+
+After p6.1.verify closes → Phase 6.2 starts with `feat(p6.2.headline)` (the first commit that USES format_inr + format_pct).
+
+**Opportunistic riders** for whichever commit next touches a renderer module:
+- Decide on the `get_message` streamlit-free claim (non-blocker #1).
+- Convert `tests/test_web_discover.py` patching to the `monkeypatch.setattr` pattern (still open from 334bada+5c801dd review).
+- `render_caveats` __all__ inclusion (still open from 7b12228 review).
+
+---
+
 ## Review of d643aef + 588e42f — feat(p6.0.format) + test(p6.0.format) — Indian rupee + percentage formatters
 
 **Verdict:** ✅ accept (both commits as a pair)
