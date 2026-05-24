@@ -1959,3 +1959,36 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** **Before `feat(p3.4): ShortStraddle`, do a small `chore(p3.5.b): SPECS §4a — strike-vs-spot rationale + ROI-non-annualized caveat + uniform-rate symbol-bias`.** Three or four added sentences. Pins the v1 simplifications IN WRITING so a Phase-5 reader doesn't draw wrong ranking conclusions. Then `feat(p3.4): ShortStraddle`. The strategy itself is mechanical given the SPECS §5 ATM rule already pinned.
 
 ---
+
+## Review of e7a9058 — chore(p3.5.b): SPECS §4a — pin 4 v1 margin simplifications + bias direction
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Document the 4 grilling-surfaced margin caveats in SPECS §4a so downstream consumers (Phase 5 ranker, Phase 6 UI, future operator) cannot claim ignorance. Code-level fix deferred per "trade-offs, not bugs" framing.
+
+**What works:**
+- **All 4 caveats addressed verbatim** ([SPECS.md:438-477](SPECS.md#L438-L477)) with the exact ranking implications I flagged:
+  1. Strike-vs-spot with symmetric/asymmetric cancellation explained
+  2. `roi_pct` non-annualized + explicit `× 252 / hold_trading_days` formula
+  3. Uniform 20% with "rankings rotate by symbol vol" tight phrasing
+  4. Multi-leg conservatism — "Phase-5 UI must surface this caveat alongside any ROI-based ranking" makes it a UI requirement
+- **Bias direction explicit**: "margin overstated → ROI understated → paper-to-live safer" — names the trade-off intentionally rather than apologetically.
+- **"baked into the engine's documentation so no downstream consumer can claim ignorance"** ([SPECS.md:478-480](SPECS.md#L478-L480)) — exactly the right framing for a v1 simplification.
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- **Caveat #1 says "Phase 4 multi-strategy may revisit"** — "may" is soft. Either commit to "Phase 4 will revisit IF Phase-5 ranking shows obvious asymmetric-strategy mis-ranking", or defer firmly to Phase 7. Soft "may" creates a decision point with no clear trigger.
+- **Caveat #4 implies a Phase-5/6 UI requirement** but doesn't specify HOW to surface it. Worth a one-line callout: e.g., "rendered as a permanent disclaimer banner alongside any ROI-leaderboard view, similar to the survivorship-bias note at §6b.3". Otherwise the requirement could land as a footnote nobody reads.
+- **No worked example for caveat #3** (rankings rotate by symbol vol). One paragraph: "e.g., short straddle on ADANIENT might show ROI 1.5% (real margin 25% → realized ROI 1.2%); short straddle on HDFCBANK might show 0.8% (real margin 14% → realized ROI 1.15%) — the v1 ranking has ADANIENT > HDFCBANK; reality is closer than that gap suggests." Cosmetic.
+
+**Domain / correctness checks:**
+- **Statistical claims:** the bias directions are correctly characterized.
+- **Look-ahead bias:** N/A.
+- **Other:** N/A pure docs.
+
+**What I tried:** Read the SPECS diff in full. Cross-checked each caveat against the grilling math from the prior review — all four numerical claims accurate.
+
+**Next-commit suggestion:** `feat(p3.4): src/strategies/short_straddle.py — picks ATM CE+PE per SPECS §5`. The strategy is mechanical given everything pinned. Three implementation decisions: **(1) Where does the strike-grid come from?** — call `load_bhavcopy_fo(entry_date)` and filter to `(symbol, expiry, OPTSTK)` to get available strikes; pick `argmin(|K - spot_at_entry|)` with tiebreaker = lower strike per SPECS §5. **(2) The returned Trade has two `SELL` legs at the same ATM strike**, one CE one PE, qty_lots=1 (or `params.get("qty_lots", 1)`). **(3) The strategy.name is `"short_straddle"` — matches the `Trade.strategy` string the kernel already supports. The load-bearing test: hand-check `ShortStraddle().generate_trades("RELIANCE", date(2024,1,25), date(2024,1,4), date(2024,1,24), spot_at_entry=2596.65, params={})` → returns one Trade with legs `(Leg("CE",2600,"SELL",1), Leg("PE",2600,"SELL",1))`. Plus the tiebreaker test: spot exactly between two strikes (e.g. 2610 with strikes at 2600 and 2620) → picks 2600 (lower). After p3.4 → `chore(p3.verify): live short straddle on RELIANCE Jan-2024 (T-15 → T-1) — first real ₹P&L number`. THAT is when the user's original ask materializes end-to-end with real NSE numbers.
+
+---
