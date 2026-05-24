@@ -2613,3 +2613,30 @@ Then p4.4.{a..d} — the 4 new strategies. Each is a small commit, mostly mechan
 Then p4.4.b (ShortStrangle — strike_offset_pct param), p4.4.c (LongStrangle), and p4.4.d (IronCondor + caveat #1 spot-vs-strike margin fix).
 
 ---
+
+## Review of 3480c68 — feat(p4.4.a): LongStraddle strategy + sign-mirror tests vs ShortStraddle
+
+**Verdict:** ✅ accept
+
+**What works:**
+- **Clean mirror**: `side="BUY"` legs, `recommended_strategy_offset_pct=1.0` (long-only has no SPAN offset).
+- **`_pick_atm_strike` shared** — imported from `short_straddle` module so both strategies use SPECS §5 verbatim. No code duplication.
+- **Sign-mirror test no-slippage**: short +₹2,750 ↔ long -₹2,750. Pins SPECS §3a side_sign convention.
+- **Slippage asymmetry test (the one I would have flagged if wrong)**: short was winning, win shrinks; long was losing, loss grows. **BOTH grosses move TOWARD MORE NEGATIVE under slippage** — i.e., the asymmetric conservatism is across the win/loss BOUNDARY, not within either side. The BUILDER explicitly notes: *"I initially asserted 'both magnitudes shrink' — wrong. Reviewer's prediction was right. The test now reflects the correct math."* This kind of explicit course-correction is the value of the grilling loop.
+- 6 new tests; 241/241 full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`_pick_atm_strike` imported from `short_straddle`** creates a cross-module dependency on a private (underscore-prefixed) function. Phase 4 will add 2-3 more strategies that share this rule. Consider promoting to a shared `src/strategies/atm.py` module (or making it public on `short_straddle`). Cosmetic.
+- **Slippage test tolerance is ±1.0** on ~₹500 haircuts. Loose. Tighter to ±0.01 would catch finer regressions. Cosmetic.
+
+**Domain / correctness checks:**
+- **Sign convention via side_sign:** verified by the explicit mirror test.
+- **Slippage direction:** correctly asymmetric across the win/loss boundary, not within. Phase 4 ranker will use this as the natural conservatism — winning strategies get shrunk, losing strategies get worse. Across many trades, this **strictly demotes false-positive strategies** because their wins are taxed and their losses penalized. Right shape.
+
+**What I tried:** `python -m pytest tests/test_long_straddle.py -v` → 6/6 pass. Read the implementation.
+
+**Next-commit suggestion:** `feat(p4.4.b): src/strategies/short_strangle.py`. The first strategy with a TUNABLE PARAM: `strike_offset_pct` (default ~2%). Strikes are OTM: call_strike ≈ argmin(|K - spot × (1 + offset_pct)|), put_strike ≈ argmin(|K - spot × (1 - offset_pct)|), both with the SPECS §5 lower-tiebreaker rule against the available bhavcopy strikes. Load-bearing tests: **(a)** `strike_offset_pct=0` → degenerates to ShortStraddle (both legs ATM); **(b)** `strike_offset_pct=0.02` on spot 2596 → call ≈ 2640 (closest in ₹20 grid to 2648), put ≈ 2540 (closest to 2544); **(c)** `recommended_strategy_offset_pct=0.70` per SPECS §4a; **(d)** unavailable target strike falls back to nearest available (no crash). The strangle is also the first place where caveat #1 (strike-vs-spot margin) starts to matter — though the bias is small for symmetric strangles (both wings cancel). p4.4.d (IronCondor) is where it really bites.
+
+---
