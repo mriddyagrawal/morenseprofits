@@ -3306,6 +3306,67 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 79d50d8 — fix(p6.1.caveats): correct survivorship snapshot date 2026-07-01 → 2024-07-01
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the BLOCKER I flagged in 7b12228 review. 1-char text correction + anti-regression test.
+
+**What works (every closure item from my 7b12228 review):**
+
+- **Text fix is the literal 1-char change**: `2026` → `2024` at [src/web/caveats.py:52](src/web/caveats.py#L52). No collateral edits, no scope creep.
+- **Anti-regression test `test_survivorship_caveat_cites_correct_snapshot_date`** ([tests/test_web_caveats.py:38-47](tests/test_web_caveats.py#L38-L47)) — **two assertions, exactly as I recommended**:
+  ```python
+  assert "2024-07-01" in SURVIVORSHIP_CAVEAT          # positive
+  assert "2026-07-01" not in SURVIVORSHIP_CAVEAT     # explicit anti-regression
+  ```
+  The "not in 2026-07-01" assertion pins the SPECIFIC typo so it can't reappear via a future copy-edit. Catches the exact pattern that slipped past `test_survivorship_caveat_is_substantive_paragraph` (which only checks length + key-term presence).
+- **Test docstring captures the WHY**: "LOAD-BEARING anti-regression... a wrong date in an honest-disclosure constant silently undermines every backtest result an operator interprets." Future contributor reading the test understands the consequence of breaking it.
+- **Commit message acknowledges the asymmetric-conservatism reasoning verbatim** from my 7b12228 review block ("operators who notice the impossible date lose trust in the rest of the UI; operators who don't notice silently act on the wrong fact"). Direct reviewer→builder→fix loop closed in <5 minutes from blocker flag to fix commit.
+- **Caught BEFORE `chore(p6.1.verify)`** — commit body explicitly notes this, preventing the wrong date from getting screenshot into committed documentation.
+
+**Live-verified:**
+- `pytest tests/test_web_caveats.py -v` → 7/7 (including the new anti-regression test). Test catches what it claims to catch.
+- `pytest tests/` → 404/404 full suite passes.
+- `grep -n "07-01" src/web/caveats.py` → only line 52, now reads "2024-07-01".
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The `is`/`not in` pair is the right pattern for known-typo regression tests.** Pure `==` would catch the specific 2024 date but not a future drift to "2025-07-01" or "2024-07-02"; pure `"2024" in` would pass on "2024-something-else". The explicit "2026-07-01 not in" specifically guards against THE typo that occurred. **Worth applying this pattern to the MARGIN_TIER_B_CAVEAT** if any specific values get changed there in the future (e.g., the offset multipliers 0.60 / 0.35).
+
+2. **The 7b12228 review's other 2 non-blocker flags were NOT closed in this commit** — appropriate (single-purpose commit):
+   - `render_caveats` missing from `__all__` despite docstring claim
+   - "~10% discount" claim in MARGIN_TIER_B unsupported by any analysis
+   Both still open; opportunistic for future caveats-touching commits.
+
+3. **Reviewer-loop credit**: commit body explicitly references `c53a9d1 review` as the source of the flag. The pattern (commit cites the review that surfaced the issue) is now established discipline for fix commits. Good.
+
+**Domain / correctness checks:**
+- **Asymmetric-conservatism**: ✓ honest-disclosure layer restored — the operator now sees the actual snapshot date.
+- **No regression risk**: ✓ 1-char change + 1 test added; 404/404 passes.
+- **Test specificity**: ✓ anti-regression test would fail loudly if the bug recurs.
+
+**What I tried:**
+- `git show 79d50d8` — clean diff: 1 line changed in caveats.py + 12 lines added to test file.
+- `pytest tests/test_web_caveats.py -v` → 7/7 with the new test.
+- Verified the running constant now reads "2024-07-01" via direct import.
+
+**Sequencing observation:** Review-to-fix cycle time on this BLOCKER:
+- 01:01:38 — efe1c73 (mounts buggy constant in app shell)
+- ~01:04:09 — c53a9d1 (my BLOCKING review)
+- 01:05:34 — 79d50d8 (fix lands)
+≈ **86 seconds from BLOCKER flag to committed fix.** This is the reviewer-loop pattern operating at its tightest. The user's "ship as a parallel REVIEWER agent" investment paid off here — without the reviewer, the wrong date would have shipped to `chore(p6.1.verify)` and been screenshot into committed documentation.
+
+**Next-commit suggestion:** d643aef (`feat(p6.0.format)`) just landed concurrent with this — reviewing next. Then per DESIGN_SPEC §4 the remaining Phase-6.1 items are:
+1. `feat(p6.1.empty)` — `src/web/empty_state.py` per DESIGN_SPEC §2.6.
+2. `chore(p6.1.verify)` — visual + smoke against current parquets.
+
+After Phase 6.1 closes → Phase 6.2 (Leaderboard tab) starts.
+
+---
+
 ## Review of efe1c73 — feat(p6.1.app): app.py — sidebar + 4 placeholder tabs + caveats strip
 
 **Verdict:** ⚠ **accept conditional on the 7b12228 date-bug fix landing as a commit.** App shell itself is clean; the asymmetric-conservatism gap is inherited from the un-fixed caveat constant.
