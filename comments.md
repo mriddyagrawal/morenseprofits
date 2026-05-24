@@ -3306,6 +3306,95 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of efe1c73 — feat(p6.1.app): app.py — sidebar + 4 placeholder tabs + caveats strip
+
+**Verdict:** ⚠ **accept conditional on the 7b12228 date-bug fix landing as a commit.** App shell itself is clean; the asymmetric-conservatism gap is inherited from the un-fixed caveat constant.
+
+**Phase / commit goal (as I understood it):** First runnable Streamlit surface. Header + sidebar + 4 placeholder tabs. Caveats render at the top of every tab. Sweep auto-picked by newest mtime per SPECS §11.2. State convention follows SPECS §11.4 (`mp_` prefix); min-N flows top-down per SPECS §11.5.
+
+### Inherited blocker status
+
+The buggy `2026-07-01` SURVIVORSHIP_CAVEAT from 7b12228 is mounted in this commit's app shell. **Every tab calls `render_caveats()` ([app.py:204, 211, 217, 223](app.py)), which renders the constant verbatim.** Running `streamlit run app.py` against the verify parquet would surface the wrong date in the caveats card across all 4 tabs.
+
+**Working-tree observation (not blocking, just reporting)**: I observe that `src/web/caveats.py` has an **uncommitted local edit** in the working tree changing `2026-07-01` → `2024-07-01`. `git diff HEAD -- src/web/caveats.py` shows the fix; `git status` confirms it's unstaged. **Someone (BUILDER or the user) saw the BLOCKING flag in my 7b12228 review and fixed the file locally, but hasn't yet committed.** I have not staged or committed this change (per my discipline — I only write to `comments.md`). **The fix must be committed before `chore(p6.1.verify)` screenshots the UI**, otherwise the running shell still has the bug and the screenshots immortalize it.
+
+Recommend BUILDER lands the fix as the very next commit: `fix(p6.1.caveats): correct survivorship snapshot date 2026-07-01 → 2024-07-01` + the regression test (per my 7b12228 review block).
+
+---
+
+### What works (the shell itself):
+
+- **Module layout matches SPECS §11.1**: `app.py` is the thin entry; helpers from `src.web.caveats`, `src.web.discover`, `src.analytics.aggregate`, `src.strategies.registry`. No business logic in `app.py` itself — just composition + state wiring.
+- **State convention** ([app.py:55-67](app.py#L55-L67)): `_init_state()` is idempotent (only initializes keys not already present); all 6 cross-cutting keys correctly prefixed `mp_` per SPECS §11.4.
+- **`@st.cache_data` on `_load_sweep`** ([app.py:76-79](app.py#L76-L79)) — tab switches don't re-read the parquet. Cache-key on `str(path)` so Streamlit's string-hash works deterministically.
+- **`st.set_page_config` as first call** ([app.py:44-49](app.py#L44-L49)) — Streamlit's hard requirement; correctly placed before any other `st.*`.
+- **Error handling at `main()`** ([app.py:241-248](app.py#L241-L248)) — `FileNotFoundError` and `Exception` both caught with user-facing `st.error`. The bare `Exception` catches `ArrowInvalid` from pyarrow on a corrupt parquet, surfacing the message instead of crashing the app.
+- **Header sweep selector** ([app.py:85-105](app.py#L85-L105)) — picks newest mtime via `find_latest_sweep`, shows filename + last-updated timestamp. Renders the "no sweeps yet" warning when `latest is None` (proper empty state, matches §11.2 contract).
+- **`_render_sidebar`** ([app.py:111-174](app.py#L111-L174)) — strategies/symbols/min_n/regime controls; sweep metadata caption with rows + strategies + symbols + run_id. Matches DESIGN_SPEC §1.2.
+- **`_apply_filters` is a pure function** ([app.py:180-191](app.py#L180-L191)) — takes a DataFrame, returns a filtered DataFrame. Tabs use this rather than each implementing their own filter logic — single source of truth for filter composition.
+- **`render_caveats()` called at the top of every tab** ([app.py:204, 211, 217, 223](app.py)) — satisfies PLAN §3 Phase 6.5 "caveats always visible" exit criterion.
+- **Tab tab-handlers are tiny placeholders** that each render the caveats + a tab heading + an `st.info` "implemented in feat(p6.X.Y)" pointer. Reviewable shape — each tab becomes a small diff when Phase 6.2/6.3/6.4/6.5 land.
+- **`else: main()` ergonomic** ([app.py:266-270](app.py#L266-L270)) — Streamlit imports app.py directly (not as `__main__`), so the `if __name__ == "__main__"` check doesn't fire. The `else` branch runs `main()` on import. **Defensive against the common Streamlit gotcha** of `if __name__ == "__main__"` quietly never firing.
+- **386/386 tests pass** — no test changes; app.py is import-time tested via smoke-launch in the next verify commit.
+
+**Live smoke-tested:**
+- `.venv/bin/python -c "import app"` → imports cleanly. Streamlit emits `WARNING: missing ScriptRunContext!` (expected in bare-mode import; not an error).
+- Cross-checked that `app.py` does NOT directly import the caveat constants — it calls `render_caveats()` which uses them. The bug propagation path is `7b12228 caveats.py:52` → `render_caveats_strip()` → `app.py:_render_*_tab` → operator's screen.
+
+**Non-blocking observations:**
+
+1. **🔬 Multiselect default behavior has a subtle UX gotcha.** [app.py:118-123, 129-134](app.py#L118-L134):
+   ```python
+   st.session_state["mp_strategies_filter"] = st.sidebar.multiselect(
+       "Strategies", options=available_strategies,
+       default=st.session_state["mp_strategies_filter"] or available_strategies,
+   )
+   ```
+   If the operator explicitly deselects ALL strategies (`mp_strategies_filter` becomes `[]`), the next render's `default=` clause sees a falsy value and re-defaults to `available_strategies` (all). **UX consequence**: "deselect all" silently bounces back to "all selected". Operator can't actually filter to zero strategies as a way to inspect the empty-state path.
+   
+   **Better pattern**: separate the "uninitialized" sentinel from the "explicitly empty" state. e.g., use `None` as the uninitialized default in `_init_state()` and check `if st.session_state["mp_strategies_filter"] is None: ... = available_strategies`. Cosmetic; only matters if the empty-state UX paths from DESIGN_SPEC §2.6 want to exercise "user selected zero strategies" as a tab-empty trigger.
+
+2. **`except Exception as e` at [app.py:246](app.py#L246) is too broad.** Catches KeyboardInterrupt, SystemExit, GeneratorExit, etc. **Recommended narrow** to `(pyarrow.lib.ArrowInvalid, OSError, ValueError)` or whatever pyarrow actually raises. Same flag as 5c801dd review's `test_corrupt_parquet`. Cosmetic.
+
+3. **Cache invalidation gotcha**: `_load_sweep` cache-keys on `str(path)` not on `(path, mtime)`. If the operator runs a new sweep that overwrites an existing parquet (unlikely with hash-based run_ids, but theoretically possible if the same seed produces the same hash), the cache serves the stale frame. **Mitigation**: add `path.stat().st_mtime` to the cache key — `_load_sweep(parquet_path_str, mtime)` and call as `_load_sweep(str(p), p.stat().st_mtime)`. Streamlit invalidates automatically on the second arg change. Not blocking for v1; just noting.
+
+4. **`v0.6.1 skeleton` hardcoded** at [app.py:105](app.py#L105). Won't auto-update as Phase 6.2/6.3/6.4/6.5 land. **Better**: read from git via `subprocess.check_output(["git", "describe", "--always", "--dirty"], cwd=REPO).strip()`. Each phase-tag (per DESIGN_SPEC §6 tagging discipline) auto-surfaces. Cosmetic; can land alongside `chore(p6.5.tag)`.
+
+5. **Regime filter is wired in the sidebar but NOT applied in `_apply_filters`.** [app.py:151-161 + 180-191](app.py#L151-L161). Help text explicitly says "v0.6.1 placeholder". Acceptable; **but worth a `# TODO p6.5+`** comment next to the unused regime check so it's not forgotten.
+
+6. **No test commit.** Commit body says app.py is "import-time tested by smoke-launch in verify commit" — i.e., `chore(p6.1.verify)`. Acceptable; rendering tests in pytest are heavy. **Recommended import smoke-test**: `tests/test_app_import.py` with one test: `def test_app_imports_cleanly(): import app`. Catches a module-import-time crash (missing module, syntax error) without needing a Streamlit script-runtime. ~5 lines.
+
+7. **`_init_state()` sets `mp_selected_sweep = None`** at [app.py:59](app.py#L59), but `_render_header` writes the actual sweep path to it at [app.py:99](app.py#L99). This is fine, BUT it means the initial state has `None` even when a sweep exists — only after `_render_header()` runs does it become populated. Order matters; `main()` calls `_render_header()` first, then checks `mp_selected_sweep`. Correct sequencing, just brittle. Worth a docstring note: "side-effect: `_render_header` writes `mp_selected_sweep`; downstream code reads it."
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ⚠ inherited bug from 7b12228 (the date typo) propagates to every rendered tab; **app shell itself is clean** — caveats correctly always-visible, every tab calls `render_caveats`.
+- **Determinism**: ✓ sweep auto-picked by newest mtime (deterministic); `_apply_filters` is pure; cache deterministic on `str(path)`.
+- **Module-isolation respect**: ✓ `app.py` correctly imports `streamlit` at module-top (the entry point may); `discover.py` stays streamlit-free per §11.1.
+- **State convention**: ✓ all 6 keys `mp_`-prefixed.
+- **Min-N flow top-down**: ✓ slider at [app.py:137-148](app.py#L137-L148) writes to `mp_min_n`; no tab will hardcode a threshold (verified by reading the 4 placeholder tabs — they don't reference `mp_min_n` yet, but the wiring is in place for p6.2-p6.5).
+
+**What I tried:**
+- Read app.py end-to-end.
+- Live import smoke-test: `python -c "import app"` → clean.
+- Cross-checked the caveat propagation path (`7b12228` constant → `render_caveats` → 4 tab handlers).
+- `git diff HEAD -- src/web/caveats.py` — discovered the uncommitted local fix (2026 → 2024); reported it above without staging.
+- 386/386 full suite passes (no app-specific tests).
+
+**Sequencing observation:** Two Phase-6.1 feature commits in 90 seconds (7b12228 → efe1c73). Tight cadence. The trade-off: BUILDER's commit pipeline runs ahead of my review feedback, so the 7b12228 BLOCKING flag wasn't visible until efe1c73 had already mounted the buggy constant. **Lesson: my reviews need to land faster, OR BUILDER needs to pause for a watcher beat before stacking dependent commits.** Both pressures are real; no clean answer. Just observing.
+
+**Next-commit suggestion (revised given the inherited blocker):**
+
+1. **🔴 IMMEDIATE: `fix(p6.1.caveats): correct survivorship snapshot date 2026-07-01 → 2024-07-01`** — stage and commit the local working-tree edit + add the regression test. Unblocks `chore(p6.1.verify)` screenshotting the correct UI.
+2. `feat(p6.1.empty)` — `src/web/empty_state.py` per DESIGN_SPEC §2.6 (6 pre-written degenerate-data messages).
+3. `chore(p6.1.verify)` — `streamlit run app.py --server.headless` smoke + visual screenshot of every tab against `DESIGN/leaderboard.png` / `DESIGN/per_stock.png` etc. **Should land AFTER the date fix** for screenshot honesty.
+
+After Phase 6.1 closes → `feat(p6.2.headline)` is the first Phase-6.2 commit (renders the 4-card strip per DESIGN_SPEC §2.5 Leaderboard row). Needs `feat(p6.0.format)` first (still skipped) for `format_inr()`.
+
+**Reminder for the format helpers**: `feat(p6.0.format)` + `test(p6.0.format)` are still un-landed (DESIGN_SPEC §4 sequence deviation flagged in 334bada review). They need to land before `feat(p6.2.headline)` because the headline cards render rupee amounts that need the lakhs/crores formatter.
+
+---
+
 ## Review of 7b12228 — feat(p6.1.caveats): src/web/caveats.py — 3 caveat constants + 2 render helpers
 
 **Verdict:** ⚠ **accept-with-blocker — `SURVIVORSHIP_CAVEAT` has a 2-year date typo (2026-07-01 instead of 2024-07-01). MUST be fixed before any Phase-6 UI renders this constant to an operator.**
