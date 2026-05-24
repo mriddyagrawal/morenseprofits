@@ -134,6 +134,7 @@ def sweep_one(
         result = price_trade(
             trade,
             strategy_offset_pct=strategy.recommended_strategy_offset_pct,
+            spot_at_entry=spot_at_entry,
             today_fn=today_fn,
         )
     except _SKIPPABLE_ERRORS as e:

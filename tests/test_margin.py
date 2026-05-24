@@ -233,3 +233,138 @@ def test_alternate_span_pct_for_sensitivity():
     assert out_agg["sell_leg_margin"] == 0.30 * 2600 * 250
     # 30/20 = 1.5x
     assert out_agg["total"] == pytest.approx(1.5 * out_v1["total"], abs=1e-9)
+
+
+# ============================================================
+# SPECS §4a caveat #1: spot_at_entry kwarg (spot-based notional)
+# ============================================================
+
+def test_default_notional_basis_is_strike_backward_compat():
+    """No spot_at_entry kwarg → margin uses strike. Pins existing
+    behavior so the kwarg is purely additive — every pre-existing
+    test (and any external caller) keeps the same numbers."""
+    legs = [_leg("SELL", 1, 250, 50.0, 2600.0)]
+    out = MARGIN_MODEL_V1.estimate(legs)
+    assert out["notional_basis"] == "strike"
+    assert out["sell_leg_margin"] == 0.20 * 2600 * 250
+
+
+def test_spot_at_entry_switches_notional_to_spot():
+    """spot_at_entry=2596.65 → SELL leg uses 2596.65 × shares × pct,
+    not strike × shares × pct. The notional_basis output flips to
+    'spot' so consumers can audit which basis was used."""
+    legs = [_leg("SELL", 1, 250, 50.0, 2600.0)]
+    out = MARGIN_MODEL_V1.estimate(legs, spot_at_entry=2596.65)
+    assert out["notional_basis"] == "spot"
+    assert out["sell_leg_margin"] == pytest.approx(0.20 * 2596.65 * 250)
+    # Strictly different from strike-based (spot != strike)
+    assert out["sell_leg_margin"] != 0.20 * 2600 * 250
+
+
+def test_spot_equals_strike_collapses_to_strike_based():
+    """Sanity: when spot_at_entry exactly equals the strike, both
+    bases produce the same SELL-leg margin. The fix's bias correction
+    is zero at the money — which is the right shape."""
+    legs = [_leg("SELL", 1, 250, 50.0, 2600.0)]
+    out_strike = MARGIN_MODEL_V1.estimate(legs)
+    out_spot = MARGIN_MODEL_V1.estimate(legs, spot_at_entry=2600.0)
+    assert out_strike["sell_leg_margin"] == out_spot["sell_leg_margin"]
+    # Only the basis label differs
+    assert out_strike["notional_basis"] == "strike"
+    assert out_spot["notional_basis"] == "spot"
+
+
+def test_asymmetric_4_leg_structure_bias_is_significant():
+    """LOAD-BEARING for caveat #1: on an asymmetric 4-leg structure
+    (iron-condor-shape), strike-based margin is biased high (sum of
+    4 different strikes / 4) vs spot-based (1 × spot per leg).
+
+    Setup: spot=2600, lot=250, qty=1. Iron-condor strikes:
+      SELL 2640 CE (inner call, +1.5% OTM)
+      BUY  2750 CE (outer call wing, +5.8% OTM)
+      SELL 2560 PE (inner put, -1.5% OTM)
+      BUY  2450 PE (outer put wing, -5.8% OTM)
+
+    Only the SELL legs contribute to sell_margin_raw. Strike-based:
+      0.20 × (2640 + 2560) × 250 = ₹2,60,000.
+    Spot-based:
+      0.20 × (2600 + 2600) × 250 = ₹2,60,000.
+
+    For a symmetric inner pair (2640/2560 averaging to 2600 = spot)
+    the bias is ZERO. The asymmetric bias only appears when the inner
+    strikes don't average to spot — e.g., a skewed entry. Test that
+    too with an asymmetric inner pair."""
+    spot = 2600.0
+    legs_symmetric = [
+        _leg("SELL", 1, 250, 30.0, 2640.0),
+        _leg("BUY",  1, 250, 5.0,  2750.0),
+        _leg("SELL", 1, 250, 28.0, 2560.0),
+        _leg("BUY",  1, 250, 4.0,  2450.0),
+    ]
+    strike_out = MARGIN_MODEL_V1.estimate(legs_symmetric, strategy_offset_pct=0.35)
+    spot_out = MARGIN_MODEL_V1.estimate(
+        legs_symmetric, strategy_offset_pct=0.35, spot_at_entry=spot,
+    )
+    # Symmetric inner pair → bias is exactly zero
+    assert strike_out["sell_leg_margin"] == spot_out["sell_leg_margin"]
+
+    # Now SKEWED structure: both shorts above spot (bias side)
+    legs_skewed = [
+        _leg("SELL", 1, 250, 30.0, 2700.0),  # +3.8% OTM
+        _leg("BUY",  1, 250, 5.0,  2800.0),
+        _leg("SELL", 1, 250, 28.0, 2650.0),  # +1.9% OTM
+        _leg("BUY",  1, 250, 4.0,  2500.0),
+    ]
+    strike_skew = MARGIN_MODEL_V1.estimate(legs_skewed, strategy_offset_pct=0.35)
+    spot_skew = MARGIN_MODEL_V1.estimate(
+        legs_skewed, strategy_offset_pct=0.35, spot_at_entry=spot,
+    )
+    # Strike-based: 0.20 × (2700 + 2650) × 250 × 0.35 = ₹93,625
+    assert strike_skew["sell_leg_margin"] == pytest.approx(
+        0.20 * (2700 + 2650) * 250 * 0.35, abs=1e-6,
+    )
+    # Spot-based: 0.20 × (2600 + 2600) × 250 × 0.35 = ₹91,000
+    assert spot_skew["sell_leg_margin"] == pytest.approx(
+        0.20 * (2600 + 2600) * 250 * 0.35, abs=1e-6,
+    )
+    # Strike-based overstates margin for above-spot shorts (the
+    # direction caveat #1 predicts)
+    assert strike_skew["sell_leg_margin"] > spot_skew["sell_leg_margin"]
+
+
+def test_spot_at_entry_does_not_affect_buy_legs():
+    """BUY-leg margin = premium paid × shares, independent of spot.
+    The fix only touches SELL-leg notional. Pin so a future
+    misrefactor that also rewrites BUY math is caught."""
+    legs = [_leg("BUY", 1, 250, 50.0, 2600.0)]
+    out_strike = MARGIN_MODEL_V1.estimate(legs)
+    out_spot = MARGIN_MODEL_V1.estimate(legs, spot_at_entry=2500.0)
+    assert out_strike["buy_leg_premium"] == out_spot["buy_leg_premium"]
+    assert out_strike["total"] == out_spot["total"] == 50.0 * 250
+
+
+def test_spot_at_entry_must_be_positive_when_provided():
+    """spot_at_entry=0 or negative is meaningless; reject loudly."""
+    legs = [_leg("SELL", 1, 250, 50.0, 2600.0)]
+    with pytest.raises(ValueError, match="spot_at_entry"):
+        MARGIN_MODEL_V1.estimate(legs, spot_at_entry=0.0)
+    with pytest.raises(ValueError, match="spot_at_entry"):
+        MARGIN_MODEL_V1.estimate(legs, spot_at_entry=-100.0)
+
+
+def test_spot_basis_combines_with_strategy_offset_and_symbol_pct():
+    """All three Tier-B kwargs compose: spot × shares × symbol_pct
+    × strategy_offset. Pin one composite to catch a future refactor
+    that breaks the order of operations."""
+    legs = [_leg("SELL", 1, 250, 50.0, 2600.0)]
+    out = MARGIN_MODEL_V1.estimate(
+        legs,
+        strategy_offset_pct=0.60,
+        symbol_margin_pct=0.25,
+        spot_at_entry=2596.65,
+    )
+    expected_raw = 0.25 * 2596.65 * 250
+    expected_post = expected_raw * 0.60
+    assert out["sell_leg_margin_raw"] == pytest.approx(expected_raw)
+    assert out["sell_leg_margin"] == pytest.approx(expected_post)
+    assert out["notional_basis"] == "spot"

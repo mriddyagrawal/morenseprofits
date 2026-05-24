@@ -341,6 +341,47 @@ def test_auto_vol_resolves_symbol_margin_pct_when_kwarg_absent(monkeypatch):
     assert out["margin_at_entry"] == pytest.approx(0.17 * 2600 * 250, abs=1e-6)
 
 
+def test_spot_at_entry_flows_through_to_margin_basis():
+    """SPECS §4a caveat #1: price_trade plumbs spot_at_entry to
+    MarginModelV1.estimate. Same trade priced once with strike-based
+    (no kwarg) and once with spot-based (with kwarg, spot != strike).
+    Margin should differ predictably; the margin_breakdown_json should
+    record `notional_basis`.
+
+    Setup: SELL 2700 CE on spot=2596.65 (deep OTM, biggest bias).
+    Strike-based: 0.20 × 2700 × 250 = ₹1,35,000.
+    Spot-based:   0.20 × 2596.65 × 250 = ₹1,29,832.50.
+    Strike overstates by ~₹5,167."""
+    import json
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    ce = _option_frame([(entry, 30.0, 250), (exit_, 5.0, 250)])
+    load = _stub_load_option({(2700.0, "CE"): ce})
+    trade = Trade(
+        symbol="RELIANCE", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2700, "SELL", 1),),
+        strategy="naked_short_call",
+    )
+    common = dict(
+        load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+        slippage_model=_NO_SLIPPAGE, symbol_margin_pct=0.20,
+    )
+    strike_based = price_trade(trade, **common)
+    spot_based = price_trade(trade, spot_at_entry=2596.65, **common)
+
+    assert strike_based["margin_at_entry"] == pytest.approx(0.20 * 2700 * 250)
+    assert spot_based["margin_at_entry"] == pytest.approx(0.20 * 2596.65 * 250)
+    assert strike_based["margin_at_entry"] > spot_based["margin_at_entry"]
+
+    # margin_breakdown_json records which basis was used (auditable
+    # in the parquet by Phase-5 / debugging).
+    strike_bd = json.loads(strike_based["margin_breakdown_json"])
+    spot_bd = json.loads(spot_based["margin_breakdown_json"])
+    assert strike_bd["notional_basis"] == "strike"
+    assert spot_bd["notional_basis"] == "spot"
+
+
 def test_strategy_offset_pct_flows_through_to_margin():
     """Strategy classes pass their real-world offset; price_trade
     forwards it. Short straddle 0.60 → margin drops by 40%."""

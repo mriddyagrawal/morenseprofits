@@ -171,6 +171,7 @@ def price_trade(
     slippage_model: SlippageModelV1 = SLIPPAGE_MODEL_V1,
     strategy_offset_pct: float = 1.0,
     symbol_margin_pct: float | None = None,
+    spot_at_entry: float | None = None,
     today_fn: Callable[[], date] = date.today,
 ) -> dict:
     """Price every leg of ``trade``; return one row in the
@@ -190,6 +191,11 @@ def price_trade(
       ``trade.entry_date``; passing an explicit float overrides
       (useful for tests and sensitivity analysis). Falls back to
       the margin model's uniform default if computation fails.
+    - ``spot_at_entry`` (default None = strike-based — caveat #1):
+      when provided, SELL-leg notional uses spot × shares × symbol_pct
+      instead of strike × shares × symbol_pct. The sweeper passes the
+      symbol's spot on entry_date to get the better approximation;
+      ad-hoc callers can omit to preserve the legacy strike-based path.
     """
     # Resolve load_option_fn lazily so monkeypatch.setattr on
     # options_loader.load_option takes effect (defaults are evaluated
@@ -228,6 +234,7 @@ def price_trade(
         leg_results,
         strategy_offset_pct=strategy_offset_pct,
         symbol_margin_pct=resolved_symbol_pct,
+        spot_at_entry=spot_at_entry,
     )
     margin = float(margin_breakdown["total"])
 

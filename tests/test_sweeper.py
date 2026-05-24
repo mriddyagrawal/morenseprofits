@@ -162,6 +162,27 @@ def test_sweep_one_returns_full_results_dict(monkeypatch, tmp_path):
     assert out["entry_spot"] == 2596.65
 
 
+def test_sweep_one_uses_spot_based_margin_basis(monkeypatch, tmp_path):
+    """SPECS §4a caveat #1: the sweeper has spot_at_entry locally
+    (it sources it from spot_loader before calling generate_trades),
+    so it passes spot through to price_trade and the margin model
+    uses spot-based notional by default. Pin the result via the
+    margin_breakdown_json's notional_basis field."""
+    import json
+    _wire_mocks(monkeypatch)
+    _redirect_results(monkeypatch, tmp_path)
+    cache.CACHE_DIR = tmp_path
+
+    out = sweep_one(
+        "short_straddle", "RELIANCE", date(2024, 1, 25),
+        entry_offset_td=15, exit_offset_td=1,
+        today_fn=lambda: date(2026, 5, 24),
+    )
+    assert out is not None
+    breakdown = json.loads(out["margin_breakdown_json"])
+    assert breakdown["notional_basis"] == "spot"
+
+
 def test_sweep_one_rejects_inverted_window():
     """T-1 entry, T-15 exit is nonsensical (would mean exiting BEFORE
     entering). Loud failure at the boundary."""
