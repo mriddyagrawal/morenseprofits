@@ -11,7 +11,7 @@ The cache is the only persistence layer for raw NSE data. Every loader in
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -105,7 +105,20 @@ def bhavcopy_fo_path(trade_date: date) -> Path:
     Filename is the trade date in YYYYMMDD form so the cache directory
     sorts naturally and a future "rebuild expiries for all symbols in
     Jan 2024" knows exactly which files are relevant.
+
+    **Type contract**: `trade_date` must be a `datetime.date` and **not** a
+    `datetime.datetime` (a subclass of date — would be silently accepted).
+    A tz-aware datetime would be genuinely ambiguous about which trade date
+    it names (`23:59 UTC` vs `23:59 IST` straddle different calendar days);
+    a naive datetime is merely unnecessary. Caller does `dt.date()` to opt
+    in. Loud rejection beats silent truncation.
     """
+    if isinstance(trade_date, datetime):
+        raise TypeError(
+            f"bhavcopy_fo_path expects datetime.date, got datetime: {trade_date!r}. "
+            f"Call .date() on it first — a tz-aware datetime would be ambiguous "
+            f"about which trade date it represents."
+        )
     return _ensure_root() / "bhavcopy_fo" / f"{trade_date.strftime('%Y%m%d')}.parquet"
 
 

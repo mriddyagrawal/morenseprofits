@@ -43,6 +43,25 @@ def test_path_builders(monkeypatch, tmp_path):
     assert exp.name == "RELIANCE.parquet"
 
 
+def test_bhavcopy_fo_path_rejects_datetime(monkeypatch, tmp_path):
+    """datetime is a subclass of date — Python's isinstance(dt, date) is True
+    for datetime, so a naive `date`-typed param would silently accept it.
+    A tz-aware datetime would be genuinely ambiguous about which trade date
+    it names. Loud rejection beats silent truncation."""
+    from datetime import datetime as _dt
+    _redirect_cache(monkeypatch, tmp_path)
+    # Naive datetime
+    with pytest.raises(TypeError, match="datetime"):
+        cache.bhavcopy_fo_path(_dt(2024, 1, 25, 9, 30))
+    # tz-aware datetime
+    from datetime import timezone
+    with pytest.raises(TypeError, match="datetime"):
+        cache.bhavcopy_fo_path(_dt(2024, 1, 25, 23, 59, tzinfo=timezone.utc))
+    # date (good path) still works
+    p = cache.bhavcopy_fo_path(date(2024, 1, 25))
+    assert p.name == "20240125.parquet"
+
+
 def test_bhavcopy_fo_path(monkeypatch, tmp_path):
     """bhavcopy_fo is symbol-agnostic — one file per trade date, used by
     every symbol's expiry calendar. Filename is YYYYMMDD for natural sort."""
