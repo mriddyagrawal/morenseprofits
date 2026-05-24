@@ -191,9 +191,9 @@ def parse_legacy(raw: str, trade_date: date) -> pd.DataFrame:
         "low": df["LOW"].astype("float64"),
         "close": df["CLOSE"].astype("float64"),
         "settle_price": df["SETTLE_PR"].astype("float64"),
-        "contracts": df["CONTRACTS"].astype("int64"),
-        "oi": df["OPEN_INT"].astype("int64"),
-        "oi_change": df["CHG_IN_OI"].astype("int64"),
+        "contracts": df["CONTRACTS"].fillna(0).astype("int64"),
+        "oi": df["OPEN_INT"].astype("Int64"),
+        "oi_change": df["CHG_IN_OI"].astype("Int64"),
     })
     out["trade_date"] = _stamp_trade_date(len(out), trade_date)
     return out
@@ -245,7 +245,7 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
     # TtlTrfVal=19,661,050, NewBrdLotQty=250 → notional/contract ≈ 3024,
     # ≈ UndrlygPric 3041 → TtlTrfVal is *underlying* notional, TtlTradgVol
     # is contracts. Earlier "divide by lot" math was wrong; fixed.
-    contracts = df["TtlTradgVol"].astype("int64")
+    contracts = df["TtlTradgVol"].fillna(0).astype("int64")
 
     out = pd.DataFrame({
         "instrument": instrument,
@@ -259,8 +259,8 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
         "close": df["ClsPric"].astype("float64"),
         "settle_price": df["SttlmPric"].astype("float64"),
         "contracts": contracts,
-        "oi": df["OpnIntrst"].astype("int64"),
-        "oi_change": df["ChngInOpnIntrst"].astype("int64"),
+        "oi": df["OpnIntrst"].astype("Int64"),
+        "oi_change": df["ChngInOpnIntrst"].astype("Int64"),
     })
     out["trade_date"] = _stamp_trade_date(len(out), trade_date)
     return out

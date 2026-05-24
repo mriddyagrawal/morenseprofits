@@ -65,8 +65,13 @@ def _assert_specs_2_4_schema(df: pd.DataFrame) -> None:
     assert pd.api.types.is_datetime64_any_dtype(df["trade_date"])
     for c in ("strike", "open", "high", "low", "close", "settle_price"):
         assert df[c].dtype.name == "float64", f"{c} dtype = {df[c].dtype.name}"
-    for c in ("contracts", "oi", "oi_change"):
-        assert df[c].dtype.name == "int64", f"{c} dtype = {df[c].dtype.name}"
+    # SPECS §2.4: contracts is plain int64 (absent → 0); oi / oi_change
+    # are nullable Int64 (legitimately unknown is meaningful).
+    assert df["contracts"].dtype.name == "int64", (
+        f"contracts dtype = {df['contracts'].dtype.name}"
+    )
+    for c in ("oi", "oi_change"):
+        assert df[c].dtype.name == "Int64", f"{c} dtype = {df[c].dtype.name}"
 
 
 def test_legacy_parser_returns_specs_2_4_schema():
@@ -301,6 +306,27 @@ def test_load_bhavcopy_fo_udiff_cache_hit_skips_fetch(monkeypatch, tmp_path):
     df2 = bfo.load_bhavcopy_fo(UDIFF_DATE)
     assert calls["n"] == 1
     pd.testing.assert_frame_equal(df1, df2)
+
+
+# ===========================================================
+# Nullable Int64 for oi / oi_change — survives upstream blanks
+# ===========================================================
+
+def test_parser_handles_blank_oi_via_nullable_int(monkeypatch):
+    """A future upstream row with a blank OPEN_INT (NSE has done this on
+    new-contract bootstrap days) must NOT crash the parser. SPECS §2.4
+    says oi is Int64 (nullable) for exactly this case."""
+    raw = (
+        "INSTRUMENT,SYMBOL,EXPIRY_DT,STRIKE_PR,OPTION_TYP,OPEN,HIGH,LOW,"
+        "CLOSE,SETTLE_PR,CONTRACTS,VAL_INLAKH,OPEN_INT,CHG_IN_OI,TIMESTAMP\n"
+        "OPTSTK,RELIANCE,25-Jan-2024,2620,CE,10,11,9,10.5,10.5,1,0.5,,,25-JAN-2024\n"
+    )
+    df = bfo.parse_legacy(raw, date(2024, 1, 25))
+    assert len(df) == 1
+    assert pd.isna(df.iloc[0]["oi"])
+    assert pd.isna(df.iloc[0]["oi_change"])
+    # contracts present → 1 (not coerced to NA — SPECS says fillna(0) for absent)
+    assert df.iloc[0]["contracts"] == 1
 
 
 # ===========================================================

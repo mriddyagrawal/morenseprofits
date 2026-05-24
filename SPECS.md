@@ -135,9 +135,9 @@ normalized lowercase; raw upstream uses uppercase):
 | `option_type` | `string` | "CE" / "PE" / `<NA>` for futures |
 | `open`, `high`, `low`, `close` | `float64` | premium INR |
 | `settle_price` | `float64` | NSE daily settle |
-| `contracts` | `int64` | number of contracts traded |
-| `oi` | `int64` | open interest |
-| `oi_change` | `int64` | change in OI |
+| `contracts` | `int64` (plain) | number of contracts traded; **fillna(0)** because an absent value means zero traded — that's truth-preserving, not made-up |
+| `oi` | `Int64` (nullable) | open interest; **legitimately unknown** is meaningful (NSE occasionally blanks OI on new contracts); preserves the distinction between 0 and missing |
+| `oi_change` | `Int64` (nullable) | change in OI; same reasoning as `oi` |
 | `trade_date` | `date` | the date the bhavcopy represents (== the filename) |
 
 **Look-ahead bias contract.** The bhavcopy is dated by `trade_date`. Engine
