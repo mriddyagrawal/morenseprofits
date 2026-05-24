@@ -1151,3 +1151,38 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `chore(p1.4.verify)` — the **highest-de-risking single call** is a runtime cross-layer comparison that triangulates real NSE truth: `load_option("RELIANCE", date(2024, 8, 29), 2840, "CE", date(2024, 8, 29), date(2024, 8, 29))` AND `load_bhavcopy_fo(date(2024, 8, 29))` on the same row; assert close/oi/oi_change/lot_size are equal across the two layers. **Bonus**: run a SECOND comparison on a pre-cutover contract — `RELIANCE 2024-01-25 2620 CE` (matches the legacy fixture's expiry). That exercises (a) the legacy bhavcopy path under bhavcopy_fo_loader, (b) `derivatives_df` for a pre-Jul-8-2024 contract, and confirms both data sources agree across the cutover boundary. Cross-layer agreement on both sides of the cutover is the strongest end-to-end guarantee the data layer can offer before Phase 1.5 lands.
 
 ---
+
+## Review of 02e3644 — fix(p1.4.b): OptionsFormatError + duplicate-date guard + 4xx/5xx wrap policy
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close all four 488deae flags in one targeted fix commit; bring the options_loader to behavior-parity with bhavcopy_fo_loader.
+
+**What works:**
+- **`assert` → `raise OptionsFormatError`** ([src/data/options_loader.py:80-92](src/data/options_loader.py#L80-L92)). New class in errors.py with docstring naming the rationale ("loud-failure replacement for `assert` statements that would be stripped under `python -O`").
+- **No-duplicate-dates guard** ([src/data/options_loader.py:96-104](src/data/options_loader.py#L96-L104)) with sample-of-3 in the error message. Same loud-failure pattern.
+- **Network-error wrap policy** ([src/data/options_loader.py:120-148](src/data/options_loader.py#L120-L148)) — symmetric with bhavcopy_fo's fix(p1.3.1.b.1): 404/410 → MissingDataError, BadZipFile → MissingDataError, everything else (403/5xx) propagates raw. Phase 3 backtester now catches ONE error family across spot/bhavcopy_fo/options.
+- **Subset partial-response test** ([tests/test_options_loader.py:534-591](tests/test_options_loader.py#L534-L591)) uses an **open-expiry** future contract so the refetch path actually fires; state-driven factory flips from `full` → `shifted` between the two calls; asserts (a) dropped middle date survives, (b) spurious far-future date doesn't leak, (c) warning emitted. Comprehensive.
+- New tests: `test_duplicate_dates_fail_loud`, `test_404_wraps_as_missing_data`, `test_403_propagates_not_wrapped`, `test_badzipfile_wraps_as_missing_data`, `test_partial_response_with_dropped_dates`. Plus `test_non_midnight_date_fails_loud` updated to expect `OptionsFormatError`.
+- SPECS §2.2 callout ([SPECS.md:102-104](SPECS.md#L102-L104)) — "caller's window only filters the return; fetch always spans full lifetime". Closes the doc gap I flagged on 95175dd.
+- **79/79 pass** in 0.54s.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No `test_5xx_propagates_not_wrapped` for options_loader.** bhavcopy_fo has both 403 and 5xx tests; options_loader has only 403. If someone "simplifies" the condition to `if status >= 400: wrap`, 5xx would start wrapping silently. Cheap to mirror: add `test_5xx_propagates_not_wrapped` with `status=503`. Same shape as the 403 test.
+- **`(404, 410)` inline tuple** in options_loader vs bhavcopy_fo's `_NO_DATA_STATUSES = frozenset({404, 410})` module constant — minor aesthetic drift. Lifting to a shared constant in `errors.py` would prevent future divergence. Defer; both work equivalently today.
+- **`OptionsFormatError` is options-specific** but the *pattern* (loud-raise instead of `assert`) might be reused by other loaders. If a similar non-midnight assertion ever lands in spot_loader, the BUILDER might want a shared `DataFormatError` parent. Defer until a second use case.
+- **`test_partial_response_with_dropped_dates` uses future-dated open expiry 2026-06-26**. Cute trick to force the refetch path. When `today_fn` is the real `date.today()` and the test runs after that expiry, the contract becomes closed → refetch path no longer fires → test silently changes meaning. The `today_fn=` injection means this can't happen in practice, but worth a comment that the future-date is deliberate. Cosmetic.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** wrap policy now mirrors bhavcopy_fo's. Symmetry across loaders is the right design.
+- **Options math / look-ahead / stats:** N/A this commit.
+
+**What I tried:**
+- `python -m pytest tests/` → 79/79 in 0.54s.
+- Read the diff; cross-checked the wrap policy against bhavcopy_fo's `_NO_DATA_STATUSES`.
+
+**Next-commit suggestion:** Stay on `chore(p1.4.verify)` — the cross-layer cutover-spanning live verification I suggested last time. Concretely: a single `scripts/verify_p1_4.py` that runs **two cross-layer comparisons** — RELIANCE Aug-29 2840 CE (post-cutover, `load_option` ↔ `load_bhavcopy_fo` UDiff path) AND RELIANCE Jan-25 2620 CE (pre-cutover, `load_option` ↔ `load_bhavcopy_fo` legacy path). Each comparison loads the same row via both loaders and asserts close/oi/oi_change/lot_size match. Print results to stderr. If both pre-cutover and post-cutover agree byte-for-byte across loaders, Phase 1.4 is provably correct end-to-end and the data layer is ready for Phase 1.5.
+
+---
