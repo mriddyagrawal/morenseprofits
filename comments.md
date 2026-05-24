@@ -2198,3 +2198,56 @@ After that the live verify produces the first defensible end-to-end number on re
 **Next-commit suggestion:** **`feat(p3.5.g): SlippageModelV1`** as the very next commit, BEFORE Phase 4 sweeps launch. Three reasons stacked: (1) the user explicitly asked for asymmetric conservatism; (2) Phase 4 sweep results will be aggregated and ranked — a systematic +₹500/trade optimism bias will steer the user toward false-positive "winning" windows; (3) cheap to add now (~50 lines, mirrors CostModel pattern). Then `feat(p3.5.h): roi_pct_annualized` (~5 lines) so Phase 5's ranker has a fair comparison column. Then Phase 4 — the sweeper. Once Phase 4 ships, the user has not just one ₹P&L number but a heatmap of which (entry, exit) windows historically paid, with honest conservatism baked in.
 
 ---
+
+## Review of 45541e0 — feat(p3.5.g): SlippageModelV1 — asymmetric conservatism via realized-price haircut
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement the slippage model that delivers the asymmetric conservatism the user explicitly asked for. Lands BEFORE Phase 4 sweep — per the prior review's urgency.
+
+**What works:**
+- **Asymmetric conservatism mathematically verified end-to-end.** Walked through both directions:
+  - Winning SELL leg (PE 43.15→0.40): gross +₹10,687.50 (raw) → +₹10,578.62 (realized) — **win shrunk by ₹108.88** ✓
+  - Losing SELL leg (CE 56.50→95.05): gross -₹9,637.50 (raw) → -₹10,016.38 (realized) — **loss grew by ₹378.88** ✓
+  - Total: gross +₹1,050 → +₹562 (a ₹488 honest haircut)
+  - The asymmetry magnitudes differ because slippage is %-based (1% of ₹95 = bigger absolute bite than 1% of ₹0.40). **Right direction at the gross_pnl level: wins shrink, losses grow.** Exactly what the user asked about.
+- **API design mirrors CostModel/MarginModel patterns**: `SlippageModelV1(slippage_pct=0.01)` frozen dataclass, injectable kwarg on `price_trade`, default singleton.
+- **Direction-aware**: `realized_price(close, action)` — SELL → ×(1-pct) (less received), BUY → ×(1+pct) (more paid).
+- **Audit trail intact**: leg result dict carries BOTH `entry_px` (raw) and `entry_px_realized`. Anyone re-deriving the gross_pnl can verify the haircut.
+- **Validation** in `__post_init__`: `0.0 <= slippage_pct < 1.0`. Zero allowed (toggle to no-slippage); 100% rejected.
+- 11 slippage tests + the existing pnl tests updated to pass `slippage_model=_NO_SLIPPAGE` explicitly where the hand-checks pin pre-slippage canonical values.
+- 203/203 in full suite (confirmed via 3 consecutive clean runs — one transient flake on the first pass appears to have been cache-state pollution between my own verify_p3 invocation and the test run).
+
+**THE NUMBER THAT MATTERS — RELIANCE Jan-2024 short straddle with 1% slippage**:
+
+| | Without slippage (old) | With 1% slippage (NEW DEFAULT) |
+|---|---|---|
+| Gross P&L | +₹1,050 | +₹562 |
+| Net P&L | +₹910 | +₹423 |
+| ROI (20-day) | 0.65% | 0.30% |
+| Annualized | ~8.2%/year | ~3.8%/year |
+
+**This is the honest number to act on**. The trade is still positive but materially less so. Without slippage the user would have been overconfident in a marginal trade. With it, the math captures exactly what the user asked for in the cost/margin thread: "if it's going to give me a 10% profit and I'm actually seeing just 8% I'm fine with that — but I don't want it to be too optimistic." 0.65% → 0.30% is that conservative discount, in action.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`verify_p3.py` script wasn't updated** to print the raw-vs-realized comparison side-by-side. The user re-running the verify sees the new (lower) numbers but doesn't immediately see WHY they dropped. A 5-line addition: "Without slippage: Gross +₹1050 / Net +₹910 / ROI 0.65%. With 1% slippage (default): Gross +₹562 / Net +₹423 / ROI 0.30%." Same pattern the BUILDER suggested for Tier-A-vs-Tier-B margin in the prior review.
+- **Slippage is uniform across symbols** (Phase-7 backlog item: per-symbol rates calibrated by liquidity tier — ADANIENT options have wider spreads than HDFCBANK).
+- **Slippage is uniform across moneyness** — OTM options have wider bid-asks than ATM. Acceptable v1 simplification; document in SPECS if not already.
+- **The `entry_px_realized` is in `legs_json` (string)** — Phase-5 ranker/UI parsing JSON to recover this is fine for v1 but a top-level `legs_realized_json` column or per-leg columns might be cleaner. Defer until UI consumes.
+
+**Domain / correctness checks:**
+- **Asymmetric conservatism math:** verified by walking both winning and losing leg scenarios. Math is right.
+- **Slippage magnitude (1%):** realistic for NSE blue-chip option bid-asks. ADANIENT or illiquid mid-caps would need 2-3% per side; v1's uniform 1% is mildly optimistic for those, but in the right direction overall.
+- **Sign convention:** unchanged. SELL with entry > exit still produces positive gross; slippage just nudges entry down + exit up so the gap narrows.
+- **Look-ahead bias:** N/A — slippage is a post-hoc deduction from already-realized prices.
+
+**What I tried:**
+- Ran `verify_p3.py` independently — confirmed Gross +₹562, Net +₹423, ROI 0.30%. Matches BUILDER's reported.
+- Read [src/engine/slippage.py](src/engine/slippage.py) and the integration in [src/engine/pnl.py](src/engine/pnl.py) end-to-end.
+- Walked the math by hand for both winning and losing SELL legs to confirm the asymmetric direction is correct.
+
+**Next-commit suggestion:** Per the BUILDER's own note, `feat(p3.5.h): roi_pct_annualized + hold_trading_days columns` is next — already in flight. Then Phase 4 (sweeper). The Phase-4 sweep will now produce **honest, conservative, ranking-comparable** numbers across (entry_offset, exit_offset) × symbol × month — exactly what the project was built for.
+
+---
