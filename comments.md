@@ -3306,6 +3306,117 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 04647aa — feat(p6.2.toggle): leaderboard within-stock vs across-stocks toggle
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Final Phase 6.2 commit. `st.radio` toggle between "Across stocks" (current default: one big leaderboard) and "Within stock" (group by symbol, rank strategies per symbol — answers "which window for stock X?"). Both views are first-class research questions per DESIGN_SPEC §5.2.
+
+**What works:**
+
+- **Module-level constants** ([src/web/leaderboard.py:224-226](src/web/leaderboard.py#L224-L226)):
+  ```python
+  TOGGLE_KEY: str = "mp_leaderboard_mode"
+  MODE_ACROSS: str = "Across stocks"
+  MODE_WITHIN: str = "Within stock"
+  ```
+  Pinned in `test_mode_toggle_strings_pinned`. `mp_` namespace prefix per SPECS §11.4. ✓
+- **`render_mode_toggle()`** ([src/web/leaderboard.py:229-258](src/web/leaderboard.py#L229-L258)) — initializes session_state if absent; uses `key=TOGGLE_KEY` so the widget's state IS the canonical session state. Returns the mode string for the caller to dispatch on. **`horizontal=True`** keeps the radio compact above the table (no vertical real-estate cost).
+- **`render_within_stock_rank` is the per-symbol ranker** ([src/web/leaderboard.py:261-345](src/web/leaderboard.py#L261-L345)):
+  - Filters to `n_trades >= min_n` via boolean indexing, NOT via `rank_strategies()`. **Commit body acknowledges**: "the analytics-layer 100%-suppression warning does NOT fire on the all-below-min_n path here. Intentional — per-symbol grouping needs different aggregation primitive than the single-rank case." Defensible — the UI tier still routes to the canonical `render_empty("leaderboard_all_below_min_n", ...)`.
+  - **Per-symbol rank via `groupby("symbol").cumcount() + 1`** — clean pandas idiom. Pre-sort `[symbol ASC, median_roi_pct_annualized DESC]` ensures cumcount produces correct rank-within-group.
+  - **Final sort `[symbol ASC, rank_within_symbol ASC]`** — table reads contiguously per symbol; operator scans HDFCBANK section, then INFY, etc.
+  - **`rank_within_symbol` column placed second** (after symbol). Symbol-first layout reads "which stock am I looking at? what's the best strategy for it?".
+- **Empty-state paths mirror the main rank table**:
+  - 0 filtered rows → `render_empty("leaderboard_no_rows_after_filters")`
+  - All below min_n → `render_empty("leaderboard_all_below_min_n", n_pairs=..., min_n=...)`
+- **App.py wire-in is clean** ([app.py diff](app.py)): 3-way dispatch in `_render_leaderboard_tab` — headline → toggle → mode-dispatched ranker → thin samples. Replaces the prior `_placeholder("Within-stock vs across-stocks toggle", ...)` line.
+- **Help text** on the toggle widget explains both modes succinctly: "Across stocks → one big rank table; Within stock → strategies ranked per symbol; the rank column resets at each new symbol."
+
+**Live-tested:**
+
+```
+Single-symbol verify dataset (RELIANCE only):
+  within-stock table: 1 row × 9 cols
+  symbol=RELIANCE, rank_within_symbol=1, strategy=short_straddle, n=18,
+    median_ann=247.92, total_pnl=₹124,613.31
+
+Simulated multi-symbol (RELIANCE + HDFCBANK):
+  within-stock table: 2 rows
+  rank_within_symbol = [1, 1]  ← each symbol gets its OWN rank=1
+  HDFCBANK rank=1 short_straddle
+  RELIANCE rank=1 short_straddle
+```
+**Critical property confirmed**: rank resets at each symbol — exactly the design intent.
+
+**5 new tests:**
+- `test_within_stock_resets_rank_at_each_symbol` — rank=1 appears once per symbol, NOT once total.
+- `test_within_stock_sorted_symbol_then_rank` — final sort order pinned.
+- `test_within_stock_empty_routes_through_empty_state` — empty df → canonical message.
+- `test_within_stock_all_below_min_n_routes_through_empty_state` — all-suppressed → canonical message.
+- `test_mode_toggle_strings_pinned` — TOGGLE_KEY + MODE_ACROSS + MODE_WITHIN constants.
+- **23 leaderboard tests** total (4 headline + 5 table + 5 thin + 5 toggle + 4 misc); 436/436 full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **`rank_within_symbol` is a NEW column name** not in SUMMARY_COLUMNS. It's computed inline in `render_within_stock_rank` and lives only in this view. **Fine for UI artifacts** — analytics canonical schema doesn't need to track every UI-derived column. Just noting the convention.
+
+2. **Both modes filter on `n_trades >= min_n`** but via different code paths (`rank_strategies(summary, min_n=min_n)` for across; boolean indexing for within). **Both produce the same "thin pairs are suppressed" result**, but the within-stock path doesn't emit the analytics-layer UserWarning. **Subtle inconsistency**: a developer reading `rank_strategies` might assume the warning is the canonical "all suppressed" signal, only to find within-stock silently bypasses it. **Worth a docstring note in `render_within_stock_rank`**: "Bypasses rank_strategies() entirely; the UserWarning at the analytics layer does NOT fire here. UI still surfaces the equivalent message via render_empty." Cosmetic-to-minor; the commit body already acknowledges this but the source code doesn't.
+
+3. **`MODE_ACROSS = "Across stocks"` and `MODE_WITHIN = "Within stock"`** — user-visible strings exposed as module-level constants. If a future localization effort lands, these strings would need to be wrapped in a translation function. Not a current concern (single-language UI); just noting.
+
+4. **The within-stock table has `symbol` as the FIRST column** (left edge) — operator reads symbol → rank → strategy. The across-stock table has `rank` first (`#` column), then strategy/symbol. **Reading order is different across modes** — this is correct for the use case (within-stock groups by symbol; across-stock groups by global rank) but a careful operator might initially find the column-order swap jarring. **Mitigation in DESIGN_SPEC §5.2**: the toggle is explicit (`Across stocks` vs `Within stock`); the labels prime the reading order. ✓
+
+5. **Toggle position**: the toggle is rendered AFTER the headline strip and BEFORE the main ranking table. So the headline (which is always "across stocks" semantics — `n_pairs`, total P&L across everything) doesn't change when the operator flips the toggle. **Is this confusing?** No — the headline shows GLOBAL aggregates; the toggle controls only the RANKING table beneath. Worth a docstring note ("headline is mode-invariant; only the ranking table is dispatched") for clarity. Cosmetic.
+
+6. **The thin samples sidecar is rendered AFTER both modes** ([app.py diff](app.py)) — appears once at the bottom regardless of toggle state. **Suppressed rows are the same** (thin = `n_trades < min_n` at the pair level, mode-agnostic). ✓ Correct behavior; just noting for future readers.
+
+**Domain / correctness checks:**
+
+- **Statistical-honesty contract**: ✓ both modes filter by min_n; both route to `render_empty` on empty/suppressed states.
+- **Asymmetric-conservatism**: ✓ rank=1 in within-stock mode still requires `n_trades >= min_n` — no thin-N pair gets falsely promoted within a symbol either.
+- **Determinism**: ✓ sort is deterministic; cumcount is deterministic on sorted input.
+- **§5.2 contract**: ✓ both views first-class; one toggle dispatches.
+- **§11.4 state namespace**: ✓ `mp_leaderboard_mode`.
+
+**What I tried:**
+- Read [src/web/leaderboard.py:218-345](src/web/leaderboard.py#L218-L345) end-to-end.
+- Reviewed the 5 new tests in test_web_leaderboard.py.
+- Live-tested within-stock rank on single-symbol verify parquet → 1 row, rank=1.
+- Live-tested simulated multi-symbol (RELIANCE + fake HDFCBANK) → each symbol gets its own rank=1. **Confirmed the cumcount-per-group behavior.**
+- Cross-checked the app.py 3-way dispatch.
+- `pytest tests/test_web_leaderboard.py -v` → 23/23 (5 new for toggle + 18 pre-existing).
+- `pytest tests/` → 436/436.
+
+**Sequencing observation:** **Phase 6.2 (Leaderboard tab) is COMPLETE.** Four commits per DESIGN_SPEC §4 commit list:
+- ✅ p6.2.headline (452b503)
+- ✅ p6.2.table (8a07859)
+- ✅ p6.2.thin (9dc2f1e)
+- ✅ p6.2.toggle (04647aa)
+
+23 tests cover the Leaderboard tab end-to-end; 436/436 full suite. **All my Phase-5 → Phase-6.2 statistical-honesty concerns have been closed at the implementation layer**:
+- Caveats render verbatim (corrected 2024 date)
+- Thin samples explicitly surfaced via sidecar
+- Min_n flows top-down from sidebar
+- Both within/across views first-class
+- n_trades visible as a separate column
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 15: **`feat(p6.3.headline)`** — the 3-card Heatmap headline strip. Cards per §2.5 Heatmap row:
+- BEST CELL — `pivot_window.max().max()` (post-mask) + (entry T-?, exit T-?) subtitle
+- WORST CELL — `pivot_window.min().min()` (post-mask) + (entry T-?, exit T-?) subtitle
+- MEDIAN CELL — `pivot_window.stack().median()` + "across N visible cells" subtitle
+
+Load-bearing for asymmetric-conservatism: BEST and WORST values should both be POST-mask (i.e., they reflect what the operator SEES in the heatmap, not the underlying possibly-thin-N values). The mockup-bug "BEST CELL +82.3 %/yr alongside AVG ROI +264.1 %/yr" (best can't be less than avg) is impossible if both numbers come from the same masked pivot.
+
+Then `feat(p6.3.pivot)` (the dual Plotly heatmaps) + `feat(p6.3.hover)` (customdata tooltips with the std-bias copy).
+
+**Opportunistic riders** for future Phase-6 doc-touching commits (still 8 outstanding non-blockers from prior reviews):
+- `chore(p6.2.verify)` could close most of them in a single doc-touch pass before Phase 6.3 starts. **My lean**: BUILDER lands `chore(p6.2.verify)` between Phase 6.2 close and Phase 6.3 start, OR folds into a later verify commit if the visual baseline isn't urgent.
+
+---
+
 ## Review of 9dc2f1e — feat(p6.2.thin): leaderboard "Thin samples — not ranked" sidecar
 
 **Verdict:** ✅ accept
