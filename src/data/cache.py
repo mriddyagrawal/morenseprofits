@@ -26,9 +26,29 @@ class CacheVersionMismatch(RuntimeError):
 
 _VERSION_FILE = ".cache_version"
 
+# Memoize the version-sentinel check: SPECS-required loud failure on a
+# mismatched cache, but a stat-per-path-build is too expensive once a sweep
+# is constructing ~10k paths. We verify on first touch per process.
+_root_verified: bool = False
+
+
+class StrikeNotIntegerError(ValueError):
+    """NSE stock-option strikes are whole rupees. A non-integer strike here
+    would collide via int(round(...)) with a neighbour (banker's rounding:
+    50.5 → 50, same file as a true ₹50 strike)."""
+
+
+class WouldOverwriteError(RuntimeError):
+    """SPECS §7: cached historical data is append-mostly. Use overwrite=True
+    on `write()` to opt into clobbering an existing file."""
+
 
 def _ensure_root() -> Path:
-    """Create cache root if missing and write/verify the version sentinel."""
+    """Create cache root if missing and write/verify the version sentinel.
+    Memoized via _root_verified — repeat calls cost ~zero."""
+    global _root_verified
+    if _root_verified:
+        return CACHE_DIR
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     sentinel = CACHE_DIR / _VERSION_FILE
     if sentinel.exists():
@@ -40,7 +60,15 @@ def _ensure_root() -> Path:
             )
     else:
         sentinel.write_text(str(CACHE_VERSION))
+    _root_verified = True
     return CACHE_DIR
+
+
+def _reset_root_memo() -> None:
+    """Test-only: drop the memoized verification so monkeypatched CACHE_DIR
+    is re-validated. Production code never needs to call this."""
+    global _root_verified
+    _root_verified = False
 
 
 def spot_path(symbol: str, year: int) -> Path:
@@ -48,7 +76,12 @@ def spot_path(symbol: str, year: int) -> Path:
 
 
 def option_path(symbol: str, expiry: date, strike: float, option_type: Literal["CE", "PE"]) -> Path:
-    strike_int = int(round(strike))
+    if float(strike) != int(strike):
+        raise StrikeNotIntegerError(
+            f"strike {strike!r} is not a whole rupee; NSE stock-option strikes are integer. "
+            f"Pass an int or a float with no fractional part."
+        )
+    strike_int = int(strike)
     expiry_tag = expiry.strftime("%Y%m%d")
     return (
         _ensure_root()
@@ -71,10 +104,24 @@ def read(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def write(path: Path, df: pd.DataFrame) -> None:
+def write(path: Path, df: pd.DataFrame, *, overwrite: bool = False) -> None:
     """Write df to path atomically (write-then-rename) so a crash mid-write
-    cannot leave a half-baked file the next reader would happily load."""
+    cannot leave a half-baked file the next reader would happily load.
+
+    Refuses to clobber an existing file unless `overwrite=True` (SPECS §7);
+    loaders that re-fetch the current year's spot tail will pass overwrite=True.
+    """
+    if path.exists() and not overwrite:
+        raise WouldOverwriteError(
+            f"{path} already exists; pass overwrite=True to clobber (SPECS §7)."
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_parquet(tmp, index=False)
-    tmp.replace(path)
+    try:
+        df.to_parquet(tmp, index=False)
+        tmp.replace(path)
+    except Exception:
+        # Atomic-write guarantee: never leave a half-baked .tmp behind on failure.
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise

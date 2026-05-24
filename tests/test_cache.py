@@ -10,8 +10,10 @@ from src.data import cache
 
 
 def _redirect_cache(monkeypatch, tmp_path):
-    """Point cache.CACHE_DIR at a per-test temp dir."""
+    """Point cache.CACHE_DIR at a per-test temp dir AND reset the memoized
+    root-verification flag so the new dir's sentinel is checked fresh."""
     monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
+    cache._reset_root_memo()
 
 
 def test_round_trip(monkeypatch, tmp_path):
