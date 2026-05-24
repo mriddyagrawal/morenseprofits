@@ -959,3 +959,45 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `chore(p1.3.verify): one live-NSE end-to-end run` — the **highest-de-risking single call** is one that **spans the Jul-8-2024 cutover**: `monthly_expiries("RELIANCE", date(2024, 6, 1), date(2024, 9, 30))`. This exercises (a) the legacy fetcher for June, (b) the UDiff fetcher live for July/August/September — which we've never run for real (the recorded fixture was Aug-29 only, captured by the discovery script, not by the loader's actual fetch path). It confirms in one shot: dispatch picks the right channel across the boundary, UDiff fetch works end-to-end with the pinned Chrome UA, and the resulting expiry list matches NSE's published monthly schedule (Jun-27 / Jul-25 / Aug-29 / Sep-26 are the canonical last-Thursday-of-month for 2024). Print the result to stderr + cross-check those 4 dates against known truth. If anything's off, the discovery is contained and offline tests still pass.
 
 ---
+
+## Review of 4d9b544 — chore(p1.3.verify): live-NSE cutover-spanning verification — ALL GREEN
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Run a single live call that spans the Jul-8-2024 cutover and corroborates the offline test suite against real NSE data — exercising both fetch paths, dispatch, WAF UA, cache, and window filter end-to-end.
+
+**What works:**
+- **I ran the script independently** (cold cache, no prior state) — `python scripts/verify_p1_3.py` → **ALL 4 SCENARIOS GREEN**:
+  - Cold call: `[2024-06-27, 2024-07-25, 2024-08-29, 2024-09-26]` in 3.4s. **Exact match** against the canonical last-Thursday-of-month schedule.
+  - Hot call: same result in 32ms (cache hit confirmed).
+  - Narrow Aug window: `[2024-08-29]` only.
+  - Cross-check: Jun-3 bhavcopy independently lists RELIANCE expiries `[2024-06-27, 2024-07-25, 2024-08-29]` — Jun-27 corroborated.
+- **My result == the BUILDER's reported result, byte-for-byte.** Independent reproducibility confirmed.
+- 4 scenarios chosen for de-risking value, not coverage volume:
+  1. Cold across cutover → dispatch + both fetch paths + WAF UA in one shot.
+  2. Hot → cache contract.
+  3. Narrow window → window filter on cached data.
+  4. Direct bhavcopy load → independent corroboration without going through the calendar.
+- Hand-check truth named in code ([scripts/verify_p1_3.py:34-39](scripts/verify_p1_3.py#L34-L39)) with per-line dates and "Thursday" annotations — so a future reader doesn't need to relook up what the canonical schedule is.
+- Failure handling is explicit (`return 1` per scenario, useful messages).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No assertion that BOTH fetch paths actually fired during the cold call.** If a future regression forced `_udiff_start_date` to far-future, the cold call would route Jul/Aug/Sep through legacy → those would all `MissingDataError` (no legacy bhavcopies post-cutover) → calendar returns empty → script's `expected != []` test fires. So the existing test catches it indirectly. But explicit logging (`print(f"_udiff_start_date={...}")` + a one-shot assertion that the path was exercised) would surface the dispatch decision visibly. Cheap add.
+- **Cold timing not asserted upper bound.** 3.4s on my machine, 5.6s on the BUILDER's. If a future change accidentally makes the cold path 30s, the script still passes. A `if cold_s > 15: print("WARN: cold path slow")` would flag drift. Defer; the script is one-off.
+- **Script can't re-verify cold path on a populated cache** (running it twice in a row turns the "cold" call into a hot call). A `--clean` flag that `rm -rf data/cache/expiries/RELIANCE.parquet` + the relevant bhavcopy parquets before the cold call would let you re-verify on demand. Defer to next time someone wants to re-run.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** legacy via NSEArchives, UDiff via direct requests — both proven live.
+- **Options math:** the 4 returned dates are the actual NSE monthly stock-option expiries for Jun-Sep 2024. Verified against my own recollection of the NSE calendar (last Thursday of each month, with the standard convention that they ARE last Thursday because none of these months had a Thursday-on-holiday situation).
+- **Look-ahead bias:** N/A this commit.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- `rm`'d nothing manually — verified `data/cache/` didn't exist locally (BUILDER's run was gone).
+- `python scripts/verify_p1_3.py` cold → all green as reported, with timings within ~40% of the BUILDER's.
+
+**Next-commit suggestion:** Per the BUILDER's note, the next is a tiny `fix(p1.3.x)` for the open non-blocking flags: (1) `warnings.warn(...)` in `_sample_expiries_for_month` when all 7 candidate days raise `MissingDataError`; (2) SPECS §2.3 note on the empty-month sentinel-row gap; (3) update `test_month_with_no_trading_in_first_7_days_returns_empty` to use `warnings.catch_warnings(record=True)` and assert the new warning fires. Then **straight to `feat(p1.4): options_loader`** — the load-bearing concern there is the **strike-key collision** (cache file path uses `int(strike)`, but the bhavcopy stores `strike: float64`; ensure the loader rejects non-integer strikes via the same `StrikeNotIntegerError` guard `cache.option_path` has, since this is the layer where strike values cross from float to int-keyed-on-disk).
+
+---
