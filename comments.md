@@ -695,3 +695,39 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `test(p1.3.1)` — the **load-bearing test pair**: (1) `test_load_bhavcopy_fo_cache_hit` — call `load_bhavcopy_fo` twice with the same `trade_date`; monkeypatch `_fetch_raw` to **raise** on the second call; assert the second call succeeds purely from parquet. Without this, a regression that drops the `cache.exists` short-circuit would silently re-fetch every call (and Phase 2/3 sweeps would melt your laptop). (2) `test_holiday_shifted_expiry_warns` — construct a **synthetic UDiff CSV** with one row where `XpryDt != FininstrmActlXpryDt` (mutate one row of the recorded fixture); assert exactly one `UserWarning` with the divergence count, and assert the output `expiry` column carries `FininstrmActlXpryDt` for that row. The warning path is currently reachable-but-untested. The two together cover the highest-blast-radius behaviors not already verified end-to-end above.
 
 ---
+
+## Review of fca735a — test(p1.3.1): bhavcopy_fo_loader — 16 tests including both load-bearing ones
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin every contract introduced by f5ff10c, with the cache-hit and holiday-shift tests as the named load-bearing pair.
+
+**What works:**
+- **40/40 pass** in 0.33s.
+- Both load-bearing tests present and green ([tests/test_bhavcopy_fo_loader.py:248-300](tests/test_bhavcopy_fo_loader.py#L248-L300) for cache; [tests/test_bhavcopy_fo_loader.py:196-241](tests/test_bhavcopy_fo_loader.py#L196-L241) for divergence) — the synthetic UDiff mutation is the right pattern (only one row diverges, exactly one file-level warning, ActlXpryDt wins).
+- `_assert_specs_2_4_schema` ([tests/test_bhavcopy_fo_loader.py:56-66](tests/test_bhavcopy_fo_loader.py#L56-L66)) shared helper used by both parsers + cache round-trip. DRY.
+- Hand-check guards the **TtlTradgVol/lot bug the BUILDER caught during implementation** ([tests/test_bhavcopy_fo_loader.py:102-121](tests/test_bhavcopy_fo_loader.py#L102-L121)) — the `contracts == 26` assertion is the regression block.
+- `test_udiff_unknown_instrument_code_raises` mutates `,STO,` to `,XYZ,` and asserts `BhavcopyFormatError` — covers future NSE additions like a currency segment.
+- Two off-by-one tests (legacy via TIMESTAMP, udiff via TradDt) prove the mis-dispatched-fetch trap holds on both branches.
+- Schema dtype assertions check `pd.StringDtype()` and `is_datetime64_any_dtype` (per §2.0 rule) and the float64/int64 pins.
+- Cache hit test uses `pd.testing.assert_frame_equal(df1, df2)` — strict comparison between fresh in-memory and parquet round-trip frames. Catches subtle dtype/attribute drift.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Header field-position assertion** in the holiday-shift test ([tests/test_bhavcopy_fo_loader.py:206](tests/test_bhavcopy_fo_loader.py#L206)): `assert xpry_idx == 9 and actl_idx == 10`. Brittle to upstream UDiff column order changes. The assertion serves as a sanity-canary (test fails loud if order changes) so it's defensible — just naming it.
+- **`_fetch_raw` dispatch logic isn't unit-tested.** All cache-hit / round-trip tests monkeypatch `_fetch_raw` directly, bypassing the `< udiff_start_date()` branch. A regression that flipped the `<` to `<=` (and thus mis-routed the 2024-07-08 boundary day) would not be caught. One-shot test: monkeypatch `_fetch_legacy` and `_fetch_udiff` to track which was called, hit it with dates straddling the cutover, assert dispatch.
+- **`int64` dtype assertion is the brittle path I flagged on f5ff10c.** Today's fixtures have no NaN; if upstream ever drops in a blank `CONTRACTS`, the dtype assertion is fine but the parser fails. Carries until the followup fix.
+- **No `force_refresh` test yet** — fine because the feature doesn't exist; just noting it'll need one when added.
+
+**Domain / correctness checks:**
+- **jugaad-data usage / options math / look-ahead / stats:** N/A this commit (pure tests).
+- **Schema/dtype:** every column in SPECS §2.4 has at least one dtype assertion via `_assert_specs_2_4_schema`. SPECS contract is now structurally enforced.
+
+**What I tried:**
+- `python -m pytest tests/ -v` → 40/40 pass, 0.33s.
+- Read the whole test file. Cross-checked the mutation logic in the divergence test against the UDiff fixture's column order.
+
+**Next-commit suggestion:** Per the BUILDER's note the **followup fix commit comes next**. The three followups have different urgency — **prioritize `MissingDataError` wrapping for weekend/holiday fetches** because the upcoming `feat(p1.3.2): expiry_calendar` will need to cleanly distinguish "this candidate date had no F&O bhavcopy" from "the fetch crashed". Concretely: `_fetch_legacy` wraps `BadZipFile`/`HTTPError` into `MissingDataError(f"no F&O bhavcopy for {trade_date}")`; same for `_fetch_udiff`'s 404/403 path. Then `feat(p1.3.2)` can `try: load_bhavcopy_fo(d) except MissingDataError: continue` while iterating candidate sample days per month — clean control flow without leaking network internals. `Int64Dtype()` + `force_refresh` can land in the same commit or follow, but the `MissingDataError` wrap is on the p1.3.2 critical path.
+
+---
