@@ -261,3 +261,52 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** `feat(p1.2): data/spot_loader.py` — bake **three** invariants from commit-one. (1) The previous two I called out: sort by `date` asc + monotonicity assert (PLAN.md change-log mandates it); force-refresh policy where closed years are immutable. (2) **NEW** — commit to **"one parquet per year contains the ENTIRE year, not just the days a caller asked for"**. Sparse year-caches lead to silent gaps when a later sweep widens the request: the union of "Jan 2–Jan 5" + "Jan 2–Dec 31" looks fine but actually missed Jan 6–Jan 31 if the first call cached only its 4 days. Easiest: every miss fetches the whole year (closed years) or the whole-year-up-to-today (current year). (3) Inject `today()` (or `today_fn: Callable[[], date] = date.today`) so tests can freeze time without monkeypatching the stdlib.
 
 ---
+
+## Review of 8d34626 — feat(p1.2): data/spot_loader.py — year-keyed cache with 4 frozen invariants
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the first loader. All three of my next-commit invariants implemented + a fourth bug the BUILDER caught during their own verification (jugaad's date column is offset 5h30m from midnight IST).
+
+**What works:**
+- All four invariants present and individually verifiable: full-year parquets, closed-year immutability, length-checked current-year refetch, sort+monotonicity assert ([src/data/spot_loader.py:3-19](src/data/spot_loader.py#L3-L19), [src/data/spot_loader.py:64-68](src/data/spot_loader.py#L64-L68)).
+- `today_fn` injection ([src/data/spot_loader.py:72-82](src/data/spot_loader.py#L72-L82)) — tests can freeze time; verified by passing `lambda: date(2024,6,1)` and watching the cached parquet stop at 2024-05-31.
+- **The date-shift bug is real and the fix works**: confirmed end-to-end. NSE Jan-2 trading row arrives raw at `2024-01-01 18:30:00` (yes, the *previous* calendar date), +5h30m correction lands at `2024-01-02 00:00:00`. Single-day `load_spot("RELIANCE", Jan-2, Jan-2)` returns exactly 1 row, close=2611.7 — the regression a future refactor must never reintroduce.
+- Concat-then-filter handles cross-year cleanly ([src/data/spot_loader.py:135-145](src/data/spot_loader.py#L135-L145)). Verified Dec-15-2023 → Jan-15-2024 returns 21 rows, monotonic across the boundary.
+
+**My verification grid (live NSE):**
+| check | observed |
+|---|---|
+| cold fetch Jan 2–5 | 34ms, 4 rows, closes 2611.7 / 2583.3 / 2596.65 / 2607.7 |
+| hot read same range | 32.5ms (PLAN target is <50ms ✓) |
+| single-day Jan-2 (the bug case) | 1 row, close=2611.7 ✓ |
+| cross-year Dec-15-23 → Jan-15-24 | 21 rows, monotonic ✓ |
+| full-year invariant | partial query → 249-row 2024.parquet on disk ✓ |
+| from_date > to_date | raises `ValueError` ✓ |
+| force_refresh | re-fetches & overwrites ✓ |
+| today_fn=2024-06-01 | cache ends at 2024-05-31 (≤ frozen today) ✓ |
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- **Subtle dtype inconsistency for `symbol` vs `series`.** Verified: `symbol` is `<StringDtype(na_value=nan)>` (scalar-broadcast default) while `series` is `<StringDtype(na_value=<NA>)>` (explicit `.astype("string")`). Both pass `is_string_dtype`, but `df.dropna(subset=["symbol"])` and `dropna(subset=["series"])` use different missing-value sentinels — corner-case correctness drift waiting to happen. Fix: `df["symbol"] = pd.Series([symbol.upper()] * len(df), dtype="string")` or assign-then-`.astype("string")`.
+- **Partial-response guard is length-only** ([src/data/spot_loader.py:108-114](src/data/spot_loader.py#L108-L114)). If NSE returns a same-length-but-different-rows fresh frame (e.g. one date dropped, one added), the length check passes and we silently overwrite. Cheap upgrade: `if not set(cached["date"]).issubset(set(fresh["date"])):` → also refuse.
+- **`warnings.simplefilter("ignore", UserWarning)`** ([src/data/spot_loader.py:80](src/data/spot_loader.py#L80)) suppresses ALL UserWarnings during the fetch. Narrow to the known timezone message: `warnings.filterwarnings("ignore", message=".*timezones available.*")`. Otherwise a future jugaad upgrade may emit a meaningful UserWarning we'd swallow.
+- **Concat-then-filter cost on multi-year sweeps**: at sweep time (Phase 4) `load_spot` may be called O(stocks × strategies × months) — each call concat'ing all year parquets. Probably fine on a warm cache, but worth a perf check when Phase 4 lands. Don't optimize now.
+- **`max_cached >= today` cache-skip path** ([src/data/spot_loader.py:105](src/data/spot_loader.py#L105)) — fine in practice, but if a sweep runs intraday before NSE's EOD bhavcopy is published, the cache will refuse to refetch even though "today's" row doesn't yet exist. The right semantics here is "do not refresh until bhavcopy is available". Possibly out of scope; just flagging.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct; series="EQ" pinned; UserWarning rationale documented in the suppress block; **the date-shift fix is the kind of thing PLAN.md §4 hard-rule #2 ("real prices only") implicitly required**. Without this, every backtest's entry/exit-date prices would be off-by-one trading day. This is the most important bug caught so far.
+- **Options math:** N/A.
+- **Statistical claims:** N/A.
+- **Look-ahead bias:** the loader returns historical EOD up to `today_fn()` — caller is still responsible for not querying the future. Engine work in Phase 3 will need to enforce.
+- **Schema:** [src/data/spot_loader.py:36-48](src/data/spot_loader.py#L36-L48) rename map matches SPECS §2.1 column order. Good.
+
+**What I tried:**
+- 9 end-to-end checks against live NSE (see grid above). All green.
+- Re-read [src/data/spot_loader.py](src/data/spot_loader.py) line by line.
+- Verified the date-shift arithmetic by sorting raw output and walking through the timestamps before/after `+5h30m`.
+
+**Next-commit suggestion:** `test(p1.2): spot_loader` — and the **load-bearing test is the date-shift regression**. Construct a `pd.DataFrame` matching jugaad's raw shape (DATE column at `YYYY-MM-DD 18:30:00`), monkeypatch `jugaad_data.nse.stock_df` to return it, then call `load_spot(sym, Jan-2, Jan-2)` and assert (a) exactly one row, (b) `date` equals `pd.Timestamp("2024-01-02")`, (c) the close matches the input row. If this test ever turns red, every backtest's entry/exit price is off-by-one. Also pin the four invariants individually (full-year-cache, immutable-closed-year, length-check-refuses-shrink, monotonic-output) and the `today_fn` freeze. Plus a "no-network on second call" test by monkeypatching `stock_df` to raise — proves the cache contract holds.
+
+---
