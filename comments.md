@@ -2993,3 +2993,45 @@ For Jan-25 T-5→T-3, the formula doubles the apparent annualized return: **1395
 **Next-commit suggestion:** **Phase 5 — `feat(p5.1): per-stock × strategy summary stats (mean, median, win-rate, max-DD, sample N)`**. The aggregation + ranking layer. Now that the underlying data is honest (slippage applied, margin spot-based, ROI exactly annualized, lot-size historical), the ranker can produce reliable cross-strategy comparisons. Load-bearing concerns: (1) **Statistical honesty** — surface sample N alongside every percentile; refuse to rank a strategy with N<5 (the user wanted "no cherry-picked windows"); (2) **Survivorship-bias disclaimer** still load-bearing from §6b.3; (3) **The annualization fix matters most here** — Phase-5 will sort/filter by `roi_pct_annualized` and the now-exact values will produce trustworthy rankings.
 
 ---
+
+## Review of f8d0df0 — feat(p5.1): per-stock × strategy summary stats from sweep parquet
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land the first Phase-5 aggregator. Group by `(strategy, symbol)`, emit canonical summary stats. Statistical-honesty contract: surface N, don't filter small samples silently.
+
+**What works:**
+- **`SUMMARY_COLUMNS` canonical schema** ([src/analytics/aggregate.py:24-48](src/analytics/aggregate.py#L24-L48)) — 12 columns covering identity, sample size, P&L, ROI (holding + annualized), and per-trade extremes.
+- **`MIN_N_FOR_RANKING = 5` exported as module constant** ([src/analytics/aggregate.py:57](src/analytics/aggregate.py#L57)) — pattern is transparency-over-silent-filtering. Aggregator does NOT drop small-N rows; consumers filter via `.query("n_trades >= MIN_N_FOR_RANKING")`. **Exactly the user's "no quiet filtering" preference matches the SPECS §6b.3 survivorship discipline.**
+- **`empty_summary_frame()`** with canonical schema ([src/analytics/aggregate.py:60-63](src/analytics/aggregate.py#L60-L63)) — downstream `.groupby` won't KeyError on empty input.
+- **Required-column validation raises ValueError with helpful diagnostic** ([src/analytics/aggregate.py:89-95](src/analytics/aggregate.py#L89-L95)) — same loud-failure pattern as `results.write_results`.
+- **Deterministic sort by `(strategy, symbol)`** ([src/analytics/aggregate.py:137](src/analytics/aggregate.py#L137)).
+- **Verified live**: on the real p4.verify 18-row dataset, produces sensible aggregates (single (RELIANCE, short_straddle) row with N=18, win%=83.3, median annualized +247.9%/yr).
+- 11 new tests; 310/310 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions (Phase 5.5 ranker will need these):**
+
+1. **No dispersion metric** (`std_roi_pct`, `std_net_pnl`). Phase-5.5 ranker that wants risk-adjusted comparison (Sharpe-like = mean / std) can't compute it from this summary. Worth adding before p5.5 lands — same module, ~4 lines.
+
+2. **No `total_net_pnl`** column for aggregate strategy P&L ("this strategy made ₹X across all trades"). Cosmetic; user might want it in the UI.
+
+3. **`worst_roi_pct` labeled implicitly as max DD** in the docstring ("the natural 'max drawdown' for a per-trade dataset") — but it's actually "worst single-trade ROI", which is a different metric from path-dependent max-DD. The latter is a Phase-6 concern (needs trade ordering). The current name is fine; just worth being explicit that `worst_roi_pct` ≠ traditional max-DD.
+
+4. **`win_rate_pct = 100 × (net_pnl > 0).sum() / n`** uses strict `>` — exactly-zero trades count as losses. Defensible (a zero-P&L trade is no win) but worth a SPECS note for the user's mental model.
+
+5. **No groupby keys other than (strategy, symbol)** — Phase-5 PLAN specifies a separate p5.2 for (entry_offset, exit_offset) heatmap, p5.3 for year-over-year decay, p5.4 for month-of-year seasonality. Each will need its own aggregator. The pattern is fine — multiple specialized aggregators rather than one generic one.
+
+**Domain / correctness checks:**
+- **Statistical honesty:** ✓ N surfaced; aggregator transparent; MIN_N_FOR_RANKING is a guideline not a filter.
+- **Annualization:** uses the now-exact `roi_pct_annualized` from the 06bb5e7 fix. Phase-5 ranking won't be polluted by the prior calendar-day bias.
+- **Survivorship:** the SPECS §6b.3 caveat still applies — Phase-6 UI needs to render the survivorship disclaimer alongside any leaderboard derived from this.
+
+**What I tried:**
+- `python -m pytest tests/` → 310/310.
+- Loaded the p4.verify parquet through `summarize_by_stock_strategy` — got a sensible single-row summary. Required-column validation fires correctly. Empty-input returns the canonical schema.
+
+**Next-commit suggestion:** Per PLAN.md, `feat(p5.2): entry/exit heatmap matrix — avg P&L by (entry_offset, exit_offset)`. This is the dataset that turns into Phase-6's visualization — for each `(strategy, symbol)`, pivot by `(entry_offset_td, exit_offset_td)`; cell values = mean (or median) of some metric (net_pnl, roi_pct, roi_pct_annualized). Load-bearing decisions: **(1)** pivot value should default to `median_roi_pct_annualized` (robust to outliers, cross-window-comparable); **(2)** NaN cells for missing combinations (no false implication of zero P&L); **(3)** same `MIN_N_FOR_RANKING` applies per-cell (a heatmap cell with N=1 should be visually distinguishable from N=10 in Phase-6's render); **(4)** API shape: `pivot_window(results_df, strategy, symbol, *, value_col="roi_pct_annualized", aggfunc="median") -> pd.DataFrame` (index=entry_offset_td desc, columns=exit_offset_td desc). Or one big multi-level frame the consumer can slice. Either works; the BUILDER's call.
+
+---
