@@ -1314,3 +1314,51 @@ Trivial followup. Two tiny things closed from the 02e3644 review:
 **Next-commit suggestion:** `test(p1.5)` — make the **load-bearing test the Ram-Mandir-closure compositional case** (`offset_trading_days(2024-01-22, 0) == 2024-01-20` and `offset_trading_days(2024-01-22, 1) == 2024-01-19`). This single test proves THREE non-obvious things at once: (a) round-down semantics for non-trading anchors works; (b) the bootstrap-from-spot architecture captures Saturday special sessions that any pre-computed holidays database would have missed; (c) the Definition-A compositional interpretation of n=1 (my fee312f flag) is the one in code. Plus: the canonical hand-check (`Jan-25 → n=15 → Jan-4`), `n<0` raises ValueError, insufficient-history raises ValueError with the buffer-cap diagnostic, AND a **jugaad_data.holidays cross-check** (load `holidays(2024)`, intersect with `trading_days(2024-01-01, 2024-12-31)` — must be empty). That last one is the structural sanity check the SPECS mandates.
 
 ---
+
+## Review of 46054a8 — test(p1.5): trading_calendar — 12 tests including Muhurat Trading cross-check
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin trading_calendar contracts offline + add live network tests that corroborate the offline behavior against real NSE data.
+
+**What works:**
+- **90/90 default + 2/2 network = 92/92 green** in my run.
+- **Hand-check load-bearing test FIRST** ([tests/test_trading_calendar.py:61-73](tests/test_trading_calendar.py#L61-L73)) — `offset_trading_days(2024-01-25, 15) == 2024-01-04`. Docstring explicitly says "a single off-by-one breaks every backtest's prices silently".
+- **`_JAN_2024_NSE_DAYS` synthetic fixture** ([tests/test_trading_calendar.py:43-54](tests/test_trading_calendar.py#L43-L54)) captures TWO real NSE quirks: Jan-22 Ram Mandir closure AND Jan-20 Saturday compensation. The fixture's correctness was live-verified before being baked offline.
+- **The compositional / round-down semantics tests close my fee312f ambiguity by code**:
+  - `test_n_zero_on_non_trading_day_rounds_down` ([tests/test_trading_calendar.py:89-97](tests/test_trading_calendar.py#L89-L97)) → Jan-22 → 0 → Jan-20.
+  - `test_n_one_on_non_trading_day` ([tests/test_trading_calendar.py:100-110](tests/test_trading_calendar.py#L100-L110)) → Jan-22 → 1 → Jan-19 (Definition A compositional).
+- **`test_overlap_with_jugaad_holidays_is_only_muhurat_trading`** ([tests/test_trading_calendar.py:195-218](tests/test_trading_calendar.py#L195-L218)) — **major real-NSE discovery**: 2024-11-01 (Diwali Lakshmi Puja Muhurat) appears in BOTH `trading_days` and `jugaad.holidays(2024)` because NSE runs a ~1-hour ceremonial session that produces real OHLC AND is marked as a "holiday" upstream. The test allowlists `KNOWN_MUHURAT_2024 = {date(2024,11,1)}` and asserts the difference is empty. Sets the right precedent: future Diwali muhurat days need adding.
+- `test_offset_trading_days_live_reliance_jan_25` runs the same canonical hand-check via REAL `load_spot` — independent corroboration that the offline synthetic fixture matches reality.
+- Network tests properly marked `@pytest.mark.network` per pytest.ini — opt-in, default-skipped.
+- `test_insufficient_history_raises` ([tests/test_trading_calendar.py:122-130](tests/test_trading_calendar.py#L122-L130)) — uses a 5-day fixture + n=100 to force the buffer-cap ValueError.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`KNOWN_MUHURAT_2024` is inline in the test.** For 2025+ sweeps the test will fail loud (good!) but the update mechanic is hidden. Lifting to a module-level `_KNOWN_MUHURAT_BY_YEAR = {2024: {date(2024,11,1)}, 2025: {...}, ...}` would make future-year additions a one-line PR.
+- **No `test_n_one_on_trading_day_anchor` for the n=1-from-trading-day case.** Implicitly covered by the n=15 hand-check but worth pinning: `offset(2024-01-25, 1) == 2024-01-24`. One line.
+- **`test_offset_trading_days_live_reliance_jan_25` doesn't use `today_fn`** — uses real `date.today()`. If the test is run before 2024-01-25 (it won't be in practice, but hypothetically), the calendar's `end = min(anchor, today)` would change behavior. Cosmetic.
+- The synthetic fixture is the "1 month" view. A larger fixture spanning 2-3 months with more holidays would let `test_insufficient_history_raises` use more realistic n values. Minor.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** cross-check works as designed; one expected overlap (Muhurat).
+- **Options math / look-ahead / stats:** N/A this commit.
+- **Architectural validation:** the Muhurat finding confirms that the bootstrap-from-spot strategy captures MORE accurate trading semantics than any pre-computed holidays database. Phase 3 backtest can trust this.
+
+**What I tried:**
+- `python -m pytest tests/` → 90/90 default in 0.56s.
+- `python -m pytest tests/test_trading_calendar.py -m network -v` → 2/2 network tests pass live.
+- Read the full test file; cross-checked the synthetic fixture against my own NSE knowledge.
+
+**Phase 1.5 status:** **DONE.** Trading calendar works correctly even for the rare NSE weirdness (Saturday compensation, Muhurat).
+
+**Next-commit suggestion:** Per the BUILDER's note, `chore(p1.5.verify)` next, then Phase 1.6 (offline-mode kwarg). For p1.5.verify I'd recommend going beyond a single-function live check: write a small **Phase-1 integration script** that strings the whole data layer end-to-end on one realistic backtest preamble. E.g.:
+1. `monthly_expiries("RELIANCE", 2024-01-01, 2024-01-31)` → confirm `[date(2024,1,25)]`.
+2. `offset_trading_days(date(2024,1,25), 15)` → confirm `date(2024,1,4)`.
+3. `load_option("RELIANCE", date(2024,1,25), <ATM_strike>, "CE", date(2024,1,4), date(2024,1,25))` → confirm ~15 trading-day rows of real prices.
+4. Independently `load_bhavcopy_fo(date(2024,1,4))` → assert ATM CE close from bhavcopy == load_option's Jan-4 close.
+
+That single integration proves all four loaders + the calendar agree end-to-end — Phase 1 is then *operationally* ready for Phase 2 (universe) and Phase 3 (engine).
+
+---
