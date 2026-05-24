@@ -1581,3 +1581,35 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `feat(p2.2): src/universe/momentum.py`. BEFORE writing code, pin three loose ends from the d61b164 review in SPECS §6b.2: **(a) tercile boundary for n=40** → 40/3=13.33, so pick e.g. `bullish=14, neutral=13, non_bullish=13` (top-heavy gives the higher-conviction bucket the larger sample) — and write `len(out["bullish"]) >= len(out["non_bullish"])` into the test contract; **(b) holiday-aligned lookback** → `lookback_date = trading_calendar.offset_trading_days(as_of, lookback_trading_days)` where `lookback_trading_days ≈ 6 * 21` (avg trading days/month) — switching from "6 calendar months" to "126 trading days" sidesteps the Jan-1-is-holiday trap entirely AND makes the lookback determinable from the trading calendar without month-arithmetic; **(c) delisted-symbol policy** → if `load_spot` for a universe symbol raises `MissingDataError` (delisted/renamed), the classifier **must drop the symbol with a `warnings.warn(...)` listing which one** and continue with the rest, NOT propagate. Otherwise one stale name in `blue_chip` would break the whole classifier. Test for this: monkeypatch `load_spot` to raise for one symbol; assert the symbol is missing from all three output lists AND a warning was emitted. The load-bearing test for p2.2 is `test_classify_momentum_is_deterministic` (two calls → byte-identical splits) — same pattern as expiry_calendar.
 
 ---
+
+## Review of 397ad65 — chore(p2.2.prep): pin tercile + holiday lookback + delisted policy in SPECS §6b.2
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Resolve the three loose ends I flagged on d61b164 + 019663e in SPECS BEFORE writing the classifier, so the impl is mechanical.
+
+**What works:**
+- **Tercile pinned 14/13/13 top-heavy** ([SPECS.md:405-411](SPECS.md#L405-L411)) — exactly my suggested split, with the "higher-conviction bucket gets larger sample" rationale.
+- **Lookback switched to trading days** ([SPECS.md:395-399](SPECS.md#L395-L399)) — `lookback_trading_days=126` (~6×21) routed through `offset_trading_days`. Sidesteps the calendar-month holiday trap by construction. Function signature updated.
+- **Delisted policy explicit and load-bearing** ([SPECS.md:413-418](SPECS.md#L413-L418)) — `MissingDataError` → warn+drop, **NOT** propagate. `OfflineCacheMiss` (distinct class per SPECS §6a) DOES propagate. The two-class distinction we baked in for offline mode pays off here.
+- **Anchor close logic explicitly defined** ([SPECS.md:400-404](SPECS.md#L400-L404)) — numerator = "largest date ≤ as_of", denominator = "smallest date ≥ lookback_date". Handles partial-history symbols cleanly (no assumed full window).
+- **`lookback_trading_days` framed as Phase-5-tunable** — comment notes "Phase 5 can sensitivity-test lookback_trading_days as a parameter". Right call.
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- **126 magic constant** — define as `_DEFAULT_LOOKBACK_TRADING_DAYS = 126` in `momentum.py` (or a module-level constant) so Phase 5 sensitivity tests can reference the constant rather than hardcoding 126 in two places.
+- **Insufficient-history at the front edge.** If a caller runs `classify_momentum(date(2019,1,1), ..., lookback_trading_days=126*5)`, `offset_trading_days` raises ValueError ("cannot find N trading days back"). The classifier doesn't catch — propagates. That's the right behavior (loud failure on impossible request) but worth a one-line SPECS callout so the implementer doesn't accidentally wrap it.
+- **Partial-history symbols.** If a symbol started trading mid-window (e.g. ADANIGAS pre-listing), the "smallest date ≥ lookback_date" denominator picks the listing date itself → much shorter realized lookback than other symbols. The trailing-return number is then heterogeneous across the universe. Defensible (anything else requires synthetic baseline), but worth noting the partial-history case in §6b.2 so reviewers of backtest results understand a "missing window" symbol isn't excluded — it's just measured on a shorter window.
+- **No worked example** — adding `monthly_expiries`-style example would help: "for `as_of=date(2024,7,1)`, lookback_date = `offset_trading_days(as_of, 126)` ≈ `date(2023,12,28)`; expected output split sizes for `len(blue_chip())=40` are `bullish=14, neutral=13, non_bullish=13`". Cosmetic.
+
+**Domain / correctness checks:**
+- **Look-ahead bias:** anchor close pinned to "largest date ≤ as_of" — no leak by construction.
+- **Statistical claims:** tercile cut is a reasonable proxy for momentum; the top-heavy split is defensible; the 126-day lookback is a common momentum factor convention.
+- **jugaad-data / options math:** N/A this commit.
+
+**What I tried:** Read the SPECS diff; mentally traced the lookback-date math for `as_of=date(2024,7,1)`.
+
+**Next-commit suggestion:** `feat(p2.2): src/universe/momentum.py` is now mechanical. The **load-bearing test** is `test_classify_momentum_is_deterministic` — two calls with identical inputs → byte-identical bullish/neutral/non_bullish lists. Same pattern as expiry_calendar. Three other tests must land in the immediately-following `test(p2.2)` commit because the implementation surfaces them as risks: **(1)** `test_split_sizes_sum_to_universe` (bullish+neutral+non_bullish == len(universe), no leaks) — guards against an off-by-one in the slice arithmetic; **(2)** `test_delisted_symbol_dropped_with_warning` — monkeypatch `load_spot` to `MissingDataError` for one universe entry, assert it's absent from ALL three lists AND a warning was emitted; **(3)** `test_OfflineCacheMiss_propagates` — sister test ensures the distinct-class semantic from SPECS §6a still holds at the classifier layer (one stale name should NOT silently mask an offline failure). Pin those three at minimum.
+
+---
