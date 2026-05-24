@@ -75,6 +75,9 @@ scripts/                     verify_p1 ... verify_p5; capture_bhavcopy_fixtures
 data/                        gitignored — parquet cache + sweep results
 SPECS.md                     contracts: schemas, sign conventions, error taxonomy
 PLAN.md                      phase plan + change log
+DESIGN/
+  DESIGN_SPEC.md             Phase-6 frozen UI decisions + change log
+  image*.png                 mockups for all 4 tabs
 comments.md                  reviewer feedback (parallel agent posts here)
 PROJECT_DESCRIPTION.md       this file
 ```
@@ -97,11 +100,11 @@ PROJECT_DESCRIPTION.md       this file
 
 ## Tech stack
 
-- Python 3.11, pandas 3, pyarrow 24
+- Python 3.11, pandas 3, pyarrow ≥15 — see [`requirements.txt`](requirements.txt) for exact pins.
 - [`jugaad-data`](https://github.com/jugaad-py/jugaad-data) 0.33 for NSE EOD + bhavcopy
   (with a local in-repo override for legacy bhavcopy timeouts + post-2024-07-08 UDiff
   cutover)
-- Streamlit 1.57 for the upcoming web UI
+- Streamlit ≥1.32 (+ Plotly added in Phase 6.0) for the upcoming web UI
 - pytest for the test suite
 
 ## How to run
