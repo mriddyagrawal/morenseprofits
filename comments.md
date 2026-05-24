@@ -849,3 +849,32 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `feat(p1.3.2): expiry_calendar` — the **load-bearing test from commit one is determinism**: call `monthly_expiries(symbol, from_date, to_date)` twice with the same inputs (monkeypatch `load_bhavcopy_fo` to return a fixed frame); assert byte-identical sorted output. The entire reason this module exists is to escape the `list(set(dts))` non-determinism we logged in PLAN.md change-log on 2026-05-24; if the calendar's output isn't deterministic, every Phase-3 backtest is too. **Sampling strategy I'd commit to**: for each calendar month in the window, iterate days 1..7 and take the first that resolves (`except MissingDataError: continue`) — the MissingDataError wrap from bc1add4 makes this trivial. One bhavcopy per month gives ALL listed expiries (near + far months), so a 12-month window's union is essentially complete. Document the strategy in SPECS §2.3. Hand-check the BUILDER planned originally: `monthly_expiries("RELIANCE", 2024-01-01, 2024-01-31) == [date(2024,1,25)]`. With the legacy fixture already containing RELIANCE expiries [Jan-25, Feb-29, Mar-28], the determinism test can drive end-to-end without live network.
 
 ---
+
+## Review of ce95d70 — chore(p1.3.2.prep): SPECS §2.3 sampling strategy + legacy wrap-precision note
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin the sampling strategy and determinism contract in SPECS §2.3 before the p1.3.2 implementation lands, and acknowledge the legacy/UDiff wrap-precision asymmetry I flagged on 765c49d.
+
+**What works:**
+- **SPECS §2.3 sampling strategy** ([SPECS.md:118-130](SPECS.md#L118-L130)) — exactly the four-step pattern from my prior suggestion: iterate days 1..7 per calendar month → first to resolve wins → filter OPTSTK-for-symbol → union & sorted.
+- **Determinism contract named explicitly**: "two calls return byte-identical lists" ([SPECS.md:128-130](SPECS.md#L128-L130)). The reason for the module exists in writing.
+- `expiry_date` / `month_anchor` now reference §2.0 — closes the date-dtype generalization properly.
+- Legacy `_fetch_legacy` docstring update ([src/data/bhavcopy_fo_loader.py:95-104](src/data/bhavcopy_fo_loader.py#L95-L104)) names the asymmetry, points the next debugger at the WAF-after-update failure mode. Closes the 765c49d flag with words, not extra code.
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- **Days-1..7 strategy is undefended against pathological months.** Extremely unlikely (NSE has at most ~3 consecutive non-trading days), but if a future calendar disruption ever produced 7 consecutive non-trading days (force-majeure suspension), the iteration would exhaust. Decide now: extend to day 8+? log warning + skip month? Document the fallback.
+- **Cache invalidation contract is ambitious.** SPECS §2.3 says "subsequent call for a new month range only fetches the missing months" — that's incremental cache, which requires tracking *which* months are present (a month with zero expiries leaves no rows). For v1, **commit to a simpler "full-window rebuild" semantic** and defer incremental to Phase 7 polish. Otherwise p1.3.2 will need a sentinel-row scheme just to mark "this month was sampled, found nothing" — yak-shaving for a feature we don't need yet. Add to SPECS: "v1: full rebuild when window changes; incremental optimization deferred."
+- **`expiry` vs `expiry_date` naming inconsistency.** §2.4 (bhavcopy) uses `expiry`; §2.3 (calendar) uses `expiry_date`. Different names for the same date semantics. Fine if intentional (calendar output is conceptually a list of dates, hence the suffix) — but a one-line note explaining the rename will save the next reader a grep.
+
+**Domain / correctness checks:**
+- **Look-ahead bias:** N/A pure docs; but the sampling-day strategy implicitly assumes day-1-of-month is in the past relative to the call site. Caller responsibility.
+- **jugaad-data / options math / stats:** N/A.
+
+**What I tried:** Read the diff; verified the sampling strategy's "one bhavcopy per month is sufficient" claim against the recorded fixtures (legacy 20240125 has RELIANCE expiries Jan-25/Feb-29/Mar-28 visible — one sample → 3 expiries listed → consistent with the claim).
+
+**Next-commit suggestion:** `feat(p1.3.2): expiry_calendar` — the prior suggestion still holds (determinism is the load-bearing first test, candidate-day iteration via `MissingDataError`, hand-check `RELIANCE 2024-01 == [2024-01-25]`). One sharpening: **make v1 a full-window rebuild, not incremental** — the cache is a single per-symbol parquet, blow it away on window change. The SPECS §2.3 incremental phrasing can be revised in the same commit (or deferred to a fix later) — but don't yak-shave a sentinel-row scheme for the empty-month case in p1.3.2 itself. Get the deterministic, correct, hand-check-passing calendar landed first; optimize cache invalidation in Phase 7.
+
+---
