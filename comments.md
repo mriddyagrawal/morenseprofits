@@ -878,3 +878,46 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `feat(p1.3.2): expiry_calendar` — the prior suggestion still holds (determinism is the load-bearing first test, candidate-day iteration via `MissingDataError`, hand-check `RELIANCE 2024-01 == [2024-01-25]`). One sharpening: **make v1 a full-window rebuild, not incremental** — the cache is a single per-symbol parquet, blow it away on window change. The SPECS §2.3 incremental phrasing can be revised in the same commit (or deferred to a fix later) — but don't yak-shave a sentinel-row scheme for the empty-month case in p1.3.2 itself. Get the deterministic, correct, hand-check-passing calendar landed first; optimize cache invalidation in Phase 7.
 
 ---
+
+## Review of 26b964e — feat(p1.3.2): expiry_calendar.monthly_expiries — sampled-bhavcopy union
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement the SPECS §2.3 sampling strategy: enumerate month anchors, sample days 1..7 per anchor, filter OPTSTK-for-symbol, union, sort, cache. Determinism is the contract.
+
+**What works:**
+- Algorithm follows the SPECS §2.3 sampling strategy faithfully ([src/data/expiry_calendar.py:10-21](src/data/expiry_calendar.py#L10-L21) docstring; matches the steps in §2.3 1:1).
+- **Three deduplication / sort gates** kill non-determinism on every path: `sorted()` inside `_sample_expiries_for_month`, `drop_duplicates + sort_values` before persisting ([src/data/expiry_calendar.py:131-139](src/data/expiry_calendar.py#L131-L139)), and `sorted(set(...))` on the final return ([src/data/expiry_calendar.py:149](src/data/expiry_calendar.py#L149)).
+- `_empty_calendar_frame()` ([src/data/expiry_calendar.py:71-78](src/data/expiry_calendar.py#L71-L78)) shapes the cold-cache case so the concat/dedupe path doesn't have to special-case it. Clean.
+- `_CANDIDATE_SAMPLE_DAYS = tuple(range(1, 8))` ([src/data/expiry_calendar.py:33](src/data/expiry_calendar.py#L33)) — module-level constant; trivially extended later.
+- `MissingDataError` caught and silently continues to next candidate day ([src/data/expiry_calendar.py:62-63](src/data/expiry_calendar.py#L62-L63)) — exactly what the bc1add4 wrap was designed for. Other exceptions propagate.
+- Cache pattern uses `cache.write(..., overwrite=True)` ([src/data/expiry_calendar.py:139](src/data/expiry_calendar.py#L139)) because cache is being REPLACED with the merged set — correct for an incremental-merge model.
+- **Verified end-to-end** with synthetic bhavcopy fixture:
+  - Two calls → byte-identical output (`[date(2024,1,25)]`); 2nd call: 0 new fetches.
+  - Jan-Mar window with one-month-per-sample → 3 expiries returned, 3 fetches issued.
+  - Narrow Jan 1-10 window → `[]` even though Jan-25 is in cache (window filter works).
+  - Lowercase `"reliance"` → normalized to `RELIANCE` cache.
+  - `from_date > to_date` → `ValueError`.
+  - Incremental extension: 1st call covers Jan (1 fetch); 2nd call asks Jan-Mar (2 new fetches for Feb+Mar, Jan from cache).
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Empty-month sentinel gap (the incremental-cache caveat I raised on ce95d70).** A month where the symbol has no OPTSTK rows (RELIANCE will never trip this; some delisted/pre-F&O exotic might) yields zero new rows in `_build_new_rows`, so the anchor never appears in `cached["month_anchor"].unique()`, so it'll be re-sampled on every future call. Two paths: (a) document the limitation in the module docstring + SPECS §2.3; (b) add a sentinel row (`expiry_date=NaT, month_anchor=anchor`) per sampled month. For v1 (a) is fine; flag it in writing.
+- **Silent loss when all 7 candidate days raise MissingDataError.** `_sample_expiries_for_month` returns `[]` ([src/data/expiry_calendar.py:64-65](src/data/expiry_calendar.py#L64-L65)) with no warning. NSE has never had 7 consecutive non-trading days, but if a future calendar disruption produces that, the calendar will silently miss expiries. One-line `warnings.warn(f"no usable bhavcopy in days 1..7 for {anchor}")` before returning would surface it.
+- **`force_refresh` kwarg not added** for symmetry with `load_spot` / `load_bhavcopy_fo`. Defensible (calendar is a derived view; force-refresh the underlying bhavcopies) but worth documenting why we didn't add it.
+- The same expiry can appear under multiple `month_anchor` rows by design (Jan sample lists Jan/Feb/Mar expiries; Feb sample lists Feb/Mar/Apr; …). Dedupe on full tuple keeps them. The final `unique()` on `expiry_date` collapses correctly. Worth a test to pin this against future refactors that might dedupe-on-(symbol,expiry_date) and silently lose the audit trail of which sample-month observed an expiry.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** indirect — through `load_bhavcopy_fo`. Correct.
+- **Options math:** filters strictly for `instrument == "OPTSTK"` ([src/data/expiry_calendar.py:66](src/data/expiry_calendar.py#L66)) — excludes FUTSTK and any future-only contracts. Correct for short-straddle.
+- **Look-ahead bias:** the sampling iterates candidate dates *within the month being sampled* — caller's `to_date` could be in the past, so candidate days could be in the past or near-future. The calendar doesn't enforce "candidate ≤ today". For a backtest at-time-T, this is acceptable because the candidate is days-of-month-in-question, not days-of-today. But callers querying a future month would silently fetch a non-existent bhavcopy → MissingDataError → empty.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- Monkeypatched `bhavcopy_fo_loader.load_bhavcopy_fo` with a synthetic RELIANCE OPTSTK frame (3 forward expiries) for days 1..7 of each tested month; MissingDataError otherwise.
+- Drove 6 distinct scenarios end-to-end (determinism, window, narrow window, lowercase, validation, incremental extension). All green.
+
+**Next-commit suggestion:** `test(p1.3.2)` — make determinism `test_monthly_expiries_is_deterministic` THE FIRST test in the file, with a comment naming it as load-bearing per the module's reason-to-exist. Two calls under the same monkeypatch → `assert result1 == result2` AND `pd.testing.assert_frame_equal(read_cache(), read_cache())` on the on-disk parquet (catches any cache-write nondeterminism). Then pin the **hand-check** against the recorded legacy fixture: monkeypatch `_fetch_raw` so day-1 of Jan-2024 returns the real legacy fixture; assert `monthly_expiries("RELIANCE", Jan-1, Jan-31) == [date(2024,1,25)]`. Plus tests for incremental extension (Jan-only first → Jan-Mar second triggers only 2 new fetches) and the empty-result case (all 7 days MissingDataError → `[]`, ideally with a recorded warning per the silent-loss flag above).
+
+---
