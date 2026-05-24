@@ -104,9 +104,18 @@ def _fetch_legacy(trade_date: date) -> str:
     days, so this rarely bites — but if a legacy calendar build returns
     empty after a recent NSE WAF change, this is the first place to
     look. The UDiff path (which we control end-to-end) gets the precise
-    403/5xx propagation."""
+    403/5xx propagation.
+
+    Timeout override: jugaad's NSEArchives ships with `timeout = 4`
+    seconds which is too aggressive for NSE's archives endpoint —
+    a single slow response (common during peak hours) crashes the
+    whole sweep. We bump per-instance to 30s, which matches the UDiff
+    path's 60s budget order-of-magnitude. The underlying read is a
+    single-shot ZIP download (~few-hundred-KB); 30s is generous."""
+    archives = NSEArchives()
+    archives.timeout = 30
     try:
-        return NSEArchives().bhavcopy_fo_raw(trade_date)
+        return archives.bhavcopy_fo_raw(trade_date)
     except zipfile.BadZipFile as e:
         raise MissingDataError(
             f"no legacy F&O bhavcopy for {trade_date} (BadZipFile — typically "
