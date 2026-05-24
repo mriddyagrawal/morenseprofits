@@ -455,6 +455,30 @@ def test_network_errors_are_not_wrapped(monkeypatch):
 # Cache round-trip preserves SPECS §2.4 schema
 # ===========================================================
 
+def test_force_refresh_refetches(monkeypatch, tmp_path):
+    """Mirrors spot_loader.test_force_refresh_refetches: cache present
+    + force_refresh=True triggers a re-fetch and overwrites the cache."""
+    _redirect_cache(monkeypatch, tmp_path)
+    raw = _legacy_raw()
+    calls = {"n": 0}
+
+    def fake_fetch(td):
+        calls["n"] += 1
+        return raw, "legacy"
+
+    monkeypatch.setattr(bfo, "_fetch_raw", fake_fetch)
+
+    bfo.load_bhavcopy_fo(LEGACY_DATE)
+    assert calls["n"] == 1
+    bfo.load_bhavcopy_fo(LEGACY_DATE)  # cache hit
+    assert calls["n"] == 1
+    bfo.load_bhavcopy_fo(LEGACY_DATE, force_refresh=True)
+    assert calls["n"] == 2
+    # And a subsequent normal call hits the (overwritten) cache
+    bfo.load_bhavcopy_fo(LEGACY_DATE)
+    assert calls["n"] == 2
+
+
 def test_cache_round_trip_preserves_schema(monkeypatch, tmp_path):
     _redirect_cache(monkeypatch, tmp_path)
     raw = _legacy_raw()
