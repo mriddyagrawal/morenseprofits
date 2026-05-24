@@ -188,6 +188,56 @@ Commits:
 3. `feat(p7): BLUE_CHIP_BY_QUARTER point-in-time membership for true survivorship-bias-free backtests.`
 4. `chore(p7): final commit — Phase 7 complete — project final`
 
+### Phase 8 (DEFERRED) — Agent-callable research API
+
+**Goal:** Let any Claude (or other MCP-capable agent) issue its own
+research queries against the backtest dataset without having to read
+Python — turns the platform from "single-user web app" into "shared
+research backend".
+
+Read-only scope. No order execution.
+
+Sketch:
+1. `feat(p8): src/mcp_server/server.py — MCP server skeleton`
+2. `feat(p8): tool list_universe(category)`
+3. `feat(p8): tool classify_regime(symbol, as_of)`
+4. `feat(p8): tool expiries_for(symbol, year)`
+5. `feat(p8): tool backtest_one(strategy, symbol, expiry, entry_offset_td, exit_offset_td)`
+6. `feat(p8): tool sweep_windows(strategy, symbol, expiry, entry_grid, exit_grid)`
+7. `feat(p8): tool summarize(strategy, symbol_or_category, year_range, regime_filter)`
+8. `chore(p8): SPECS §10 — MCP tool contracts; integration test against a local MCP client`
+
+### Phase 9 (DEFERRED) — Paper trading
+
+**Goal:** Simulated open-position tracker with live mark-to-market.
+Validates the research outputs against real-time NSE prices without
+risking capital.
+
+Sketch:
+1. `chore(p9): SPECS §11 — paper-positions schema + mark-to-market policy + close-on-expiry rule`
+2. `feat(p9): src/paper/positions.py — open / close / list — parquet-backed store`
+3. `feat(p9): src/paper/mtm.py — fetch live spot+option via NSELive, recompute unrealized P&L`
+4. `feat(p9): MCP tools paper_open / paper_status / paper_close`
+5. `chore(p9): runbook — how to interpret paper P&L vs backtest P&L`
+
+### Phase 10 (DEFERRED — separate project scope) — Live trading
+
+**Goal:** Real broker integration with risk controls + audit. Treat as
+its own quarter of work, not as one more phase.
+
+Hard prerequisites before any Phase-10 commit:
+- ≥ 3 months of paper-trading track record matching backtest expectations
+- Written runbook: order state machine, kill-switch, daily loss limit
+- Per-trade approval (no autonomous execution v1) — agent proposes, human approves, system executes
+
+Sketch:
+1. Broker API client (Zerodha Kite or equivalent) with auth + token refresh
+2. Order state machine (placed → ack'd → filled → settled) with idempotency keys
+3. Risk controls (max position size, drawdown stop, daily loss limit)
+4. Audit log — every order traceable to agent decision + human approval
+5. Kill switch (single env var disables order placement immediately)
+6. Phase-10 final commit only after the runbook + audit are reviewed
+
 ## 4. Hard correctness rules (engine must enforce, not just hope)
 
 1. **No look-ahead.** Strategy receives only `market_data[market_data.date <= entry_date]`. Engine asserts this.
@@ -214,3 +264,4 @@ Anything not explicitly nailed down above — schema field order, internal helpe
 - 2026-05-24 — Reviewer flagged that `jugaad_data.nse.expiry_dates` returns `list(set(dts))` — non-deterministic iteration order across runs. This is why the Phase-0 smoke test printed different "first expiry" values on different invocations (Jan-25 vs Feb-29 vs Mar-28) — set iteration, not NSE. Every loader that consumes a set/dict-derived collection from jugaad must `sorted(...)` before caching or returning. Phase 1.2's spot_loader bakes in `sort_values("date")` + monotonicity assertion at the data-layer boundary so this class of bug dies once.
 - 2026-05-24 — Phase-2 blue-chip universe sized down from 50 to **40** per user direction ("just kinda good is fine; reporting/analysis quality matters more than exact composition"). The 10 dropped members were the lower-options-liquidity tail of Nifty 50. Survivorship-bias caveat in SPECS §6b.3 still applies and is unchanged.
 - 2026-05-24 — Deferred Phase-7 item added per user request: **user-curated-universe skill**. End-of-project, lets the operator feed in their own stock list per session (e.g. "run the same report on this 30-stock watchlist"). Until then v1 ships the hardcoded blue-chip 40.
+- 2026-05-24 — Three new DEFERRED phases added (8/9/10) per user direction: **Phase 8 agent-callable research API** (MCP server with 6 read-only tools — list_universe/classify_regime/expiries_for/backtest_one/sweep_windows/summarize — so any Claude instance can do its own research against our dataset); **Phase 9 paper trading** (positions store + live mark-to-market via NSELive + 3 MCP tools); **Phase 10 live trading** (broker integration, treated as its own quarter of work with hard prerequisites — paper-trading track record, runbook, per-trade approval gate, kill switch). 8 and 9 are natural extensions of the data+analytics surface; 10 is scoped as a separate project to be undertaken only after paper-trading validation.
