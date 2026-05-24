@@ -3306,6 +3306,111 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 0845230 — feat(p6.4.headline): Trends tab — strategy/symbol selectors + 4-card strip
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Open Phase 6.4 (Trends tab). Same pattern as Heatmap's `feat(p6.3.headline)`: in-tab selectors (one pair at a time — trend signals dilute across strategies) + 4-card strip below. Cards per DESIGN_SPEC §2.5 Trends row: BEST/WORST MONTH / TIGHTEST MONTH STD / LATEST YEAR ROI with pp-delta vs prior year.
+
+**What works:**
+
+- **Selector pattern mirrors heatmap.py** ([src/web/trends.py:34-63](src/web/trends.py#L34-L63)) — `mp_trends_strategy` + `mp_trends_symbol` per §11.4 namespace; smart-fallback defaults handle stale session state. Help text on the strategy selectbox explains the one-pair-at-a-time semantic. **Consistency with Heatmap tab is the point** — operator's mental model carries between tabs.
+- **Four cards in canonical order** ([src/web/trends.py:70-75](src/web/trends.py#L70-L75)) — pinned by `_HEADLINE_LABELS` tuple at module level. Order matches DESIGN_SPEC §2.5 Trends row: Best month / Worst month / Tightest month std / Latest year ROI.
+- **Min_n discipline applies separately to monthly and yearly aggregates** ([src/web/trends.py:107-108](src/web/trends.py#L107-L108)) — `monthly_eligible = monthly[monthly["n_trades"] >= min_n]`; `yearly_eligible = yearly[yearly["n_trades"] >= min_n]`. **Subtle property**: at the verify-set `min_n=7` (just above 6 trades per month), month cards dash but the year card stays populated (year-level n=18 > 7). **This is correct** — year statistics are reliable at year-level N regardless of per-month thinness. Pinned by `test_all_months_below_min_n_dashes_for_month_cards`.
+- **PP-delta computation** ([src/web/trends.py:171-179](src/web/trends.py#L171-L179)) — `delta_pp = latest_val - prior_val`. **Units are percentage points** (pp) not "%" — correct semantic for comparing two annualized-ROI percentages. `sign = "+" if delta_pp >= 0 else ""` — explicit positive sign; negative falls through to `:.1f`'s natural `-`. Subtitle reads "2024 (vs 2023: +X.X pp)".
+- **🔬 Single-year omits delta** ([src/web/trends.py:180-183](src/web/trends.py#L180-L183)) — instead of faking a `+0.0 pp` (which would be misleading on a single-year dataset), the subtitle reads "2024 (no prior year for delta)". **Asymmetric-conservatism honored**: don't manufacture a comparison when there's nothing to compare against.
+- **Tightest std card format** ([src/web/trends.py:153-157](src/web/trends.py#L153-L157)) — `f"±{std_val:.1f}%/yr"` with `±` prefix. **Consistent with the leaderboard's std column** convention.
+- **5 distinct empty-state paths** all with operator-action subtitles:
+  - 0 filtered rows → "no data after filters" (4 dashes)
+  - selectors None → same
+  - selected pair has 0 trades → "no trades for X × Y" (4 dashes)
+  - no months with N ≥ min_n → "no months with N ≥ K" (3 dashes; year card may still render)
+  - no years with N ≥ min_n → "no years with N ≥ K" (year-card-only dash)
+- **8 new tests** covering: 4-card order, dashes-on-empty/no-pair, hand-derived best/worst month picks, tightest-std identification, year-over-year +X.X pp delta computation, single-year omits delta, all-months-below-min_n branch behavior, naming-rule (no rupee glyph leaks into percentage cards).
+
+**Live-tested all three branches:**
+
+```
+Test 1 (verify, min_n=5):
+  Best month         +269.3%/yr   month 2 (N=6)
+  Worst month        +106.5%/yr   month 3 (N=6)
+  Tightest month std ±94.3%/yr    month 2 (most consistent)
+  Latest year ROI    +247.9%/yr   2024 (no prior year for delta)
+
+Test 2 (min_n=7, all months suppressed; year still passes at n=18):
+  Best/Worst/Tightest: "—" + "no months with N ≥ 7"
+  Latest year ROI    +247.9%/yr   2024 (no prior year for delta)
+  ← Year card stays populated because year-level n=18 ≥ 7
+
+Test 3 (empty df):
+  All 4 cards: "—" + "no data after filters"
+```
+
+All values match my earlier reviews of p5.4 + p5.2 (Feb median +269.25%, std 94.29; Mar median +106.46%). ✓ The trends-headline data plumbing produces results identical to the analytics layer.
+
+**459/459 full suite** (was 451 + 8).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Month rendered as integer `"month 2"` instead of `"Feb"`** ([src/web/trends.py:120, 138, 156](src/web/trends.py#L120-L156)). The implementation literally follows the DESIGN_SPEC §2.5 example ("month M (N=X)") but the operator reads months as **Jan/Feb/Mar/...**, not 1/2/3. **Recommended UX upgrade**: `calendar.month_abbr[int(best['month'])]` → "Feb (N=6)" instead of "month 2 (N=6)". One-line edit; high readability win. Worth a quick polish commit OR fold into `chore(p6.4.verify)`. Cosmetic but visible to operator.
+
+2. **`sort_values("year")` is called twice** ([src/web/trends.py:167, 172](src/web/trends.py#L167-L172)) — once for the latest, once for the prior. Minor inefficiency; could sort once and reuse. Cosmetic.
+
+3. **The verify dataset's "no prior year for delta" subtitle** is the right asymmetric-conservatism wording — don't manufacture a delta when there's nothing to compare. **On a future 2-year sweep (per DESIGN_SPEC §3.2)**, the delta would render. **Worth a test** for the 2-year case to ensure the delta computation is correct when both years pass min_n. Looking at the test list, `test_latest_year_roi_with_prior_year_delta` does this. ✓ Tested.
+
+4. **`yearly_eligible.sort_values("year").iloc[-1]`** returns the most recent year. **If years are non-contiguous** (e.g., 2022 + 2024 with no 2023), the delta would render as "2024 (vs 2022: +X.X pp)" — comparing across a 2-year gap as if year-adjacent. **For the v1 verify-derived sweeps** (continuous 2-year ranges per §3.2), this won't happen. For sparse-year sweeps in Phase 7+, the pp delta could be misleading without surfacing the gap. **Cosmetic non-blocker**: subtitle could read "2024 (vs 2022 — 2 years prior: +X.X pp)" to surface the gap. Minor.
+
+5. **`monthly` and `yearly` aggregates are recomputed every render** — no caching. Streamlit's render cycle reruns on every interaction. **For the verify-set 18-row pair** this is trivially fast (<1ms). **For a future sweep with thousands of trades**, this could add latency. **Mitigation**: `@st.cache_data` on `summarize_by_month`/`summarize_by_year` calls, OR precompute in the parent function. Not blocking; just noting for the p6.5.sweep performance concern.
+
+6. **`format_pct` not used for the std card** ([src/web/trends.py:155](src/web/trends.py#L155)) — uses bespoke `f"±{std_val:.1f}%/yr"`. **The `±` prefix isn't supported by `format_pct`** — `format_pct(signed=True)` prepends `+` or `-`, not `±`. Acceptable inconsistency: the std card needs ± semantics (always-positive, always-bidirectional); `format_pct` doesn't have that mode. **Could extend `format_pct` with `bidirectional=True`** for consistency. Minor.
+
+7. **`monthly_eligible.loc[monthly_eligible[col].idxmax()]`** pattern repeats across the 3 month cards — could DRY into a small helper. Cosmetic.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ single-year explicitly omits delta; no manufactured comparisons.
+- **Statistical-honesty**: ✓ min_n discipline applied independently to monthly + yearly aggregates; thin months dashed.
+- **§2.5 naming rule**: ✓ all 4 card values are percentages with `%/yr` suffix; no rupee glyph leaks.
+- **Mockup-bug prevention**: ✓ values come from the aggregator output, not from inline computation that might mis-label.
+- **§2.6 contract**: ✓ all empty-state paths have operator-action wording.
+- **§11.4 state namespace**: ✓ mp_trends_strategy, mp_trends_symbol.
+- **Cross-checked vs p5.4 output**: ✓ live numbers match exactly (Feb 269.3 / 94.3 / month 2; Mar 106.5 / month 3).
+
+**What I tried:**
+- Read [src/web/trends.py](src/web/trends.py) end-to-end.
+- Live-tested 3 branches against the verify dataset:
+  - min_n=5: all month cards populated; year card single-year omit-delta
+  - min_n=7: month cards dashed but year card stays populated (year-level N=18)
+  - empty df: all 4 dashes
+- `pytest tests/test_web_trends.py -v` → 8/8.
+- `pytest tests/` → 459/459.
+
+**Sequencing observation:** Phase 6.4 opens with the same structural pattern as 6.3 (selectors + 4-card headline). **Code reuse via patterns is now firmly established**:
+- `mp_*_strategy` / `mp_*_symbol` selectbox pattern (heatmap + trends).
+- 4-card `st.columns(4)` + `st.metric` headline pattern (leaderboard + trends).
+- 3-card variant (heatmap).
+- `render_empty(...)` for canonical empty messages.
+- `format_pct(signed=True, annualized=True)` for ROI cards; `f"±{...:.1f}%/yr"` for std cards.
+- min_n discipline + thin-sample dashing.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 19: **`feat(p6.4.yoy)`** — Plotly line chart of `summarize_by_year` median annualized ROI over years. Critical design decisions:
+1. **Single-line plot** (not a multi-strategy comparison) — one pair at a time matches the selector semantic.
+2. **N visible per point** — either as tooltip text or as bubble size (sister chart in commit 20 handles N more prominently).
+3. **`scattergl.Mode="lines+markers"`** so single-year data still renders a point (not an empty line).
+4. **Empty-state path**: `trends_yoy_single_year` reason key (verify set will trigger this — only 2024 data).
+
+Then commit 20 (`p6.4.yoy_n`): sister chart — win-rate line + sample-size bars on a dual-y-axis subplot. The sister chart is what makes the YoY interpretation honest (per DESIGN_SPEC §10 user-journey step 4: "the upward drift is real not a thin-sample artifact").
+
+Then commit 21 (`p6.4.moy`): MoY bar chart over Jan-Dec. Verify-set will show 3 visible bars (Jan/Feb/Mar) with the rest empty.
+
+**Opportunistic riders** for `chore(p6.4.verify)` or next polish pass:
+- `calendar.month_abbr` for the trends headline subtitles (#1 above).
+- The 10+ outstanding non-blockers from prior reviews still open.
+
+---
+
 ## Review of 7b9b283 — feat(p6.3.hover): customdata tooltips on heatmap cells + std-bias note
 
 **Verdict:** ✅ accept
