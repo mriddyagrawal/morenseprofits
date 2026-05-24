@@ -508,6 +508,34 @@ def test_403_propagates_not_wrapped(monkeypatch, tmp_path):
         )
 
 
+def test_5xx_propagates_not_wrapped(monkeypatch, tmp_path):
+    """Mirror of bhavcopy_fo's test — 5xx is retryable, not 'no data'.
+    Wrapping as MissingDataError would mask transient NSE outages as
+    silent skips during a sweep. Tests that a future "simplify to
+    status >= 400" regression fires here, not at runtime."""
+    _redirect_cache(monkeypatch, tmp_path)
+
+    class _FakeResp:
+        status_code = 503
+        def raise_for_status(self):
+            err = _requests.HTTPError("503 Service Unavailable")
+            err.response = self
+            raise err
+
+    def raiser(*args, **kw):
+        err = _requests.HTTPError("503 Service Unavailable")
+        err.response = _FakeResp()
+        raise err
+
+    monkeypatch.setattr(options_loader, "derivatives_df", raiser)
+    with pytest.raises(_requests.HTTPError, match="503"):
+        options_loader.load_option(
+            "RELIANCE", date(2024, 1, 25), 2620, "CE",
+            date(2024, 1, 25), date(2024, 1, 25),
+            today_fn=lambda: date(2026, 5, 24),
+        )
+
+
 def test_badzipfile_wraps_as_missing_data(monkeypatch, tmp_path):
     """jugaad's internal unzip raises BadZipFile when NSE returns HTML
     for an unlisted contract. Wrap as MissingDataError."""
@@ -532,6 +560,10 @@ def test_partial_response_with_dropped_dates(monkeypatch, tmp_path):
     inserted MUST keep the cache and warn — length-only check would let
     this through silently."""
     _redirect_cache(monkeypatch, tmp_path)
+    # Future-dated expiry by design — the open-expiry refetch branch is
+    # what we want to exercise. The today_fn injection insulates us from
+    # the real clock; if today_fn is ever defaulted in a future refactor,
+    # this test would silently change behavior once 2026-06-26 passes.
     expiry = date(2026, 6, 26)  # open-expiry (future) so refetch path fires
     initial_dates = [date(2026, 5, 1) - timedelta(days=i) for i in range(20, -1, -1)]
 
