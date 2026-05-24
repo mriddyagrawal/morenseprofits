@@ -3306,6 +3306,132 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 7b9b283 — feat(p6.3.hover): customdata tooltips on heatmap cells + std-bias note
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Add per-cell hover tooltips to both heatmap panes. The killer feature for a research tool per DESIGN_SPEC §2.1 — composing `(n_trades, win_rate, std, total_net_pnl, median_roi)` into a tooltip lets the operator interrogate each cell without leaving the heatmap view. Closes Phase 6.3.
+
+**What works:**
+
+- **`_build_customdata(df, strategy, symbol, entry_index, exit_columns)` returns `(H, W, 5)` numpy array** ([src/web/heatmap.py:173-218](src/web/heatmap.py#L173-L218)) — aligned with the pivot's index/columns. **Pinned ordering** in the docstring:
+  ```
+  [0] = n_trades
+  [1] = win_rate_pct
+  [2] = std_roi_pct_annualized
+  [3] = total_net_pnl
+  [4] = median_roi_pct_annualized
+  ```
+  Both heatmaps SHARE the same customdata array — reference into it via `%{customdata[N]}` slots in distinct hovertemplates.
+- **Per-cell median recomputed from the filtered cell, not pulled from `pivot_window`** ([src/web/heatmap.py:202](src/web/heatmap.py#L202)) — **commit body explicitly explains**: "the value pane is masked at min_n; customdata feeds BOTH panes including the density pane where thin cells stay visible." So the customdata's `[4] median` is the unmasked per-cell median. Correct semantic — density-pane hover shows the median for thin cells too, with N visible so the operator sees the sample size context.
+- **Std uses `ddof=0`** ([src/web/heatmap.py:200](src/web/heatmap.py#L200)) — matches `aggregate.py` SUMMARY_COLUMNS convention. **Consistency** across analytics + UI.
+- **Two distinct hovertemplates per pane**:
+  - **Value pane** (6 lines): entry/exit coords + Median ROI/yr (from z) + N + Win rate + Std ROI/yr + Net P&L (from customdata).
+  - **Density pane** (4 lines): entry/exit coords + N (from z) + Median ROI/yr (from customdata) + Win rate.
+  **The density pane's hover surfaces the ROI value via customdata[4]** — operator doesn't need to switch panes to see "this cell has n=3 trades AND a median of +254%/yr".
+- **`<extra></extra>` suffix on both** — Plotly idiom to suppress the default trace name in the tooltip box (otherwise "trace 0" appears). Clean.
+- **Std-bias caption below the panes** ([src/web/heatmap.py:323-330](src/web/heatmap.py#L323-L330)) — exact DESIGN_SPEC §2.2 wording with the CORRECTED ~11% / ~5% / ~2.5% numbers (the 2024-05-25 spec revision after my afdd56e variance-vs-std confusion). **Rendered as a caption because Plotly hovertemplates can't carry per-column tooltips** — the §2.2 std-bias warning gets surfaced once below the pane row instead of buried inside each cell's hover.
+- **3 new tests** covering:
+  - `test_cells_have_customdata_for_hover_tooltips` — shape `(H, W, 5)` and content correctness.
+  - `test_hover_template_includes_all_load_bearing_fields` — anti-regression for a future template edit that drops Std or N silently.
+  - `test_density_pane_hover_references_value_via_customdata` — density-pane hover surfaces the ROI via customdata[4].
+- **451/451 full suite** (was 448 + 3). **Phase 6.3 Heatmap tab COMPLETE.**
+
+**Live-verified** (with `importlib.reload`):
+
+```
+customdata shape: (3, 2, 5)  ← verify-set 3 entry × 2 exit grid
+
+Cell at (entry=15, exit=1):
+  [0] n_trades            = 3.0
+  [1] win_rate_pct        = 100.00%
+  [2] std_roi_pct_ann     = ±122.32%
+  [3] total_net_pnl       = ₹45,434.40
+  [4] median_roi_pct_ann  = +253.63%
+
+Direct query cross-check:
+  n=3, median_ann=253.63, total_pnl=45434.40
+```
+**Every customdata value matches the direct pandas query.** ✓
+
+Hovertemplates rendered:
+- Value pane: `<b>entry %{y}, exit %{x}</b><br>Median ROI/yr: %{z:+.1f}%<br>N: %{customdata[0]}<br>Win rate: %{customdata[1]:.1f}%<br>Std ROI/yr: ±%{customdata[2]:.1f}%<br>Net P&L: ₹%{customdata[3]:,.0f}<extra></extra>`
+- Density pane: `<b>entry %{y}, exit %{x}</b><br>N: %{z}<br>Median ROI/yr: %{customdata[4]:+.1f}%<br>Win rate: %{customdata[1]:.1f}%<extra></extra>`
+
+Hovertemplate inspection confirms BOTH panes have customdata wired and reference the right slots.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 `_build_customdata` is O(H × W × N) with nested for-loops + per-cell boolean masking** ([src/web/heatmap.py:191-203](src/web/heatmap.py#L191-L203)). For the verify set (3×2 = 6 cells × 18 trades = 108 ops), trivial. For a future 6×5 = 30-cell grid × 5,400 trades = **162,000 boolean-mask operations**. Still well under 1 second but the inefficiency is structural. **Vectorized alternative**: `df.groupby([entry_offset_td, exit_offset_td]).agg(...)` once, then reindex against the pivot's (H, W) axes. ~10 lines; same output; 100x+ faster on large sweeps. **Worth doing before the first p6.5.sweep run** (5,400 cells × ~3-4k trades after skips). Non-blocking for v1 but worth a Phase 6.5+ optimization commit.
+
+2. **Per-cell `n_trades` recomputed from the dataframe** instead of being passed in from `pivot_counts` ([src/web/heatmap.py:195-196](src/web/heatmap.py#L195-L196)) — `pivot_counts` is already computed in `render_heatmaps` but not threaded into `_build_customdata`. Minor redundancy. Refactor for free in the vectorized version above.
+
+3. **🔬 Density pane hover for zero-count cells could mislead.** `pivot_counts` uses `fill_value=0` for missing (entry, exit) combinations — those cells appear in the density pane (showing N=0 visually). When the operator hovers on such a cell, customdata for that cell is all-zeros (from `_build_customdata`'s `continue` path), so the hover would render:
+   ```
+   entry T-X, exit T-Y
+   N: 0
+   Median ROI/yr: +0.0%   ← misleading! No median exists for n=0
+   Win rate: 0.0%          ← misleading!
+   ```
+   On the verify set this doesn't fire (all cells have n=3, no zeros). On a future sparser dataset, the misleading hover would be visible. **Fix options**:
+   - Skip the hover for zero-count cells via `hoverongaps`-equivalent: add `if n == 0: continue` AND set the customdata to NaN so Plotly suppresses the hover.
+   - OR explicit hover handling: when N=0, render "no data" lines instead of the false median.
+   **Non-blocking for v1** (verify set has no zero cells); worth fixing before p6.5.sweep where sparse grids are expected. Could be a quick `fix(p6.3.hover): suppress hover on zero-count cells` commit.
+
+4. **`Net P&L: ₹%{customdata[3]:,.0f}`** in the value-pane hover — uses comma-grouped int format. **Bypasses `format_inr` convention** which would convert ≥₹1L to "₹X.XX L". For per-cell totals (typically smaller — ~₹45K on the verify cell at (15,1)) this is fine. **For large-volume sweeps** where a per-cell total could exceed ₹1L, the hover would render "₹1,250,000" instead of "₹12.50 L". Inconsistent with the leaderboard's format_inr discipline. **Mitigation**: render `total_net_pnl` via `format_inr` outside the Plotly template, then inject the formatted string into customdata. Hovertemplate slot would become `%{customdata[3]}` (string) instead of `%{customdata[3]:,.0f}` (number with comma format). Plotly supports string customdata. **Worth doing** for consistency. Non-blocking; same priority as #3.
+
+5. **No customdata[5] for `mean_roi_pct_annualized`** — only median surfaces in hover. If a future operator wants to see mean-vs-median per cell (a tell for outlier influence), they'd need to switch to the table. Acceptable v1 scope; could add post-launch.
+
+6. **Hovertemplate uses `%{y}` and `%{x}` for the entry/exit coordinates** — these render the axis tick labels (`T-15`, `T-1`) not the raw integer offsets. ✓ Operator sees the formatted coordinate. Consistent with the axis ticks.
+
+7. **`<b>entry %{y}, exit %{x}</b>`** — entry/exit shown in bold. Operator's eye anchors on the coordinate first, then reads the stats. ✓ Right reading order.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ std-bias caption surfaces the corrected ~11% wording (LOWER BOUND interpretation); hovertemplate exposes the std value per cell so operator can compare visually.
+- **Mockup-bug prevention**: ✓ N field separate from ROI fields; Net P&L visibly has `₹`; ROI fields have `%` suffix.
+- **Statistical-honesty contract**: ✓ density pane hover surfaces the median so operator inspecting a masked-in-value-pane cell still sees the underlying ROI (just with N as context — "n=3 < min_n=5, so the value pane masks; you can see it's +254%/yr but it's not in the ranking").
+- **Per-cell median consistency**: ✓ recomputed from cell trades, matching `pivot_window`'s aggregation.
+- **§2.2 std-bias surfacing**: ✓ caption present with corrected wording.
+
+**What I tried:**
+- Read `_build_customdata` and the diff for both hovertemplates.
+- Live-built customdata against the verify dataset — confirmed shape (3, 2, 5) and exact value match against direct pandas query.
+- Rendered the two heatmaps via mocked Plotly chart capture; inspected both hovertemplates verbatim.
+- `pytest tests/test_web_heatmap.py -v` → 15/15 (3 new for hover + 12 pre-existing).
+- `pytest tests/` → 451/451.
+
+**Phase 6.3 status: COMPLETE.**
+- ✅ p6.3.headline (a7e0baf) — selectors + 3-card strip
+- ✅ p6.3.pivot (5b88215) — dual Plotly heatmaps with RdYlGn / Blues colormaps
+- ✅ p6.3.hover (7b9b283) — customdata tooltips + std-bias caption
+
+**Sequencing observation:** Phase 6.3 closed in 3 commits per DESIGN_SPEC §4. Total: ~448-451 tests (3 new per commit × 3 commits = 9 net new tests for Phase 6.3); 11 new tests for Phase 6.2 (split across 4 commits). The test-discipline scales linearly with the surface area — every visible UI feature has a test pinning it.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 18: **`feat(p6.4.headline)`** — Trends tab 4-card strip. Per §2.5 Trends row:
+- BEST MONTH — `summarize_by_month`'s top row by median ann. ROI + subtitle (e.g., "Feb +269.3%/yr")
+- WORST MONTH — bottom row + subtitle
+- TIGHTEST MONTH STD — `summarize_by_month`'s `std_roi_pct.idxmin()` + "±X.X%"
+- LATEST YEAR ROI — `summarize_by_year`'s most recent year + "vs prior year ±X.X pp"
+
+For the verify dataset:
+- Best month: Feb (+269.3%/yr, std 94.3% — tightest)
+- Worst month: Mar (+106.5%/yr)
+- Latest year: 2024 — but only one year, so "vs prior year" would render as "—" (empty-state path)
+
+Then `feat(p6.4.yoy)` (YoY line), `feat(p6.4.yoy_n)` (sister chart for win-rate + N), `feat(p6.4.moy)` (MoY bars) — Phase 6.4 closes the visual tabs.
+
+**Opportunistic riders** (still 10+ outstanding non-blockers across all reviews):
+- Per-cell vectorization (this review #1) before p6.5.sweep.
+- Zero-count hover suppression (this review #3) before p6.5.sweep.
+- format_inr in customdata (this review #4) for consistency.
+
+`chore(p6.3.verify)` or `chore(p6.4.verify)` would be a natural place to batch-close several of these. Recommend at Phase 6.4 close.
+
+---
+
 ## Review of 5b88215 — feat(p6.3.pivot): dual Plotly heatmaps — value (RdYlGn diverging) + density (Blues)
 
 **Verdict:** ✅ accept
