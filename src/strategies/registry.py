@@ -19,12 +19,14 @@ from __future__ import annotations
 from src.strategies.base import Strategy
 from src.strategies.long_straddle import LongStraddle
 from src.strategies.short_straddle import ShortStraddle
+from src.strategies.short_strangle import ShortStrangle
 
 
 # Registered strategies. Adding a new one = import it + add one line here.
 STRATEGIES: dict[str, Strategy] = {
     "long_straddle": LongStraddle(),
     "short_straddle": ShortStraddle(),
+    "short_strangle": ShortStrangle(),
 }
 
 
