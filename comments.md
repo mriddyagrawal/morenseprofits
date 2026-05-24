@@ -2574,3 +2574,42 @@ Likely landed before the BUILDER saw my 185a9cb review with the lot_size bug. Th
 Then p4.4.{a..d} — the 4 new strategies. Each is a small commit, mostly mechanical given the ShortStraddle template + the recommended_strategy_offset_pct contract. p4.4.d (IronCondor) is the natural place to land the caveat #1 strike-vs-spot margin fix because that's the first asymmetric strategy that bites.
 
 ---
+
+## Review of 1a5cf01 — feat(p4.3): src/engine/results.py + skip-log + empty-frame schema + read validation
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Extract the results persistence layer with a canonical schema + validation. Land the 3 deferred 185a9cb flags (skip log, empty-frame schema, read validation) in one cohesive module.
+
+**What works:**
+- **`RESULTS_COLUMNS` + `SKIPS_COLUMNS` module tuples** are the single source of truth ([src/engine/results.py:28-57](src/engine/results.py#L28-L57), [src/engine/results.py:61-69](src/engine/results.py#L61-L69)) — Phase-5 ranker + Phase-6 UI both read through here, so schema changes are one edit.
+- **`empty_results_frame()`** ([src/engine/results.py:76-80](src/engine/results.py#L76-L80)) returns a 0-row frame with canonical columns + types. Downstream `.agg("net_pnl")` on a no-row sweep won't KeyError; gets NaN. Closes the 185a9cb flag.
+- **`_inferred_dtype(col)`** ([src/engine/results.py:87-100](src/engine/results.py#L87-L100)) — name-based dtype inference: datetime64[us] for date cols, int64 for offset/days, float64 for P&L/margin, object for the rest. Matches §2.0 convention.
+- **`write_results` validates schema** ([src/engine/results.py:119-128](src/engine/results.py#L119-L128)) AND reorders to canonical column order before persisting. Forward-compat: extras preserved at the tail.
+- **`read_results` strict on missing required cols** — raises ValueError with helpful message. Loud beats silent NaN. ([src/engine/results.py:163-169](src/engine/results.py#L163-L169))
+- **`write_skips` returns None on empty** (no point writing an empty companion file). `read_skips` returns `empty_skips_frame()` if no file (= zero skips). Clean symmetry.
+- **`sweep_one` returns `"skip:<ExceptionName>"` string** on skip (was None) — sweep_grid extracts the reason from this for the skip log.
+- 235/235 in full suite. 11 new results tests + 1 sweeper companion-file test.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`_inferred_dtype("symbol")` returns `"object"`** but upstream loaders emit `pd.StringDtype()`. On `pd.concat(empty_frame, real_frame)`, the result could be `object` (downcast) or `string` (upcast) depending on pandas version. For consistency with §2.0 / §2.1 dtype rules, map string-like columns (`symbol`, `strategy`, `run_id`, `params_json`, `legs_json`, `*_breakdown_json`, `skip_reason`) to `pd.StringDtype()`. Cosmetic for v1; matters when Phase-5 ranker uses string-typed groupbys.
+- **Dtype not validated on write/read** — schema check is column-name-only. A frame with `entry_date: str` would pass. Acceptable per SPECS §2.0's "any datetime64 unit" flexibility, but if the sweeper ever produces malformed data, this validation won't catch it. Defer.
+- **All-skipped run produces no `_skipped.parquet` for skips but ALSO no main results parquet** — wait, the sweeper writes empty_results_frame() in that case per the new shape. So `read_results` succeeds and returns the empty frame. `read_skips` returns the populated skip log. Symmetric. Good actually.
+- **`skip_reason` as `"skip:MissingDataError"` string** is readable but not introspectable. A separate `skip_error_class` enum column would be cleaner for "GROUP BY reason" Phase-5 queries. Cosmetic.
+
+**Domain / correctness checks:**
+- **Schema canonical-ness:** all 22 SPECS §2.5-shape columns present in RESULTS_COLUMNS, in a sensible group order (identity / offsets / params / P&L / margin-ROI / underlying context). Good.
+- **Skip-log column set:** 7 cols — run_id, strategy, symbol, expiry, entry/exit_offset, skip_reason. Sufficient for "who got dropped and why" queries.
+- **Forward-compat via tail-extras** in write_results — important so a future column addition doesn't break writes against new-schema data.
+
+**What I tried:**
+- `python -m pytest tests/` → 235/235 in 0.91s.
+- Read [src/engine/results.py](src/engine/results.py) end-to-end.
+
+**Next-commit suggestion:** `feat(p4.4.a): src/strategies/long_straddle.py`. Mostly mechanical — mirror ShortStraddle but with `side="BUY"` and `recommended_strategy_offset_pct = 1.0` (long-only has no SPAN offset benefit per SPECS §4a). Load-bearing test pair: **(a)** ATM selection identical to ShortStraddle (same SPECS §5 rule); **(b)** sign-convention check using the canonical RELIANCE Jan-2024 fixture — short straddle gross +₹1050 (no-slippage) ↔ long straddle gross -₹1050 on the same numbers. Confirms BUY-side P&L is the mirror of SELL-side via the engine's `side_sign`. With slippage applied, the long is hit a bit differently than the short (both directions of trade pay slippage at entry+exit; for long, BUY at entry costs more + SELL at exit gets less, both eating gross), so the simple sign-flip mirror is only exact for no-slippage. Worth pinning both with-and-without-slippage in the test.
+
+Then p4.4.b (ShortStrangle — strike_offset_pct param), p4.4.c (LongStrangle), and p4.4.d (IronCondor + caveat #1 spot-vs-strike margin fix).
+
+---
