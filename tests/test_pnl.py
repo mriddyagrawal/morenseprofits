@@ -233,8 +233,61 @@ def test_returned_schema_matches_results_2_5_subset():
     )
     out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
     expected = {"symbol", "expiry", "entry_date", "exit_date", "strategy",
-                "params_json", "legs_json", "gross_pnl"}
+                "params_json", "legs_json", "gross_pnl",
+                "costs", "net_pnl", "costs_breakdown_json"}
     assert set(out) == expected
+
+
+def test_reliance_jan_2024_full_pipeline_gross_costs_net():
+    """LOAD-BEARING for the wire-up: the same RELIANCE Jan-2024 fixture
+    that pinned gross_pnl=+₹2750 (P&L kernel) AND the cost model's
+    ₹141.78 hand-check — verify they tie together correctly into
+    net_pnl ≈ ₹2608.22 via price_trade. If gross + cost computations
+    drift apart at the wire-up boundary, this fires."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    ce = _option_frame([(entry, 56.50, 250), (exit_, 95.00, 250)])
+    pe = _option_frame([(entry, 50.00, 250), (exit_, 0.50, 250)])
+    load = _stub_load_option({(2600.0, "CE"): ce, (2600.0, "PE"): pe})
+
+    trade = Trade(
+        symbol="RELIANCE", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(
+            Leg("CE", 2600, "SELL", 1),
+            Leg("PE", 2600, "SELL", 1),
+        ),
+        strategy="short_straddle",
+    )
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    assert out["gross_pnl"] == 2750.0
+    assert out["costs"] == pytest.approx(141.780645, abs=1e-3)
+    assert out["net_pnl"] == pytest.approx(2750.0 - 141.780645, abs=1e-3)
+
+
+def test_cost_model_is_injectable_for_sensitivity():
+    """Zero-brokerage variant returns smaller costs; doesn't affect
+    the default singleton — pin the dependency-injection contract."""
+    from src.engine.costs import CostModelV1
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame([(entry, 100.0, 250), (exit_, 10.0, 250)])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    out_default = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    zero_brokerage = CostModelV1(brokerage_per_order=0.0)
+    out_zero = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+                           cost_model=zero_brokerage)
+    # Zero-brokerage saves exactly 2 orders × ₹20 = ₹40 (single-leg trade)
+    # plus the 18% GST that would have applied to that brokerage = ₹7.20
+    assert out_default["costs"] - out_zero["costs"] == pytest.approx(40 + 40*0.18, abs=1e-6)
+    # net_pnl moves by the same delta
+    assert out_zero["net_pnl"] - out_default["net_pnl"] == pytest.approx(40 + 40*0.18, abs=1e-6)
 
 
 # ============================================================

@@ -41,6 +41,7 @@ import pandas as pd
 
 from src.data import options_loader
 from src.data.errors import LookaheadError, MissingDataError
+from src.engine.costs import COST_MODEL_V1, CostModelV1
 from src.strategies.base import Leg, Trade, side_sign
 
 
@@ -133,21 +134,25 @@ def price_trade(
     trade: Trade,
     *,
     load_option_fn: LoadOptionFn = options_loader.load_option,
+    cost_model: CostModelV1 = COST_MODEL_V1,
     today_fn: Callable[[], date] = date.today,
 ) -> dict:
     """Price every leg of ``trade``; return one row in the
-    results-schema (SPECS §2.5) shape.
+    results-schema (SPECS §2.5) shape with `gross_pnl`, `costs`, and
+    `net_pnl` all populated.
 
-    The returned dict has ``gross_pnl`` summed across legs but NO
-    ``costs`` or ``net_pnl`` — those are applied by the caller via
-    ``src/engine/costs.py``. Keeping pricing and costs separate makes
-    cost-model sensitivity analysis (Phase 5) a swap.
+    ``cost_model`` defaults to the project-wide ``COST_MODEL_V1``;
+    Phase-5 sensitivity analysis injects alternate instances without
+    touching the singleton.
     """
     leg_results = [
         _price_one_leg(trade, leg, load_option_fn=load_option_fn, today_fn=today_fn)
         for leg in trade.legs
     ]
     gross = sum(r["gross_pnl"] for r in leg_results)
+    cost_breakdown = cost_model.total_cost(leg_results)
+    costs = float(cost_breakdown["total"])
+    net = float(gross) - costs
     return {
         "symbol": trade.symbol,
         "expiry": trade.expiry,
@@ -157,4 +162,7 @@ def price_trade(
         "params_json": json.dumps(trade.params, sort_keys=True),
         "legs_json": json.dumps(leg_results, sort_keys=True, default=str),
         "gross_pnl": float(gross),
+        "costs": costs,
+        "net_pnl": net,
+        "costs_breakdown_json": json.dumps(cost_breakdown, sort_keys=True),
     }
