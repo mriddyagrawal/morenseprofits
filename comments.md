@@ -1653,3 +1653,39 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** Per the BUILDER's plan, `chore(p2.verify)` next. The strongest single live check: run `classify_momentum(date(2024, 7, 1), blue_chip(date(2024, 7, 1)))` end-to-end against real NSE and assert (a) the three buckets sum to ≤40 (some symbols may be delisted post-2024-07-01 in NSE's archives), (b) exact split sizes for the non-delisted slice (14/13/13 if all 40 resolve), (c) a few hand-verifiable economic constraints — e.g. RELIANCE's classification matches its actual H1-2024 return (rallied → likely bullish); HDFCBANK's classification matches its H1-2024 underperformance (likely non_bullish). Print everything to stderr for human cross-check. Independent reproducibility against the BUILDER's own run is the strongest test we can do before Phase 3 lands.
 
 ---
+
+## Review of 9989967 — chore(p2.verify): live universe classification end-to-end — ALL GREEN
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Live end-to-end verification of Phase 2 — exercise blue_chip + classify_momentum against real NSE, assert top-heavy invariant, determinism, and two hand-verifiable economic constraints.
+
+**What works:**
+- **I ran the script independently — ALL GREEN, byte-identical split** with the BUILDER's reported buckets. Determinism holds across the second call.
+- **Economic plausibility is striking**: PSU/commodity/telco bullish (COALINDIA, ONGC, POWERGRID, SBIN, TATASTEEL, TATAMOTORS, BHARTIARTL); private bank + FMCG non_bullish (HDFCBANK, KOTAKBANK, INDUSINDBK, HINDUNILVR, ITC, NESTLEIND). These line up with what Indian financial press actually reported for H1 2024 — the classifier isn't just internally consistent, it tracks reality.
+- **RELIANCE → bullish, HDFCBANK → non_bullish** — the two hand-checks the BUILDER pinned. Both confirmed live.
+- **Top-heavy invariant**: 14/13/13 verified.
+- Script handles the "drop delisted" path gracefully ([scripts/verify_p2.py:61-64](scripts/verify_p2.py#L61-L64)) — would print a WARN if any of the 40 names dropped (they didn't this time, but the script is robust).
+- **`OK-ISH` branch for HDFCBANK** ([scripts/verify_p2.py:112-115](scripts/verify_p2.py#L112-L115)) is a pragmatic relaxation — `neutral` also accepted since the non_bullish/neutral boundary is a tercile cut. Captures the right level of looseness for a regime classification.
+- 0.8s cold-ish (cache mostly warm from earlier verify runs) vs the BUILDER's 115.6s true-cold. Both reasonable.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **No telemetry / `MORENSE_WARN_ON_FETCH=1` exercise.** A second sub-run with the env var set, on a warm cache, would corroborate that the classifier doesn't make accidental fetches — i.e. the parquet cache really absorbs every load_spot call. Defer.
+- **No assertion that the dropped-symbol list is empty.** The script prints a WARN but exits 0 even if 5 symbols dropped. The "40/40 classify" expectation is implicit. Could tighten with `assert total == 40` if you want a regression block for any future jugaad-archive shrinkage. Defer; the WARN is visible.
+- **Only two economic hand-checks** (RELIANCE bullish, HDFCBANK non_bullish). With more known H1-2024 narratives — TATASTEEL bullish, ASIANPAINT non_bullish — the script could pin 3-4 more. Each adds regression coverage with very little code. Cosmetic.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** classifier delegates to load_spot which is already tested live in Phase 1.
+- **Look-ahead bias:** the classifier uses `load_spot(symbol, lookback_date, as_of)` — bounded above by `as_of`. No leak.
+- **Statistical claims:** tercile cut at 14/13/13 matches the canonical case; the actual buckets are economically sensible.
+
+**What I tried:**
+- `python scripts/verify_p2.py` independently → all 6 sub-checks green; same split as the BUILDER's run.
+
+**PHASE 2 STATUS: DONE.** Universe + momentum classifier work end-to-end on real NSE data with economically validated output. 129 offline tests + 1 live verify all green.
+
+**Next-commit suggestion:** **Phase 3 — short straddle engine.** This is the user's original ask actualized: a backtester that says "if you'd entered this trade on this day, you'd have made/lost ₹X." Per PLAN.md the first commit is `feat(p3): Trade + Leg dataclasses; per-trade P&L kernel`. The **load-bearing decision is the sign convention** — for a SELL leg, `pnl = (entry_price - exit_price) × qty × lot_size`; for BUY it's the opposite. A single sign flip and every backtest is wrong by 100%. Pin in SPECS §4: `pnl_per_leg = (entry - exit) × side_sign × qty × lot_size` where `side_sign("SELL")=+1, side_sign("BUY")=-1`. The **load-bearing test** is a two-leg short-straddle hand-check on the canonical RELIANCE Jan-2024 contract we already pinned in Phase 1: entry T-15 (= Jan-4, ATM 2600), exit T-1 (= Jan-24). CE entry 56.50 (Phase-1 verified), PE entry need-to-fetch; CE exit need-to-fetch (was deep ITM in the integration verify at 102.40 on Jan-25, so Jan-24 should be close), PE exit need-to-fetch. The engine output (gross P&L = (56.50 - CE_exit) + (PE_entry - PE_exit)) × 250 lot should match a hand-computed number. **No look-ahead enforcement**: the engine must reject if any code path inside the trade-pricing kernel reads data with `date > exit_date`. PLAN.md §4.1's hard rule from the start of the project; now we land it.
+
+---
