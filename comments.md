@@ -768,3 +768,36 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Per the BUILDER's note, **`fix(p1.3.1.c): Int64Dtype + force_refresh`** is next. Two micro-decisions to pin BEFORE writing the code: **(1) For `Int64`, you need to update `_assert_specs_2_4_schema` from `dtype.name == "int64"` → accepting either `int64` or `Int64`, AND amend SPECS §2.4 to say "nullable integer (Int64) when upstream blanks are possible; plain int64 otherwise". The semantically right choice IMO is `Int64` for `oi` / `oi_change` (legitimately unknown is meaningful) and `int64` for `contracts` (an absent value means 0 traded, fillna(0) is the truth-preserving move). State this in SPECS so it's not a runtime surprise. (2) `force_refresh=True` must pass `cache.write(..., overwrite=True)` AND the test should assert that with cache present + `force_refresh=True`, `_fetch_raw` is called once (mirrors `spot_loader.test_force_refresh_refetches`). After those land, **immediately** kick off `feat(p1.3.2): expiry_calendar` — the MissingDataError wrap just made the calendar's iteration loop trivial; don't let the followup-bundle grow.
 
 ---
+
+## Review of 765c49d — fix(p1.3.1.b.1): narrow MissingDataError wrap to 404/410; propagate 403/5xx
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Tighten the wrap policy so a stale-UA WAF block (403) or a transient NSE outage (5xx) doesn't masquerade as "no data" during a calendar iteration loop.
+
+**What works:**
+- `_NO_DATA_STATUSES = frozenset({404, 410})` ([src/data/bhavcopy_fo_loader.py:88](src/data/bhavcopy_fo_loader.py#L88)) — explicit allowlist with inline rationale per excluded code (403 → WAF, 5xx → retryable, other 4xx → code bug).
+- Conditional wrap pattern ([src/data/bhavcopy_fo_loader.py:120-125](src/data/bhavcopy_fo_loader.py#L120-L125)) — `if status in _NO_DATA_STATUSES` then wrap, else bare `raise` to propagate the original HTTPError with its traceback intact. Clean.
+- `test_udiff_403_propagates_not_wrapped` ([tests/test_bhavcopy_fo_loader.py:385-398](tests/test_bhavcopy_fo_loader.py#L385-L398)) and `test_udiff_5xx_propagates_not_wrapped` ([tests/test_bhavcopy_fo_loader.py:401-414](tests/test_bhavcopy_fo_loader.py#L401-L414)) pin the policy at both ends — 403 raises HTTPError("403"), 503 raises HTTPError("503"). A future regression that re-broadens the wrap fires both tests.
+- Docstring cleanup removes "post-cutover" / "pre-cutover" from the causes list — those are dispatch errors, not data gaps. Right call.
+- The reasoning in the UDiff docstring ("a calendar build silently skipping every date because the UA went stale would be the worst kind of quiet failure") captures exactly the loud-over-silent mental model.
+- 47/47 pass in 0.34s.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **Asymmetry between legacy and UDiff paths.** Legacy can't distinguish 403/404/5xx because jugaad's `@unzip` swallows them all into `BadZipFile`. So a 403 to jugaad would wrap as MissingDataError — silently. In practice, jugaad has worked for legacy dates for years and the WAF rarely 403s old endpoints; the asymmetry is unlikely to bite. But worth a one-line acknowledgment in the legacy docstring: "if jugaad's underlying response was anything other than a non-trading-day HTML page, the wrap is wrong — but we can't tell from the BadZipFile alone."
+- **`_FakeResp` is inlined in 5 tests now**. Could be a tiny test helper `def _http_resp(status, content=b''):`. Cosmetic — DRY only if a 6th test appears.
+- The 5xx test uses 503 only. 500/502/504 follow the same code path; pinning 503 as the representative is fine, but if you ever switch the policy to "retry 5xx N times" you'll want to test each. Defer.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct — legacy uses NSEArchives, UDiff uses requests directly, no overlap.
+- **Look-ahead bias / options math / stats:** N/A.
+
+**What I tried:**
+- `python -m pytest tests/` → 47/47 in 0.34s.
+- Read the diff; mentally walked through what would happen on a 4xx-not-in-allowlist (e.g. 400) → propagates as raw HTTPError → caller sees code bug. Correct.
+
+**Next-commit suggestion:** Stay on `fix(p1.3.1.c): Int64Dtype + force_refresh` as previously planned. The Int64-vs-int64 split per column from the bc1add4 review still holds (`Int64` for `oi`/`oi_change` — legitimately unknown; `int64` for `contracts` — absent = 0 traded, `fillna(0)` is truth-preserving). One add: with the wrap policy now this tight, the BUILDER may discover during p1.3.2 implementation that NSE's actual missing-date behavior includes **HTTP 200 with a JSON error body** (third format some endpoints do) — keep an eye on that edge case during the p1.3.verify live run and add it as a third wrap site if it bites. For now, no action needed.
+
+---
