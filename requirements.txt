@@ -9,7 +9,10 @@ pyarrow>=15.0.0   # parquet engine
 
 # Web
 streamlit>=1.32.0
-altair>=5.0.0     # streamlit's default chart lib; explicit for clarity
+plotly>=5.20.0    # heatmaps + trend charts; hover-tooltip composition
+                  # via customdata is the killer feature for the research
+                  # UI (per DESIGN_SPEC §2.1). Replaces altair, which was
+                  # never actually imported in src/ or tests/.
 
 # Testing
 pytest>=8.0.0
