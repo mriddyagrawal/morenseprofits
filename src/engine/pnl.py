@@ -149,6 +149,19 @@ def _safe_roi(net: float, margin: float) -> float | None:
     return 100.0 * net / margin
 
 
+def _annualize_roi(roi_pct: float | None, hold_trading_days: int) -> float | None:
+    """Scale holding-period ROI to a 252-trading-day year. SPECS §4a
+    caveat #2: cross-window ranking is meaningless without this — a
+    30-day-hold strategy at 0.65% ROI looks identical in a leaderboard
+    to a 5-day-hold strategy at 0.65% even though the second is 6× the
+    daily rate.
+
+    Returns None if roi_pct is None or hold_trading_days <= 0."""
+    if roi_pct is None or hold_trading_days <= 0:
+        return None
+    return float(roi_pct) * 252.0 / hold_trading_days
+
+
 def price_trade(
     trade: Trade,
     *,
@@ -212,6 +225,16 @@ def price_trade(
         symbol_margin_pct=resolved_symbol_pct,
     )
     margin = float(margin_breakdown["total"])
+
+    # Holding-period vs annualized ROI (SPECS §4a caveat #2). Use
+    # calendar-day count divided by 252/365 ≈ 0.69 as the trading-day
+    # approximation to avoid an import dependency on trading_calendar
+    # for the hot path. For cross-strategy ranking the relative
+    # ordering is what matters; the 252/365 vs 252/365.25 nit is in
+    # the noise.
+    hold_calendar_days = max(1, (trade.exit_date - trade.entry_date).days)
+    hold_trading_days = max(1, round(hold_calendar_days * 252 / 365))
+    roi = _safe_roi(net, margin)
     return {
         "symbol": trade.symbol,
         "expiry": trade.expiry,
@@ -226,5 +249,7 @@ def price_trade(
         "costs_breakdown_json": json.dumps(cost_breakdown, sort_keys=True),
         "margin_at_entry": margin,
         "margin_breakdown_json": json.dumps(margin_breakdown, sort_keys=True),
-        "roi_pct": _safe_roi(net, margin),
+        "roi_pct": roi,
+        "hold_trading_days": hold_trading_days,
+        "roi_pct_annualized": _annualize_roi(roi, hold_trading_days),
     }

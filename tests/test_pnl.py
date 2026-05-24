@@ -242,8 +242,15 @@ def test_returned_schema_matches_results_2_5_subset():
     expected = {"symbol", "expiry", "entry_date", "exit_date", "strategy",
                 "params_json", "legs_json", "gross_pnl",
                 "costs", "net_pnl", "costs_breakdown_json",
-                "margin_at_entry", "margin_breakdown_json", "roi_pct"}
+                "margin_at_entry", "margin_breakdown_json", "roi_pct",
+                "hold_trading_days", "roi_pct_annualized"}
     assert set(out) == expected
+    # New: hold + annualization fields populated
+    assert out["hold_trading_days"] > 0
+    assert out["roi_pct_annualized"] is not None
+    # 252 / hold_trading_days × roi_pct
+    expected_ann = out["roi_pct"] * 252 / out["hold_trading_days"]
+    assert out["roi_pct_annualized"] == pytest.approx(expected_ann, abs=1e-9)
 
 
 def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():

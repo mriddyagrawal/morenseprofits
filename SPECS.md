@@ -223,7 +223,9 @@ One row per closed trade.
 | `net_pnl` | `float64` | `gross_pnl − costs` |
 | `margin_at_entry` | `float64` | capital deposited per `margin_model` (see §4a). Indian options: BUY legs = premium paid; SELL legs = ~20% × strike × shares (SPAN+Exposure approx.) |
 | `margin_breakdown_json` | `string` | per-component map: sell_leg_margin/buy_leg_premium/total |
-| `roi_pct` | `float64\|null` | `100 × net_pnl / margin_at_entry`. Phase-5 ranking depends on this — absolute P&L is misleading when margins differ across strategies |
+| `roi_pct` | `float64\|null` | `100 × net_pnl / margin_at_entry`. Holding-period — NOT annualized. Phase-5 ranking should use `roi_pct_annualized` for cross-window comparison |
+| `hold_trading_days` | `int32` | trading-day count between entry_date and exit_date (`max(1, calendar_days × 252/365)`); approximate but cheap, avoids a trading_calendar dependency on the hot path |
+| `roi_pct_annualized` | `float64\|null` | `roi_pct × 252 / hold_trading_days`. The fair cross-window metric — a 5-day-hold strategy at 0.5% beats a 30-day-hold strategy at 0.5% in this column even though they look identical in `roi_pct` |
 | `notional_at_entry` | `float64` | underlying spot × total lot exposure (added by sweeper, not the kernel) |
 | `entry_spot` | `float64` | spot close on entry_date (added by sweeper) |
 | `exit_spot` | `float64` | spot close on exit_date (added by sweeper) |
