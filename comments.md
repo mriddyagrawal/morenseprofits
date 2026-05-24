@@ -644,3 +644,54 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Before writing any parser code in `feat(p1.3.1)`, **pin the column-mapping table in SPECS §2.4** — one table per format, each row `(upstream column) → (§2.4 column) [transform]`. That makes the parser a mechanical translation, not a judgment call mid-implementation. The two non-obvious mappings to spell out: (a) legacy `CLOSE` → `close` and `SETTLE_PR` → `settle_price`, UDiff `ClsPric` → `close` and `SttlmPric` → `settle_price` — verified consistent across both formats (option's daily settle, which on expiry day equals reference value for ITM contracts); (b) UDiff `FinInstrmTp` codes (`STO`/`IDO`/`STF`/`IDF`) map 1:1 to legacy `OPTSTK`/`OPTIDX`/`FUTSTK`/`FUTIDX`, and §2.4 stores the legacy form as the canonical. With that table in SPECS, the parser is ~80 lines and the test suite asserts the table row-for-row.
 
 ---
+
+## Review of f5ff10c — feat(p1.3.1): bhavcopy_fo_loader — dual-format dispatch + SPECS §2.4 normalize
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement the F&O bhavcopy loader as a fetcher/parser split that dispatches by trade_date (legacy < 2024-07-08 < UDiff) and normalizes both upstream schemas to SPECS §2.4. Cache per-date.
+
+**What works:**
+- Fetcher/parser split exactly as suggested ([src/data/bhavcopy_fo_loader.py:73-100](src/data/bhavcopy_fo_loader.py#L73-L100) for fetcher, [src/data/bhavcopy_fo_loader.py:126-229](src/data/bhavcopy_fo_loader.py#L126-L229) for parsers). Parsers are public so fixture-driven tests can drive them with no network mock.
+- `_udiff_start_date()` pulls from `NSEArchives.udiff_start_date` ([src/data/bhavcopy_fo_loader.py:77-80](src/data/bhavcopy_fo_loader.py#L77-L80)) — lockstep with upstream.
+- `src/data/errors.py` is the right shape for a centralized DataError taxonomy.
+- **Trade-date stamp + upstream-match assertion** ([src/data/bhavcopy_fo_loader.py:138-143](src/data/bhavcopy_fo_loader.py#L138-L143) legacy, [src/data/bhavcopy_fo_loader.py:181-185](src/data/bhavcopy_fo_loader.py#L181-L185) udiff) — catches mis-dispatched fetches loudly. Verified: passing `date(2024,1,26)` with the Jan-25 fixture raises a clear `BhavcopyFormatError`.
+- **Format-marker sniffing** ([src/data/bhavcopy_fo_loader.py:63-64](src/data/bhavcopy_fo_loader.py#L63-L64)) — subset-based, allows benign upstream column additions without flipping into `BhavcopyFormatError`. Right balance.
+- **XpryDt vs FininstrmActlXpryDt divergence warning** is **file-level granularity** ([src/data/bhavcopy_fo_loader.py:188-195](src/data/bhavcopy_fo_loader.py#L188-L195)) with a count and a "likely holiday-shifted" interpretation. Closes the aggregation-level flag I raised on 50a2bc9.
+- **TtlTradgVol semantic verified during implementation** ([src/data/bhavcopy_fo_loader.py:207-211](src/data/bhavcopy_fo_loader.py#L207-L211)) — comment shows the BUILDER caught and corrected a "divide by lot" assumption by checking against a known row (RELIANCE 2840CE, 26 contracts × ~3024 notional/contract ≈ 78k, TtlTrfVal=19.6M = underlying notional). That's the verify-as-you-go pattern paying off.
+- **End-to-end verification (mine, against fixtures):**
+  - Legacy 35-row fixture → 14-col §2.4 frame. All dtypes match (`string`, `datetime64[us]`, `float64`, `int64`).
+  - RELIANCE 1900 CE legacy hand-check ✓: `close=804.0, contracts=1, oi=250, oi_change=250, settle_price=2706.25`.
+  - UDiff fixture → same 14-col §2.4 frame.
+  - RELIANCE 2840 CE UDiff hand-check ✓: `close=201.7, oi=41500, oi_change=-1500, contracts=26`.
+  - RELIANCE expiries from Aug-29 UDiff: `['2024-08-29','2024-09-26','2024-10-31']` — material for p1.3.2's calendar build.
+  - Corrupt header → `BhavcopyFormatError` listing missing required cols.
+  - Off-by-one trade_date → `BhavcopyFormatError`.
+  - Parquet round-trip preserves `datetime64[us]`.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`.astype("int64")` on `contracts/oi/oi_change` is brittle to upstream NaN.** Today's fixtures have no blanks but a future upstream row with a missing `CONTRACTS` would `IntCastingNaNError`. Either use `pd.Int64Dtype()` (nullable) or `.fillna(0).astype("int64")` with a warning. SPECS §2.4 says `int64`, so the choice is between strict + brittle vs nullable. Pick deliberately, document in SPECS.
+- **Weekend/holiday fetches not translated to `MissingDataError`.** `load_bhavcopy_fo(date(2024,7,7))` (a Sunday) would raise raw `HTTPError` from requests or `BadZipFile` from jugaad. Wrap both in `MissingDataError` so Phase 2/3 callers have one catch.
+- **Asymmetric upstream caching**: legacy goes through `NSEArchives().bhavcopy_fo_raw` which hits jugaad's internal pickle cache (`J_CACHE_DIR`); UDiff goes through bare `requests.get` (no upstream cache). Functionally fine because our parquet cache is in front of both — but worth noting for the upcoming cache-hit telemetry chore (p1.7) that a "cold from our cache, warm from jugaad" hit is possible only on the legacy path.
+- **Browser UA pinned to Chrome 134** ([src/data/bhavcopy_fo_loader.py:52-55](src/data/bhavcopy_fo_loader.py#L52-L55)) — when NSE bumps WAF strictness this'll start 403ing. Worth a one-line "if you start seeing 403s, bump this" inline comment beyond the existing "Don't strip 'to be tidy'".
+- **Divergence-warning code path is reachable but untested** in the recorded fixture (the Aug-29 bhavcopy happens to have 0 divergences). The next test commit MUST include a synthetic fixture with one `XpryDt != FininstrmActlXpryDt` row.
+- **Default `cache.write(path, df)` call** in `load_bhavcopy_fo` ([src/data/bhavcopy_fo_loader.py:247](src/data/bhavcopy_fo_loader.py#L247)) uses `overwrite=False`. On a cold call, path doesn't exist, write succeeds. On a re-fetch (force-refresh scenario), it'd `WouldOverwriteError`. Pin a `force_refresh: bool = False` kwarg now to mirror `spot_loader.load_spot` — or commit to the manual `rm` path. Doctrinal call.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct on both paths. `NSEArchives.udiff_start_date` accessed at class level.
+- **Options math:** `strike: NaN` for futures rows, `option_type: <NA>` for futures rows — both verified in the data; means downstream `df[df["instrument"]=="OPTSTK"]` filters cleanly.
+- **Look-ahead bias:** `trade_date` stamped from request, so a bhavcopy can't be backdated by accident; SPECS §2.4's "consumers filter `trade_date ≤ entry_date`" rule still applies at the engine.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- Ran `parse_legacy` and `parse_udiff` on the recorded fixtures.
+- RELIANCE 1900 CE legacy + RELIANCE 2840 CE UDiff hand-checks against the raw fixture lines.
+- Corrupt-header negative test.
+- Off-by-one trade_date negative test.
+- Parquet round-trip via `to_parquet`/`read_parquet`.
+
+**Next-commit suggestion:** `test(p1.3.1)` — the **load-bearing test pair**: (1) `test_load_bhavcopy_fo_cache_hit` — call `load_bhavcopy_fo` twice with the same `trade_date`; monkeypatch `_fetch_raw` to **raise** on the second call; assert the second call succeeds purely from parquet. Without this, a regression that drops the `cache.exists` short-circuit would silently re-fetch every call (and Phase 2/3 sweeps would melt your laptop). (2) `test_holiday_shifted_expiry_warns` — construct a **synthetic UDiff CSV** with one row where `XpryDt != FininstrmActlXpryDt` (mutate one row of the recorded fixture); assert exactly one `UserWarning` with the divergence count, and assert the output `expiry` column carries `FininstrmActlXpryDt` for that row. The warning path is currently reachable-but-untested. The two together cover the highest-blast-radius behaviors not already verified end-to-end above.
+
+---
