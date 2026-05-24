@@ -277,13 +277,15 @@ def classify_momentum(
     as_of: date,
     universe: list[str],
     *,
-    lookback_months: int = 6,
+    lookback_trading_days: int = 126,
     today_fn: Callable[[], date] = date.today,
     offline: bool = False,
 ) -> dict[str, list[str]]:
     """Returns {"bullish": [...], "neutral": [...], "non_bullish": [...]}.
-    Each list sorted alphabetically. Splits by trailing-return terciles
-    per SPECS §6b.2."""
+    Each list sorted alphabetically. Tercile split (top-heavy for n=40:
+    bullish=14, neutral=13, non_bullish=13). Lookback in *trading days*
+    via offset_trading_days to dodge the calendar-month holiday trap.
+    Delisted symbols dropped with a warning. See SPECS §6b.2."""
 
 # src/strategies/base.py
 @dataclass(frozen=True)
@@ -391,16 +393,33 @@ evaluated as-of 2024-07-01" even when run later.
 
 ### 6b.2 Momentum (v1)
 
-`classify_momentum(as_of, universe, lookback_months=6) -> dict`:
+`classify_momentum(as_of, universe, *, lookback_trading_days=126, today_fn=date.today, offline=False) -> dict`:
 
-  - For each symbol in `universe`, compute trailing return:
-    `(spot.close[as_of] - spot.close[as_of - lookback_months]) / spot.close[as_of - lookback_months]`
-  - Sort symbols by trailing return descending.
-  - Top third (terciles, ties broken by symbol name ascending) →
-    `"bullish"`; middle third → `"neutral"`; bottom third →
-    `"non_bullish"`.
-  - Returns `{"bullish": [...], "neutral": [...], "non_bullish": [...]}`,
+  - **Lookback expressed in trading days, not calendar months.** Default
+    126 ≈ 6 calendar months × 21 trading days. This sidesteps the
+    "lookback date lands on a NSE holiday → load_spot returns 0 rows →
+    divide-by-zero" trap that a naive `as_of - 6 months` produces.
+    Implementation: `lookback_date = offset_trading_days(as_of, lookback_trading_days)`.
+  - **Anchor close.** The two closes for the return calculation come
+    from `load_spot(symbol, lookback_date, as_of)`; we pick the row
+    with the largest date ≤ `as_of` for the numerator and the row with
+    the smallest date ≥ `lookback_date` for the denominator. Both are
+    trading-day rows by construction.
+  - **Trailing return**: `(close_at_as_of - close_at_lookback) / close_at_lookback`.
+  - **Tercile split** (n = len(universe), e.g. 40):
+    - bullish  = top `ceil(n/3)` by return descending (40 → 14)
+    - non_bullish = bottom `floor(n/3)` (40 → 13)
+    - neutral = the middle remainder (40 → 13)
+    The top-heavy convention gives the higher-conviction bucket the
+    larger sample. Ties broken by symbol-name ascending.
+  - **Output**: `{"bullish": [...], "neutral": [...], "non_bullish": [...]}`,
     each list sorted alphabetically for determinism.
+  - **Delisted / renamed symbols** (LOAD-BEARING): if `load_spot` raises
+    `MissingDataError` for a universe symbol, the classifier **drops it
+    with a `warnings.warn(...)` naming the symbol** and proceeds with
+    the remaining universe. One stale name in `blue_chip` must not
+    break the whole classifier. `OfflineCacheMiss` is NOT swallowed
+    (per the SPECS §6a distinct-class rule) — propagates.
 
 ### 6b.3 SURVIVORSHIP BIAS (load-bearing caveat)
 
