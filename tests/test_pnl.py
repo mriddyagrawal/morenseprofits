@@ -234,16 +234,22 @@ def test_returned_schema_matches_results_2_5_subset():
     out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
     expected = {"symbol", "expiry", "entry_date", "exit_date", "strategy",
                 "params_json", "legs_json", "gross_pnl",
-                "costs", "net_pnl", "costs_breakdown_json"}
+                "costs", "net_pnl", "costs_breakdown_json",
+                "margin_at_entry", "margin_breakdown_json", "roi_pct"}
     assert set(out) == expected
 
 
-def test_reliance_jan_2024_full_pipeline_gross_costs_net():
-    """LOAD-BEARING for the wire-up: the same RELIANCE Jan-2024 fixture
-    that pinned gross_pnl=+₹2750 (P&L kernel) AND the cost model's
-    ₹141.78 hand-check — verify they tie together correctly into
-    net_pnl ≈ ₹2608.22 via price_trade. If gross + cost computations
-    drift apart at the wire-up boundary, this fires."""
+def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():
+    """LOAD-BEARING for the full financial picture: all THREE layers
+    tied together on the canonical RELIANCE Jan-2024 short straddle.
+
+    Expected from prior hand-checks:
+      gross_pnl  = +₹2,750     (P&L kernel)
+      costs      = ~₹141.78    (COST_MODEL_V1, SPECS §4)
+      net_pnl    = ~₹2,608.22
+      margin     = ₹2,60,000   (MARGIN_MODEL_V1, SPECS §4a; 2 × 0.20 × 2600 × 250)
+      roi_pct    = ~+1.00 %    (net_pnl / margin × 100)
+    """
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     ce = _option_frame([(entry, 56.50, 250), (exit_, 95.00, 250)])
@@ -262,7 +268,9 @@ def test_reliance_jan_2024_full_pipeline_gross_costs_net():
     out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
     assert out["gross_pnl"] == 2750.0
     assert out["costs"] == pytest.approx(141.780645, abs=1e-3)
-    assert out["net_pnl"] == pytest.approx(2750.0 - 141.780645, abs=1e-3)
+    assert out["net_pnl"] == pytest.approx(2608.219, abs=1e-3)
+    assert out["margin_at_entry"] == 260_000.0  # 2 × 0.20 × 2600 × 250
+    assert out["roi_pct"] == pytest.approx(100 * 2608.219 / 260_000.0, abs=1e-3)
 
 
 def test_cost_model_is_injectable_for_sensitivity():

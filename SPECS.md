@@ -217,12 +217,16 @@ One row per closed trade.
 | `exit_offset_td` | `int32` | trading days before expiry on exit (positive; 0 = expiry day) |
 | `params_json` | `string` | strategy-specific knobs (e.g. strike_offset_pct) |
 | `legs_json` | `string` | list of {strike, type, side, qty, entry_px, exit_px, lot_size} |
-| `gross_pnl` | `float64` | sum of (entry_px − exit_px) × side × qty × lot_size |
-| `costs` | `float64` | applied per cost model |
-| `net_pnl` | `float64` | gross − costs |
-| `notional_at_entry` | `float64` | underlying spot × total lot exposure |
-| `entry_spot` | `float64` | spot close on entry_date |
-| `exit_spot` | `float64` | spot close on exit_date |
+| `gross_pnl` | `float64` | sum of (entry_px − exit_px) × side × qty × lot_size per SPECS §3a |
+| `costs` | `float64` | total frictional fees per `cost_model` (see §4) |
+| `costs_breakdown_json` | `string` | per-component map: brokerage/stt/exchange/gst/sebi/stamp_duty/total |
+| `net_pnl` | `float64` | `gross_pnl − costs` |
+| `margin_at_entry` | `float64` | capital deposited per `margin_model` (see §4a). Indian options: BUY legs = premium paid; SELL legs = ~20% × strike × shares (SPAN+Exposure approx.) |
+| `margin_breakdown_json` | `string` | per-component map: sell_leg_margin/buy_leg_premium/total |
+| `roi_pct` | `float64\|null` | `100 × net_pnl / margin_at_entry`. Phase-5 ranking depends on this — absolute P&L is misleading when margins differ across strategies |
+| `notional_at_entry` | `float64` | underlying spot × total lot exposure (added by sweeper, not the kernel) |
+| `entry_spot` | `float64` | spot close on entry_date (added by sweeper) |
+| `exit_spot` | `float64` | spot close on exit_date (added by sweeper) |
 
 ## 3. Public function signatures (frozen interfaces — change requires PLAN.md change-log entry)
 
@@ -389,6 +393,50 @@ For Indian equity options, per leg, per round trip:
 | Stamp duty | buy side only | 0.003% of premium turnover |
 
 A `params: dict | None = None` argument lets the engine pass a different cost model for sensitivity analysis. Default behavior never changes silently.
+
+## 4a. Margin model (Indian options-specific, frozen)
+
+Margin is **capital that must be deposited as collateral** while a
+position is open. Distinct from costs (frictional outflows). The trade's
+P&L is *unrelated* to margin; ROI = `net_pnl / margin_at_entry` is
+how cross-strategy comparison happens (Phase 5 ranking depends on this).
+
+NSE F&O rules drive the asymmetry between BUY and SELL legs:
+
+- **BUY leg** (long option): pay the full premium upfront. That premium
+  IS the max possible loss, and serves as the margin. No additional
+  block. `margin_per_buy_leg = entry_premium × qty_lots × lot_size`.
+- **SELL leg** (short option, naked): receive the premium as credit
+  but block **SPAN + Exposure margin** because losses are theoretically
+  unlimited. Real SPAN math depends on volatility + NSE's daily SPAN
+  file; we approximate with a constant fraction of underlying notional.
+  `margin_per_sell_leg ≈ SPAN_PCT × strike × qty_lots × lot_size`
+  where `SPAN_PCT ≈ 0.20` (covers SPAN ~13-18% + Exposure ~3-5%).
+
+For multi-leg strategies (short straddle, iron condor, ...) real SPAN
+benefits from the partial offset between legs — a true short straddle
+margin is LESS than the sum of two naked-short margins because one
+leg's gain caps the other's loss. **Our v1 approximation sums per-leg
+margins**, which is **conservative** (overstates margin slightly,
+making backtests look slightly worse than real, which is the
+safer direction for a paper-trade-then-live-trade pipeline).
+
+`MARGIN_MODEL_V1`:
+
+| concept | rule |
+|---|---|
+| BUY leg | `entry_premium × qty × lot_size` (max loss = premium paid) |
+| SELL leg | `0.20 × strike × qty × lot_size` (SPAN + Exposure approx.) |
+| trade total | sum of per-leg margins (conservative for multi-leg) |
+
+**Calibration hand-check**: RELIANCE 2600 short straddle, lot 250, 1 lot
+each side → SELL CE: `0.20 × 2600 × 250 = ₹1,30,000`. SELL PE: same
+₹1,30,000. Sum = **₹2,60,000**. Real broker block for this position
+is typically ₹1.4–1.7L (one-leg-offset benefit applies in SPAN),
+so our ₹2.6L approximation is ~1.6× generous. Acceptable for v1.
+
+Phase 7 backlog: parse NSE's daily SPAN file for accurate margin.
+Until then, `MARGIN_MODEL_V1` is what every backtest uses.
 
 ## 5. ATM strike selection rule (frozen)
 

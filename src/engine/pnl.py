@@ -42,6 +42,7 @@ import pandas as pd
 from src.data import options_loader
 from src.data.errors import LookaheadError, MissingDataError
 from src.engine.costs import COST_MODEL_V1, CostModelV1
+from src.engine.margin import MARGIN_MODEL_V1, MarginModelV1
 from src.strategies.base import Leg, Trade, side_sign
 
 
@@ -130,29 +131,40 @@ def _price_one_leg(
     }
 
 
+def _safe_roi(net: float, margin: float) -> float | None:
+    """Return on capital, %. None if margin is zero (avoid div-by-zero —
+    a trade with zero margin is impossible in practice but defensive)."""
+    if margin <= 0:
+        return None
+    return 100.0 * net / margin
+
+
 def price_trade(
     trade: Trade,
     *,
     load_option_fn: LoadOptionFn = options_loader.load_option,
     cost_model: CostModelV1 = COST_MODEL_V1,
+    margin_model: MarginModelV1 = MARGIN_MODEL_V1,
     today_fn: Callable[[], date] = date.today,
 ) -> dict:
     """Price every leg of ``trade``; return one row in the
-    results-schema (SPECS §2.5) shape with `gross_pnl`, `costs`, and
-    `net_pnl` all populated.
+    results-schema (SPECS §2.5) shape with the full financial picture:
+    `gross_pnl`, `costs`, `net_pnl`, `margin_at_entry`, and `roi_pct`
+    (net_pnl / margin × 100).
 
-    ``cost_model`` defaults to the project-wide ``COST_MODEL_V1``;
-    Phase-5 sensitivity analysis injects alternate instances without
-    touching the singleton.
+    ``cost_model`` / ``margin_model`` default to the project singletons;
+    Phase-5 sensitivity injects alternate instances without touching them.
     """
     leg_results = [
         _price_one_leg(trade, leg, load_option_fn=load_option_fn, today_fn=today_fn)
         for leg in trade.legs
     ]
-    gross = sum(r["gross_pnl"] for r in leg_results)
+    gross = float(sum(r["gross_pnl"] for r in leg_results))
     cost_breakdown = cost_model.total_cost(leg_results)
     costs = float(cost_breakdown["total"])
-    net = float(gross) - costs
+    net = gross - costs
+    margin_breakdown = margin_model.estimate(leg_results)
+    margin = float(margin_breakdown["total"])
     return {
         "symbol": trade.symbol,
         "expiry": trade.expiry,
@@ -161,8 +173,11 @@ def price_trade(
         "strategy": trade.strategy,
         "params_json": json.dumps(trade.params, sort_keys=True),
         "legs_json": json.dumps(leg_results, sort_keys=True, default=str),
-        "gross_pnl": float(gross),
+        "gross_pnl": gross,
         "costs": costs,
         "net_pnl": net,
         "costs_breakdown_json": json.dumps(cost_breakdown, sort_keys=True),
+        "margin_at_entry": margin,
+        "margin_breakdown_json": json.dumps(margin_breakdown, sort_keys=True),
+        "roi_pct": _safe_roi(net, margin),
     }
