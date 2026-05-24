@@ -130,10 +130,21 @@ normalized lowercase; raw upstream uses uppercase):
 | `oi_change` | `int64` | change in OI |
 | `trade_date` | `date` | the date the bhavcopy represents (== the filename) |
 
+**Date dtype contract.** `expiry` and `trade_date` are stored on disk as
+`datetime64[us]` (matches the post-parquet-roundtrip dtype the spot loader
+already settled on per §2.1). Any public API that promises a `date` exposes
+these via `.dt.date`. Pinning this here so the p1.3.1 parser doesn't pick a
+third variant silently.
+
+**Look-ahead bias contract.** The bhavcopy is dated by `trade_date`. Engine
+consumers that join bhavcopy rows into a backtest **must** filter
+`trade_date ≤ entry_date` at use time — Phase 3's backtester enforces this.
+
 **Format compatibility note.** Per jugaad-data docs `bhavcopy_fo_raw` handles
 both pre-Jul-8-2024 (BHAVDATA-FULL CSV) and ≥Jul-8-2024 (UDiff) formats
-transparently. We must verify this in `bhavcopy_fo_loader` tests for at least
-one date on each side of the cutover.
+transparently. p1.3.1 tests verify this against **recorded byte-for-byte
+fixtures** on each side of the cutover, not live calls (live tests are
+skipped by default per `pytest.ini`).
 
 ### 2.5 Results — `data/results/{strategy}_{run_id}.parquet`
 One row per closed trade.
@@ -268,6 +279,7 @@ Loaders accept an optional `offline: bool = False` keyword (default off). When T
 
 - Caches are **append-mostly**. We never overwrite a parquet that contains real historical data unless `--force-refresh` is passed via CLI.
 - Schema changes bump a `CACHE_VERSION` constant in `src/data/cache.py`; on bump, the cache directory is moved to `data/cache.v{N-1}/` (manual cleanup, never automatic deletion).
+- **Additive vs breaking.** Adding a new schema family (e.g. §2.4 bhavcopy_fo added in p1.3.0) does **not** bump `CACHE_VERSION` — existing on-disk data is unaffected. Only a change to an *existing* schema's column set or dtypes triggers a bump.
 
 ## 8. Error taxonomy
 

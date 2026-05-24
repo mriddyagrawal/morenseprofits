@@ -98,7 +98,8 @@ Steps (one commit each):
 13. `test(p1.4): options_loader schema + cache-hit test against fixture`
 14. `feat(p1.5): data/trading_calendar.py — trading_days() + offset_trading_days() built on RELIANCE spot + jugaad holidays overlay`
 15. `test(p1.5): trading_calendar correctness — offset(expiry, 0) == expiry, monotonic, etc.`
-16. `chore(p1): offline-mode kwarg on every loader + cache-hit telemetry`
+16. `chore(p1.6): offline-mode kwarg on every loader (behavior contract per SPECS §6a)`
+17. `chore(p1.7): cache-hit telemetry — warn when a sweep accidentally hits the network`
 
 Exit criteria:
 - Second call to any loader is < 50ms (disk hit, no network).
