@@ -3306,6 +3306,113 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 5b88215 — feat(p6.3.pivot): dual Plotly heatmaps — value (RdYlGn diverging) + density (Blues)
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Visual centerpiece of the Heatmap tab. Two side-by-side Plotly heatmaps: value pane (median ROI/yr per (entry, exit) cell, RdYlGn diverging) + density pane (n_trades per cell, Blues sequential). Thin cells masked in the value pane via `pivot_window.where(pivot_counts >= min_n)`. Empty-state branches use the canonical `render_empty` reason keys.
+
+**What works:**
+
+- **DESIGN_SPEC §2.3 colormap mandate honored unconditionally**:
+  - **Value pane**: `colorscale="RdYlGn"` + `zmid=0` ([src/web/heatmap.py:244-245](src/web/heatmap.py#L244-L245)). Diverging: red = loss, white = breakeven, green = profit. Per §2.3 this is required EVEN when all current cells are positive — a future negative cell on a later sweep would otherwise mid-color in green and mislead.
+  - **Density pane**: `colorscale="Blues"` + `zmin=0` ([src/web/heatmap.py:271-272](src/web/heatmap.py#L271-L272)). Sequential; 0 = white. The right semantic for counts (no "negative count" possible).
+- **🔬 Colormap fingerprints pinned by tests** ([tests/test_web_heatmap.py:217-256](tests/test_web_heatmap.py#L217-L256)):
+  - `test_value_pane_uses_diverging_rdylgn_colormap` checks first RGB stop `rgb(165,0,38)` (deep red) and last `rgb(0,104,55)` (deep green).
+  - `test_density_pane_uses_sequential_blues` checks first `rgb(247,251,255)` (near-white) and last `rgb(8,48,107)` (deep blue).
+  **Anti-version-drift discipline**: a future Plotly upgrade that silently changes the default RdYlGn / Blues palette will fail the tests, surfacing the regression. The reviewer would have to check whether the new palette still honors §2.3 (diverging) before merging. ✓ Excellent.
+- **Both panes share orientation per §2.2**: index = entry_offset_td DESC (T-15 top, T-1 bottom), columns = exit_offset_td DESC (T-3 left, T-1 right). Axis tick labels formatted as "T-N" via `_format_offset_label` so the operator reads "T-15 at entry, T-3 at exit" naturally.
+- **Cell value annotation on the value pane** ([src/web/heatmap.py:248-253](src/web/heatmap.py#L248-L253)) — visible cells show their rounded value `f"{val:.0f}%/yr"`; masked cells get blank text. Uses the `value_z[i][j] == value_z[i][j]` NaN-check idiom (consistent with `format_pct`'s pattern).
+- **Cell count annotation on the density pane** ([src/web/heatmap.py:273-276](src/web/heatmap.py#L273-L276)) — non-zero cells show their int count; zero cells get blank text.
+- **`hoverongaps=False`** on both panes — masked cells don't fire hover tooltips. ✓ No "hover on blank → no data" confusion.
+- **Empty-state branches**:
+  - 0 filtered rows → `render_empty("leaderboard_no_rows_after_filters")` ([src/web/heatmap.py:201-203](src/web/heatmap.py#L201-L203))
+  - selectors None → same reason key
+  - `values.empty` (selector picked pair with zero data) → inline `st.info("No (entry × exit) cells available for X × Y. Pick another pair.")` ([src/web/heatmap.py:210-215](src/web/heatmap.py#L210-L215))
+  - `n_entry < 2 OR n_exit < 2` → `render_empty("heatmap_single_axis", n_entry=N, n_exit=N)` ([src/web/heatmap.py:217-224](src/web/heatmap.py#L217-L224))
+  - Every cell masked → `render_empty("heatmap_all_masked", min_n=N)` ([src/web/heatmap.py:229-232](src/web/heatmap.py#L229-L232))
+- **Partial-mask path renders BOTH panes AND a footer caption** ([src/web/heatmap.py:298-306](src/web/heatmap.py#L298-L306)) — "X cell(s) masked from the value pane at min_n=K (still visible in the density pane). Lower the threshold via the sidebar slider to inspect thin cells." **The density pane IS the diagnostic** — operator sees the count in the cell, sees the value pane is blank for that cell, knows why. Composable transparency.
+- **`st.columns(2)` for the side-by-side layout** ([src/web/heatmap.py:291](src/web/heatmap.py#L291)) + `st.plotly_chart(..., use_container_width=True)` — Plotly figures expand to their column width naturally.
+- **6 new tests** covering: both-panes-render, RdYlGn fingerprint, Blues fingerprint, single-axis empty-state, all-masked empty-state, partial-mask caption count. 448/448 full suite (was 442 + 6).
+
+**Live-tested** (with `importlib.reload` to clear stale Python module cache from earlier imports):
+
+```
+Test 1: min_n=5 verify-set default → 0 plotly figures rendered;
+  render_empty('heatmap_all_masked', min_n=5) called. ✓ Honest report.
+
+Test 2: min_n=1 → 2 plotly figures rendered:
+  Figure 0: title='Median ROI/yr', colorscale=RdYlGn diverging
+    First stop: rgb(165,0,38) deep red; last: rgb(0,104,55) deep green
+  Figure 1: title='Sample density (trades per cell)', colorscale=Blues
+    First stop: rgb(247,251,255) near-white; last: rgb(8,48,107) deep blue
+```
+
+Confirmed §2.3 colormap mandate is operational at runtime.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Cell annotation format spec is `:.0f` (unsigned)** ([src/web/heatmap.py:249](src/web/heatmap.py#L249)) — `f"{val:.0f}%/yr"` renders +247.92 as "248%/yr" (no `+` sign). The **headline cards** from a7e0baf use `format_pct(signed=True)` which renders as "+247.9%/yr". **Format inconsistency** between the heatmap cell annotations and the headline cards. **Three options**:
+   - Add `+` to the heatmap cell format: `f"{val:+.0f}%/yr"` → "+248%/yr". Consistent with cards.
+   - Drop `+` from cards too. Inconsistent.
+   - Document the asymmetry: "heatmap cells use unsigned format because the colormap (red/green) carries the sign signal visually; cards use signed format because they're textual-only."
+   
+   **My lean**: option 3 (docstring note) since the colormap IS the sign signal in the heatmap. The unsigned format keeps annotations compact in narrow cells. **OR** add `+` for consistency. Cosmetic; visible to operators; worth a Phase 6.3 polish decision.
+
+2. **`if len(df) == 0` AND `if strategy is None or symbol is None` BOTH route to `leaderboard_no_rows_after_filters`** ([src/web/heatmap.py:201-206](src/web/heatmap.py#L201-L206)) — uses the leaderboard-prefixed reason key as the canonical "no data" message. **Acceptable** (the message text is generic enough to apply to any tab), but the prefix suggests it's leaderboard-specific. **Better long-term**: add a tab-agnostic `no_rows_after_filters` reason key to `empty_state.py` and use it across tabs. Cosmetic.
+
+3. **`if values.empty:` branch uses inline `st.info(...)` instead of `render_empty`** ([src/web/heatmap.py:210-215](src/web/heatmap.py#L210-L215)) — the empty_state module doesn't have a reason key for "selector picked a pair with no cells" (the closest is `per_stock_no_trades` but that's wrong semantically). **Could add a `heatmap_no_cells_for_pair` reason key** for canonical messaging. Inline `st.info` works but breaks the §2.6 "every empty-state goes through render_empty" pattern. Cosmetic.
+
+4. **Footer caption only fires when `n_masked > 0`** ([src/web/heatmap.py:300](src/web/heatmap.py#L300)) — when all cells are visible (no masking), no footer. When ALL are masked, the function early-returns before the chart-render so no footer either. **Only the partial-mask case shows the footer.** Sensible — operators don't need a "0 cells masked" caption.
+
+5. **Chart `height=400` hardcoded** ([src/web/heatmap.py:261, 286](src/web/heatmap.py#L261-L286)) — might look cramped on a wide 3x6 grid (6 entry offsets × 6 exit offsets) but fine for the current 3x2 verify set. Visual-check during chore(p6.3.verify). Cosmetic.
+
+6. **`textfont={"size": 12}`** — same on both panes. Defensible. Worth verifying readability against the dark theme (per DESIGN_SPEC §2.3) — light text on the deep-color cells should still be legible. Visual-check.
+
+7. **`colorbar={"title": "%/yr", "x": 1.02}`** ([src/web/heatmap.py:254](src/web/heatmap.py#L254)) — colorbar title is "%/yr" which matches the cell annotation unit. The `x=1.02` positions the colorbar just outside the plot area. Consistent.
+
+8. **The committed 5b88215 does NOT include `_build_customdata` or any customdata hooks** — those are coming in `feat(p6.3.hover)` (commit 17). I observed BUILDER's working tree already has the function defined + the customdata wired into the Heatmap calls (in-flight for the next commit). **My initial live-test crashed on a stale Python module cache**; after `importlib.reload(src.web.heatmap)` everything ran cleanly. **Note for self**: when reviewing a commit and live-testing, clear module caches if I've imported the module earlier in the same shell session.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ thin-cell masking honored; partial-mask footer explicitly tells the operator how many cells were masked and what to do about it.
+- **Diverging colormap mandate**: ✓ `RdYlGn` + `zmid=0` pinned by both code AND a test that checks the RGB fingerprint.
+- **Min_n flows top-down per SPECS §11.5**: ✓ sidebar → app.py → render_heatmaps kwarg.
+- **§2.2 contract**: ✓ value heatmap masked via `pivot_window.where(pivot_counts >= min_n)`; density heatmap shows raw counts.
+- **§2.6 empty-state**: ✓ 3 of 4 empty paths use canonical render_empty; `values.empty` uses inline `st.info` (minor inconsistency, flagged).
+- **Determinism**: ✓ pivot_window output is deterministic; PNG render is deterministic at the data-level (Plotly's rasterization isn't bit-deterministic but the underlying numeric grids are).
+
+**What I tried:**
+- `git show 5b88215:src/web/heatmap.py` — read the actual committed version (without `_build_customdata` from the in-flight p6.3.hover work).
+- Read all 12 tests in `tests/test_web_heatmap.py`.
+- Live-tested with `importlib.reload(src.web.heatmap)` to clear cached module state.
+- Verified colormap fingerprints at runtime (RdYlGn diverging; Blues sequential).
+- Cross-checked all 4 empty-state branches.
+- `pytest tests/test_web_heatmap.py -v` → 12/12.
+- `pytest tests/` → 448/448.
+
+**Sequencing observation:** Phase 6.3 progressing on plan:
+- ✅ p6.3.headline (a7e0baf)
+- ✅ p6.3.pivot (5b88215, this commit)
+- 🔄 p6.3.hover (in-flight in working tree — I observed `_build_customdata` already defined locally, customdata + hovertemplate wired)
+
+The working-tree changes for p6.3.hover look substantial (adds `_build_customdata`, customdata arrays on both panes, distinct hovertemplate per pane, std-bias caption text per §2.2). Reviewing in detail when committed. **I did NOT stage or commit these changes per discipline.**
+
+**Next-commit suggestion:** `feat(p6.3.hover)` per DESIGN_SPEC §4 commit 17. Per the working-tree preview:
+- `customdata=[n_trades, win_rate_pct, std_roi_pct_annualized, total_net_pnl, median_roi_pct_annualized]` aligned with the (entry, exit) grid.
+- Distinct hovertemplate per pane:
+  - Value pane: "entry T-X, exit T-Y / Median ROI/yr / N / Win rate / Std ROI/yr / Net P&L"
+  - Density pane: "entry T-X, exit T-Y / N / Median ROI/yr / Win rate"
+- Std-bias caption text below the panes — surfaces the §2.2 tooltip wording ("~11% at n=5, ~5% at n=10, ~2.5% at n=20") since Plotly hovertemplates can't carry per-column tooltips.
+
+Then Phase 6.3 closes; Phase 6.4 (Trends) starts with `feat(p6.4.headline)`.
+
+**Opportunistic riders** (still 8 outstanding non-blockers from prior reviews + this one's 3) — a `chore(p6.3.verify)` cleanup pass after Phase 6.3 closes could batch-close most of them. Recommend at Phase 6.3 close.
+
+---
+
 ## Review of a7e0baf — feat(p6.3.headline): heatmap tab — strategy/symbol selectors + 3-card strip
 
 **Verdict:** ✅ accept
