@@ -2439,3 +2439,18 @@ This is the answer to the user's exact question from the cost/margin thread. A n
 After p4.2 → p4.3 (results store: write/read parquet) → p4.4.{a,b,c,d} (4 new strategies, with p4.4.d wiring the caveat #1 spot-vs-strike margin fix) → p4.5 (parallelize) → p4.5 test (byte-identical under n_workers=1 vs 4) → p4.verify (live small sweep).
 
 ---
+
+## Review of 7346291 — chore(p4.0.b): SPECS §6c — pin run_id hash inputs, semantic equality, re-run policy
+
+**Verdict:** ✅ accept
+
+Tiny docs commit cleanly closing 3 of the 6 65c7d73 flags. Verbatim implementation of my recommendations:
+- `run_id` hash inputs explicitly listed; operational kwargs excluded
+- Determinism test now uses `pd.testing.assert_frame_equal(read(a), read(b))` — semantic, not raw-bytes
+- Re-run policy pinned: existing parquet → return cached frame; `force: bool = False` kwarg overrides
+
+The 2 informational flags (performance arithmetic, per-strategy offset for asymmetric) correctly skipped — no spec change needed.
+
+**Next-commit suggestion:** Unchanged from 481c566 — `feat(p4.2): src/engine/sweeper.py`. The contracts are all pinned now. Implementation is mechanical.
+
+---
