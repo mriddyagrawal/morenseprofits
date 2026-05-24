@@ -742,3 +742,87 @@ The engine prefers loud failure over silent fallback. The sweeper catches `DataE
 - Network-touching tests are marked `@pytest.mark.network` and skipped by default; run via `pytest -m network`.
 - Fixture parquets in `tests/fixtures/` are tiny (≤ 50 rows) and committed to git.
 - Determinism: `tests/test_engine.py::test_byte_identical_reruns` hashes the result parquet.
+
+## 11. Web layer contract (Phase 6)
+
+The `src/web/` package + `app.py` at the repo root render the Phase-5 dataset
+as a Streamlit application. Per [DESIGN/DESIGN_SPEC.md](DESIGN/DESIGN_SPEC.md)
+all UI architecture decisions live there; SPECS §11 pins only the **contracts**
+the web layer must honor.
+
+### 11.1 Module layout
+
+```
+app.py                  ← Streamlit entry point. Thin: sidebar, 4 tabs.
+src/web/
+  __init__.py
+  discover.py           ← sweep-parquet discovery; pure helpers.
+  caveats.py            ← canonical caveat constants + render helper.
+  leaderboard.py        ← Phase 6.2 — rank table + thin-samples sidecar.
+  heatmap.py            ← Phase 6.3 — dual Plotly heatmaps.
+  trends.py             ← Phase 6.4 — YoY + MoY charts.
+  per_stock.py          ← Phase 6.5 — per-symbol dashboard.
+```
+
+`app.py` MAY import any `src.web.*` module. `src/web/*` modules MUST NOT
+import `streamlit` at module-import time if they're meant to be unit-tested
+without a Streamlit context — pure-data helpers (e.g., `discover`) stay
+streamlit-free for testability.
+
+### 11.2 Sweep discovery rule (frozen)
+
+`src.web.discover.find_latest_sweep(results_dir=RESULTS_DIR) -> Path | None`:
+
+- Scan `results_dir.glob("sweep_*.parquet")` excluding `*_skipped.parquet`.
+- Return the path with the **newest mtime**.
+- Return `None` if no candidates exist (caller renders a "no sweeps yet" message).
+
+The mtime convention is load-bearing per DESIGN_SPEC §1.5: matches the operator's
+"the sweep I just ran" mental model. The "largest by row count" alternative
+(used by `scripts/verify_p5.py`) is rejected here because a stale-but-big
+historical sweep would silently outrank a fresh small one.
+
+`src.web.discover.read_sweep_with_skips(parquet_path) -> tuple[DataFrame, DataFrame]`:
+
+- Read the results parquet.
+- Read the companion `*_skipped.parquet` if present; otherwise return
+  `empty_skips_frame()`.
+- Both frames preserve their canonical schemas (RESULTS_COLUMNS / SKIPS_COLUMNS).
+- Raises `FileNotFoundError` if the results parquet does not exist.
+
+### 11.3 Canonical caveat constants (frozen)
+
+`src.web.caveats` exposes three constants, each a verbatim renderable string:
+
+- `MULTIPLE_COMPARISONS_CAVEAT` — re-exported from `src.analytics.rank`
+  (one source of truth — never duplicated).
+- `SURVIVORSHIP_CAVEAT` — paraphrases SPECS §6b.3 for a UI reader. Notes
+  the v1 blue-chip universe is a 2024-07-01 snapshot.
+- `MARGIN_TIER_B_CAVEAT` — summarizes SPECS §4a caveats 1, 3, 4: ranking
+  is biased relative to a real-broker SPAN file (high-vol symbols + low-
+  offset strategies look better than they would on production margin).
+
+`src.web.caveats.render_caveats_expander()` renders all three as labeled
+sub-sections inside a single `st.warning`-styled `st.expander` (per
+DESIGN_SPEC §1.4 — one expander, open by default, banner-blindness
+mitigation). Returns `None` (Streamlit side-effect).
+
+### 11.4 State contract
+
+Every cross-cutting filter (sweep selection, strategy multiselect, symbol
+multiselect, `min_n` slider, regime radio) lives in `st.session_state` with
+keys prefixed `mp_` (e.g., `mp_min_n`, `mp_selected_sweep`). The four tab
+modules read from `st.session_state` and never own filter state themselves.
+
+### 11.5 Min-N filter flow
+
+The sidebar `min_n` slider's value (default `MIN_N_FOR_RANKING = 5`) is the
+single threshold used by BOTH the leaderboard ranker AND the heatmap masking.
+No tab hardcodes a different threshold — moving the slider updates every view
+consistently per DESIGN_SPEC §8 wiring constraint.
+
+### 11.6 Universe as `list[str]`
+
+The symbol filter passes `list[str]` everywhere. No tab module calls
+`blue_chip(as_of)` directly — Phase-7 user-curated-universe support becomes
+a sidebar text-area → `list[str]` conversion, not a refactor.
