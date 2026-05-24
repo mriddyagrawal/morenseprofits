@@ -21,9 +21,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import requests as _requests
+import zipfile as _zipfile
+
 from src.data import bhavcopy_fo_loader as bfo
 from src.data import cache
-from src.data.errors import BhavcopyFormatError
+from src.data.errors import BhavcopyFormatError, MissingDataError
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LEGACY_DATE = date(2024, 1, 25)
@@ -298,6 +301,96 @@ def test_load_bhavcopy_fo_udiff_cache_hit_skips_fetch(monkeypatch, tmp_path):
     df2 = bfo.load_bhavcopy_fo(UDIFF_DATE)
     assert calls["n"] == 1
     pd.testing.assert_frame_equal(df1, df2)
+
+
+# ===========================================================
+# Fetcher dispatch at the cutover boundary (off-by-one trap)
+# ===========================================================
+
+def test_fetch_raw_dispatches_at_cutover_boundary(monkeypatch):
+    """A `<` vs `<=` slip on the 2024-07-08 boundary would silently mis-
+    route fetches. Pin: day-before -> legacy; cutover day -> udiff;
+    day-after -> udiff."""
+    monkeypatch.setattr(bfo, "_udiff_start_date", lambda: date(2024, 7, 8))
+    seen = {"legacy": [], "udiff": []}
+
+    def fake_legacy(td):
+        seen["legacy"].append(td)
+        return "raw-legacy"
+
+    def fake_udiff(td):
+        seen["udiff"].append(td)
+        return "raw-udiff"
+
+    monkeypatch.setattr(bfo, "_fetch_legacy", fake_legacy)
+    monkeypatch.setattr(bfo, "_fetch_udiff", fake_udiff)
+
+    raw, fmt = bfo._fetch_raw(date(2024, 7, 7))
+    assert fmt == "legacy"
+    raw, fmt = bfo._fetch_raw(date(2024, 7, 8))
+    assert fmt == "udiff"
+    raw, fmt = bfo._fetch_raw(date(2024, 7, 9))
+    assert fmt == "udiff"
+
+    assert seen["legacy"] == [date(2024, 7, 7)]
+    assert seen["udiff"] == [date(2024, 7, 8), date(2024, 7, 9)]
+
+
+# ===========================================================
+# MissingDataError wrap for non-trading-day / 404 cases
+# (p1.3.2 critical path — calendar iteration uses MissingDataError to skip)
+# ===========================================================
+
+def test_legacy_fetch_wraps_badzipfile_as_missing_data(monkeypatch):
+    """When NSE serves an HTML 'not found' page (non-trading day, future
+    date, post-cutover), jugaad raises BadZipFile. We surface it as
+    MissingDataError so p1.3.2 can `except MissingDataError: continue`
+    while sampling candidate dates."""
+    class _FakeArc:
+        def bhavcopy_fo_raw(self, dt):
+            raise _zipfile.BadZipFile("not a zip")
+
+    monkeypatch.setattr(bfo, "NSEArchives", lambda: _FakeArc())
+    with pytest.raises(MissingDataError, match="no legacy F&O bhavcopy"):
+        bfo._fetch_legacy(date(2024, 1, 6))  # Saturday
+
+
+def test_udiff_fetch_wraps_404_as_missing_data(monkeypatch):
+    class _FakeResp:
+        status_code = 404
+        def raise_for_status(self):
+            err = _requests.HTTPError("404 Not Found")
+            err.response = self
+            raise err
+
+    monkeypatch.setattr(bfo.requests, "get", lambda *a, **kw: _FakeResp())
+    with pytest.raises(MissingDataError, match="no UDiff F&O bhavcopy.*404"):
+        bfo._fetch_udiff(date(2024, 7, 13))  # Saturday
+
+
+def test_udiff_fetch_wraps_badzipfile_as_missing_data(monkeypatch):
+    """NSE sometimes returns HTML with 200 status instead of a 404 for
+    missing dates — that surfaces as BadZipFile inside the unzip."""
+    class _FakeResp:
+        status_code = 200
+        content = b"<html>not a zip</html>"
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(bfo.requests, "get", lambda *a, **kw: _FakeResp())
+    with pytest.raises(MissingDataError, match="no UDiff F&O bhavcopy.*BadZipFile"):
+        bfo._fetch_udiff(date(2024, 7, 13))
+
+
+def test_network_errors_are_not_wrapped(monkeypatch):
+    """A connection-level RequestException is retryable, not 'no data';
+    must propagate unchanged so caller can decide how to handle it."""
+    def boom(*a, **kw):
+        raise _requests.ConnectionError("network down")
+
+    monkeypatch.setattr(bfo.requests, "get", boom)
+    with pytest.raises(_requests.ConnectionError):
+        bfo._fetch_udiff(date(2024, 8, 29))
 
 
 # ===========================================================

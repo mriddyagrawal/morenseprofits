@@ -18,3 +18,13 @@ class BhavcopyFormatError(DataError):
     ≥Jul-8-2024 (UDiff) schema. Raised loud instead of falling through to a
     permissive parser — a future NSE format change is an error, not a
     silent partial-fill."""
+
+
+class MissingDataError(DataError):
+    """Required upstream data is unavailable for the requested key. Examples:
+    no F&O bhavcopy for a non-trading day (weekend, NSE holiday); no traded
+    option price for a leg on a required entry/exit date; missing spot row.
+
+    Callers iterating candidate dates (e.g. expiry-calendar building) use
+    this to distinguish "no data here" from "the network blew up" — the
+    latter raises `requests.RequestException` and is NOT wrapped."""

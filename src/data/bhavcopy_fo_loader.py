@@ -35,7 +35,7 @@ import requests
 from jugaad_data.nse.archives import NSEArchives
 
 from src.data import cache
-from src.data.errors import BhavcopyFormatError
+from src.data.errors import BhavcopyFormatError, MissingDataError
 
 
 # Match the discovered post-Jul-8 archive URL pattern (verified live on 4
@@ -81,17 +81,43 @@ def _udiff_start_date() -> date:
 
 
 def _fetch_legacy(trade_date: date) -> str:
-    return NSEArchives().bhavcopy_fo_raw(trade_date)
+    """Returns CSV text. Raises MissingDataError if NSE has no bhavcopy
+    for this date (typically: weekend, NSE holiday, post-cutover date —
+    BadZipFile fires because NSE serves an HTML 'not found' page).
+    Network-level errors (connection reset, timeout) propagate as
+    requests.RequestException — those are retryable, not "no data"."""
+    try:
+        return NSEArchives().bhavcopy_fo_raw(trade_date)
+    except zipfile.BadZipFile as e:
+        raise MissingDataError(
+            f"no legacy F&O bhavcopy for {trade_date} (BadZipFile — typically "
+            f"a non-trading day or NSE-returned HTML)"
+        ) from e
 
 
 def _fetch_udiff(trade_date: date) -> str:
+    """Returns CSV text. Raises MissingDataError on 404 (no bhavcopy for
+    this date) or BadZipFile (NSE returned an HTML body instead of a ZIP).
+    Connection-level requests.RequestException is NOT wrapped — those are
+    retryable."""
     url = _UDIFF_URL_TPL.format(ymd=trade_date.strftime("%Y%m%d"))
-    r = requests.get(url, headers=_NSE_HEADERS, timeout=60)
-    r.raise_for_status()
-    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-        name = zf.namelist()[0]
-        with zf.open(name) as fp:
-            return fp.read().decode("utf-8")
+    try:
+        r = requests.get(url, headers=_NSE_HEADERS, timeout=60)
+        r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            name = zf.namelist()[0]
+            with zf.open(name) as fp:
+                return fp.read().decode("utf-8")
+    except requests.HTTPError as e:
+        raise MissingDataError(
+            f"no UDiff F&O bhavcopy for {trade_date} "
+            f"(HTTP {e.response.status_code if e.response is not None else '?'})"
+        ) from e
+    except zipfile.BadZipFile as e:
+        raise MissingDataError(
+            f"no UDiff F&O bhavcopy for {trade_date} (BadZipFile — NSE "
+            f"likely returned HTML for a non-trading day)"
+        ) from e
 
 
 def _fetch_raw(trade_date: date) -> tuple[str, FormatTag]:
