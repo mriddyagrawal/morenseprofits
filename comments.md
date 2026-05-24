@@ -1035,3 +1035,39 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `feat(p1.4): data/options_loader.py` — mirror `spot_loader`'s structure (`_normalize`, `_fetch_year`-equivalent, per-(symbol, expiry, strike, type) parquet cache, `force_refresh` kwarg, `MissingDataError` wrap). Three things to bake in from commit one: **(1)** the **+5h30m IST date-shift fix** — `derivatives_df` likely returns the same `YYYY-MM-DD 18:30:00` representation as `stock_df`; verify by inspecting one raw row before normalizing. If true, normalize via the same idiom; if not, document the difference. **(2)** the `expiry` argument MUST go through the same `isinstance(_, datetime)` rejection as `bhavcopy_fo_path` — strike-int and expiry-date integrity at the API boundary, not deep inside the fetcher. **(3)** the **single load-bearing test**: hand-check `load_option("RELIANCE", date(2024,8,29), 2840, "CE", date(2024,8,29), date(2024,8,29))` against the recorded UDiff fixture values — `close=201.70, oi=41500, oi_change=-1500, contracts=26, lot_size=250`. Same row we already pinned in the bhavcopy_fo tests; if the options_loader returns the same numbers, the layers agree.
 
 ---
+
+## Review of 1cff529 — chore(p1.4.prep): SPECS §2.2 amended with live-discovered derivatives_df facts
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Mirror the 641276e discovery pattern for derivatives_df — go look at real data, pin everything surprising in SPECS before writing the loader.
+
+**What works:**
+- **All three claims verified live by me**:
+  - **No IST shift on `derivatives_df`** ✓ — confirmed Timestamp values at `00:00:00` for Aug-28/29. SAVES THE BUILDER from copy-pasting the spot_loader shift logic blindly.
+  - **OI / CHANGE IN OI are float64 in jugaad's output** ✓ — Int64 nullable cast in the SPECS is exactly right.
+  - **TOTAL TRADED QUANTITY = share units, not contracts** ✓ — empirically 6500 / lot 250 = 26 contracts, matching bhavcopy_fo's reported contracts=26 byte-for-byte.
+- **Cross-layer agreement holds**: `derivatives_df` for the Aug-29 row shows `CLOSE=201.7, OI=41500, CHANGE IN OI=-1500` — exact match against the bhavcopy_fo fixture's `close=201.70, oi=41500, oi_change=-1500`. Two completely different upstream channels surfacing the same truth.
+- SPECS §2.2 amendments are precise per-column ([SPECS.md:96-113](SPECS.md#L96-L113)), with rationale embedded next to each non-obvious dtype/units choice. Future readers don't re-derive.
+- "One parquet per (symbol, expiry, strike, option_type); first fetch pulls full contract lifetime" ([SPECS.md:97-101](SPECS.md#L97-L101)) — explicit policy decision before implementation. Right move.
+- `contracts = volume // lot_size` in the SPECS note ([SPECS.md:111](SPECS.md#L111)) — closes the same TtlTradgVol/lot confusion that bit f5ff10c, preemptively.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **NEW finding: `derivatives_df` returns rows in descending date order** (newest first). I tripped over this myself in the verify run — `df.iloc[-1]` got me Aug-28 not Aug-29 until I sorted ascending. The loader **must** sort ascending in `_normalize` (mirrors spot_loader). Add one line to SPECS §2.2: "rows returned by `derivatives_df` are in descending order; loader sorts ascending and asserts monotonicity per the data-layer invariant".
+- **"~120 calendar days back from expiry"** ([SPECS.md:99](SPECS.md#L99)) as first-fetch policy — why 120? NSE typically lists stock-option contracts ~90 days before expiry (3 forward monthly expiries). Either pin the value to a real listing convention (90) or document the rationale (e.g. "120 gives a comfortable buffer against the 3-month listing window"). Currently it reads like a magic number.
+- **`MARKET LOT` dtype not verified** as plain int. My run showed `LOT=250` int-looking but I didn't dump `df.dtypes`. The BUILDER's empirical findings should include this explicitly if they want to assert plain `int64`. Defer; the cast `.astype("int64")` will fix any float-typed `MARKET LOT` silently anyway.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** the asymmetry between `stock_df` (needs +5h30m) and `derivatives_df` (doesn't) is real, surprising, and now documented. Saves a half-hour of reconfusion later.
+- **Options math:** lot_size + share-units volume → contracts derivation makes the relationship explicit. Good for Phase 3 backtester's lot-size accounting.
+- **Look-ahead bias:** N/A this commit.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- `derivatives_df("RELIANCE", Aug-28..Aug-29, 2840 CE Aug-29 expiry)` live, sorted ascending, cross-checked all three discovery claims against the existing bhavcopy_fo fixture's pinned values.
+
+**Next-commit suggestion:** `feat(p1.4): options_loader` — the spot_loader pattern transplants almost directly with one structural change because of the new findings: **(1) `_normalize` does NOT add +5h30m** (derivatives_df is already midnight IST — verified). **(2) `_normalize` MUST sort ascending** (derivatives_df returns descending — also verified). **(3) Cast `OPEN INTEREST` / `CHANGE IN OI` from float64 → Int64** (jugaad emits float with NaN; SPECS says nullable Int64). **(4) Hand-check test pins the Aug-29 cross-layer agreement**: `load_option("RELIANCE", date(2024,8,29), 2840, "CE", date(2024,8,29), date(2024,8,29))` must return one row with `close=201.7, oi=41500, oi_change=-1500, volume=6500, lot_size=250` — same numbers as the bhavcopy_fo test. If the two layers ever disagree, ONE of them is wrong, and the test tells you which by name. **(5) `isinstance(expiry, datetime)` rejection at the load_option API boundary** mirrors the bhavcopy_fo_path discipline.
+
+---
