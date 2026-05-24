@@ -282,6 +282,85 @@ def test_sweep_grid_skips_missing_data_without_dying(monkeypatch, tmp_path):
     assert 0 <= len(df) <= 2
 
 
+def test_notional_at_entry_uses_per_leg_lot_size_not_constant(monkeypatch, tmp_path):
+    """LOAD-BEARING regression block. PLAN §4 rule #3: lot size is
+    per-row historical, NOT a constant. A previous bug hardcoded
+    lot_size=250 in notional_at_entry computation; this test pins
+    the correct per-row read from legs_json.
+
+    Two synthetic stocks with different lots (250 vs 550, mimicking
+    RELIANCE vs HDFCBANK) at the SAME spot → notional differs by
+    exactly the lot ratio."""
+    cache.CACHE_DIR = tmp_path
+    _redirect_results(monkeypatch, tmp_path)
+
+    # Build mocks where the option frame's lot_size column differs by symbol
+    def fake_offset(anchor, n, *, today_fn=date.today, offline=False):
+        return date(2024, 1, 4) if n == 15 else date(2024, 1, 24)
+    monkeypatch.setattr(trading_calendar, "offset_trading_days", fake_offset)
+
+    def fake_load_spot(symbol, fd, td, *, today_fn=date.today, offline=False,
+                       force_refresh=False):
+        # Same spot for both symbols → notional difference comes from lot
+        return pd.DataFrame({
+            "date": pd.Series([pd.Timestamp(fd)], dtype="datetime64[us]"),
+            "symbol": pd.array([symbol], dtype="string"),
+            "close": [2000.0],
+        })
+    monkeypatch.setattr(spot_loader, "load_spot", fake_load_spot)
+
+    def fake_bhavcopy(td, *, force_refresh=False, offline=False):
+        # Provide strikes for both BIGLOT and SMALLLOT
+        rows = []
+        for sym in ("BIGLOT", "SMALLLOT"):
+            for k in (1980, 2000, 2020):
+                for ot in ("CE", "PE"):
+                    rows.append((sym, k, ot))
+        return pd.DataFrame({
+            "instrument": pd.array(["OPTSTK"] * len(rows), dtype="string"),
+            "symbol": pd.array([r[0] for r in rows], dtype="string"),
+            "option_type": pd.array([r[2] for r in rows], dtype="string"),
+            "strike": [float(r[1]) for r in rows],
+            "expiry": pd.Series(
+                [pd.Timestamp("2024-01-25")] * len(rows), dtype="datetime64[us]",
+            ),
+        })
+    monkeypatch.setattr(bhavcopy_fo_loader, "load_bhavcopy_fo", fake_bhavcopy)
+
+    # Different lot per symbol
+    def fake_load_option(symbol, expiry, strike, option_type, fd, td, *,
+                        force_refresh=False, today_fn=date.today, offline=False):
+        lot = 550 if symbol == "BIGLOT" else 250
+        return pd.DataFrame({
+            "date": pd.Series(
+                [pd.Timestamp(date(2024, 1, 4)), pd.Timestamp(date(2024, 1, 24))],
+                dtype="datetime64[us]",
+            ),
+            "close": [100.0, 50.0],
+            "lot_size": pd.array([lot, lot], dtype="int64"),
+        })
+    from src.data import options_loader
+    monkeypatch.setattr(options_loader, "load_option", fake_load_option)
+
+    big = sweep_one(
+        "short_straddle", "BIGLOT", date(2024, 1, 25),
+        entry_offset_td=15, exit_offset_td=1,
+        today_fn=lambda: date(2026, 5, 24),
+    )
+    small = sweep_one(
+        "short_straddle", "SMALLLOT", date(2024, 1, 25),
+        entry_offset_td=15, exit_offset_td=1,
+        today_fn=lambda: date(2026, 5, 24),
+    )
+    assert big is not None and small is not None
+    # BIGLOT: 2000 spot × (1 lot × 550 shares × 2 legs) = 2,200,000
+    # SMALLLOT: 2000 spot × (1 lot × 250 shares × 2 legs) = 1,000,000
+    assert big["notional_at_entry"] == 2_200_000.0
+    assert small["notional_at_entry"] == 1_000_000.0
+    # Ratio matches lot ratio (550/250 = 2.2)
+    assert big["notional_at_entry"] / small["notional_at_entry"] == pytest.approx(2.2)
+
+
 def test_sweep_offline_cache_miss_propagates(monkeypatch, tmp_path):
     """LOAD-BEARING per SPECS §6a + §6c.2: OfflineCacheMiss must NOT
     be swallowed by the MissingDataError skip-loop. Otherwise an

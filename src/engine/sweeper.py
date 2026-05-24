@@ -27,6 +27,7 @@ Achieved by:
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date
 from typing import Callable, Iterable
 
@@ -142,11 +143,15 @@ def sweep_one(
     result["exit_offset_td"] = int(exit_offset_td)
     result["entry_spot"] = spot_at_entry
     result["exit_spot"] = exit_spot
-    # notional_at_entry = spot × total lot exposure (across all SELL legs)
+    # notional_at_entry = spot × total share exposure. PLAN §4 rule #3:
+    # read per-row lot_size from legs_json, NOT a constant. NSE lot sizes
+    # vary by symbol (RELIANCE 250 / HDFCBANK 550 / INFY 400 / ICICIBANK
+    # 700) and change over time within a symbol; the per-row value the
+    # P&L kernel already extracted from the bhavcopy is canonical.
+    leg_results = json.loads(result["legs_json"])
     total_share_exposure = sum(
-        leg.qty_lots * 250  # lot_size approximated from typical NSE; real
-                            # values are per-row in legs_json
-        for leg in trade.legs
+        int(leg_r["qty_lots"]) * int(leg_r["lot_size"])
+        for leg_r in leg_results
     )
     result["notional_at_entry"] = spot_at_entry * total_share_exposure
     return result
