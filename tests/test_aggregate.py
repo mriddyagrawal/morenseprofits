@@ -17,10 +17,13 @@ import pytest
 
 from src.analytics.aggregate import (
     MIN_N_FOR_RANKING,
+    MONTHLY_SUMMARY_COLUMNS,
     SUMMARY_COLUMNS,
     YEARLY_SUMMARY_COLUMNS,
+    empty_monthly_summary_frame,
     empty_summary_frame,
     empty_yearly_summary_frame,
+    summarize_by_month,
     summarize_by_stock_strategy,
     summarize_by_year,
 )
@@ -335,6 +338,114 @@ def test_yearly_sample_size_surfaced_per_year():
     assert sizes == {2022: 1, 2023: 6}
     # 2022's row is INCLUDED (no silent drop) — consumer-side filter
     assert (df["n_trades"] < MIN_N_FOR_RANKING).any()
+
+
+# ============================================================
+# summarize_by_month — Phase 5.4 seasonality aggregator
+# ============================================================
+
+def _mo(strategy, symbol, year, month, net_pnl, roi_pct, roi_pct_annualized):
+    """Convenience builder — expiry on day 15 of (year, month)."""
+    return {
+        "strategy": strategy, "symbol": symbol,
+        "expiry": pd.Timestamp(f"{year}-{month:02d}-15"),
+        "net_pnl": net_pnl, "roi_pct": roi_pct,
+        "roi_pct_annualized": roi_pct_annualized,
+    }
+
+
+def test_monthly_empty_frame_has_canonical_schema():
+    df = empty_monthly_summary_frame()
+    assert list(df.columns) == list(MONTHLY_SUMMARY_COLUMNS)
+    assert len(df) == 0
+    assert "month" in df.columns
+    assert str(df["month"].dtype) == "int64"
+
+
+def test_monthly_columns_extend_summary_with_month():
+    assert MONTHLY_SUMMARY_COLUMNS[:3] == ("strategy", "symbol", "month")
+    assert MONTHLY_SUMMARY_COLUMNS[3:] == SUMMARY_COLUMNS[2:]
+
+
+def test_monthly_aggregates_across_years_within_same_month():
+    """LOAD-BEARING: Jan-2022 + Jan-2023 + Jan-2024 all fold into the
+    same ``month=1`` row. Seasonality is the orthogonal question to
+    decay — decay holds the month fixed, seasonality folds across years."""
+    df = summarize_by_month(_fixture([
+        _mo("S", "X", 2022, 1, 100.0, 1.0, 12.0),
+        _mo("S", "X", 2023, 1, 200.0, 2.0, 24.0),
+        _mo("S", "X", 2024, 1, 300.0, 3.0, 36.0),
+        _mo("S", "X", 2024, 7, 50.0, 0.5, 6.0),
+    ]))
+    # 2 rows: month=1 (3 trades) and month=7 (1 trade)
+    assert len(df) == 2
+    jan = df[df["month"] == 1].iloc[0]
+    assert jan["n_trades"] == 3
+    assert jan["median_roi_pct_annualized"] == 24.0  # median of [12, 24, 36]
+    jul = df[df["month"] == 7].iloc[0]
+    assert jul["n_trades"] == 1
+
+
+def test_monthly_pins_seasonality_shape():
+    """Hand-crafted seasonality: Q1 strong, Q3 weak — a Phase-6 bar
+    chart of median_roi_pct_annualized by month will show this clearly."""
+    rows = []
+    # Q1 = jan, feb, mar — strong months
+    for m in (1, 2, 3):
+        rows.append(_mo("S", "X", 2024, m, 100.0, 1.0, 12.0))
+    # Q3 = jul, aug, sep — weak months
+    for m in (7, 8, 9):
+        rows.append(_mo("S", "X", 2024, m, -50.0, -0.5, -6.0))
+    df = summarize_by_month(_fixture(rows))
+    assert len(df) == 6
+    strong = df[df["month"].isin([1, 2, 3])]["median_roi_pct_annualized"]
+    weak = df[df["month"].isin([7, 8, 9])]["median_roi_pct_annualized"]
+    assert all(v == 12.0 for v in strong)
+    assert all(v == -6.0 for v in weak)
+
+
+def test_monthly_month_derived_from_expiry():
+    """Expiry month, not entry_date month — same convention as
+    summarize_by_year."""
+    df = summarize_by_month(_fixture([
+        # Two trades, expiry months 1 and 12 of 2024
+        {**_mo("S", "X", 2024, 1, 100.0, 1.0, 12.0)},
+        {**_mo("S", "X", 2024, 12, 200.0, 2.0, 24.0)},
+    ]))
+    assert set(df["month"]) == {1, 12}
+
+
+def test_monthly_empty_input_returns_canonical_empty_frame():
+    df = summarize_by_month(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }))
+    assert list(df.columns) == list(MONTHLY_SUMMARY_COLUMNS)
+    assert len(df) == 0
+
+
+def test_monthly_missing_expiry_raises():
+    bad = pd.DataFrame([{
+        "strategy": "s", "symbol": "x",
+        "net_pnl": 1.0, "roi_pct": 1.0, "roi_pct_annualized": 1.0,
+    }])
+    with pytest.raises(ValueError, match="expiry"):
+        summarize_by_month(bad)
+
+
+def test_monthly_sort_order_ascending_by_month():
+    """Months 1..12 ascending — natural reading order. Phase-6 bar
+    charts depend on this for a left-to-right time axis."""
+    df = summarize_by_month(_fixture([
+        _mo("S", "X", 2024, 12, 1.0, 0.1, 1.0),
+        _mo("S", "X", 2024, 1,  1.0, 0.1, 1.0),
+        _mo("S", "X", 2024, 7,  1.0, 0.1, 1.0),
+    ]))
+    assert list(df["month"]) == [1, 7, 12]
 
 
 def test_zero_net_pnl_does_not_count_as_winning():

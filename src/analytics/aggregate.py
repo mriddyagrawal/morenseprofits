@@ -78,17 +78,33 @@ YEARLY_SUMMARY_COLUMNS: tuple[str, ...] = (
 ) + SUMMARY_COLUMNS[2:]  # share the per-row stats schema verbatim
 
 
+MONTHLY_SUMMARY_COLUMNS: tuple[str, ...] = (
+    "strategy",
+    "symbol",
+    "month",
+) + SUMMARY_COLUMNS[2:]  # same per-row stats; month replaces year
+
+
 def empty_yearly_summary_frame() -> pd.DataFrame:
     """Empty frame with canonical YEARLY_SUMMARY_COLUMNS — Phase-6's
     decay-plot consumer won't KeyError on an empty sweep."""
     return pd.DataFrame({
-        col: pd.Series(dtype=_yearly_inferred_dtype(col))
+        col: pd.Series(dtype=_time_bin_inferred_dtype(col))
         for col in YEARLY_SUMMARY_COLUMNS
     })
 
 
-def _yearly_inferred_dtype(col: str) -> str:
-    if col == "year":
+def empty_monthly_summary_frame() -> pd.DataFrame:
+    """Empty frame with canonical MONTHLY_SUMMARY_COLUMNS — Phase-6's
+    seasonality-plot consumer won't KeyError on an empty sweep."""
+    return pd.DataFrame({
+        col: pd.Series(dtype=_time_bin_inferred_dtype(col))
+        for col in MONTHLY_SUMMARY_COLUMNS
+    })
+
+
+def _time_bin_inferred_dtype(col: str) -> str:
+    if col in {"year", "month"}:
         return "int64"
     return _inferred_dtype(col)
 
@@ -118,7 +134,7 @@ def _summarize(
     if len(results_df) == 0:
         # Empty input → empty canonical-schema frame (no KeyError downstream).
         return pd.DataFrame({
-            col: pd.Series(dtype=_yearly_inferred_dtype(col))
+            col: pd.Series(dtype=_time_bin_inferred_dtype(col))
             for col in canonical_columns
         })
 
@@ -155,7 +171,7 @@ def _summarize(
     out = pd.DataFrame(out_rows)[list(canonical_columns)]
     # Dtype normalization matches the empty-frame schema
     for col in canonical_columns:
-        target = _yearly_inferred_dtype(col)
+        target = _time_bin_inferred_dtype(col)
         if str(out[col].dtype) != target:
             out[col] = out[col].astype(target)
     # Determinism — sort by the group keys themselves
@@ -202,4 +218,37 @@ def summarize_by_year(results_df: pd.DataFrame) -> pd.DataFrame:
     return _summarize(
         df, ["strategy", "symbol", "year"],
         canonical_columns=YEARLY_SUMMARY_COLUMNS,
+    )
+
+
+def summarize_by_month(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Group by ``(strategy, symbol, month)`` where ``month`` is the
+    calendar month (1..12) of the expiry. Lets consumers see
+    seasonality: "is Feb a better month for short straddles than Nov?".
+
+    Each row aggregates trades across ALL years for that calendar
+    month — January 2022 + January 2023 + January 2024 land in the
+    same ``month=1`` bucket. The decay question is answered by
+    ``summarize_by_year``; this aggregator answers the orthogonal
+    seasonality question.
+
+    Same statistical-honesty contract: n_trades surfaced per month;
+    consumers filter via ``n_trades >= MIN_N_FOR_RANKING`` to suppress
+    thin months from a seasonality bar chart.
+
+    Required: ``strategy``, ``symbol``, ``expiry``, ``net_pnl``,
+    ``roi_pct``, ``roi_pct_annualized``."""
+    if "expiry" not in results_df.columns:
+        raise ValueError(
+            f"summarize_by_month requires 'expiry' column; "
+            f"got {sorted(results_df.columns)}"
+        )
+    if len(results_df) == 0:
+        return empty_monthly_summary_frame()
+
+    df = results_df.copy()
+    df["month"] = pd.to_datetime(df["expiry"]).dt.month.astype("int64")
+    return _summarize(
+        df, ["strategy", "symbol", "month"],
+        canonical_columns=MONTHLY_SUMMARY_COLUMNS,
     )
