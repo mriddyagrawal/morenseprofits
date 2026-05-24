@@ -3306,6 +3306,96 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of baec7f5 — feat(p6.5.headline): Per-stock tab — quick-switcher + 4-card strip
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Open the Per-stock tab. Two components: (1) the **quick-switcher button row** per DESIGN_SPEC §1.2 — top-8 symbols by trade count, navigation only (sidebar filter stays canonical); (2) **4-card per-symbol headline** per §2.5 Per-stock row.
+
+**What works:**
+
+- **🔬 Quick-switcher honors the §1.2 "two sources of truth" guard** ([src/web/per_stock.py:39-83](src/web/per_stock.py#L39-L83)):
+  - State key `mp_per_stock_symbol` per §11.4 namespace.
+  - **Clicking a switcher button does NOT mutate `mp_symbols_filter`** (the sidebar's canonical multiselect). The switcher writes only to its own state key.
+  - Right-aligned caption reinforces: "_Top-8 by N. Sidebar filter canonical._" Operator reads this once and knows the contract.
+  - Currently-selected symbol gets a `"▶ "` prefix on its button — visually distinct from non-selected without changing the button widget itself (still clickable to "re-select").
+  - **`if current not in candidates`** stale-state guard — if the sidebar filter narrows and the previously-selected symbol is no longer available, defaults to the first candidate. Defensive.
+- **Top-N=8 truncation** via `_SWITCHER_TOP_N: int = 8` — module-level constant; easy to bump if the design changes.
+- **Sort by N DESC** — busiest symbols (most trades) appear first. Operator scans for "where's the most data".
+- **`st.rerun()` after state mutation** — Streamlit reruns the page so subsequent renders see the new selection without a delay.
+- **4-card headline per §2.5 Per-stock row** ([src/web/per_stock.py:90-180](src/web/per_stock.py#L90-L180)):
+  - TOP STRATEGY — best `median_roi_pct_annualized` for selected symbol; subtitle "+X.X%/yr median ann."
+  - SYMBOL WIN RATE — overall `(net_pnl > 0).sum() / n_trades`; subtitle "X of Y trades"
+  - SYMBOL TOTAL P&L — `sum(net_pnl)` via `format_inr`; subtitle "N strategy × M window(s)"
+  - STRATEGIES ABOVE BENCHMARK — count where `median_roi_pct_annualized > 0`; subtitle "median ann ROI > 0% (breakeven)"
+- **Naming rule honored** (§2.5 anti-mockup-bug): "P&L" label → ₹ value via `format_inr`; "Win rate" label → % value via `format_pct`. **Pinned by `test_naming_rule_pnl_label_includes_rupee_symbol`** which asserts the rupee value AND that no `%` leaks into the rupee card.
+- **Min_n discipline on TOP STRATEGY** ([src/web/per_stock.py:128-144](src/web/per_stock.py#L128-L144)) — uses `summary[summary["n_trades"] >= min_n]` so a thin-N strategy doesn't get falsely promoted to "top". Falls back to "—" + "no strategies with N ≥ K" if all thin.
+- **Win rate + total P&L compute across ALL trades for the symbol** (not just rank-eligible) — matches the leaderboard pattern: aggregates are unconditional; min_n applies at the ranking-decision layer.
+- **7 new tests** pin: 4-card canonical order; dashes on empty/no-symbol; top strategy picked by median ann ROI; win rate %; total P&L ₹ (and NOT %); strategies-above-benchmark count; naming rule.
+- **481/481 full suite** (was 474 + 7).
+
+**Live-tested on verify dataset (RELIANCE only):**
+
+```
+Top strategy                short_straddle           +247.9%/yr median ann.
+Symbol win rate             83.3%                    15 of 18 trades
+Symbol total P&L            ₹1.25 L                  1 strategy × 6 window(s)
+Strategies above benchmark  1/1                      median ann ROI > 0% (breakeven)
+```
+Cross-checked: ₹1.25 L = ₹125,000 ≈ ₹124,613.31 (verify-set total_net_pnl). 1 strategy × 6 windows (the verify sweep ran 6 entry-offset × 1-exit-offset = 6 (entry, exit) combinations). ✓
+
+**Empty branches both behave:**
+```
+symbol=None              → 4 dashes + "no data after filters"
+symbol='NONEXISTENT'     → 4 dashes + "no trades for NONEXISTENT"
+```
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **Quick-switcher button row uses `st.columns(N+1)`** where N is the number of symbols + 1 for the caption ([src/web/per_stock.py:70](src/web/per_stock.py#L70)). With top-N=8 + caption, that's 9 columns. **At narrow viewport widths**, 9 columns squeeze each button to <80px — labels could truncate. **Visual-check at chore(p6.5.verify)**. Cosmetic.
+
+2. **Switcher buttons don't show N count** in the label — only in the tooltip (`help=f"Switch to {sym} ({int(counts[sym])} trades)"`). **On a multi-pair real sweep, operator scanning the row sees "RELIANCE / HDFCBANK / INFY / ..." without knowing relative N**. Hover-only is fine for the v1; could be a Phase-7 polish ("RELIANCE (n=18)") if operators ask.
+
+3. **`st.button(label, key=f"mp_per_stock_sw_{sym}", ...)`** ([src/web/per_stock.py:74](src/web/per_stock.py#L74)) — uses dynamic key per-symbol. **If two symbols share a name across sweeps** (unlikely with NSE tickers but possible), there'd be a key collision. **Defensive enough** — NSE symbols are unique.
+
+4. **`▶ {sym}` selected marker** — Unicode triangle. Renders on any modern terminal/browser. **Could be a Streamlit style class** (`unsafe_allow_html` + `<strong>`) for stronger emphasis, but the simple Unicode prefix is clean. Cosmetic.
+
+5. **`n_windows = sym_df[["entry_offset_td", "exit_offset_td"]].drop_duplicates().shape[0]`** ([src/web/per_stock.py:160-162](src/web/per_stock.py#L160-L162)) — counts distinct (entry, exit) pairs. **For the verify-set this is 6** (6 entry offsets × 1 exit offset). **Edge case**: if the sweep has multiple symbols with different (entry, exit) grids, the count would be per-symbol — correct semantic.
+
+6. **"1 strategy × 6 window(s)" subtitle wording** — "strategy" is singular even when N=1; "window(s)" uses parenthetical-plural. **Inconsistency**: should be either "1 strategy × 6 windows" (no parens) or "1 strategy(ies) × 6 window(s)" (parens on both). Cosmetic.
+
+7. **STRATEGIES ABOVE BENCHMARK uses `> 0` (strict)** — a strategy with EXACTLY 0% median ROI is below benchmark. Defensible (zero-ROI isn't "above"). The threshold "0% breakeven" might be too lax for a real-money operator (they need positive ROI net of opportunity cost) — but for the v1 leaderboard contract, "positive median ann ROI" is the right gate.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ min_n suppresses thin-N strategies from TOP STRATEGY; quick-switcher caption explicitly names the sidebar-canonical contract.
+- **§1.2 two-sources-of-truth guard**: ✓ switcher does not mutate sidebar filter.
+- **Mockup-bug prevention**: ✓ P&L label → ₹ value; pinned by test_naming_rule.
+- **§11.4 state namespace**: ✓ `mp_per_stock_symbol`.
+- **Min_n flow top-down per SPECS §11.5**: ✓ slider → app.py → render_headline kwarg.
+- **§2.6 empty-state**: 4-dash fallback + 2 distinct subtitles (no-data vs no-trades-for-symbol). Inline rather than `render_empty`, but the message text is informative; consistent with the leaderboard headline pattern.
+
+**What I tried:**
+- `git show baec7f5 -- src/web/per_stock.py` — confirmed only `_quick_switcher` + `render_headline` are in this commit (the `render_strategy_dashboard` + `_sparkline_figure` I saw via Read are working-tree-only, for the next commit).
+- Live-tested 3 branches: populated (verify-set RELIANCE) / symbol=None / no-trades.
+- `pytest tests/test_web_per_stock.py -v` → 12/12 (12 = 7 from baec7f5 + 5 from working-tree d7e511d).
+- **Working-tree observation**: `feat(p6.5.dash)` work was already in flight (+112 lines including `render_strategy_dashboard`); committed as d7e511d ~3 minutes after baec7f5. I did NOT stage or commit per discipline.
+
+**Sequencing observation:** Per-stock tab opens with the same pattern as Heatmap + Trends — selectors (here: quick-switcher) + 4-card headline. The pattern reuse is firmly established now. **Phase 6.5 progressing**:
+- ✅ p6.5.headline (baec7f5, this commit)
+- 🔄 p6.5.dash (just landed as d7e511d — reviewing next)
+- 🔄 p6.5.sweep (commit 24) — live 5-stock × 3-strategy × 2-year sweep
+- 🔄 p6.5.verify (commit 25) — screenshot every tab
+- 🔄 p6.5.tag (commit 26) — `git tag v0.6-ui`
+
+**Next-commit suggestion:** **`feat(p6.5.dash)` — already landed in d7e511d.** Reviewing next.
+
+**Opportunistic riders for chore(p6.5.verify) batch-close** (12+ outstanding non-blockers now catalogued across all Phase-6 reviews) — recommend BUILDER lands a `chore(p6.4.verify)` or `chore(p6.5.verify)` doc-touch pass before the v0.6-ui tag.
+
+---
+
 ## Review of 2033fbd + 202b49c — feat(p6.4.yoy_n) + feat(p6.4.moy) — Phase 6.4 closure pair
 
 **Verdict:** ✅ accept (both commits) — **Phase 6.4 Trends tab COMPLETE.**
