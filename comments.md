@@ -3306,6 +3306,109 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 452b503 — feat(p6.2.headline): leaderboard 4-card headline strip + wire into app.py
+
+**Verdict:** ✅ accept (with one §4 sequence-deviation flag, non-blocking)
+
+**Phase / commit goal (as I understood it):** First commit that actually RENDERS data in a Phase-6 tab. Per DESIGN_SPEC §2.5 Leaderboard row: 4-card headline strip below the caveats, above the table placeholder. Wired into `app.py`'s `_render_leaderboard_tab` so the sidebar `min_n` slider drives the headline immediately.
+
+### 🔬 Sequence deviation — `chore(p6.1.verify)` skipped
+
+DESIGN_SPEC §4 sequence has `chore(p6.1.verify)` as commit 10, immediately before `feat(p6.2.headline)` at commit 11. **BUILDER skipped `chore(p6.1.verify)`** and went straight to Phase 6.2. The skipped verify step is the one designed to:
+1. Boot `streamlit run app.py --server.headless` and confirm HTTP 200.
+2. **Screenshot every tab against the matching DESIGN/*.png mockup** before any Phase-6.2 visual elements are introduced (so the "Phase-6.1 baseline" is captured).
+3. **Confirm the 2024-07-01 date-fix made it to the rendered UI** (the regression test catches the typo at the constant level, but a screenshot would catch a rendering bug — e.g., if `st.caption` truncates the text).
+4. Exercise the empty-state paths the verify set hits (heatmap_all_masked, trends_yoy_single_year).
+
+**Non-blocking** because:
+- This commit's `app.py` change is so small that a visual baseline would have been near-identical to the pre-headline state.
+- The user can run `streamlit run app.py` themselves to spot-check.
+- Future commits (p6.2.table, p6.3.pivot, etc.) introduce richer visuals; a verify step makes more sense as a checkpoint after Phase 6.2 closes rather than before each commit.
+
+**Recommended fix (cheap)**: defer `chore(p6.1.verify)` to fold into `chore(p6.2.verify)` at the close of Phase 6.2. OR land a quick `chore(p6.1.verify)` now as a 5-min retroactive screenshot. Either is fine; just don't lose the screenshot-discipline contract.
+
+### What works
+
+- **4-card layout via `st.columns(4)`** ([src/web/leaderboard.py:40](src/web/leaderboard.py#L40)) — clean Streamlit pattern.
+- **§2.5 naming rule strictly honored**: "Total net P&L" label + `format_inr` value (rupees); "Overall win rate" label + `format_pct` value (percentage). **Code-enforced separation prevents the "AVG ROI ₹25.76L" mockup bug** — to mis-label, a developer would have to write `st.metric("Total net P&L", format_pct(...))` which is a visible mismatch in the code review.
+- **Empty-frame fallback** ([src/web/leaderboard.py:43-49](src/web/leaderboard.py#L43-L49)) — all 4 cards render `—` with subtitle "no data after filters". **No `nan%` ever shown** per §2.5.
+- **Min_n eligibility honored on TOP PAIR card** ([src/web/leaderboard.py:62-76](src/web/leaderboard.py#L62-L76)) — won't promote a thin-sample pair to rank=1; if nothing passes min_n, renders `—` with "no pairs pass min_n=K". **Asymmetric-conservatism**: doesn't pretend a single-trade pair is a credible "best".
+- **RANKED PAIRS card surfaces suppression count** ([src/web/leaderboard.py:101-105](src/web/leaderboard.py#L101-L105)) — `n_eligible/n_total` ratio + the active threshold. The operator sees what was suppressed even when the TOP PAIR card is filled in. **Closes my p5.5 review's silent-thin-suppression concern at the UI layer.**
+- **Win rate + total P&L computed across ALL filter rows** ([src/web/leaderboard.py:79-97](src/web/leaderboard.py#L79-L97)) — these are aggregates over trades, not over (strategy, symbol) pairs; the n_trades discipline doesn't apply at the aggregate level. Comment in the commit body explains this distinction explicitly.
+- **`min_n=0` in `rank_strategies` for the eligibility count** ([src/web/leaderboard.py:55-57](src/web/leaderboard.py#L55-L57)) — correct: ranking ALL pairs (no internal filter), then post-filtering by `n_trades >= min_n` to count eligibility. Avoids re-triggering the `rank_strategies` all-suppressed warning. ✓
+- **`delta_color="off"` on every card** — subtitle renders neutral gray (not green/red). Right for descriptive subtitles that aren't gain/loss directionals.
+- **Live-tested against the verify parquet (18-row Q1-2024 RELIANCE short_straddle)**:
+  ```
+  TOP PAIR          short_straddle × RELIANCE    (+247.9%/yr median ann. ROI)
+  OVERALL WIN RATE  83.3%                        (15 of 18 trades profitable)
+  TOTAL NET P&L     ₹1.25 L                      (across 1 (strategy, symbol) pair(s))
+  RANKED PAIRS      1/1                          (min_n=5 from sidebar)
+  ```
+  Cross-checked: ₹1.25 L = ₹125,000 ≈ ₹124,613.31 (actual total_net_pnl). The `format_inr` 2-decimal rounding produces exactly the expected output.
+- **Empty-frame live-tested**: 4 cards with `—` + "no data after filters". ✓
+- **8 new tests; 421/421 full suite** (was 413 + 8).
+- **app.py wire-in is 3 lines** ([app.py:204-211](app.py#L204-L211)) — replaces the placeholder. `int(st.session_state["mp_min_n"])` cast is defensive against numpy.int64 from the slider.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 `render_empty` imported but never used** ([src/web/leaderboard.py:24](src/web/leaderboard.py#L24)) — `from src.web.empty_state import render_empty` is imported but the empty-frame branch uses `st.metric(..., "—", ...)` inline instead of calling `render_empty("leaderboard_no_rows_after_filters")`. **Two possibilities**:
+   - BUILDER intended to use `render_empty` but switched to inline metrics for the headline strip (which is a row of cards, not a single info box — `render_empty` only renders a single `st.info`).
+   - BUILDER plans to use it in `feat(p6.2.table)` for the table-empty branch.
+   
+   **Either way, the import is dead in THIS commit.** Either remove it or use it. Recommendation: remove now; re-add in p6.2.table when needed. Cosmetic.
+
+2. **No `format_inr` / `format_pct` import test.** The cards' rendering relies on these — if a typo in import name slipped through, the tests would catch it via output assertions, but a focused import test would catch it earlier. Cosmetic.
+
+3. **The TOP PAIR card subtitle uses `signed=True`** but the median annualized ROI on the verify dataset (+247.9%) is positive, so the `+` sign is visible. **For a hypothetical losing pair (e.g., -X.X%/yr median), the `+` won't render but `-` will appear naturally**. ✓ Correct behavior; just noting the asymmetric-conservatism property — losing pairs visually signal their loss; winning pairs visually signal their win.
+
+4. **`st.metric` second positional arg is the value (e.g., "₹1.25 L")** — Streamlit also has the third positional `delta` arg which renders the subtitle. This commit uses `delta` for the subtitle which is non-standard usage but works. The "delta" semantic is meant for change-over-time indicators (e.g., "+5%" vs yesterday); using it for descriptive subtitles is fine but means the cards can't ALSO show a real delta. **For Phase-7 changes-since-last-sweep view** if it lands, the cards would need restructuring. Not a current blocker.
+
+5. **The §2.5 spec says TOTAL NET P&L subtitle is "across N rank-eligible cells"** but the code uses `n_pairs_total` ([src/web/leaderboard.py:95](src/web/leaderboard.py#L95)) — which is ALL pairs, not rank-eligible ones. Then the subtitle reads "across 1 (strategy, symbol) pair(s)" on the verify set. **Spec vs implementation drift**: spec says "rank-eligible", code computes "total". On the verify set both are 1, so undetectable; on a multi-pair sweep where some pairs are thin, the displayed number would differ. **Worth aligning** to one or the other:
+   - If "total" is the right semantic (matches the commit body: "Other cards (win rate, total P&L) compute across ALL filter rows"), update DESIGN_SPEC §2.5 to read "across N (strategy, symbol) pair(s)" without "rank-eligible".
+   - If "rank-eligible" is the right semantic (operator wants "how much P&L came from the suppressed thin samples?"), fix the code to use `n_pairs_eligible`.
+   
+   **My lean**: the code's semantic (across all pairs) is right — the operator's mental model for "total P&L" is "how much did I make overall", not "how much did the rank-eligible subset make". Update the spec to match. Cosmetic; revisit during chore(p6.2.verify).
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ min_n honored on TOP PAIR; suppression count visible on RANKED PAIRS card; no `nan%` rendered.
+- **Mockup-bug prevention**: ✓ label ↔ formatter pairing is structurally enforced.
+- **Live cross-check**: ✓ all 4 cards render correct values for the verify parquet.
+- **Empty-state**: ✓ 4 `—`s + subtitle.
+- **Min_n flow top-down per SPECS §11.5**: ✓ sidebar slider → session_state → app.py wire → render_headline kwarg.
+
+**What I tried:**
+- Read [src/web/leaderboard.py](src/web/leaderboard.py) end-to-end.
+- Read the 8 new tests in [tests/test_web_leaderboard.py](tests/test_web_leaderboard.py).
+- Live-tested `render_headline(verify_parquet, min_n=5)` with mocked `st.metric` → confirmed expected output.
+- Live-tested `render_headline(empty_df, min_n=5)` → 4 dashes.
+- Cross-checked the wire-in to app.py.
+- `pytest tests/test_web_leaderboard.py -v` → 8/8.
+- `pytest tests/` → 421/421.
+
+**Sequencing observation:** This is the first Phase-6 commit that USES `format_inr` and `format_pct` — closes the loop on the d643aef format helpers landing in time for Phase 6.2. **The §4 commit order is now slightly non-canonical** (p6.1.verify skipped, p6.0.format landed late), but the dependencies all resolve cleanly: discover → app + caveats + empty + format → headline. No actual blockers from the order changes.
+
+**Next-commit suggestion:** Per DESIGN_SPEC §4 commit 12: `feat(p6.2.table)`. Render the `rank_strategies(summarize_by_stock_strategy(df), min_n=sidebar_min_n)` output as `st.dataframe` with column-config:
+- `rank` int
+- `strategy` / `symbol` text
+- `n_trades` int (PROMINENT — mitigates the lex-tiebreaker concern from my p5.5 review)
+- `win_rate_pct` formatted via `format_pct`
+- `median_roi_pct_annualized` formatted via `format_pct(signed=True, annualized=True)`
+- `mean_roi_pct_annualized` same
+- `std_roi_pct_annualized` formatted via `format_pct` with hover tooltip from DESIGN_SPEC §2.2 (the ddof=0 "observed-sample dispersion ~11% at n=5" copy that landed in aae03c0).
+- `total_net_pnl` formatted via `format_inr`
+
+After that → `feat(p6.2.thin)` (sidecar for thin-sample suppressed pairs), then `feat(p6.2.toggle)` (within-stock vs across-stocks).
+
+**Opportunistic riders** for the next commit:
+- Remove the dead `render_empty` import (non-blocker #1).
+- Decide on the "across N pairs" wording (spec vs code drift, non-blocker #5).
+- Run the deferred `chore(p6.1.verify)` screenshot OR fold into chore(p6.2.verify).
+
+---
+
 ## Review of c6e3684 — feat(p6.1.empty): src/web/empty_state.py — 7 canonical thin-data messages
 
 **Verdict:** ✅ accept
