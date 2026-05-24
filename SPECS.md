@@ -2,6 +2,8 @@
 
 Companion to PLAN.md. PLAN says *what* and *why*; SPECS pins down *exactly how*. Anything code-level that future commits will rely on lives here so reviewer + builder agree on contracts.
 
+**Canonical jugaad-data reference:** a local clone with improved docs lives at `/Users/mriddy/Documents/GitHub/jugaad-data` (the user maintains it). The PyPI 0.33.1 docs are thin; when in doubt about jugaad behavior, read `docs/guides/nse_historical.rst`, `docs/guides/caching.rst`, or the source in `jugaad_data/nse/archives.py` and `jugaad_data/holidays.py`. **Important**: jugaad has its own internal pickle disk cache (via `appdirs`, overridable via `J_CACHE_DIR`) — this can mask whether OUR loader hit the network during testing.
+
 ## 1. Repository layout
 
 ```
@@ -105,7 +107,35 @@ Columns (subset of jugaad `stock_df`, normalized):
 
 > **jugaad-data gotcha:** `expiry_dates(dt, contracts=N)` is **not** "the next N expiries". It returns the set of expiries that had **more than N contracts traded** in the F&O bhavcopy for `dt` (see `archives.py:504`). With `contracts=0` (default) it returns every expiry that showed up in the F&O book on day `dt`. For our expiry calendar, the right approach is to sample the F&O bhavcopy on the first trading day of each month in the lookback window, union the OPTSTK expiries that match `symbol`, and deduplicate. Phase 1.3 implements this.
 
-### 2.4 Results — `data/results/{strategy}_{run_id}.parquet`
+### 2.4 F&O bhavcopy — `data/cache/bhavcopy_fo/{YYYYMMDD}.parquet`
+
+Per-date F&O bhavcopy, cached **once per date** and re-used by every symbol's
+expiry-calendar build. A 5-symbol × 5-year sweep should fetch ~60 monthly
+bhavcopies once, not 300 (one per symbol per month).
+
+Columns (parsed from jugaad's `bhavcopy_fo_raw` CSV — the schema below is
+normalized lowercase; raw upstream uses uppercase):
+
+| col | dtype | notes |
+|---|---|---|
+| `instrument` | `string` | one of OPTSTK / FUTSTK / OPTIDX / FUTIDX |
+| `symbol` | `string` | uppercase, underlying |
+| `expiry` | `date` | contract expiry — the column we mine for the expiry calendar |
+| `strike` | `float64` | INR (NaN for futures rows) |
+| `option_type` | `string` | "CE" / "PE" / `<NA>` for futures |
+| `open`, `high`, `low`, `close` | `float64` | premium INR |
+| `settle_price` | `float64` | NSE daily settle |
+| `contracts` | `int64` | number of contracts traded |
+| `oi` | `int64` | open interest |
+| `oi_change` | `int64` | change in OI |
+| `trade_date` | `date` | the date the bhavcopy represents (== the filename) |
+
+**Format compatibility note.** Per jugaad-data docs `bhavcopy_fo_raw` handles
+both pre-Jul-8-2024 (BHAVDATA-FULL CSV) and ≥Jul-8-2024 (UDiff) formats
+transparently. We must verify this in `bhavcopy_fo_loader` tests for at least
+one date on each side of the cutover.
+
+### 2.5 Results — `data/results/{strategy}_{run_id}.parquet`
 One row per closed trade.
 | col | dtype | notes |
 |---|---|---|

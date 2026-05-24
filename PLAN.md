@@ -87,13 +87,18 @@ Steps (one commit each):
 2. `test(p1.1): cache helpers — round-trip + version-guard test (no network)`
 3. `feat(p1.2): data/spot_loader.py — load_spot() with year-keyed parquet cache`
 4. `test(p1.2): spot_loader schema test against tests/fixtures/spot_reliance_2024.parquet`
-5. `feat(p1.3): data/expiry_calendar.py — monthly_expiries() cached per symbol`
-6. `test(p1.3): expiry_calendar returns sorted unique dates + cache-hit test`
-7. `feat(p1.4): data/options_loader.py — load_option() with (symbol/expiry/strike-type) parquet cache`
-8. `test(p1.4): options_loader schema + cache-hit test against fixture`
-9. `feat(p1.5): data/trading_calendar.py — trading_days() + offset_trading_days() built on RELIANCE spot`
-10. `test(p1.5): trading_calendar correctness — offset(expiry, 0) == expiry, monotonic, etc.`
-11. `chore(p1): cache-hit telemetry — emit warning on network fetch when offline mode requested`
+5. `feat(p1.3.0): SPECS §2.4 — bhavcopy_fo cache type + cache.bhavcopy_fo_path helper`
+6. `test(p1.3.0): cache.bhavcopy_fo_path unit test`
+7. `feat(p1.3.1): data/bhavcopy_fo_loader.py — cached F&O bhavcopy fetch + parse`
+8. `test(p1.3.1): bhavcopy_fo_loader tests (mocked jugaad)`
+9. `feat(p1.3.2): data/expiry_calendar.py — monthly_expiries() sourced from cached bhavcopies`
+10. `test(p1.3.2): determinism + RELIANCE Jan 2024 = 2024-01-25 hand-check + sorted-unique + cache-hit`
+11. `chore(p1.3.verify): end-to-end live-NSE verification on one symbol×month`
+12. `feat(p1.4): data/options_loader.py — load_option() with (symbol/expiry/strike-type) parquet cache`
+13. `test(p1.4): options_loader schema + cache-hit test against fixture`
+14. `feat(p1.5): data/trading_calendar.py — trading_days() + offset_trading_days() built on RELIANCE spot + jugaad holidays overlay`
+15. `test(p1.5): trading_calendar correctness — offset(expiry, 0) == expiry, monotonic, etc.`
+16. `chore(p1): offline-mode kwarg on every loader + cache-hit telemetry`
 
 Exit criteria:
 - Second call to any loader is < 50ms (disk hit, no network).
