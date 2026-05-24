@@ -112,10 +112,19 @@ Columns (subset of jugaad `stock_df`, normalized):
 | col | dtype |
 |---|---|
 | `symbol` | `string` |
-| `expiry_date` | `date` |
-| `month_anchor` | `date` (first calendar day of expiry month) |
+| `expiry_date` | `date` (see §2.0) |
+| `month_anchor` | `date` (see §2.0; first calendar day of the expiry's month) |
 
-> **jugaad-data gotcha:** `expiry_dates(dt, contracts=N)` is **not** "the next N expiries". It returns the set of expiries that had **more than N contracts traded** in the F&O bhavcopy for `dt` (see `archives.py:504`). With `contracts=0` (default) it returns every expiry that showed up in the F&O book on day `dt`. For our expiry calendar, the right approach is to sample the F&O bhavcopy on the first trading day of each month in the lookback window, union the OPTSTK expiries that match `symbol`, and deduplicate. Phase 1.3 implements this.
+> **jugaad-data gotcha (background):** `expiry_dates(dt, contracts=N)` is **not** "the next N expiries". It returns the set of expiries that had **more than N contracts traded** in the F&O bhavcopy for `dt` (see `archives.py:504`). With `contracts=0` (default) it returns every expiry that showed up in the F&O book on day `dt`. Crucially, it returns `list(set(dts))` — non-deterministic across runs.
+
+**Sampling strategy (Phase 1.3.2).** `monthly_expiries(symbol, from_date, to_date)`:
+
+1. For each calendar month spanned by `[from_date, to_date]`, iterate candidate sample days `1, 2, …, 7` and call `load_bhavcopy_fo(candidate)`. The first one that resolves (no `MissingDataError`) is the sample bhavcopy for that month — one bhavcopy lists all OPTSTK expiries listed at that point, so one sample per month is sufficient.
+2. From each sample, filter `instrument == "OPTSTK"` and `symbol == <requested>`; collect the unique `expiry` values.
+3. Union across all months, drop duplicates, **`sorted(...)` before return** (kills the `list(set(dts))` non-determinism upstream).
+4. The result is cached at `data/cache/expiries/{SYMBOL}.parquet`. Cache invalidation: appending months extends the calendar; the cache stores `(symbol, expiry_date, month_anchor)` rows so a subsequent call for a new month range only fetches the missing months.
+
+**Determinism contract.** Two calls to `monthly_expiries` with identical inputs return byte-identical lists. Tests pin this — the reason the module exists is to escape the upstream set-iteration order.
 
 ### 2.4 F&O bhavcopy — `data/cache/bhavcopy_fo/{YYYYMMDD}.parquet`
 

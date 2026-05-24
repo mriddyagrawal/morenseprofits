@@ -92,7 +92,17 @@ def _fetch_legacy(trade_date: date) -> str:
     """Returns CSV text. Raises MissingDataError when NSE has no bhavcopy
     for this date (weekend or NSE holiday → NSE serves HTML → jugaad's
     @unzip decorator raises BadZipFile). Network-level errors
-    (RequestException) propagate — those are retryable, not 'no data'."""
+    (RequestException) propagate — those are retryable, not 'no data'.
+
+    **Wrap-precision limitation**: jugaad's `@unzip` decorator collapses
+    every non-ZIP response into BadZipFile, so we can't distinguish a
+    403 (WAF block) or 5xx (transient flake) from the no-bhavcopy case
+    on the legacy path. In practice the legacy archive endpoint has been
+    stable for years and almost only fails with HTML for non-trading
+    days, so this rarely bites — but if a legacy calendar build returns
+    empty after a recent NSE WAF change, this is the first place to
+    look. The UDiff path (which we control end-to-end) gets the precise
+    403/5xx propagation."""
     try:
         return NSEArchives().bhavcopy_fo_raw(trade_date)
     except zipfile.BadZipFile as e:
