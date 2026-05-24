@@ -207,6 +207,71 @@ def test_perfect_win_rate_when_all_win():
 
 
 # ============================================================
+# Risk-adjusted columns — std + total_net_pnl (p5.5 prep)
+# ============================================================
+
+def test_total_net_pnl_is_sum_of_net_pnl():
+    """Aggregate strategy P&L = sum across all trades in the bucket.
+    Cross-checks operator's "did this make money overall?" headline."""
+    df = summarize_by_stock_strategy(_fixture([
+        {"strategy": "S", "symbol": "X",
+         "net_pnl": 100.0, "roi_pct": 1.0, "roi_pct_annualized": 12.0},
+        {"strategy": "S", "symbol": "X",
+         "net_pnl": -30.0, "roi_pct": -0.3, "roi_pct_annualized": -3.6},
+        {"strategy": "S", "symbol": "X",
+         "net_pnl": 200.0, "roi_pct": 2.0, "roi_pct_annualized": 24.0},
+    ]))
+    # 100 + -30 + 200 = 270
+    assert df.iloc[0]["total_net_pnl"] == 270.0
+
+
+def test_std_roi_pct_computed_with_ddof_zero():
+    """Sample std (pandas default ddof=1) is NaN for n=1; the aggregator
+    uses population std (ddof=0) so a single-trade group gets std=0,
+    not NaN. Single observation has no variation by definition.
+
+    Three trades [1.0, 2.0, 3.0]: population variance = ((1-2)²+(2-2)²+(3-2)²)/3 = 0.6667
+    → std = sqrt(0.6667) ≈ 0.8165."""
+    df = summarize_by_stock_strategy(_fixture([
+        {"strategy": "S", "symbol": "X",
+         "net_pnl": 100.0, "roi_pct": 1.0, "roi_pct_annualized": 12.0},
+        {"strategy": "S", "symbol": "X",
+         "net_pnl": 200.0, "roi_pct": 2.0, "roi_pct_annualized": 24.0},
+        {"strategy": "S", "symbol": "X",
+         "net_pnl": 300.0, "roi_pct": 3.0, "roi_pct_annualized": 36.0},
+    ]))
+    assert df.iloc[0]["std_roi_pct"] == pytest.approx(0.8164965, abs=1e-6)
+    # Annualized std preserves the same multiplier the means have
+    assert df.iloc[0]["std_roi_pct_annualized"] == pytest.approx(9.79795, abs=1e-4)
+
+
+def test_std_is_zero_for_single_trade_not_nan():
+    """LOAD-BEARING for p5.5 Sharpe-like ranking: a single-trade group
+    must not produce NaN std (which would break sort_values). Pin
+    std=0 explicitly so a future change back to ddof=1 is caught."""
+    df = summarize_by_stock_strategy(_fixture([
+        {"strategy": "S", "symbol": "X",
+         "net_pnl": 100.0, "roi_pct": 1.0, "roi_pct_annualized": 12.0},
+    ]))
+    assert df.iloc[0]["std_roi_pct"] == 0.0
+    assert df.iloc[0]["std_roi_pct_annualized"] == 0.0
+
+
+def test_yearly_summary_inherits_new_columns():
+    """YEARLY_SUMMARY_COLUMNS extends SUMMARY_COLUMNS[2:], so std +
+    total_net_pnl appear automatically."""
+    assert "total_net_pnl" in YEARLY_SUMMARY_COLUMNS
+    assert "std_roi_pct" in YEARLY_SUMMARY_COLUMNS
+    assert "std_roi_pct_annualized" in YEARLY_SUMMARY_COLUMNS
+
+
+def test_monthly_summary_inherits_new_columns():
+    assert "total_net_pnl" in MONTHLY_SUMMARY_COLUMNS
+    assert "std_roi_pct" in MONTHLY_SUMMARY_COLUMNS
+    assert "std_roi_pct_annualized" in MONTHLY_SUMMARY_COLUMNS
+
+
+# ============================================================
 # summarize_by_year — Phase 5.3 trend aggregator
 # ============================================================
 

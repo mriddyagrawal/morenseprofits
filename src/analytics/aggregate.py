@@ -33,12 +33,17 @@ SUMMARY_COLUMNS: tuple[str, ...] = (
     # Per-trade P&L (rupees)
     "mean_net_pnl",
     "median_net_pnl",
+    # Aggregate strategy P&L across the sample (= mean × n) — operator's
+    # "did this strategy make money overall on this stock?" headline.
+    "total_net_pnl",
     # Holding-period ROI (% on margin) — the headline number
     "mean_roi_pct",
     "median_roi_pct",
+    "std_roi_pct",
     # Annualized ROI — cross-window-rankable per SPECS §4a caveat #2
     "mean_roi_pct_annualized",
     "median_roi_pct_annualized",
+    "std_roi_pct_annualized",
     # Range / per-trade drawdown — worst single-trade ROI is the
     # natural "max drawdown" for a per-trade dataset where we don't
     # impose a temporal ordering (one operator runs trades in
@@ -153,16 +158,22 @@ def _summarize(
         row: dict = dict(zip(group_keys, keys))
         n = int(len(block))
         n_win = int((block["net_pnl"] > 0).sum())
+        # pandas std() is sample-std (ddof=1) which is NaN for n=1 —
+        # use ddof=0 so a single-trade group gets std=0 (no variation
+        # in a single observation, which is the right semantic).
         row.update({
             "n_trades": n,
             "n_winning": n_win,
             "win_rate_pct": (100.0 * n_win / n) if n else 0.0,
             "mean_net_pnl": float(block["net_pnl"].mean()),
             "median_net_pnl": float(block["net_pnl"].median()),
+            "total_net_pnl": float(block["net_pnl"].sum()),
             "mean_roi_pct": float(block["roi_pct"].mean()),
             "median_roi_pct": float(block["roi_pct"].median()),
+            "std_roi_pct": float(block["roi_pct"].std(ddof=0)),
             "mean_roi_pct_annualized": float(block["roi_pct_annualized"].mean()),
             "median_roi_pct_annualized": float(block["roi_pct_annualized"].median()),
+            "std_roi_pct_annualized": float(block["roi_pct_annualized"].std(ddof=0)),
             "worst_roi_pct": float(block["roi_pct"].min()),
             "best_roi_pct": float(block["roi_pct"].max()),
         })
