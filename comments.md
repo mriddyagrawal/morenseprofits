@@ -187,3 +187,40 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** `feat(p1.2): data/spot_loader.py` — but bake **two non-negotiables** into the loader from commit 1: (a) sort the returned DataFrame by `date` ascending before write/return, and assert monotonicity (this kills the set-order class of bug at the data layer for *every* loader, not just expiries); (b) pin the force-refresh policy now — closed years are immutable on disk, current year re-fetches the tail. Both decisions are cheaper to make once than to retrofit across 5 loaders.
 
 ---
+
+## Review of ab4e423 — fix(p1.1.a): cache.py — strike-int guard, memoized root, overwrite-protect
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Address the three non-blocking flags from the b8de59 review — banker's-rounding strike collision, per-call sentinel I/O, and SPECS §7's "append-mostly" overwrite policy — plus log the `expiry_dates` set-determinism finding in PLAN's change log.
+
+**What works:**
+- `StrikeNotIntegerError` via `float(strike) != int(strike)` ([src/data/cache.py:84-88](src/data/cache.py#L84-L88)) — loud, accurate, named. Verified: `50.5` raises, `2620.0` and `2620` both resolve to `2620-CE.parquet`.
+- `_root_verified` memoization ([src/data/cache.py:30](src/data/cache.py#L30), [src/data/cache.py:45-55](src/data/cache.py#L45-L55)) — sentinel I/O is O(1)/process. Test helper now calls `_reset_root_memo()` so per-test redirection still works ([tests/test_cache.py:13-15](tests/test_cache.py#L13-L15)).
+- `write(..., *, overwrite: bool = False)` + `WouldOverwriteError` ([src/data/cache.py:107-117](src/data/cache.py#L107-L117)) — SPECS §7 is now *enforced*, not aspirational.
+- Atomic-write cleanup on failure ([src/data/cache.py:121-126](src/data/cache.py#L121-L126)) — the test name `test_atomic_write_no_tmp_left_behind` no longer overpromises; the property is real.
+- [PLAN.md:200](PLAN.md#L200) change log entry for the `list(set(dts))` discovery — explicitly mandates `sorted(...)` at the data-layer boundary "so this class of bug dies once". Good doctrine.
+- 5/5 prior tests still green via `python -m pytest tests/test_cache.py -v`.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- **Test-cross-contamination risk via global `_root_verified`.** Forgetting to call `_reset_root_memo()` in a new test fixture would silently re-use the prior process's verification. Promote to an `autouse` pytest fixture in [tests/conftest.py](tests/conftest.py) before more tests land, or stash the state in a small singleton object. Cheap insurance.
+- **Strike-int guard is strict about FP.** `float(2620.0000000001) != int(...)` raises. Fine for jugaad-derived strikes (always clean ints), but if any synthesizer ever passes computed strikes (e.g. `spot * 1.05`), the guard will bite. Document the contract (strikes are observed, not computed) or relax to `math.isclose(strike, round(strike))`.
+- **Overwrite-protect interacts with the "re-fetch current year's tail" pattern** I suggested in the last review. Phase 1.2's spot_loader will need `overwrite=True` plus a *length check* (refuse to clobber if the new fetch has fewer rows than the on-disk parquet — that would indicate a partial network response, not a real data update).
+- The `try/except Exception` in `write()` ([src/data/cache.py:121-126](src/data/cache.py#L121-L126)) is correct here because it re-raises — flagging only because the pattern is rare-enough-to-double-check, not because it's wrong.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** N/A this commit.
+- **Options math:** strike-int guard now enforces NSE stock-option strike spec. Good.
+- **Look-ahead bias:** N/A.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- `python -m pytest tests/test_cache.py -v` → 5 passed, 0.38s.
+- `python -c "..."` → confirmed `50.5` raises, `2620.0` and `2620` produce identical paths.
+- Read the diff and the full updated [src/data/cache.py](src/data/cache.py) end-to-end.
+
+**Next-commit suggestion:** `test(p1.1.a): cache.py guards — strike-int, overwrite-protect, true atomicity` — and the load-bearing one is the **true atomicity test**: monkeypatch `pd.DataFrame.to_parquet` (or `Path.replace`) to raise mid-write, then assert (1) the final destination file does not exist and (2) no `.tmp` remains. That's the property the commit message claims; until a test pins it, the next refactor can break it silently. Also pin `WouldOverwriteError` on a second `write()` to the same path, and a memoization test (mock `Path.read_text`, assert called once after N path-builds).
+
+---
