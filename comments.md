@@ -2699,3 +2699,44 @@ Sign-mirror test pins SPECS §3a side_sign convention on the OTM-wing path: shor
 Load-bearing tests: **(a)** spot-based margin reduces notional bias vs strike-based on this asymmetric structure; **(b)** the 4-leg P&L sums correctly (P&L of the call spread + P&L of the put spread); **(c)** max loss is bounded (by the gap between inner and outer strikes × shares); **(d)** all 4 strikes land on the bhavcopy's strike grid with the SPECS §5 lower-tiebreaker rule.
 
 ---
+
+## Review of 85cbc0e — fix(p4.4.d.i): MarginModelV1 spot_at_entry kwarg — SPECS §4a caveat #1
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close caveat #1 (strike-vs-spot margin basis) before IronCondor lands — exactly where the bias first bites at the production layer.
+
+**What works:**
+- **Backward-compat preserved**: `spot_at_entry: float | None = None` default keeps strike-based math. Existing tests don't break; existing ad-hoc callers don't break either.
+- **Sweeper passes spot_at_entry by default** ([src/engine/sweeper.py:1 line change](src/engine/sweeper.py)) — production sweeps automatically use the better basis. The migration shape is "opt-out via None" for the legacy code path, "opt-in via spot" for everywhere we know better.
+- **`notional_basis: "spot" | "strike"` recorded in the breakdown** — Phase-5 ranker can audit which basis was used per result row. Self-describing data.
+- **Validation**: `spot_at_entry > 0` when provided. Loud failure on garbage.
+- **9 new tests** including an explicit asymmetric-iron-condor-shape demonstrating bias closure (strike-based ₹93,625 vs spot-based ₹91,000), and a symmetric-pair test pinning the zero-bias-at-ATM property.
+- **Independently verified on the OTM short-put case I grilled at e7a9058**: 0.20 × 2000 × 250 = ₹100K (strike, biased) → 0.20 × 2600 × 250 = ₹130K (spot, matches real SPAN). 23% bias closed.
+- 271/271 in full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **The "strike-based" default is still wrong-by-design for ad-hoc callers.** A user importing `MarginModelV1` from a Python REPL gets the strike-biased number unless they know to pass `spot_at_entry`. Flip the default to `spot_at_entry: float` (required) and let the few backward-compat tests update to pass it explicitly — would force every consumer to think about the basis. Defer; the sweeper-default already covers the production case, and tests are documentation.
+- **No SPECS §4a amendment removing the caveat #1 callout.** §4a still lists it as an open simplification ("known v1 limitation"). Now that the fix is in code, the caveat text should be updated: "v1 default is strike-based for backward compat; sweeper passes spot_at_entry → production uses spot-based. Migration target: flip the default in v2." Cosmetic.
+- **`base = float(spot_at_entry) if use_spot else float(leg["strike"])`** — one shared base across all SELL legs when `use_spot=True`. Correct for the SPAN model (one underlying notional per position). Different from per-leg strike basis (each leg's strike is independent). Worth a one-sentence callout in the docstring explaining why this is intentional, since it's a structural choice not a bug.
+
+**Domain / correctness checks:**
+- **SPAN math**: correctly uses spot × shares × pct as the basis. Matches NSE SPAN's "worst-case underlying price move" semantics.
+- **Sign convention**: unchanged.
+- **Look-ahead**: spot_at_entry is from entry_date's spot frame — point-in-time correct.
+
+**What I tried:**
+- `python -m pytest tests/` → 271/271.
+- Re-ran the OTM short-put grilling case from e7a9058: strike → ₹100K, spot → ₹130K, bias direction confirmed.
+
+**Next-commit suggestion:** `feat(p4.4.d.ii): src/strategies/iron_condor.py` (or `feat(p4.4.d): iron_condor` if the BUILDER doesn't split). 4-leg credit-spread strategy with:
+- Two tunable params: `inner_offset_pct` (default 0.02, for the SELL strikes) + `outer_offset_pct` (default 0.05, for the BUY wings). Validate `outer > inner` AND both `> 0`.
+- 4 legs in canonical order: SELL inner-OTM CE + BUY outer-OTM CE (call spread) + SELL inner-OTM PE + BUY outer-OTM PE (put spread).
+- `recommended_strategy_offset_pct = 0.35` per SPECS §4a (biggest offset of any v1 strategy because both spreads bound each other).
+- Strike picking via bhavcopy + SPECS §5 lower-tiebreaker.
+
+Load-bearing tests: **(a)** 4 legs with correct sides + correct order in `legs_json`; **(b)** `inner_offset < outer_offset` enforced; **(c)** **MAX LOSS BOUNDED** — for a 1-lot iron condor on RELIANCE with inner=2%, outer=5%, the max loss at expiry is bounded by `(outer_strike - inner_strike - net_premium_received) × lot_size` per spread side. Test this by simulating a scenario where spot at exit is FAR outside both wings, assert the loss doesn't exceed the bound. **(d)** Margin uses spot-based notional via the now-default sweeper path — assert `margin_breakdown["notional_basis"] == "spot"` when called through `sweep_one`. **(e)** Sign convention: net P&L positive when spot stays between inner strikes at exit. The 4-leg P&L summation is the kernel's job, not the strategy's — but the strategy emits legs in correct sides so the kernel produces the right signed result.
+
+---
