@@ -2677,3 +2677,25 @@ After p4.4.c → `feat(p4.4.d): IronCondor` is the substantive one. **Iron condo
 Two `strike_offset_pct`-like params: `inner_offset_pct` (~2%) for the SELL strikes, `outer_offset_pct` (~5%) for the BUY wings. Iron condor is **the asymmetric-strategy case where caveat #1 (strike-vs-spot margin basis) actually bites** — because the four strikes flank the spot at four different distances. This is where the BUILDER should land the `spot_at_entry`-based margin fix in `MarginModelV1.estimate(legs, *, spot_at_entry=None)`. Defaults preserve Tier-B behavior; when provided, use spot × shares × symbol_pct instead of strike × shares × symbol_pct.
 
 ---
+
+## Review of 64775a9 — feat(p4.4.c): LongStrangle strategy + sign-mirror tests vs ShortStrangle
+
+**Verdict:** ✅ accept
+
+Clean mechanical mirror. Reuses `_pick_strangle_strikes` from short_strangle (one targeting rule, two strategies — same pattern as LongStraddle's reuse of `_pick_atm_strike`). `recommended_strategy_offset_pct = 1.0` per SPECS §4a (long-only).
+
+Sign-mirror test pins SPECS §3a side_sign convention on the OTM-wing path: short -1500 ↔ long +1500 on CE 25→60, PE 30→1 (the losing-strangle direction).
+
+9 new tests; 262/262 full suite.
+
+**No new flags.** Same observations as adc7290 carry over (bhavcopy-query code now duplicated across both strangle modules + both straddle modules — 4 strategies' worth of near-identical code; a `chore(p4.4.refactor): shared strike-picking helper` after p4.4.d would be the natural cleanup point).
+
+**Next-commit suggestion:** Unchanged — `feat(p4.4.d): IronCondor`. This is where:
+1. The asymmetric-strategy case (4 legs at 4 different strike distances from spot) finally exercises caveat #1
+2. The BUILDER lands the `spot_at_entry`-based margin fix as a kwarg on `MarginModelV1.estimate`
+3. Two new params surface: `inner_offset_pct` (SELL strikes, ~2%) + `outer_offset_pct` (BUY wings, ~5%)
+4. `recommended_strategy_offset_pct = 0.35` per SPECS §4a (biggest offset benefit of all v1 strategies)
+
+Load-bearing tests: **(a)** spot-based margin reduces notional bias vs strike-based on this asymmetric structure; **(b)** the 4-leg P&L sums correctly (P&L of the call spread + P&L of the put spread); **(c)** max loss is bounded (by the gap between inner and outer strikes × shares); **(d)** all 4 strikes land on the bhavcopy's strike grid with the SPECS §5 lower-tiebreaker rule.
+
+---
