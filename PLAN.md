@@ -60,7 +60,11 @@ The original ask centered on the **short straddle**; that remains the canonical 
 
 ## 3. Phase plan
 
-Each phase ends with **tests passing** + **at least one commit** + a status note added to this file. Commits inside a phase should each be small and stand alone. The reviewer reviews every commit; blocking issues are addressed before the next commit.
+### Granularity doctrine ("nuclear steps")
+
+A phase is a *goal*. A phase contains *steps*. A step maps to **exactly one commit** and is the smallest atomic change that still leaves the repo in a sensible state. Prefer many small commits over few large ones. After every commit the builder polls `comments.md` for new reviewer blocks before starting the next step. Reviewer blocking issues are addressed in the *very next* commit — no piling on new functionality first.
+
+Each phase ends with **tests passing** + every planned step committed + a status note added to this file.
 
 ### Phase 0 — Scaffolding `[in progress]`
 **Goal:** Establish the project skeleton, dependencies, planning docs, and pass a smoke test.
@@ -78,17 +82,23 @@ Exit criteria:
 ### Phase 1 — Data layer
 **Goal:** Read-through cached data access for spot, options, expiry calendar, NSE trading calendar.
 
-Commits:
-1. `feat(p1): spot_loader — cached stock_df wrapper with parquet store`
-2. `feat(p1): options_loader — cached derivatives_df wrapper`
-3. `feat(p1): expiry_calendar — monthly expiries per symbol, with caching`
-4. `feat(p1): trading_calendar — NSE trading days from spot series`
-5. `test(p1): data layer unit tests — schema, caching, no-network-on-hit`
+Steps (one commit each):
+1. `feat(p1.1): data/cache.py — parquet read/write/exists helpers + CACHE_VERSION dir guard`
+2. `test(p1.1): cache helpers — round-trip + version-guard test (no network)`
+3. `feat(p1.2): data/spot_loader.py — load_spot() with year-keyed parquet cache`
+4. `test(p1.2): spot_loader schema test against tests/fixtures/spot_reliance_2024.parquet`
+5. `feat(p1.3): data/expiry_calendar.py — monthly_expiries() cached per symbol`
+6. `test(p1.3): expiry_calendar returns sorted unique dates + cache-hit test`
+7. `feat(p1.4): data/options_loader.py — load_option() with (symbol/expiry/strike-type) parquet cache`
+8. `test(p1.4): options_loader schema + cache-hit test against fixture`
+9. `feat(p1.5): data/trading_calendar.py — trading_days() + offset_trading_days() built on RELIANCE spot`
+10. `test(p1.5): trading_calendar correctness — offset(expiry, 0) == expiry, monotonic, etc.`
+11. `chore(p1): cache-hit telemetry — emit warning on network fetch when offline mode requested`
 
 Exit criteria:
 - Second call to any loader is < 50ms (disk hit, no network).
-- All returned DataFrames conform to schemas in SPECS.md.
-- `pytest tests/test_data.py` green.
+- All returned DataFrames conform to schemas in SPECS.md §2.
+- `pytest tests/` green with default markers (network tests skipped).
 
 ### Phase 2 — Universe selection
 **Goal:** Reproducible stock-category definitions.
