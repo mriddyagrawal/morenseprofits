@@ -435,6 +435,36 @@ each side → SELL CE: `0.20 × 2600 × 250 = ₹1,30,000`. SELL PE: same
 is typically ₹1.4–1.7L (one-leg-offset benefit applies in SPAN),
 so our ₹2.6L approximation is ~1.6× generous. Acceptable for v1.
 
+**Margin estimation tiers (v1 ships Tier B):**
+
+Real NSE SPAN requires their daily SPAN file, archived only for the
+recent day-or-two. For *backtesting* historical dates, SPAN files are
+not available, so any margin number is approximate. Three tiers of
+approximation, each more accurate than the last:
+
+- **Tier A** — sum of per-leg (20% × strike × shares). v1 starting point.
+- **Tier B** ← *current v1*. Adds (1) `strategy_offset_pct` reducing
+  multi-leg margin per the strategy's real SPAN offset benefit (short
+  straddle 0.60, short strangle 0.70, iron condor 0.35, naked 1.0,
+  long-only 1.0), and (2) `symbol_margin_pct` derived from each
+  symbol's 6-month realized volatility via `src/engine/vol.py`. Both
+  optional kwargs to `MarginModelV1.estimate` — defaults preserve
+  Tier-A behavior so existing callers don't break.
+- **Tier C** — parse NSE's `FO-SPAN-END-DAY` file (only available for
+  today/yesterday). Reserved for Phase 9 paper trading where today's
+  margin is what matters; impossible for historical backtests because
+  the files aren't archived.
+
+Tier B brings cross-strategy ranking bias from ~60% to ~10-15% (per
+the calibration analysis below). It is the realistic ceiling for
+backtest accuracy; ranking conclusions are sound.
+
+`symbol_margin_pct` formula (in `src/engine/vol.py`):
+  `margin_pct = clamp(0.10 + 0.40 × annualized_vol, 0.10, 0.30)`
+  Calibration: HDFCBANK ~15% vol → 16% margin (real: ~14%);
+  RELIANCE ~22% vol → 19% margin (real: ~16%);
+  ADANIENT ~35% vol → 24% margin (real: ~22%).
+
 **Known v1 simplifications (cross-strategy ranking caveats — operators must understand these before drawing conclusions from Phase 5 results):**
 
 1. **Strike-based, not spot-based.** Real SPAN derives margin from
