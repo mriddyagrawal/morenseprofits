@@ -10,7 +10,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.web.per_stock import render_headline
+from src.web.per_stock import render_headline, render_strategy_dashboard
 
 
 @pytest.fixture
@@ -127,6 +127,135 @@ def test_strategies_above_benchmark_count(captured_metrics):
     benchmark = captured_metrics[3]
     assert benchmark["value"] == "2/3"
     assert "breakeven" in benchmark["delta"].lower() or "0%" in benchmark["delta"]
+
+
+# ============================================================
+# render_strategy_dashboard — per-strategy small-multiples
+# ============================================================
+
+@pytest.fixture
+def captured_dash(monkeypatch):
+    """Capture markdown / metrics / charts / info from
+    render_strategy_dashboard."""
+    events: list[dict] = []
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n_or_spec):
+        n = n_or_spec if isinstance(n_or_spec, int) else len(n_or_spec)
+        return [_NullCtx() for _ in range(n)]
+
+    def fake_markdown(text, **_):
+        events.append({"kind": "markdown", "text": text})
+
+    def fake_caption(text, **_):
+        events.append({"kind": "caption", "text": text})
+
+    def fake_plotly_chart(fig, **_):
+        events.append({"kind": "plotly_chart", "fig": fig})
+
+    def fake_info(msg, **_):
+        events.append({"kind": "info", "msg": msg})
+
+    import src.web.per_stock as ps
+    monkeypatch.setattr(ps.st, "columns", fake_columns)
+    monkeypatch.setattr(ps.st, "markdown", fake_markdown)
+    monkeypatch.setattr(ps.st, "caption", fake_caption)
+    monkeypatch.setattr(ps.st, "plotly_chart", fake_plotly_chart)
+    monkeypatch.setattr(ps.st, "info", fake_info)
+    import src.web.empty_state as es
+    monkeypatch.setattr(es.st, "info", fake_info)
+    return events
+
+
+def test_dashboard_renders_card_per_strategy(captured_dash):
+    """Two strategies on RELIANCE → at least 2 strategy headings
+    + 2 sparkline charts."""
+    rows = (
+        [_row(strategy="A", symbol="RELIANCE")] * 6 +
+        [_row(strategy="B", symbol="RELIANCE")] * 6
+    )
+    render_strategy_dashboard(pd.DataFrame(rows),
+                              symbol="RELIANCE", min_n=5)
+    # Strategy headings appear as markdown "##### A" / "##### B"
+    headings = [
+        e for e in captured_dash
+        if e["kind"] == "markdown" and e["text"].startswith("##### ")
+    ]
+    assert len(headings) == 2
+    heading_text = " ".join(h["text"] for h in headings)
+    assert "A" in heading_text
+    assert "B" in heading_text
+    # And at least 2 sparkline charts (1 per strategy)
+    charts = [e for e in captured_dash if e["kind"] == "plotly_chart"]
+    assert len(charts) >= 2
+
+
+def test_dashboard_sort_order_median_ann_roi_desc(captured_dash):
+    """Cards sorted by median ann ROI DESC so visually-best appears
+    top-left of the grid."""
+    rows = (
+        [_row(strategy="A", symbol="X", roi_pct_annualized=10.0)] * 6 +
+        [_row(strategy="B", symbol="X", roi_pct_annualized=40.0)] * 6 +
+        [_row(strategy="C", symbol="X", roi_pct_annualized=25.0)] * 6
+    )
+    render_strategy_dashboard(pd.DataFrame(rows), symbol="X", min_n=5)
+    headings = [
+        e for e in captured_dash
+        if e["kind"] == "markdown" and e["text"].startswith("##### ")
+    ]
+    # Order: B (40) → C (25) → A (10)
+    strats_in_order = [h["text"].replace("##### ", "").strip() for h in headings]
+    assert strats_in_order == ["B", "C", "A"]
+
+
+def test_dashboard_thin_n_strategy_carries_warning_badge(captured_dash):
+    """Strategies with N < min_n keep their card but get a "⚠ N<K"
+    suffix on the heading — visual signal even if operator only
+    glances at the small-multiples grid."""
+    rows = (
+        [_row(strategy="A", symbol="X")] * 6 +    # N=6, eligible
+        [_row(strategy="B", symbol="X")] * 2      # N=2, thin
+    )
+    render_strategy_dashboard(pd.DataFrame(rows), symbol="X", min_n=5)
+    headings = [
+        e for e in captured_dash
+        if e["kind"] == "markdown" and e["text"].startswith("##### ")
+    ]
+    a_h = next(h["text"] for h in headings if "A" in h["text"])
+    b_h = next(h["text"] for h in headings if "B" in h["text"])
+    assert "⚠" not in a_h
+    assert "⚠" in b_h
+    assert "N<5" in b_h
+
+
+def test_dashboard_empty_routes_through_empty_state(captured_dash):
+    """0 filtered rows → no_rows_after_filters via render_empty."""
+    render_strategy_dashboard(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+        "entry_offset_td": pd.Series(dtype="int64"),
+        "exit_offset_td": pd.Series(dtype="int64"),
+    }), symbol=None, min_n=5)
+    kinds = [e["kind"] for e in captured_dash]
+    assert "info" in kinds
+    info = next(e for e in captured_dash if e["kind"] == "info")
+    assert "filters" in info["msg"].lower()
+
+
+def test_dashboard_sparkline_omitted_when_lt_2_trades(captured_dash):
+    """A strategy with 0-1 trades for the selected symbol gets a
+    "_sparkline needs ≥2 trades_" caption instead of a chart."""
+    rows = [_row(strategy="A", symbol="X")] * 1  # 1 trade
+    render_strategy_dashboard(pd.DataFrame(rows), symbol="X", min_n=0)
+    captions = [e for e in captured_dash if e["kind"] == "caption"]
+    sparkline_msg = any("sparkline" in c["text"].lower() for c in captions)
+    assert sparkline_msg
 
 
 def test_naming_rule_pnl_label_includes_rupee_symbol(captured_metrics):

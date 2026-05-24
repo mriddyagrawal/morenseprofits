@@ -24,10 +24,12 @@ from __future__ import annotations
 from typing import Optional
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.analytics.aggregate import summarize_by_stock_strategy
 from src.web._format import format_inr, format_pct
+from src.web.empty_state import render_empty
 
 
 # Top-N to show in the quick-switcher (per §1.2 truncation rule).
@@ -176,3 +178,113 @@ def render_headline(
             "median ann ROI > 0% (breakeven)",
             delta_color="off",
         )
+
+
+# ============================================================
+# Small-multiples dashboard — Phase 6.5 commit 23 (feat(p6.5.dash))
+# ============================================================
+
+# Cards per row in the small-multiples grid.
+_CARDS_PER_ROW: int = 3
+
+
+def _sparkline_figure(net_pnls: list[float]) -> go.Figure:
+    """Tiny inline Plotly line for per-trade net_pnl. Chronology is
+    by sweep iteration order (since trade-date sorting isn't a
+    natural axis for cross-cell collections — trades from different
+    expiries interleave). For Phase-7 trade-level drill-down, the
+    sparkline order will switch to entry_date sort."""
+    color = "rgb(0, 100, 0)" if (net_pnls and net_pnls[-1] >= 0) \
+            else "rgb(200, 50, 50)"
+    fig = go.Figure(data=go.Scatter(
+        y=net_pnls,
+        mode="lines",
+        line=dict(color=color, width=2),
+        hoverinfo="skip",   # sparkline = at-a-glance; full data in headline
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.4)
+    fig.update_layout(
+        height=70,
+        margin=dict(l=0, r=0, t=0, b=0),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def render_strategy_dashboard(
+    df: pd.DataFrame,
+    *,
+    symbol: Optional[str],
+    min_n: int,
+) -> None:
+    """Per-symbol small-multiples grid: one card per strategy. Each
+    card shows N, win %, median ann ROI, and a sparkline of the
+    per-trade net_pnl series.
+
+    Cards laid out _CARDS_PER_ROW per row.
+
+    Empty paths:
+      - 0 filtered rows / no symbol  → no_rows_after_filters via render_empty
+      - symbol has no trades         → "no trades for {symbol}" info
+    """
+    if len(df) == 0 or symbol is None:
+        render_empty("leaderboard_no_rows_after_filters")
+        return
+
+    sym_df = df[df["symbol"] == symbol]
+    if len(sym_df) == 0:
+        st.info(f"No trades for {symbol} in this sweep.")
+        return
+
+    # One row per strategy for this symbol; sort by median ann ROI DESC
+    # so the visually-most-interesting cards are top-left.
+    summary = summarize_by_stock_strategy(sym_df)
+    summary = summary.sort_values(
+        "median_roi_pct_annualized", ascending=False,
+    ).reset_index(drop=True)
+
+    if len(summary) == 0:
+        st.info(f"No strategies for {symbol}.")
+        return
+
+    # Iterate strategies in chunks of _CARDS_PER_ROW.
+    for chunk_start in range(0, len(summary), _CARDS_PER_ROW):
+        chunk = summary.iloc[chunk_start:chunk_start + _CARDS_PER_ROW]
+        cols = st.columns(_CARDS_PER_ROW)
+        for i, (_, row) in enumerate(chunk.iterrows()):
+            strat = str(row["strategy"])
+            n = int(row["n_trades"])
+            with cols[i]:
+                # Thin-N badge so operator sees the warning even on the
+                # small-multiples (not only on the headline / leaderboard).
+                thin_marker = f" ⚠ N<{min_n}" if n < min_n else ""
+                st.markdown(f"##### {strat}{thin_marker}")
+                # Top-line stats — 3 inline metric-style columns
+                sub = st.columns(3)
+                with sub[0]:
+                    st.caption("N")
+                    st.markdown(f"**{n}**")
+                with sub[1]:
+                    st.caption("Win %")
+                    st.markdown(f"**{format_pct(row['win_rate_pct'])}**")
+                with sub[2]:
+                    st.caption("Median ROI/yr")
+                    st.markdown(
+                        f"**{format_pct(row['median_roi_pct_annualized'], signed=True, annualized=True)}**"
+                    )
+                # Sparkline of this strategy's per-trade net_pnl
+                strat_trades = sym_df[sym_df["strategy"] == strat]
+                if "net_pnl" in strat_trades.columns and len(strat_trades) >= 2:
+                    series = strat_trades["net_pnl"].astype(float).tolist()
+                    st.plotly_chart(
+                        _sparkline_figure(series),
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                    )
+                else:
+                    # 0-1 trades — sparkline isn't meaningful
+                    st.caption("_sparkline needs ≥2 trades_")
