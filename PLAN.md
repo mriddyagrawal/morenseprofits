@@ -143,13 +143,18 @@ Exit criteria:
 ### Phase 4 — Parameter sweep + multi-strategy framework
 **Goal:** Run thousands of backtests across the cartesian grid; add 4 more strategies.
 
-Commits:
-1. `feat(p4): Strategy protocol + registry`
-2. `feat(p4): sweeper — (strategy × stock × month × entry_offset × exit_offset)`
-3. `feat(p4): LongStraddle, ShortStrangle, LongStrangle, IronCondor strategies`
-4. `feat(p4): results store — parquet per (strategy, run_id)`
-5. `perf(p4): parallelize sweep with multiprocessing.Pool`
-6. `test(p4): sweep determinism — same inputs → identical results`
+Steps (one commit each per nuclear doctrine):
+1. `chore(p4.0): SPECS for sweep — registry, results store, determinism contract`
+2. `feat(p4.1): src/strategies/registry.py — name → Strategy mapping`
+3. `feat(p4.2): src/engine/sweeper.py — single-threaded sweep_one() + sweep_grid()`
+4. `feat(p4.3): src/engine/results.py — write/read sweep parquet per SPECS §2.5`
+5. `feat(p4.4.a): src/strategies/long_straddle.py — mirror of short_straddle`
+6. `feat(p4.4.b): src/strategies/short_strangle.py — strike_offset_pct param`
+7. `feat(p4.4.c): src/strategies/long_strangle.py`
+8. `feat(p4.4.d): src/strategies/iron_condor.py — fixes caveat #1 (spot-based margin for asymmetric)`
+9. `perf(p4.5): multiprocessing.Pool — preserves determinism`
+10. `test(p4.5): sweep byte-identical regardless of worker count`
+11. `chore(p4.verify): live small sweep on RELIANCE × 3 months × 5 windows`
 
 Exit criteria:
 - A full sweep on 5 blue-chip stocks × 12 months × 5 entry × 5 exit offsets × 5 strategies completes in < 10 min on the user's laptop after warm cache.

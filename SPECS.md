@@ -660,6 +660,65 @@ the classifier's per-call computation runs in <100ms on a warm cache.
 - Schema changes bump a `CACHE_VERSION` constant in `src/data/cache.py`; on bump, the cache directory is moved to `data/cache.v{N-1}/` (manual cleanup, never automatic deletion).
 - **Additive vs breaking.** Adding a new schema family (e.g. §2.4 bhavcopy_fo added in p1.3.0) does **not** bump `CACHE_VERSION` — existing on-disk data is unaffected. Only a change to an *existing* schema's column set or dtypes triggers a bump.
 
+## 6c. Sweeper + results store (Phase 4)
+
+### 6c.1 Strategy registry
+
+Module-level dict: `STRATEGIES: dict[str, Strategy] = {"short_straddle": ShortStraddle(), ...}`. Sweepers (Phase 4) and the MCP server (Phase 8) iterate by name. Each strategy class carries its real-world margin offset as a class attribute `recommended_strategy_offset_pct` — the sweeper reads this and forwards to `price_trade(strategy_offset_pct=...)`:
+
+```python
+class ShortStraddle:
+    name = "short_straddle"
+    recommended_strategy_offset_pct = 0.60
+```
+
+### 6c.2 Sweep entry point
+
+```python
+def sweep_grid(
+    strategies: list[str],         # names from registry
+    symbols: list[str],            # e.g. blue_chip(as_of)
+    expiries: list[date],          # from monthly_expiries
+    entry_offsets_td: list[int],   # T-N before expiry
+    exit_offsets_td: list[int],    # T-M before expiry (0 = expiry day)
+    *,
+    run_id: str | None = None,     # defaults to deterministic hash of inputs
+    today_fn: Callable = date.today,
+    offline: bool = False,
+    parallel: bool = True,
+    n_workers: int = 0,            # 0 = os.cpu_count()
+) -> pd.DataFrame:                 # SPECS §2.5 shape
+```
+
+Per-task pricing for each `(strategy, symbol, expiry, entry_off, exit_off)`:
+  1. `entry_date = offset_trading_days(expiry, entry_off)`
+  2. `exit_date  = offset_trading_days(expiry, exit_off)`
+  3. `spot_at_entry = load_spot(symbol, entry_date, entry_date).close[0]`
+  4. `trade = strategy.generate_trades(...)[0]`
+  5. `result = price_trade(trade, strategy_offset_pct=strategy.recommended_strategy_offset_pct, ...)`
+  6. Decorate result with sweep keys: `entry_offset_td`, `exit_offset_td`, `run_id`, `notional_at_entry`, `entry_spot`, `exit_spot`.
+
+`MissingDataError`, `NoLiquidStrikeError` → skip task, record reason in a separate skip log. `OfflineCacheMiss` propagates.
+
+### 6c.3 Determinism contract (LOAD-BEARING)
+
+Identical `(strategies, symbols, expiries, entry_offsets, exit_offsets)` → **byte-identical parquet on disk** regardless of:
+- Worker count (`n_workers=1` vs `n_workers=8`)
+- Worker scheduling (multiprocessing.Pool task order vs sequential)
+- Repeat invocations on the same machine
+
+Achieved by:
+1. Each task is a pure function of `(strategy_name, symbol, expiry, entry_off, exit_off)`.
+2. No shared mutable state across workers — each worker reads cache (read-only) and returns one result dict.
+3. `pd.concat(results)` after Pool returns; **sort by `(strategy, symbol, expiry, entry_offset_td, exit_offset_td)` then `reset_index(drop=True)`** before persisting.
+4. `run_id` defaults to a deterministic hash of inputs (same grid → same run_id).
+
+Test pattern: `test_byte_identical_under_parallelization` runs the same sweep with `n_workers=1` AND `n_workers=4` on a small fixture grid; asserts the two parquets hash-equal.
+
+### 6c.4 Results store
+
+`data/results/{strategy_name_or_"sweep"}_{run_id}.parquet`. SPECS §2.5 columns + sweep-specific: `entry_offset_td`, `exit_offset_td`, `notional_at_entry`, `entry_spot`, `exit_spot`. Append-only; no CACHE_VERSION guard (results are derived from the input cache which IS versioned).
+
 ## 8. Error taxonomy
 
 ```python
