@@ -43,6 +43,7 @@ from src.data import options_loader
 from src.data.errors import LookaheadError, MissingDataError
 from src.engine.costs import COST_MODEL_V1, CostModelV1
 from src.engine.margin import MARGIN_MODEL_V1, MarginModelV1
+from src.engine.slippage import SLIPPAGE_MODEL_V1, SlippageModelV1
 from src.engine.vol import symbol_margin_pct as _symbol_margin_pct
 from src.strategies.base import Leg, Trade, side_sign
 
@@ -84,6 +85,7 @@ def _price_one_leg(
     *,
     load_option_fn: LoadOptionFn,
     today_fn: Callable[[], date],
+    slippage_model: SlippageModelV1 = SLIPPAGE_MODEL_V1,
 ) -> dict:
     """Price a single leg of ``trade``. Returns a dict that the trade-
     level pricer aggregates into the results-schema row."""
@@ -118,16 +120,23 @@ def _price_one_leg(
             f"{context}: lot_size changed mid-contract "
             f"({entry_lot} -> {exit_lot}); refusing to price silently"
         )
+    # Apply slippage to raw closes (SPECS §4b): the engine transacts at
+    # entry_px_realized / exit_px_realized, not at the raw close.
+    entry_px_realized, exit_px_realized = slippage_model.realized_entry_exit(
+        leg.side, entry_px, exit_px,
+    )
     sign = side_sign(leg.side)
-    gross = (entry_px - exit_px) * sign * leg.qty_lots * entry_lot
+    gross = (entry_px_realized - exit_px_realized) * sign * leg.qty_lots * entry_lot
     return {
         "option_type": leg.option_type,
         "strike": float(leg.strike),
         "side": leg.side,
         "qty_lots": leg.qty_lots,
         "lot_size": entry_lot,
-        "entry_px": entry_px,
-        "exit_px": exit_px,
+        "entry_px": entry_px,                  # raw close from loader
+        "exit_px": exit_px,                    # raw close from loader
+        "entry_px_realized": entry_px_realized,  # post-slippage
+        "exit_px_realized": exit_px_realized,    # post-slippage
         "gross_pnl": gross,
     }
 
@@ -146,6 +155,7 @@ def price_trade(
     load_option_fn: LoadOptionFn = options_loader.load_option,
     cost_model: CostModelV1 = COST_MODEL_V1,
     margin_model: MarginModelV1 = MARGIN_MODEL_V1,
+    slippage_model: SlippageModelV1 = SLIPPAGE_MODEL_V1,
     strategy_offset_pct: float = 1.0,
     symbol_margin_pct: float | None = None,
     today_fn: Callable[[], date] = date.today,
@@ -169,7 +179,12 @@ def price_trade(
       the margin model's uniform default if computation fails.
     """
     leg_results = [
-        _price_one_leg(trade, leg, load_option_fn=load_option_fn, today_fn=today_fn)
+        _price_one_leg(
+            trade, leg,
+            load_option_fn=load_option_fn,
+            today_fn=today_fn,
+            slippage_model=slippage_model,
+        )
         for leg in trade.legs
     ]
     gross = float(sum(r["gross_pnl"] for r in leg_results))

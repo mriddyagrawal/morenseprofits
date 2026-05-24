@@ -506,6 +506,60 @@ Until then, `MARGIN_MODEL_V1` is what every backtest uses, and the
 four caveats above are baked into the engine's documentation so no
 downstream consumer can claim ignorance.
 
+## 4b. Slippage model (frozen)
+
+Bid-ask spread on NSE blue-chip options is ~1-2% of premium. Backtesting
+at the daily close (which is the LAST traded price, not where bids/asks
+sat) systematically over-promises: you don't actually transact at close.
+
+Slippage MOVES the price *against you* regardless of direction:
+
+  - When you BUY (opening long or closing short): you pay UP — close × (1 + slippage_pct)
+  - When you SELL (opening short or closing long): you receive DOWN — close × (1 − slippage_pct)
+
+So for our canonical short straddle (SELL CE + SELL PE; close = BUY both):
+
+  - entry CE (SELL): realized = close × (1 − pct) (less premium received)
+  - exit  CE (BUY):  realized = close × (1 + pct) (more premium paid to close)
+  - same for PE
+
+Net effect on gross P&L is *asymmetric in the right direction*:
+- Winning trades shrink slightly (entry credit smaller, exit debit larger)
+- Losing trades shrink MORE (same effect, but on a bigger loss base)
+
+This is the "asymmetric conservatism" the user asked about. Margin
+overstate alone is symmetric (smaller wins AND smaller losses in %), so
+it can't deliver this — slippage can.
+
+`SlippageModelV1`:
+
+| param | default | meaning |
+|---|---|---|
+| `slippage_pct` | 0.01 (1% per side) | Realistic for NSE blue-chip options. Thinner names should override upward. |
+
+Per-leg realized-price formula:
+
+```python
+side_at_open  = leg.side                                 # SELL or BUY
+side_at_close = {"SELL": "BUY", "BUY": "SELL"}[leg.side]
+entry_realized = entry_close × (1 - pct if side_at_open  == "SELL" else 1 + pct)
+exit_realized  = exit_close  × (1 - pct if side_at_close == "SELL" else 1 + pct)
+```
+
+Then `gross_pnl_per_leg = (entry_realized − exit_realized) × side_sign × qty × lot_size`.
+
+The engine emits both `entry_px` (raw close — what the data layer
+returned) and `entry_px_realized` (post-slippage — what the engine
+actually transacts at). `gross_pnl` uses realized. Audit trail intact.
+
+**Calibration**: For our canonical RELIANCE Jan-2024 short straddle
+at 1% slippage, the realized P&L drops from +₹910 (no slippage) to
+~+₹430 (with). The ~₹500 haircut matches the SPECS-§4 + bid-ask-spread
+real-world experience for NSE blue-chip options at 0.5-1.5% wide.
+
+Phase-7 backlog: per-symbol slippage (high-vol/thin-liquidity names get
+higher pct). Until then SLIPPAGE_MODEL_V1's uniform 1% is the v1 default.
+
 ## 5. ATM strike selection rule (frozen)
 
 `ATM_strike = argmin_{K ∈ available_strikes(symbol, expiry, entry_date)} |K - spot_close(entry_date)|`

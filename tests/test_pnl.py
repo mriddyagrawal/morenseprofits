@@ -14,7 +14,14 @@ import pytest
 
 from src.data.errors import LookaheadError, MissingDataError
 from src.engine.pnl import price_trade, _pick_close_on, _price_one_leg
+from src.engine.slippage import SlippageModelV1
 from src.strategies.base import Leg, Trade
+
+# Many prior hand-checked tests assume zero slippage (the canonical
+# values like RELIANCE Jan-2024 gross +₹2750 were computed at raw
+# closes). New default is 1% slippage. Pin existing tests with this
+# explicit override; a new test exercises the slippage path.
+_NO_SLIPPAGE = SlippageModelV1(slippage_pct=0.0)
 
 
 def _option_frame(dates_closes_lots: list[tuple[date, float, int]]) -> pd.DataFrame:
@@ -65,7 +72,7 @@ def test_sign_convention_short_straddle():
         ),
         strategy="short_straddle",
     )
-    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     assert out["gross_pnl"] == 45000.0, (
         f"short straddle premium decay must produce positive P&L; "
         f"got {out['gross_pnl']}. Sign flip?"
@@ -89,7 +96,7 @@ def test_sign_convention_long_straddle_loses_on_decay():
         ),
         strategy="long_straddle",
     )
-    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     assert out["gross_pnl"] == -45000.0
 
 
@@ -122,7 +129,7 @@ def test_reliance_jan_2024_atm_short_straddle_hand_check():
         ),
         strategy="short_straddle",
     )
-    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     assert out["gross_pnl"] == 2750.0
     assert out["symbol"] == "RELIANCE"
     assert out["expiry"] == date(2024, 1, 25)
@@ -177,7 +184,7 @@ def test_missing_data_at_entry_raises():
         strategy="test",
     )
     with pytest.raises(MissingDataError, match="no traded row on"):
-        price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+        price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
 
 
 def test_missing_data_at_exit_raises():
@@ -195,7 +202,7 @@ def test_missing_data_at_exit_raises():
         strategy="test",
     )
     with pytest.raises(MissingDataError, match="no traded row on"):
-        price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+        price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
 
 
 def test_lot_size_change_mid_contract_rejected():
@@ -215,7 +222,7 @@ def test_lot_size_change_mid_contract_rejected():
         strategy="test",
     )
     with pytest.raises(LookaheadError, match="lot_size changed"):
-        price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+        price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
 
 
 def test_returned_schema_matches_results_2_5_subset():
@@ -231,7 +238,7 @@ def test_returned_schema_matches_results_2_5_subset():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     expected = {"symbol", "expiry", "entry_date", "exit_date", "strategy",
                 "params_json", "legs_json", "gross_pnl",
                 "costs", "net_pnl", "costs_breakdown_json",
@@ -270,7 +277,7 @@ def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():
     # in test_auto_vol_resolves_symbol_margin_pct below.
     out = price_trade(
         trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
-        symbol_margin_pct=0.20,
+        symbol_margin_pct=0.20, slippage_model=_NO_SLIPPAGE,
     )
     assert out["gross_pnl"] == 2750.0
     assert out["costs"] == pytest.approx(141.780645, abs=1e-3)
@@ -298,7 +305,7 @@ def test_auto_vol_resolves_symbol_margin_pct_when_kwarg_absent(monkeypatch):
     )
     # No symbol_margin_pct kwarg → engine auto-computes (via the mocked
     # vol module = 0.17). Margin = 0.17 × 2600 × 250 = 110500.
-    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     assert out["margin_at_entry"] == pytest.approx(0.17 * 2600 * 250, abs=1e-6)
 
 
@@ -317,9 +324,9 @@ def test_strategy_offset_pct_flows_through_to_margin():
         strategy="short_straddle",
     )
     # Pin symbol_margin_pct=0.20 to isolate the strategy_offset effect.
-    no_offset = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+    no_offset = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE,
                             symbol_margin_pct=0.20)
-    with_offset = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+    with_offset = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE,
                               symbol_margin_pct=0.20, strategy_offset_pct=0.60)
     assert no_offset["margin_at_entry"] == 260_000.0
     assert with_offset["margin_at_entry"] == pytest.approx(260_000.0 * 0.60, abs=1e-6)
@@ -341,9 +348,9 @@ def test_cost_model_is_injectable_for_sensitivity():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    out_default = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    out_default = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     zero_brokerage = CostModelV1(brokerage_per_order=0.0)
-    out_zero = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+    out_zero = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE,
                            cost_model=zero_brokerage)
     # Zero-brokerage saves exactly 2 orders × ₹20 = ₹40 (single-leg trade)
     # plus the 18% GST that would have applied to that brokerage = ₹7.20
@@ -355,6 +362,71 @@ def test_cost_model_is_injectable_for_sensitivity():
 # ============================================================
 # qty_lots > 1 scales linearly
 # ============================================================
+
+def test_default_slippage_applied_asymmetrically():
+    """LOAD-BEARING for the asymmetric-conservatism direction. Default
+    slippage_pct=0.01 makes SELL entries receive less + BUY exits pay
+    more. For a short straddle this REDUCES gross P&L regardless of
+    direction; for losers it makes the loss bigger; for winners it
+    makes the win smaller — the asymmetric conservatism the user asked
+    for.
+
+    Canonical hand-check using RELIANCE Jan-2024 fixture:
+      CE: SELL 56.50/BUY 95.00 → realized SELL 55.935, BUY 95.95
+          gross = (55.935 - 95.95) × 250 = -10003.75
+      PE: SELL 50.00/BUY 0.50 → realized SELL 49.50, BUY 0.505
+          gross = (49.50 - 0.505) × 250 = +12248.75
+      Total gross (with 1% slippage) = +2245.0
+      vs +2750.0 without slippage → ₹505 haircut.
+    """
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    ce = _option_frame([(entry, 56.50, 250), (exit_, 95.00, 250)])
+    pe = _option_frame([(entry, 50.00, 250), (exit_, 0.50, 250)])
+    load = _stub_load_option({(2600.0, "CE"): ce, (2600.0, "PE"): pe})
+
+    trade = Trade(
+        symbol="RELIANCE", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(
+            Leg("CE", 2600, "SELL", 1),
+            Leg("PE", 2600, "SELL", 1),
+        ),
+        strategy="short_straddle",
+    )
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    # Default slippage_pct=0.01 — see SPECS §4b for the formula
+    assert out["gross_pnl"] == pytest.approx(2245.0, abs=0.5), (
+        f"slippage haircut wrong; got {out['gross_pnl']}"
+    )
+    # legs_json carries both raw + realized prices
+    import json
+    legs = json.loads(out["legs_json"])
+    ce_leg = next(l for l in legs if l["option_type"] == "CE")
+    assert ce_leg["entry_px"] == 56.50  # raw
+    assert ce_leg["entry_px_realized"] == pytest.approx(55.935, abs=1e-6)
+    assert ce_leg["exit_px"] == 95.00
+    assert ce_leg["exit_px_realized"] == pytest.approx(95.95, abs=1e-6)
+
+
+def test_slippage_zero_disables():
+    """slippage_model with 0% pct → realized == raw close → matches the
+    original (no-slippage) hand-checks. Pins the toggle path."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    ce = _option_frame([(entry, 56.50, 250), (exit_, 95.00, 250)])
+    pe = _option_frame([(entry, 50.00, 250), (exit_, 0.50, 250)])
+    load = _stub_load_option({(2600.0, "CE"): ce, (2600.0, "PE"): pe})
+    trade = Trade(
+        symbol="RELIANCE", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1), Leg("PE", 2600, "SELL", 1)),
+        strategy="short_straddle",
+    )
+    out = price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    assert out["gross_pnl"] == 2750.0  # original hand-check value
+
 
 def test_qty_lots_scales_linearly():
     entry = date(2024, 1, 4)
@@ -368,6 +440,6 @@ def test_qty_lots_scales_linearly():
     # 3 lots — same leg
     t3 = Trade(symbol="X", expiry=date(2024, 1, 25), entry_date=entry, exit_date=exit_,
                legs=(Leg("CE", 2600, "SELL", 3),), strategy="test")
-    o1 = price_trade(t1, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
-    o3 = price_trade(t3, load_option_fn=load, today_fn=lambda: date(2026, 5, 24))
+    o1 = price_trade(t1, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
+    o3 = price_trade(t3, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     assert o3["gross_pnl"] == 3 * o1["gross_pnl"]
