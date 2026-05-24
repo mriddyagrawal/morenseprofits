@@ -385,3 +385,39 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** Phase 1.1+1.2 are now well-locked. Next planned is `feat(p1.3): data/expiry_calendar.py`. Three things matter from commit one: **(1) determinism is the load-bearing invariant** — the calendar must return a sorted unique list of `date` (Python `date`, per SPECS §2.3, not `datetime64`); the first test must be "two calls with the same inputs return byte-identical lists" because the whole reason for this module is to escape the `list(set(...))` non-determinism we already logged. **(2) Source the expiries from `bhavcopy_fo`'s `EXPIRY_DT` column for OPTSTK rows of the symbol, NOT a computed "last Thursday of month"** — NSE shifts expiries when the scheduled Thursday is a holiday, and computed last-Thursday will be wrong on those months. Hand-check one known expiry as part of testing: `RELIANCE` January 2024 monthly = `2024-01-25` (last Thursday). **(3) Cache the bhavcopy itself per-date, separate from the per-symbol expiries**: one bhavcopy serves all symbols, so a 5-symbol × 5-year sweep should fetch 60 monthly bhavcopies once, not 300.
 
 ---
+
+## Review of 22d3da2 — chore(p1.3.plan): nuclear decomposition + SPECS §2.4 bhavcopy_fo cache
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Decompose the single `feat(p1.3)` step into 7 nuclear commits (cache-helper → bhavcopy-loader → expiry-calendar → live-verify), pin the bhavcopy_fo schema in SPECS §2.4, and propagate the user's pointer to the local jugaad-data clone into a canonical-reference preamble.
+
+**What works:**
+- 7-step decomposition ([PLAN.md:90-97](PLAN.md#L90-L97)) is exactly the per-date-bhavcopy / per-symbol-calendar separation I suggested. Each step has a paired test commit; the trailing `chore(p1.3.verify)` lands the live-NSE check the verify-downloads doctrine demands.
+- New SPECS §2.4 ([SPECS.md:110-136](SPECS.md#L110-L136)) — 11-column schema with proper dtypes (`instrument`/`symbol`/`option_type` as `string`, `expiry`/`trade_date` as `date`, `contracts`/`oi`/`oi_change` as `int64`, `strike`/OHLC as `float64`). One parquet per date — a 5-symbol × 5-year sweep fetches ~60 bhavcopies, not 300. Exactly the structural decision I flagged.
+- Jul-8-2024 UDiff cutover is **named in the SPECS** ([SPECS.md:133-136](SPECS.md#L133-L136)) and the BUILDER commits to verifying with tests on both sides. That's the kind of pre-decision that prevents a half-day debugging session later.
+- Canonical-reference preamble ([SPECS.md:5](SPECS.md#L5)) names the local jugaad-data clone and flags the J_CACHE_DIR pitfall — perfectly aligned with what we learned from the docs scan.
+- Hand-check `RELIANCE Jan 2024 = 2024-01-25` is baked into the p1.3.2 test description ([PLAN.md:95](PLAN.md#L95)).
+- Phase 1.5 now includes `+ jugaad holidays overlay` ([PLAN.md:99](PLAN.md#L99)) — picks up the unanswered 46ffe18 flag about `jugaad_data.holidays`.
+
+**Blocking issues (must fix before next phase):** None — docs-only.
+
+**Non-blocking suggestions:**
+- **Step 16 bundles two concerns** (`offline-mode kwarg on every loader + cache-hit telemetry`). Both are useful but logically independent — offline-mode is a behavior contract, telemetry is observability. Per the nuclear-steps doctrine, this should probably be `chore(p1.6): offline-mode kwarg` + `chore(p1.7): cache-hit telemetry`. Defer the call to the BUILDER.
+- **§2.4 schema lists `expiry: date` and `trade_date: date`** — but Python `date` isn't a native parquet/pandas type. SPECS §2.1's date drift (`datetime64[ns]` → `datetime64[us]`) already proves this is fiddly. Pin the actual on-disk representation now: e.g. "stored as `datetime64[us]`, exposed to callers as Python `date` via `.dt.date`". Save the BUILDER mid-implementation thrash in p1.3.1.
+- **No mention of CACHE_VERSION** in the schema-addition. Adding a new schema family (bhavcopy_fo) shouldn't bump the version (no on-disk structure changed for existing data), but worth a one-line SPECS §7 amendment: "additive schemas do not bump CACHE_VERSION; only schema *changes* do."
+- **The Jul-8-2024 verify** is in `p1.3.1` tests per the plan — make sure those tests use a recorded byte-for-byte sample of each format. Live tests are skipped by default per pytest.ini, so the regression value comes from the *recorded* fixtures, not live calls.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct. The per-date bhavcopy_fo cache + per-symbol expiry projection is the right separation. Avoids both `expiry_dates`'s non-determinism and the redundant-fetch trap.
+- **Options math:** N/A.
+- **Look-ahead bias:** N/A. The bhavcopy is dated — engine consumers must filter `trade_date ≤ entry_date` at use time. Worth one line in §2.4 about that contract.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- Read the diff in full. Cross-checked the §2.4 columns against `jugaad_data/nse/archives.py:322` (`bhavcopy_fo_raw`) — the BUILDER's schema is a faithful normalized subset.
+- Cross-checked the Jul-8-2024 cutover claim against `docs/guides/nse_historical.rst:18-26` in the local jugaad clone — confirmed.
+
+**Next-commit suggestion:** `feat(p1.3.0): cache.bhavcopy_fo_path` is going to be trivial (symmetric with `spot_path`/`option_path`). The interesting decision is **what dtype `trade_date`/`expiry` take on disk** — pin that BEFORE writing the path helper, so p1.3.1's parser doesn't have to revisit. Concretely: store as `datetime64[us]` (matches the spot loader's de-facto post-roundtrip dtype), expose via `.dt.date` in any public API that promises a `date`. Add one line to SPECS §2.4 saying so. Without this, the parser in p1.3.1 will choose silently and we'll catch a third dtype variant in tests.
+
+---
