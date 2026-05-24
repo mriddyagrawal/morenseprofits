@@ -310,3 +310,42 @@ Each block below corresponds to one BUILDER commit.
 **Next-commit suggestion:** `test(p1.2): spot_loader` — and the **load-bearing test is the date-shift regression**. Construct a `pd.DataFrame` matching jugaad's raw shape (DATE column at `YYYY-MM-DD 18:30:00`), monkeypatch `jugaad_data.nse.stock_df` to return it, then call `load_spot(sym, Jan-2, Jan-2)` and assert (a) exactly one row, (b) `date` equals `pd.Timestamp("2024-01-02")`, (c) the close matches the input row. If this test ever turns red, every backtest's entry/exit price is off-by-one. Also pin the four invariants individually (full-year-cache, immutable-closed-year, length-check-refuses-shrink, monotonic-output) and the `today_fn` freeze. Plus a "no-network on second call" test by monkeypatching `stock_df` to raise — proves the cache contract holds.
 
 ---
+
+## Review of c77e62f — test(p1.2.a): spot_loader — 9 tests including the date-shift regression
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Pin every invariant of the spot_loader, with `test_date_shift_regression` as the explicit load-bearing test that prevents off-by-one trading-day price corruption.
+
+**What works:**
+- **20/20 pass** in 0.23s via `python -m pytest tests/ -v`.
+- `test_date_shift_regression` ([tests/test_spot_loader.py:79-102](tests/test_spot_loader.py#L79-L102)) does exactly what I asked: feeds a `_fake_jugaad` frame with raw `Jan-1 18:30:00` for trading-day Jan-2, asserts single-day filter returns 1 row at `pd.Timestamp("2024-01-02 00:00:00")` with `close=2611.7`. The off-by-one trap is now a permanent tripwire.
+- `_fake_jugaad` helper ([tests/test_spot_loader.py:32-58](tests/test_spot_loader.py#L32-L58)) builds the exact 15-column raw shape and **constructs the timestamp via `datetime(...) - pd.Timedelta(hours=5,minutes=30)`** — so the fake faithfully simulates the +5h30m offset the real loader corrects. Reusable for every future spot-related test.
+- `test_closed_year_immutable_and_no_network_on_hit` ([tests/test_spot_loader.py:132-150](tests/test_spot_loader.py#L132-L150)) is clever: after the cold fetch, **re-monkeypatches stock_df to RAISE**, then asserts the second query succeeds purely from cache. Catches the class of bug where someone adds an accidental "refresh on every call" path.
+- `test_full_year_parquet_invariant` ([tests/test_spot_loader.py:112-115](tests/test_spot_loader.py#L112-L115)) asserts `from_date == Jan 1` and `to_date == Dec 31` inside the factory itself — sparse caches now impossible by test, not just by convention.
+- `test_partial_response_refuses_to_shrink_cache` ([tests/test_spot_loader.py:155-186](tests/test_spot_loader.py#L155-L186)) covers both the cache preservation AND the warning emission.
+- `test_returned_frame_is_monotonic` shuffles the fake input and verifies the sort survives.
+- `test_multi_year_span_fetches_each_year_once` ([tests/test_spot_loader.py:224-234](tests/test_spot_loader.py#L224-L234)) proves the cross-year stitching does N fetches, one per year.
+- Conftest autouse memo reset is doing its job — no manual `_reset_root_memo()` calls cluttering tests.
+
+**Blocking issues (must fix before next phase):** None.
+
+**Non-blocking suggestions:**
+- `_fake_jugaad` builds `DATE` via `pd.to_datetime(utc_naive)` which yields `datetime64[ns]`; real jugaad returns `datetime64[ms]` (I verified earlier). Functionally equivalent for the +5h30m shift, but if Phase 1.4 (options_loader) reuses this helper, the dtype subtlety could mask an unrelated bug. One-line fix: `pd.to_datetime(utc_naive).astype("datetime64[ms]")` to match jugaad exactly.
+- `test_partial_response_refuses_to_shrink_cache` doesn't pin **what** the warning's `stacklevel` resolves to, only that the message contains "partial NSE response". Fine — but `stacklevel=3` in the source ([src/data/spot_loader.py:112](src/data/spot_loader.py#L112)) is a hand-tuned magic number; one assertion on `w.filename` ending in `spot_loader.py` or in the caller would lock that down.
+- `test_today_fn_clamps_current_year_fetch` ([tests/test_spot_loader.py:205-219](tests/test_spot_loader.py#L205-L219)) asserts `seen_to == [fixed_today]`. Doesn't cover the edge case where `today_fn()` returns a date that's *already in the past* relative to caller's `to_date`. Probably fine; flag if Phase 3 ever calls `load_spot` with a frozen historical today.
+- The fixed `today_fn = lambda: date(2026, 5, 24)` is hardcoded in many tests — when the actual `date.today()` passes 2026-05-24 in real time, no failure modes shift, but a `TODAY_AFTER_2024 = date(2030, 1, 1)` module constant would make the intent explicit.
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** N/A this commit, but `_fake_jugaad` proves the BUILDER understands the raw shape precisely.
+- **Options math:** N/A.
+- **Look-ahead bias:** `today_fn` injection means tests can simulate "running on date X" — that's the right primitive for no-lookahead enforcement in Phase 3.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- `python -m pytest tests/ -v` → 20/20 in 0.23s.
+- Read [tests/test_spot_loader.py](tests/test_spot_loader.py) line by line; verified the `_fake_jugaad` helper matches real jugaad's column set against my own earlier inspect output.
+
+**Next-commit suggestion:** Per the BUILDER's own note this is `fix(p1.2.b)` — bundle (1) the **subset-based partial-response check** (`if not set(cached["date"]).issubset(set(fresh["date"]))`) since that's the only one of the three followups with real correctness teeth, (2) explicit `symbol` dtype cast to `"string"` matching `series`, (3) narrow warning filter `warnings.filterwarnings("ignore", message=".*timezones available.*")`. **Crucial:** add a new `test_partial_response_with_dropped_dates` to `test_spot_loader.py` — feed a "fresh" frame of the SAME length as cached but with one date dropped and one added; assert the cache stays put. The length-only check passes this case silently today; without a test the subset upgrade can regress.
+
+---
