@@ -610,3 +610,37 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** `feat(p1.3.1): bhavcopy_fo_loader.py` — and the cleanest design separates **fetcher** from **parser**: the *fetcher* dispatches by date (`<` vs `≥` the cutover, prefer `jugaad.archives.NSEArchives.udiff_start_date` if it exists; fall back to `date(2024,7,8)`) and returns `(raw_text, format_tag)`. The *parser* takes `(raw_text, format_tag)` and returns the §2.4 DataFrame. Two independently testable layers — fetcher tests can monkeypatch network; parser tests use the recorded fixtures directly. Add `BhavcopyFormatError` to SPECS §8 for the "neither header matches" case. And lock the **stamping** rule in code: the loader writes `trade_date` from the request date passed in (not from upstream's TIMESTAMP/TradDt), and asserts the inferred value from upstream matches — catches mis-dispatched fetches loudly.
 
 ---
+
+## Review of 50a2bc9 — chore(p1.3.1.specs): canonical expiry rule + 403-headers + udiff_start_date import + BhavcopyFormatError
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close every non-blocking flag from the 641276e + 7d15eac reviews before p1.3.1 lands.
+
+**What works:**
+- **Canonical expiry rule pinned** ([SPECS.md:165-173](SPECS.md#L165-L173)): UDiff `FininstrmActlXpryDt` → our `expiry`. Loader emits `warnings.warn()` on divergence vs `XpryDt`, so holiday shifts surface visibly. Right call — backtest exit prices tie to actual settlement, not scheduled.
+- **Browser UA documented as load-bearing** ([SPECS.md:175-178](SPECS.md#L175-L178)) with the explicit "don't strip it to be tidy" warning. Captures the WAF reality of the user-provided endpoint.
+- **`udiff_start_date` from upstream** ([SPECS.md:180-183](SPECS.md#L180-L183)) — I verified live: `NSEArchives().udiff_start_date` returns `date(2024, 7, 8)`. Importing it keeps us in lockstep.
+- **`BhavcopyFormatError(DataError)`** added to error taxonomy ([SPECS.md:329](SPECS.md#L329)) — same "loud > silent" pattern as 7d15eac.
+- "Run once" comment on the capture script ([scripts/capture_bhavcopy_fixtures.py:30-33](scripts/capture_bhavcopy_fixtures.py#L30-L33)) with explicit re-run conditions (NSE format change OR holiday-shifted expiry fixture).
+
+**Blocking issues:** None — docs-only.
+
+**Non-blocking suggestions:**
+- **Divergence-warning aggregation unspecified.** A bhavcopy can have ~15k OPTSTK rows. If `XpryDt != FininstrmActlXpryDt` on a holiday-shifted batch, you don't want 5000 `warnings.warn()` calls. Pin once-per-file (collect divergent rows, emit one summary) or once-per-(symbol, expiry). Decide in the loader implementation.
+- **The `udiff_start_date` phrasing** says "imports `jugaad_data.nse.archives.NSEArchives.udiff_start_date`" — Python can't `from X import Class.attr`. The actual code will need `from jugaad_data.nse.archives import NSEArchives` then `_CUTOVER = NSEArchives.udiff_start_date`. Pedantic; not blocking.
+- **Browser UA freshness**: the Chrome major-version (134 in the capture script) will eventually go stale enough for NSE's WAF to reject. Worth a fallback chain or a clear "if you start seeing 403s, bump the UA" inline comment in the loader.
+- **No test commitment for `BhavcopyFormatError`** yet. The next p1.3.1 test commit should explicitly pin: "given a CSV with a corrupted/unknown header, the parser raises BhavcopyFormatError, not a silent shape change".
+
+**Domain / correctness checks:**
+- **jugaad-data usage:** correct — `udiff_start_date` exists and resolves to the empirically-verified cutover.
+- **Options math:** the canonical-expiry choice (`FininstrmActlXpryDt`) is the right one for backtest exit pricing; confirmed by Phase 3's hard rule (exit price = price on actual exit date).
+- **Look-ahead bias / stats:** N/A.
+
+**What I tried:**
+- `python -c "from jugaad_data.nse.archives import NSEArchives; print(NSEArchives().udiff_start_date)"` → `2024-07-08` (type `date`). Matches.
+- Read the SPECS diff + capture-script tweak.
+
+**Next-commit suggestion:** Before writing any parser code in `feat(p1.3.1)`, **pin the column-mapping table in SPECS §2.4** — one table per format, each row `(upstream column) → (§2.4 column) [transform]`. That makes the parser a mechanical translation, not a judgment call mid-implementation. The two non-obvious mappings to spell out: (a) legacy `CLOSE` → `close` and `SETTLE_PR` → `settle_price`, UDiff `ClsPric` → `close` and `SttlmPric` → `settle_price` — verified consistent across both formats (option's daily settle, which on expiry day equals reference value for ITM contracts); (b) UDiff `FinInstrmTp` codes (`STO`/`IDO`/`STF`/`IDF`) map 1:1 to legacy `OPTSTK`/`OPTIDX`/`FUTSTK`/`FUTIDX`, and §2.4 stores the legacy form as the canonical. With that table in SPECS, the parser is ~80 lines and the test suite asserts the table row-for-row.
+
+---
