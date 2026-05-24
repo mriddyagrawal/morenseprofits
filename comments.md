@@ -1724,3 +1724,39 @@ That single integration proves all four loaders + the calendar agree end-to-end 
 **Next-commit suggestion:** `feat(p3.1): src/strategies/base.py — Trade, Leg, Strategy`. Three load-bearing decisions to pin in code: **(1)** `frozen=True` for both `Leg` and `Trade` (per SPECS §3) — immutability matters because a Trade is identity-equivalent to its legs+dates and accidental mutation during sweep iteration would silently shuffle results. **(2)** `__post_init__` validation: `Leg.option_type in ("CE", "PE")` raises ValueError; `Leg.side in ("BUY", "SELL")` raises; `Leg.qty_lots > 0` raises; `Trade.legs` is non-empty tuple; `Trade.entry_date < Trade.exit_date` raises (or `<=` — pin the same-day question in SPECS first). **(3)** `Strategy` is a `Protocol` (not ABC) so concrete strategies need only implement `name` + `generate_trades(...)` — duck-typed registration in Phase 4. Tests for p3.1 are tiny but mandatory: each `__post_init__` rule fires with the right ValueError. **After p3.1 lands, immediately move to `feat(p3.2): src/engine/pnl.py`** — that's where the load-bearing P&L+lookahead+missing-data logic actually lives.
 
 ---
+
+## Review of 354fc73 — feat(p3.1): src/strategies/base.py — Trade, Leg dataclasses + Strategy protocol
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Lay down the engine's input primitives: immutable `Leg` + `Trade` dataclasses with `__post_init__` validation, and a `Strategy` Protocol the engine can type-check producers against. Per the 8aac2af plan, this is the foundation for the P&L kernel landing next.
+
+**What works:**
+- **`side_sign(side)` is a free function** ([src/strategies/base.py:25-33](src/strategies/base.py#L25-L33)) — keeps the sign convention out of inline `if-else` in the kernel. Raises on invalid side too.
+- **Leg `__post_init__`** validates all four fields ([src/strategies/base.py:55-66](src/strategies/base.py#L55-L66)) — option_type, side, qty_lots, strike-integer. Each with descriptive error messages.
+- **Trade `__post_init__`** validates 3 things ([src/strategies/base.py:88-99](src/strategies/base.py#L88-L99)) — non-empty legs, entry ≤ exit, exit ≤ expiry (no holding past expiry). All three confirmed live.
+- **Both `frozen=True`** — immutability confirmed via `t.symbol = "TCS"` → `FrozenInstanceError`.
+- **`legs: tuple[Leg, ...]`** — frozen-compatible (not a list).
+- **`Strategy` is `Protocol`** — duck-typed registration in Phase 4; no ABC inheritance needed.
+- **Verified live**: all validation paths fire with the right error type and message.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`entry_date == exit_date` is allowed** ([src/strategies/base.py:91-94](src/strategies/base.py#L91-L94)) — same-day trade returns zero P&L on daily bars. Defensible (intraday turnaround can be modeled later if we ever go intraday) but **document the decision in SPECS §3a**. The 8aac2af commit didn't resolve this; the code resolved it implicitly. Lock the answer in writing.
+- **`Trade.params: dict = field(default_factory=dict)`** is mutable through reference even though `Trade` is frozen — `t.params["x"] = 1` works post-construction. SPECS §2.5 wants `params_json` to be the canonical serialization, and a mutated dict would drift from what the engine saw at pricing time. Belt-and-suspenders fix: `MappingProxyType(dict)` or convert to `tuple[tuple[str, Any], ...]` if you want true immutability. Cosmetic for v1.
+- **`legs: tuple[Leg, ...]`** doesn't validate that all legs share the same `(symbol, expiry)` — that's pinned at the Trade level via the symbol+expiry field, not at the Leg level (Leg doesn't carry symbol/expiry). Correct architecturally; just noting the design choice.
+- **No test commit yet** — BUILDER explicitly says "Tests + the P&L kernel land in feat(p3.2)". Reasonable to combine them given how tiny p3.1 is.
+
+**Domain / correctness checks:**
+- **Sign convention:** `side_sign` mirrors SPECS §3a verbatim. Verified.
+- **Options math:** strike-int guard mirrors `cache.option_path` — consistent across the project. NSE stock-option strikes are whole rupees only.
+- **Look-ahead bias:** N/A this commit; will land in p3.2.
+- **Statistical claims:** N/A.
+
+**What I tried:**
+- Constructed Legs (valid + 4 invalid variants), Trades (valid + 3 invalid variants), exercised `side_sign` happy + error paths. All matched expectations.
+
+**Next-commit suggestion:** `feat(p3.2): src/engine/pnl.py — per-trade gross P&L kernel`. THIS is where the user's original ask materializes as a callable function. Load-bearing decisions: **(1) `price_trade(trade) -> dict` matches SPECS §2.5's `results` schema** (`gross_pnl`, `costs=0` for now, `net_pnl`, `entry_spot`, `exit_spot`, `legs_json`). **(2) Per-leg pricing**: `load_option(trade.symbol, trade.expiry, leg.strike, leg.option_type, trade.entry_date, trade.exit_date)` → filter the returned frame to `df.date <= trade.exit_date` (the no-lookahead enforcement point), then `entry_close = df[df.date == entry_date].iloc[0]["close"]` (raise `MissingDataError` if empty) and similarly for exit. **(3) lot_size from historical data**: `leg_lot_size = df[df.date == entry_date].iloc[0]["lot_size"]` — read per-row, not from a constant. PLAN §4.3. **(4) Aggregate**: `gross_pnl = sum((entry - exit) * side_sign(leg.side) * leg.qty_lots * leg_lot_size for leg in trade.legs)`. **Paired test (`test(p3.2)`)** must hand-check: short straddle with CE entry=100, exit=50, PE entry=100, exit=30, lot=250 → gross_pnl = (100-50)×250 + (100-30)×250 = 12,500 + 17,500 = 30,000. SECOND test: LookaheadError fires when the fixture frame contains a row past exit_date — proves the filter happens. THIRD test: MissingDataError when entry_date is missing from the fixture frame. Those three together are the engine's load-bearing contract.
+
+---
