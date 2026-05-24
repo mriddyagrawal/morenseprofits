@@ -435,8 +435,46 @@ each side → SELL CE: `0.20 × 2600 × 250 = ₹1,30,000`. SELL PE: same
 is typically ₹1.4–1.7L (one-leg-offset benefit applies in SPAN),
 so our ₹2.6L approximation is ~1.6× generous. Acceptable for v1.
 
+**Known v1 simplifications (cross-strategy ranking caveats — operators must understand these before drawing conclusions from Phase 5 results):**
+
+1. **Strike-based, not spot-based.** Real SPAN derives margin from
+   worst-case spot moves applied to the contract, so the natural
+   basis is `spot_at_entry`, not `strike`. v1 uses `strike` for
+   reproducibility (strike is contract-invariant; spot fluctuates).
+   For symmetric short-vol strategies (short straddle, symmetric
+   strangle) the strike-vs-spot divergence partially cancels because
+   put-strike < spot < call-strike. For asymmetric strategies
+   (single-leg shorts, asymmetric wings, iron condors with uneven
+   wings) the bias is material (~20-25% off in either direction
+   depending on strike-vs-spot offset). Phase 4 multi-strategy may
+   revisit by passing `spot_at_entry` into margin estimation.
+
+2. **`roi_pct` is HOLDING-PERIOD return, not annualized.** A 30-day
+   trade looks ~6× better than a 5-day trade at the same daily rate.
+   Phase-5 ranking should normalize via `roi_pct_annualized ≈
+   roi_pct × 252 / hold_trading_days` when comparing strategies with
+   different (entry_offset, exit_offset) windows.
+
+3. **Uniform 20% across symbols.** Real SPAN varies by underlying
+   volatility — low-vol HDFCBANK ≈ 14%, high-vol ADANIENT ≈ 25%.
+   v1's uniform 0.20 makes high-vol stocks look more profitable than
+   real (margin understated) and low-vol stocks look less profitable
+   (margin overstated). Phase-7 SPAN-file parsing eliminates the
+   bias; until then any cross-symbol ranking should be read with
+   "rankings rotate by symbol vol" in mind.
+
+4. **Multi-leg conservatism asymmetry.** Real SPAN gives a big
+   offset credit for short straddles (real-margin ≈ 60% of
+   sum-of-legs) and a small credit for calendar spreads
+   (real-margin ≈ 90% of sum-of-legs). Ranking via v1 will silently
+   favor calendar-style strategies because their margin estimate is
+   closer to real, while short straddle's is ~60% over. Phase-5 UI
+   must surface this caveat alongside any ROI-based ranking.
+
 Phase 7 backlog: parse NSE's daily SPAN file for accurate margin.
-Until then, `MARGIN_MODEL_V1` is what every backtest uses.
+Until then, `MARGIN_MODEL_V1` is what every backtest uses, and the
+four caveats above are baked into the engine's documentation so no
+downstream consumer can claim ignorance.
 
 ## 5. ATM strike selection rule (frozen)
 
