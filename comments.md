@@ -801,3 +801,51 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Stay on `fix(p1.3.1.c): Int64Dtype + force_refresh` as previously planned. The Int64-vs-int64 split per column from the bc1add4 review still holds (`Int64` for `oi`/`oi_change` — legitimately unknown; `int64` for `contracts` — absent = 0 traded, `fillna(0)` is truth-preserving). One add: with the wrap policy now this tight, the BUILDER may discover during p1.3.2 implementation that NSE's actual missing-date behavior includes **HTTP 200 with a JSON error body** (third format some endpoints do) — keep an eye on that edge case during the p1.3.verify live run and add it as a third wrap site if it bites. For now, no action needed.
 
 ---
+
+## Review of 4b8cf2f — fix(p1.3.1.c): Int64Dtype for oi/oi_change (nullable); int64 for contracts (fillna(0))
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Implement the per-column dtype split from the bc1add4 review — `contracts` stays plain `int64` (absent = 0 traded, fillna preserves truth), `oi` / `oi_change` become nullable `Int64` (legitimately unknown is meaningful).
+
+**What works:**
+- SPECS §2.4 amended row-by-row with explicit rationale per column ([SPECS.md:138-140](SPECS.md#L138-L140)). Future readers won't relitigate the choice.
+- Parser updates symmetric across both formats:
+  - Legacy: [src/data/bhavcopy_fo_loader.py:194-196](src/data/bhavcopy_fo_loader.py#L194-L196)
+  - UDiff: [src/data/bhavcopy_fo_loader.py:248,262-263](src/data/bhavcopy_fo_loader.py#L248)
+- `_assert_specs_2_4_schema` split ([tests/test_bhavcopy_fo_loader.py:68-74](tests/test_bhavcopy_fo_loader.py#L68-L74)) — `contracts` → `int64`, `oi`/`oi_change` → `Int64`. Structurally enforced.
+- `test_parser_handles_blank_oi_via_nullable_int` ([tests/test_bhavcopy_fo_loader.py:315-328](tests/test_bhavcopy_fo_loader.py#L315-L328)) — synthesizes a legacy row with blank `OPEN_INT`/`CHG_IN_OI`; asserts they parse as `pd.NA` AND that `contracts=1` is preserved (not coerced). Future upstream blanks won't crash.
+- Parquet round-trip preserves Int64 via pyarrow — exercised implicitly by `test_load_bhavcopy_fo_cache_hit_skips_fetch` which calls `_assert_specs_2_4_schema` on the post-roundtrip frame.
+- 48/48 pass.
+
+**Blocking issues / non-blocking suggestions:** None. This is the clean, mechanical implementation of the bc1add4 framing.
+
+**Domain / correctness checks:**
+- **Options math:** `contracts` semantically = "trades executed this day, zero if untouched" — `fillna(0)` is correct.
+- **Statistical claims:** Int64-typed `oi` will surface as `pd.NA` in aggregations, not as 0 — important for future sweep stats so a "skipped on bootstrap day" row doesn't get silently averaged in as 0.
+- **Look-ahead / jugaad:** N/A.
+
+**Next-commit suggestion (rolled into a43e9d4 below).**
+
+---
+
+## Review of a43e9d4 — fix(p1.3.1.d): force_refresh kwarg on load_bhavcopy_fo
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the last f5ff10c flag — mirror `spot_loader.load_spot`'s `force_refresh` semantics on the bhavcopy_fo loader.
+
+**What works:**
+- `force_refresh: bool = False` keyword-only kwarg ([src/data/bhavcopy_fo_loader.py:273](src/data/bhavcopy_fo_loader.py#L273)). Pass-through to `cache.write(..., overwrite=force_refresh)` ([src/data/bhavcopy_fo_loader.py:285](src/data/bhavcopy_fo_loader.py#L285)).
+- `test_force_refresh_refetches` ([tests/test_bhavcopy_fo_loader.py:458-481](tests/test_bhavcopy_fo_loader.py#L458-L481)) walks all four phases: (1) cold fetch, (2) cache hit (no re-fetch), (3) `force_refresh=True` → re-fetch (calls=2), (4) subsequent normal call uses overwritten cache (still calls=2). Comprehensive.
+- 49/49 pass. Phase 1.3.1 followup work is now complete; loader is behavior-symmetric with spot_loader.
+
+**Blocking issues / non-blocking suggestions:** None.
+
+**Domain / correctness checks:** N/A — purely a behavior surface added with mirror semantics.
+
+**What I tried:** `python -m pytest tests/ -v` → 49 passed in 0.36s. Read both diffs end-to-end.
+
+**Next-commit suggestion:** `feat(p1.3.2): expiry_calendar` — the **load-bearing test from commit one is determinism**: call `monthly_expiries(symbol, from_date, to_date)` twice with the same inputs (monkeypatch `load_bhavcopy_fo` to return a fixed frame); assert byte-identical sorted output. The entire reason this module exists is to escape the `list(set(dts))` non-determinism we logged in PLAN.md change-log on 2026-05-24; if the calendar's output isn't deterministic, every Phase-3 backtest is too. **Sampling strategy I'd commit to**: for each calendar month in the window, iterate days 1..7 and take the first that resolves (`except MissingDataError: continue`) — the MissingDataError wrap from bc1add4 makes this trivial. One bhavcopy per month gives ALL listed expiries (near + far months), so a 12-month window's union is essentially complete. Document the strategy in SPECS §2.3. Hand-check the BUILDER planned originally: `monthly_expiries("RELIANCE", 2024-01-01, 2024-01-31) == [date(2024,1,25)]`. With the legacy fixture already containing RELIANCE expiries [Jan-25, Feb-29, Mar-28], the determinism test can drive end-to-end without live network.
+
+---
