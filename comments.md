@@ -2299,3 +2299,55 @@ This matters because a user reading the commit message expects 3.78%/year and wo
 Then **Phase 4: parameter sweep + multi-strategy framework**. The data + universe + engine are now honestly conservative, ranking-comparable, and live-verified. Phase 4 multiplies that across (strategy × stock × month × entry_offset × exit_offset) to find historical edges.
 
 ---
+
+## Review of b4fea19 — fix(p3.5.i): correct 169c7d6 annualization arithmetic + verify-script polish
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Land both my flags from the prior review — (a) the 3.78→5.46 commit-message correction, (b) the verify-script polish to surface all Phase-3 deliverables in one breath.
+
+**What works:**
+- **Explicit correction of the prior commit message** ([git log b4fea19](commit-message)): WRONG/RIGHT side-by-side. "Reviewer caught it. Honest annualized return is 5.46%/year (NOT 3.78%/year)." That's the right way to amend a prior-commit-message error in a project that doesn't rewrite history.
+- **`test_hold_trading_days_calendar_to_trading_conversion`** — pins the `20 calendar → 14 trading days` conversion. A future "let's use calendar days" regression OR a "plumb trading_calendar through" upgrade will both fire as test diffs. Clean regression block.
+- **Verify script overhaul** — independently reproduced on my machine:
+  - Per-leg breakdown now shows `raw close → realized post-slippage` side-by-side (e.g. `CE entry: 56.50 → 55.9350`)
+  - New "WITHOUT-SLIPPAGE COMPARISON" section prints both naive and honest numbers
+  - "ROI (annualized, 14 td) ← cross-window-rankable" callout makes the new column visible
+  - **Haircut line is the headline**: `₹487.75 (= 53.6% of naive net)` — the asymmetric-conservatism delta in ₹.
+- 204/204 in full suite.
+
+**The user-facing headline** the new verify produces:
+
+```
+Without slippage : ROI +0.65% (+11.76%/yr)
+With 1% slippage : ROI +0.30% (+5.46%/yr)
+Haircut          : 53.6% of naive net
+```
+
+This is the answer to the user's exact question from the cost/margin thread. A naive 11.76%/year backtest becomes an honest 5.46%/year with slippage. The user wanted "10% backtest → 8% reality is fine; not too optimistic." This is more aggressive than that — naive WAS too optimistic by 2.2×. Without this fix the user would have walked into Phase 4 trusting numbers that overstate reality by 100%+.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **"PHASE 3 IS NOW ALL CAVEATS CLOSED, ALL DOCUMENTATION ACCURATE"** in the commit message is slight overstatement. Caveat #1 (strike-vs-spot margin basis) was explicitly deferred to Phase-4+ in 169c7d6 itself. Strictly: "all caveats that bite Phase 3's ATM short straddle are closed; caveat #1 doesn't bite this strategy but will bite asymmetric Phase-4 strategies." The narrower truth.
+- **Haircut % uses `max(naive['net_pnl'], 1)` as divisor** ([scripts/verify_p3.py:147](scripts/verify_p3.py#L147)) — protects against divide-by-zero but produces nonsense for losing trades (where `naive['net_pnl']` is negative, the floor-at-1 still gives a finite % but the sign convention is misleading). Doesn't bite this verify (canonical trade is profitable) but Phase-4 sweep aggregations will hit losing trades where this % is meaningless. Defer.
+- **`SlippageModelV1(slippage_pct=0.0)` for the naive comparison** — works but slightly wasteful (it re-runs the full pricing pipeline). A `naive_only=True` flag or just direct math could short-circuit. Cosmetic.
+
+**Domain / correctness checks:**
+- **Math:** 5.46%/year verified independently. Test pins the conversion.
+- **Asymmetric conservatism:** displayed as a ₹ haircut + % difference, exactly the framing the user asked about.
+- **Caveat closure summary**:
+  - ✅ #2 (non-annualized ROI) — closed by 169c7d6 + this correction
+  - ✅ #3 (uniform 20% margin) — closed by Tier-B cluster
+  - ✅ #4 (multi-leg conservatism) — closed by Tier-B cluster
+  - ✅ Slippage gap — closed by 45541e0
+  - ⏸️ #1 (strike-vs-spot margin) — deferred to Phase 4 (doesn't bite ATM Phase 3)
+
+**What I tried:**
+- `python -m pytest tests/` → 204/204 in 0.81s.
+- `python scripts/verify_p3.py` → reproduced the haircut output exactly.
+- Read the test + verify diffs end-to-end.
+
+**Next-commit suggestion:** **Phase 4 — `feat(p4.1): Strategy protocol + registry`** kicks off. PLAN.md sequence is registry → sweeper → multi-strategy → results store → parallelize → determinism test. The single most load-bearing concern for the WHOLE PHASE 4 is **determinism under multiprocessing.Pool**: byte-identical results regardless of worker count / scheduling. Achieved by (a) each task being a pure function of `(strategy, stock, expiry, entry_offset, exit_offset)`; (b) no shared mutable state across workers; (c) sort + reset_index before persisting any sweep result parquet. Caveat #1 (strike-vs-spot) becomes relevant the moment `IronCondor` lands as a strategy — fix it at that point (~10 lines: add `spot_at_entry` param to `MarginModelV1.estimate`, default to using strike if None). The honest groundwork from Phase 3 means Phase 4 sweep results can be trusted as conservative-but-realistic.
+
+---
