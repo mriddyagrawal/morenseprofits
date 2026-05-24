@@ -1001,3 +1001,37 @@ cache.bhavcopy_fo_path(datetime(2024,1,2,9,30))   # → same path, time ignored
 **Next-commit suggestion:** Per the BUILDER's note, the next is a tiny `fix(p1.3.x)` for the open non-blocking flags: (1) `warnings.warn(...)` in `_sample_expiries_for_month` when all 7 candidate days raise `MissingDataError`; (2) SPECS §2.3 note on the empty-month sentinel-row gap; (3) update `test_month_with_no_trading_in_first_7_days_returns_empty` to use `warnings.catch_warnings(record=True)` and assert the new warning fires. Then **straight to `feat(p1.4): options_loader`** — the load-bearing concern there is the **strike-key collision** (cache file path uses `int(strike)`, but the bhavcopy stores `strike: float64`; ensure the loader rejects non-integer strikes via the same `StrikeNotIntegerError` guard `cache.option_path` has, since this is the layer where strike values cross from float to int-keyed-on-disk).
 
 ---
+
+## Review of fe6f1e0 — fix(p1.3.2.b): all-7-fail warning + multi-month-partial + byte-stable tests
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the three 2b00c68 non-blocking flags with a tiny commit, then mark Phase 1.3 done.
+
+**What works:**
+- **All-7-fail warning** ([src/data/expiry_calendar.py:78-84](src/data/expiry_calendar.py#L78-L84)) — informative message with month + symbol + "investigate if you see this in production" guidance. Right tone for an operator-facing surface.
+- **`test_multi_month_partial_failure_returns_only_successful_months`** ([tests/test_expiry_calendar.py:198-238](tests/test_expiry_calendar.py#L198-L238)) — Jan + Mar populated, Feb dark; asserts `[Jan-25, Mar-28]` (union, not all-or-nothing) AND exactly one Feb warning. Pins the "calendar is graceful under partial failure" contract.
+- **`test_on_disk_parquet_is_byte_stable_across_regenerations`** ([tests/test_expiry_calendar.py:241-261](tests/test_expiry_calendar.py#L241-L261)) — captures bytes, wipes, rebuilds, asserts bytes equal. Catches the class of regression where return-list is sorted but on-disk row-order varies across runs.
+- **Module docstring updated** ([src/data/expiry_calendar.py:21-31](src/data/expiry_calendar.py#L21-L31)) with explicit "Known v1 limitations" listing the empty-month sentinel gap (deferred to Phase 7) and the all-7-fail behavior (now warning + empty). Future readers don't re-derive.
+- **`force_refresh` deferred with reasoning** that mirrors my own framing in the prior review — accepted my "calendar is derived; force-refresh bhavcopies instead" argument verbatim.
+- 61/61 pass in 0.45s.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`read_bytes()` byte-equality test could be brittle to pyarrow metadata changes.** Today pyarrow doesn't include creation-timestamps in parquet metadata; if a future pyarrow rev does, this test fails for unrelated reasons. Equivalent-but-more-semantic: `pd.testing.assert_frame_equal(read1, read2)` on the loaded parquets. Same regression coverage, less metadata-dependence. Defer; the current test catches the actual bug class.
+- **Warning `stacklevel=3`** points 3 frames up from the warn site → `_sample_expiries_for_month`'s caller's caller = `monthly_expiries`'s caller. That's typically the right depth for an operator-facing surface. If you ever observe `:_sample_expiries_for_month:` paths in production warning logs, drop to `stacklevel=2`.
+- The fix bundle absorbed three flags in one commit instead of one per — defensible because they're tightly related (all are silent-loss surface fixes), but per nuclear-step doctrine the cleanest pattern would have been 3 micro-commits. Not worth splitting now.
+
+**Domain / correctness checks:**
+- **jugaad-data usage / options math / look-ahead / stats:** N/A this commit.
+
+**What I tried:**
+- `python -m pytest tests/ -v` → 61/61 in 0.45s.
+- Read both new tests + the warning message text.
+
+**Phase 1.3 status:** **DONE.** 61 offline tests + 1 live NSE end-to-end run (cutover-spanning RELIANCE Jun-Sep 2024) all green. The whole data layer up through the expiry calendar is provably correct, deterministic, and resilient to NSE's known weirdness.
+
+**Next-commit suggestion:** `feat(p1.4): data/options_loader.py` — mirror `spot_loader`'s structure (`_normalize`, `_fetch_year`-equivalent, per-(symbol, expiry, strike, type) parquet cache, `force_refresh` kwarg, `MissingDataError` wrap). Three things to bake in from commit one: **(1)** the **+5h30m IST date-shift fix** — `derivatives_df` likely returns the same `YYYY-MM-DD 18:30:00` representation as `stock_df`; verify by inspecting one raw row before normalizing. If true, normalize via the same idiom; if not, document the difference. **(2)** the `expiry` argument MUST go through the same `isinstance(_, datetime)` rejection as `bhavcopy_fo_path` — strike-int and expiry-date integrity at the API boundary, not deep inside the fetcher. **(3)** the **single load-bearing test**: hand-check `load_option("RELIANCE", date(2024,8,29), 2840, "CE", date(2024,8,29), date(2024,8,29))` against the recorded UDiff fixture values — `close=201.70, oi=41500, oi_change=-1500, contracts=26, lot_size=250`. Same row we already pinned in the bhavcopy_fo tests; if the options_loader returns the same numbers, the layers agree.
+
+---
