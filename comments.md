@@ -3306,6 +3306,77 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of fd72b85 — docs(plan): Phase 6 scope freeze + Phase 7 expansion
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** User-directed scope decision ("ship 4 tabs as Phase-6 v1 and add the others to next phases") transcribed into PLAN.md. Two structural changes: (1) PLAN §3 Phase-6 commit list collapsed into a pointer to DESIGN_SPEC §4 to prevent parallel-list drift, (2) Phase-7 expanded with 4 considered-but-deferred tab additions. Compare-pairs tab considered + rejected with reasoning.
+
+**What works:**
+
+1. **Single-source-of-truth collapse for Phase-6 commits.** Previous PLAN.md §3 had 5 generic commits (skeleton / per-stock dashboard / trend / ranker / caveats); DESIGN_SPEC §4 has the precise 26-sub-commit breakdown. **Two parallel lists ARE a guaranteed drift surface** — exactly the kind of staleness pattern I flagged in my 8a49165 and b7fe7e5 reviews. Collapsing to "PLAN owns headline + exit criteria; DESIGN_SPEC owns granular plan" is the right factoring. Same discipline as moving caveats to canonical constants instead of duplicating verbatim copy.
+
+2. **Phase-6 exit criteria expanded with two new bullets:**
+   - "All four tabs render against the verify-set parquet without crashes; thin-data UX paths exercised per DESIGN_SPEC §2.6." — directly checks the §2.6 degenerate-data UX contract authored in 3880d9d. **Phase 6 won't ship until the empty-state / degenerate-data branches are exercised on the 18-trade verify set.** This is the right gate.
+   - "Tagged `v0.6-ui` at completion." — matches DESIGN_SPEC §6 tagging discipline.
+
+3. **Phase-7 expansion is well-scoped:**
+   - **p7.1 trade-level drill-down** — "pick a (strategy, symbol, entry, exit, expiry) cell, render its ~3-30 actual trades with entry spot, exit spot, per-leg premiums, gross/net P&L." This is the most defensible Phase-6-deferred addition. The "show me the evidence behind the median" loop closes the operator-trust gap: ranking views show summary stats; this view shows the raw trades that produced them. **For an operator who's about to commit capital, this is the load-bearing diagnostic view.** Properly scoped as Phase-7-immediate rather than Phase-8+.
+   - **p7.2 diagnostics** — "full skip-log breakdown ('180×MissingDataError, 20×NoLiquidStrike'), bhavcopy/options coverage map, run_id history". Operator tooling, not researcher tooling — answers "did my sweep cover what I asked for?". Right complement to the 4 researcher-facing tabs.
+   - **p7.3 export buttons** — CSV + PNG via st.download_button. Closes DESIGN_SPEC §9 open Q explicitly. **Clean Phase-6 → Phase-7 boundary**: open Qs in DESIGN_SPEC get scheduled into the next phase rather than left as forever-pending.
+   - **p7.4 regime drill-down** — surfaces classify_momentum output as data. "Which months are bullish, trailing-return distribution." Trust-building view; useful once multi-year data lands.
+
+4. **Compare-pairs tab considered + REJECTED with reasoning**: "largely covered by Heatmap filter-switching + Leaderboard sorting; not unique enough." **Considered the alternatives**: rejection IS defensible but worth a future-flag — see non-blocker #1 below.
+
+5. **Change-log entry 2026-05-25** records the freeze + decision rationale + the rejected alternative. **Matches the PLAN §7 discipline**: not just "I changed the plan", but "I changed the plan because X, considered Y and rejected because Z". Audit trail is intact.
+
+**Live-verified:**
+- `git show fd72b85 -- PLAN.md` — 30-line edit, 19+/11-, only PLAN.md touched. No code; no test regression possible.
+- Cross-checked the DESIGN_SPEC §4 pointer: §4 does contain the 26-sub-commit breakdown (verified during 3880d9d review). The pointer resolves to real content.
+- Confirmed change-log entry follows the dated-bullet convention (matches the 2026-05-24 entries above it).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **Compare-pairs rejection has one edge case worth flagging.** The rejection is defensible for the typical operator question "which pair is best overall?" (covered by Leaderboard sort) and "what's the offset window for this pair?" (covered by Heatmap). **But the question "is A better than B at this specific offset window?" is genuinely awkward in the current 4-tab structure** — you'd need to flip the Heatmap's strategy/symbol selectors back and forth, mentally retaining the prior cell value. **Not a blocker** — operators can do this with the existing tabs; just slower. **If user feedback during Phase-6 validation surfaces "I keep flipping back and forth between two strategies on the Heatmap", revisit compare-pairs for a Phase-8 addition.** Currently nothing forces this revisit; just flagging so it's not invisible.
+
+2. **DESIGN_SPEC §4 26-commit list now load-bearing for Phase-6 planning.** Previously, PLAN.md and DESIGN_SPEC could disagree and a reader could check both. Now PLAN.md defers; DESIGN_SPEC IS the plan. **One side effect**: if DESIGN_SPEC §4 is ever revised mid-Phase-6 (likely — change logs already started), the running view of "what's left" lives only in the spec. Mitigations: change-log discipline (already in place at §11), git-blame on DESIGN_SPEC §4 commits. Acceptable.
+
+3. **PLAN.md §3 Phase 7 commit list has both new (p7.1-p7.4) and existing (README, user-curated-universe, BLUE_CHIP_BY_QUARTER) items.** Ordering: the new tab-additions land first (1-4), then the polish/docs/data items (5-8). **Defensible ordering** — Phase-7 ships value-additions before retro-docs polish. Could also be argued the other way (close out Phase-6 polish + docs THEN add new tabs to Phase 7), but no real difference at this granularity.
+
+4. **No DESIGN_SPEC change required** — PLAN.md now points TO DESIGN_SPEC, not vice versa. Asymmetric reference is fine; the design doc doesn't need to know about the freeze (it already pre-froze the 4-tab scope in 3880d9d's revision).
+
+**Domain / correctness checks:**
+- **User-directive traceability**: ✓ commit body quotes the user's direction verbatim ("ship 4 tabs as Phase-6 v1 and add the others to next phases") + dates the entry.
+- **No code regression possible**: ✓ docs-only.
+- **Plan ↔ Design consistency**: ✓ PLAN exit criteria for Phase 6 now references DESIGN_SPEC §2.6 (thin-data UX) — the docs reinforce each other instead of duplicating.
+
+**What I tried:**
+- Read the full PLAN.md diff.
+- Cross-checked DESIGN_SPEC §4 → has the 26-commit breakdown referenced by PLAN.
+- Re-read the rejected-alternative reasoning for compare-pairs; mentally tested against the "is A better than B at offset W" use case (flagged in non-blocker #1).
+
+**Sequencing observation:** This is the right pre-code-work commit. With Phase-6 scope frozen, exit criteria pinned, and Phase-7 already scoped, BUILDER can land `feat(p6.0.format)` next without worrying about scope creep mid-implementation. **The scope-freeze + change-log discipline is exactly what prevents Phase-6 from drifting from 26 commits to 35.**
+
+**Next-commit suggestion** (unchanged from my aae03c0 review):
+1. `feat(p6.0.format)` — `src/web/_format.py` per DESIGN_SPEC §2.7.
+2. `test(p6.0.format)` — boundary tests.
+
+Then `feat(p6.1.discover)` per SPECS §11.2. First real Phase-6 code lands at that point.
+
+**Status — Phase-6 readiness:** All preconditions met:
+- ✅ Dependencies updated (d9f2cb2)
+- ✅ SPECS §11 web contracts pinned (b7fe7e5 + 1c00f69)
+- ✅ DESIGN_SPEC §4 26-commit roadmap is now PLAN's source of truth (fd72b85)
+- ✅ All accumulated reviewer flags closed (aae03c0)
+- ✅ Mockups properly named + README'd (aae03c0)
+- ✅ 367/367 tests pass
+
+Code work can start.
+
+---
+
 ## Review of aae03c0 — chore: close 3 reviewer-flag cleanup items
 
 **Verdict:** ✅ accept
