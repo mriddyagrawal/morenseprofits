@@ -2781,3 +2781,29 @@ Load-bearing tests: **(a)** 4 legs with correct sides + correct order in `legs_j
 The PAIRED `test(p4.5)` is: monkeypatch fetchers + load_spot + load_bhavcopy to deterministic fakes (so workers can't have non-deterministic data); run `sweep_grid(..., n_workers=1)` then `sweep_grid(..., n_workers=4, force=True)`; assert `pd.testing.assert_frame_equal(read1, read2)`. That single test is what proves SPECS §6c.3 determinism contract holds.
 
 ---
+
+## Review of 8d49bf7 — chore(p4.4.refactor): extract _strikes.py — SPECS §5 picker in one place
+
+**Verdict:** ✅ accept
+
+Closes the refactor flag I've been raising since p4.4.b (ShortStrangle). Clean consolidation:
+
+- **`_strikes.py` owns SPECS §5** in one place — `load_available_strikes()` + `pick_nearest()` + `NoLiquidStrikeError`. Adding a 6th strategy now means 2 lines instead of 12.
+- **No more cross-module private imports** — long_straddle / long_strangle no longer reach into their short cousins' `_pick_*` private namespaces.
+- **Backward compat preserved** via `NoLiquidStrikeError` re-export from `short_straddle` (sweeper + existing tests don't break).
+- 11 new tests pin the helper's contract (filter, sort, dedup, tiebreaker, edge cases). 296/296 full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking suggestions:**
+- **`NoLiquidStrikeError` could move to `src/data/errors.py`** (the centralized error taxonomy per SPECS §8). Currently it's in a strategy submodule + re-exported — architecturally a touch off, since this error class is shared infrastructure not strategy-specific. Cosmetic.
+- **`pick_nearest` docstring requires non-empty sorted-ascending input** but doesn't validate. `min([], ...)` raises `ValueError` if passed empty; unsorted input produces wrong tiebreaker. Single assert would close the gap. Cosmetic.
+- **The two-step pattern `strikes = load_available_strikes(...); s = pick_nearest(strikes, t)`** could compress to one call. Defer — current shape lets callers reuse the strike list across multiple targets (iron condor needs 4 picks from one fetch), which would be lost in a single-call API.
+
+**Domain / correctness checks:**
+- **SPECS §5**: argmin distance + lower-strike tiebreaker, implemented exactly once via the `(abs(k - target), k)` tuple key.
+- **Whole-rupee assumption**: `int(s)` silently truncates fractional strikes. Docstring acknowledges this. Fine for v1 OPTSTK universe.
+
+**Next-commit suggestion:** Per PLAN.md, `perf(p4.5): multiprocessing.Pool — preserves determinism` next. The load-bearing details are already in the a4aa27c next-commit-suggestion above (pickling closures, scheduling vs sort_values backstop, per-process cache state, skip log aggregation). The PAIRED `test(p4.5)` runs `n_workers=1` vs `n_workers=4` and asserts `pd.testing.assert_frame_equal(read1, read2)` — that's the SPECS §6c.3 determinism contract proof.
+
+---
