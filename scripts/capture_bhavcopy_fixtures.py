@@ -27,7 +27,10 @@ re-derive them):
     FinInstrmTp values: STO (stock option), IDO (index option),
     STF (stock future), IDF (index future).
 
-Run once; outputs are committed to git for the test suite to use offline.
+**Run once.** Outputs are committed to git for the test suite to use offline;
+re-running overwrites them. Only re-run if NSE changes the format AGAIN or
+you need a fresh fixture from a different date (e.g. a holiday-shifted
+expiry month to disambiguate `XpryDt` vs `FininstrmActlXpryDt`).
 """
 from __future__ import annotations
 

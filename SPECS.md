@@ -162,6 +162,26 @@ UDiff columns: `TradDt,BizDt,Sgmt,Src,FinInstrmTp,FinInstrmId,ISIN,TckrSymb,Scty
 
 The loader normalizes both → §2.4 schema; downstream callers (`expiry_calendar`, Phase 1.4 options_loader) see one shape.
 
+**Canonical `expiry` column.** UDiff exposes both `XpryDt` (originally
+scheduled expiry) and `FininstrmActlXpryDt` (actually-settled expiry); they
+agree except on holiday-shifted Thursdays (e.g. scheduled Thursday is a NSE
+holiday → contract settles previous trading day). The loader maps
+**`FininstrmActlXpryDt`** to our `expiry` column because that's the date a
+backtest's exit price ties to. When the two diverge, the loader emits a
+`warnings.warn(...)` so we know holiday shifts are happening; we never
+silently coerce. (Legacy format has only `EXPIRY_DT` — no divergence to
+record.)
+
+**Browser User-Agent requirement.** The direct-URL UDiff fetch returns
+HTTP 403 without a `User-Agent` header from a recent browser. The loader
+ships the same `Mozilla/5.0 ... Chrome/...` UA that `scripts/capture_bhavcopy_fixtures.py`
+uses. Don't strip it "to be tidy" — NSE's WAF rejects bare requests.
+
+**Cutover date source-of-truth.** The loader imports
+`jugaad_data.nse.archives.NSEArchives.udiff_start_date` rather than
+hardcoding `date(2024, 7, 8)`. Keeps us in lockstep if upstream ever
+shifts their view of the boundary.
+
 **Tests use recorded byte-for-byte fixtures** at `tests/fixtures/bhavcopy_fo_legacy_*.csv` and `tests/fixtures/bhavcopy_fo_udiff_*.csv` — live tests are skipped by default per `pytest.ini`, so regression value lives in the recordings.
 
 ### 2.5 Results — `data/results/{strategy}_{run_id}.parquet`
@@ -306,6 +326,7 @@ class DataError(Exception): ...
 class MissingDataError(DataError): ...            # leg/spot missing for required date
 class NoLiquidStrikeError(DataError): ...         # no strikes traded on entry_date
 class CacheCorruptError(DataError): ...
+class BhavcopyFormatError(DataError): ...         # CSV header matches neither pre/post Jul-8-2024 schema
 class StrategyConfigError(ValueError): ...        # bad params dict
 ```
 
