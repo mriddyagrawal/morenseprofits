@@ -68,9 +68,19 @@ _WORKER_TODAY: date | None = None
 
 def _worker_init(today_date: date) -> None:
     """Pool initializer. Stashes today_date so worker tasks can build a
-    today_fn without pickling a lambda from the main process."""
+    today_fn without pickling a lambda from the main process. Also
+    silences the noisy ``options_loader`` "dropped N partial row(s)"
+    UserWarning that would otherwise drown out tqdm output — it fires
+    once per NSE fetch and is purely informational (see options_loader
+    line 316 for the source)."""
     global _WORKER_TODAY
     _WORKER_TODAY = today_date
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*dropped \d+ partial row.*",
+        category=UserWarning,
+    )
 
 
 def _worker_today_fn() -> date:
