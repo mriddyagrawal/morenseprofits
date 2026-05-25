@@ -53,8 +53,13 @@ from src.strategies.base import Leg, Trade, side_sign
 LoadOptionFn = Callable[..., pd.DataFrame]
 
 
-def _pick_close_on(df: pd.DataFrame, target: date, *, context: str) -> tuple[float, int]:
-    """Return (close, lot_size) for the row whose date equals ``target``.
+def _pick_close_on(
+    df: pd.DataFrame, target: date, *, context: str,
+) -> tuple[float, int, int | None, int | None]:
+    """Return (close, lot_size, volume, oi) for the row whose date equals
+    ``target``. ``volume``/``oi`` are returned as ``None`` if those columns
+    are absent (test fixtures use minimal frames); production loader frames
+    always carry them per §2.3.
 
     Raises ``MissingDataError`` if no such row exists; raises
     ``LookaheadError`` if multiple rows share the date (parser bug).
@@ -76,7 +81,14 @@ def _pick_close_on(df: pd.DataFrame, target: date, *, context: str) -> tuple[flo
             f"{context}: multiple rows on {target} — duplicate date suggests "
             f"a parser bug, refusing to pick one silently"
         )
-    return float(row.iloc[0]["close"]), int(row.iloc[0]["lot_size"])
+    r = row.iloc[0]
+    volume: int | None = None
+    oi: int | None = None
+    if "volume" in row.columns and pd.notna(r["volume"]):
+        volume = int(r["volume"])
+    if "oi" in row.columns and pd.notna(r["oi"]):
+        oi = int(r["oi"])
+    return float(r["close"]), int(r["lot_size"]), volume, oi
 
 
 def _price_one_leg(
@@ -110,8 +122,12 @@ def _price_one_leg(
             f"{context}: frame contains rows past exit_date {trade.exit_date}: "
             f"{[str(d) for d in offenders]}. Look-ahead bias would leak."
         )
-    entry_px, entry_lot = _pick_close_on(df, trade.entry_date, context=f"{context} entry")
-    exit_px, exit_lot = _pick_close_on(df, trade.exit_date, context=f"{context} exit")
+    entry_px, entry_lot, entry_vol, entry_oi = _pick_close_on(
+        df, trade.entry_date, context=f"{context} entry",
+    )
+    exit_px, exit_lot, exit_vol, exit_oi = _pick_close_on(
+        df, trade.exit_date, context=f"{context} exit",
+    )
     # Lot size at ENTRY is what's used for the P&L calc (NSE rarely
     # changes lot size mid-contract; if it ever does, exit_lot would
     # differ and we'd want to know — assert).
@@ -137,6 +153,13 @@ def _price_one_leg(
         "exit_px": exit_px,                    # raw close from loader
         "entry_px_realized": entry_px_realized,  # post-slippage
         "exit_px_realized": exit_px_realized,    # post-slippage
+        # Liquidity at entry + exit (shares units; contracts = vol/lot_size).
+        # Surfaces per-leg thinness so the drill-down can flag low-OI /
+        # zero-volume legs that the flat 1% slippage model under-charges.
+        "entry_volume": entry_vol,
+        "exit_volume": exit_vol,
+        "entry_oi": entry_oi,
+        "exit_oi": exit_oi,
         "gross_pnl": gross,
     }
 
