@@ -3306,6 +3306,107 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of a27f9a7 + ef522aa — feat: sweep_grid gains multiprocessing.Pool + p7_wide_sweep uses 8-worker parallel
+
+**Verdict:** ⚠ **accept-with-followup** — **real determinism bug**: skips parquet rows are written in completion-order (random under parallel) rather than canonical order. Violates the docstring's "byte-identical regardless of n_workers" claim and SPECS §6c.3 for the SKIPS parquet specifically. Fix is trivial; flagging for a single-commit follow-up.
+
+### a27f9a7 — feat: sweep_grid gains parallel + progress bar (deferred p4.5)
+
+**Phase / commit goal:** Long-deferred Phase-4.5 commit (per PLAN.md change log 2026-05-24: "p4.5 deferred until per-task latency is measured"). 216k-cell wide sweep was the trigger — ~45 min single-threaded on M1 Max idling 7/8 cores. New params (default-off, backward-compat):
+- `n_workers: int = 1` — `>1` routes through `mp.Pool.imap_unordered`.
+- `show_progress: bool = False` — wraps iteration in `tqdm`.
+
+**What works:**
+
+- **Cross-process `today_fn` handling** ([src/engine/sweeper.py:66-82](src/engine/sweeper.py#L66-L82)): module-level `_WORKER_TODAY` global + Pool `initializer=_worker_init` stashes the resolved date once in each worker; `_worker_today_fn()` reads it. **Avoids the unpicklable-lambda problem cleanly.** Test wire-ups (`today_fn=lambda: date(2026, 5, 24)`) keep working in single-threaded mode; parallel mode bypasses pickling entirely.
+- **`_worker_run` returns `(task_args, result)`** ([src/engine/sweeper.py:85-96](src/engine/sweeper.py#L85-L96)) — pairs every result back to its (strategy, symbol, expiry, entry, exit) regardless of completion order. **Skip-log can be constructed correctly even though `imap_unordered` returns in race-condition order.**
+- **`chunksize = max(1, len(worker_args) // (n_workers * 32))`** ([src/engine/sweeper.py:299](src/engine/sweeper.py#L299)) — auto-sized. For 216k tasks × 8 workers → chunksize ~845. Reasonable: not so small that IPC dominates, not so large that tail work-stealing collapses.
+- **`mp.Pool(...) as pool`** context manager — graceful shutdown on exit.
+- **`from tqdm import tqdm` lazy-imported** inside the function ([src/engine/sweeper.py:307, 314](src/engine/sweeper.py#L307-L314)) — only loads tqdm when show_progress=True. Defensible.
+- **Backward-compat preserved**: `n_workers=1` (default) keeps the original single-threaded path verbatim; existing tests unaffected.
+- **run_id correctly excludes `n_workers` and `show_progress`** ([src/engine/sweeper.py:107-118](src/engine/sweeper.py#L107-L118)): "Operational kwargs are explicitly EXCLUDED — same logical sweep produces same run_id regardless of how executed." ✓
+- **Results parquet sort preserves determinism**: `df.sort_values([strategy, symbol, expiry, entry_offset_td, exit_offset_td]).reset_index(drop=True)` ([src/engine/sweeper.py:329-332](src/engine/sweeper.py#L329-L332)) — completion order is irrelevant for the results parquet.
+
+**🔬 DETERMINISM BUG — skips parquet rows in completion order, not canonical:**
+
+The results parquet is sorted post-collection (above), but **`write_skips(skipped, run_id)` just dumps the list in append order**:
+
+```python
+# src/engine/results.py:170-185
+def write_skips(skip_rows: list[dict], run_id: str, ...):
+    if not skip_rows:
+        return None
+    df = pd.DataFrame(skip_rows)
+    ...
+    df_ordered = df[list(SKIPS_COLUMNS)]
+    df_ordered.to_parquet(path, index=False)   # ← no sort
+```
+
+**Consequence:**
+- Single-threaded `n_workers=1`: tasks complete in canonical order → skips appended in canonical order → skips parquet rows in canonical order.
+- Parallel `n_workers=8`: tasks complete in `imap_unordered` (race-conditioned) order → skips appended in random order → skips parquet rows in random order.
+
+**Same logical sweep → DIFFERENT byte-identicality of the skips parquet between worker counts.** Sweeper docstring's claim "byte-identical output regardless of `n_workers`" ([src/engine/sweeper.py:237-238](src/engine/sweeper.py#L237-L238)) is true for the RESULTS parquet only, **NOT for the SKIPS parquet**. Violates SPECS §6c.3 for the skips file.
+
+**Fix (one-line)**: either sort skipped list before passing to `write_skips`:
+```python
+sk = sorted(skipped, key=lambda r: (r["strategy"], r["symbol"], r["expiry"], int(r["entry_offset_td"]), int(r["exit_offset_td"])))
+_results.write_skips(sk, run_id=run_id)
+```
+OR sort inside `write_skips` by `SKIPS_COLUMNS[0:5]` for stronger always-canonical guarantee.
+
+**Recommended fix-commit**: `fix(p4.5): sort skips by canonical key before write — restore §6c.3 byte-identicality across n_workers`. ~3-line patch + a regression test that runs `sweep_grid(n_workers=1)` vs `sweep_grid(n_workers=4)` on a fixture with skips and asserts both skips parquets are `pd.testing.assert_frame_equal`-clean.
+
+**Other non-blocking observations:**
+
+1. **No test exercises the parallel path.** Existing `test_sweep_grid_deterministic` only tests single-threaded (its second call hits the cached parquet, not a fresh parallel run). **The skips-ordering bug above would have been caught by a `test_sweep_grid_parallel_matches_serial` test.** Worth landing alongside the fix-commit.
+
+2. **Worker process state leaks across Pool invocations**: `_WORKER_TODAY` global is set by Pool initializer, NEVER cleared. If sweep_grid is called multiple times in the same Python process with different today_fn values, the second call's Pool replaces `_WORKER_TODAY` but the first call's `_WORKER_TODAY` lingered as garbage. **Not a correctness issue** (each Pool sets its own value) but worth a docstring note. Cosmetic.
+
+3. **`assert _WORKER_TODAY is not None`** ([src/engine/sweeper.py:79](src/engine/sweeper.py#L79)) — defensive. Plain `assert` (not `raise`), which means `python -O` strips the check. **For a guard that surfaces "initializer never ran" (a real ops failure mode), an explicit `raise RuntimeError(...)` would be safer.** Cosmetic.
+
+4. **`f"skip:{type(e).__name__}"` reason serialization** preserved by `_worker_run` → `_handle` parsing ([src/engine/sweeper.py:278](src/engine/sweeper.py#L278)). Stringified skip reasons survive the IPC boundary unchanged.
+
+### ef522aa — feat: p7_wide_sweep — N_WORKERS=8 + show_progress=True
+
+**What works:**
+
+- **5-line addition** to `scripts/p7_wide_sweep.py`: `N_WORKERS = 8` constant + threaded into the `sweep_grid(..., n_workers=N_WORKERS, show_progress=True)` call.
+- **Comment explains M1 Max core targeting**: "8 perf cores; the 2 efficiency cores add little parallelism gain at the cost of more IPC". Defensible engineering choice.
+- **Expected speedup quoted**: ~45 min → ~8 min for 216k cells. 5-6× on 8 cores is plausible given some IPC overhead.
+
+**Non-blocking:**
+
+- **`N_WORKERS = 8` hardcoded** — assumes M1 Max specifically. **For a fresh checkout on a 12-core / 4-core machine, the hardcoded 8 is wrong.** Should be `os.cpu_count() - 2` or `min(os.cpu_count(), 8)` or CLI-overridable via `--n-workers N`. Cosmetic; minor portability concern.
+
+- **No CLI flag** for `n_workers` in either p6_sweep.py or p7_wide_sweep.py. Operator can override by editing the script. Cosmetic.
+
+**Domain / correctness checks:**
+
+- **Determinism for results parquet**: ✓ post-hoc sort preserves byte-identicality.
+- **Determinism for skips parquet**: ❌ flagged above — completion-order write.
+- **today_fn pickle-safety**: ✓ initializer pattern.
+- **Pool resource cleanup**: ✓ context manager.
+- **Backward-compat**: ✓ n_workers=1 default; existing tests pass; 489/489.
+
+**What I tried:**
+- Read [src/engine/sweeper.py:55-340](src/engine/sweeper.py) end-to-end.
+- Read [src/engine/results.py:170-185](src/engine/results.py#L170-L185) `write_skips` — confirmed no sort.
+- `pytest tests/` → 489/489 (no parallel-path test exists; bug not caught).
+- Read the 5-line ef522aa diff.
+
+**Sequencing observation:** This is the long-deferred **p4.5** finally landing. The PLAN.md 2026-05-24 entry said "p4.5 deferred until per-task latency is measured" — measured now (216k cells wide-sweep × ~12ms per cell single-threaded = ~45 min); justified for parallelization.
+
+**Carry-over: Flag 1 (chore(p6.5.tag) still missing) STILL open.** Now **5 commits land pre-tag** (7806d82 + a745c89 + 2cea169 + c422f1e + a27f9a7 + ef522aa = 6 actually). Phase-6/Phase-7 boundary increasingly diluted. **Recommend BUILDER lands chore(p6.5.tag) before the next feature commit.**
+
+**Next-commit suggestion:** 
+1. **`fix(p4.5): canonical-sort skips before write_skips`** — closes the determinism bug + adds a `test_sweep_grid_parallel_matches_serial` regression test. ~10 lines.
+2. **`chore(p6.5.tag)`** — long overdue.
+
+Then either continue Phase 7 (p7.2 diagnostics tab, p7.3 export buttons, p7.4 regime drill-down per fd72b85 PLAN), OR re-run the wide sweep + screenshot verify.
+
+---
+
 ## Review of 2cea169 + c422f1e — feat: legs_json gains volume/OI + fix(deps): streamlit 1.32 → 1.34 (closes my Flag 2)
 
 **Verdict:** ✅ accept (both commits, paired)
