@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing as mp
 from datetime import date
 from typing import Callable, Iterable
 
@@ -48,6 +49,51 @@ from src.strategies.short_straddle import NoLiquidStrikeError
 # SPECS §6a's class-distinction rule (a cold offline cache is operator
 # error, not "no data").
 _SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)
+
+
+# ------------------------------------------------------------
+# Worker-process state — for multiprocessing.Pool path.
+# ------------------------------------------------------------
+#
+# `today_fn` is a Callable[[], date] which may be a lambda → unpicklable,
+# so we can't ship it across the Pool boundary directly. Instead we
+# resolve it once in the main process and stash the resulting date in a
+# worker-module global via Pool's initializer. Each worker rebuilds a
+# trivial closure-free today_fn from that global.
+#
+# Module-level (not class state) because Pool initializer requires a
+# module-level callable + state mutation in the worker import.
+_WORKER_TODAY: date | None = None
+
+
+def _worker_init(today_date: date) -> None:
+    """Pool initializer. Stashes today_date so worker tasks can build a
+    today_fn without pickling a lambda from the main process."""
+    global _WORKER_TODAY
+    _WORKER_TODAY = today_date
+
+
+def _worker_today_fn() -> date:
+    """Module-level today_fn used inside worker processes. Picklable by
+    name (closures wouldn't pickle, lambdas wouldn't pickle)."""
+    assert _WORKER_TODAY is not None, (
+        "_worker_today_fn called outside a Pool — initializer never ran"
+    )
+    return _WORKER_TODAY
+
+
+def _worker_run(args: tuple) -> tuple:
+    """Pool worker entrypoint. Unpacks the task tuple, runs sweep_one,
+    returns (task_args, result) so the main process can pair skips back
+    to their (strategy, symbol, expiry, entry, exit) for the skip log
+    regardless of completion order."""
+    s, sym, exp, eo, xo, offline = args
+    result = sweep_one(
+        s, sym, exp, eo, xo,
+        today_fn=_worker_today_fn,
+        offline=offline,
+    )
+    return ((s, sym, exp, eo, xo), result)
 
 
 def _compute_run_id(
@@ -176,6 +222,8 @@ def sweep_grid(
     today_fn: Callable[[], date] = date.today,
     offline: bool = False,
     force: bool = False,
+    n_workers: int = 1,
+    show_progress: bool = False,
 ) -> pd.DataFrame:
     """Cartesian-product sweep over the given grid.
 
@@ -186,9 +234,18 @@ def sweep_grid(
     exists and ``force=False``, returns the cached frame without
     re-running. ``force=True`` rebuilds.
 
-    NOTE: this is the single-threaded reference impl. ``perf(p4.5)``
-    adds the multiprocessing.Pool variant which must produce
-    byte-identical output (semantic-equal per pandas).
+    Determinism (SPECS §6c.3): byte-identical output regardless of
+    ``n_workers``. Achieved because (a) ``sweep_one`` is pure, (b) we
+    sort + reset_index post-collection by the canonical key tuple, and
+    (c) parquet write is deterministic given input.
+
+    n_workers > 1 routes through ``multiprocessing.Pool``. ``today_fn``
+    is resolved ONCE in the main process and passed to workers via the
+    Pool initializer so unpicklable lambdas are safe.
+
+    show_progress=True wraps the iteration in tqdm for a per-cell bar —
+    cheap, optional; tqdm is in requirements.txt for the prefetch script
+    already.
     """
     if run_id is None:
         run_id = _compute_run_id(
@@ -200,8 +257,9 @@ def sweep_grid(
         return pd.read_parquet(path)
 
     # Enumerate tasks in deterministic order — sorted across every axis.
-    # Single-threaded loop matches this order; parallel pool will sort
-    # results post-hoc so the order doesn't matter for output.
+    # Single-threaded loop matches this order; parallel pool sorts results
+    # post-hoc (via the canonical-key sort below) so worker completion
+    # order doesn't matter for output.
     tasks = [
         (s, sym, exp, eo, xo)
         for s in sorted(strategies)
@@ -214,11 +272,9 @@ def sweep_grid(
 
     rows: list[dict] = []
     skipped: list[dict] = []
-    for (s, sym, exp, eo, xo) in tasks:
-        result = sweep_one(
-            s, sym, exp, eo, xo,
-            today_fn=today_fn, offline=offline,
-        )
+
+    def _handle(task_args: tuple, result) -> None:
+        s, sym, exp, eo, xo = task_args
         if isinstance(result, str) and result.startswith("skip:"):
             skipped.append({
                 "run_id": run_id,
@@ -229,11 +285,40 @@ def sweep_grid(
                 "exit_offset_td": int(xo),
                 "skip_reason": result[len("skip:"):],
             })
-            continue
+            return
         if result is None:
-            continue
+            return
         result["run_id"] = run_id
         rows.append(result)
+
+    if n_workers > 1:
+        today_date = today_fn()
+        worker_args = [(s, sym, exp, eo, xo, offline) for (s, sym, exp, eo, xo) in tasks]
+        # chunksize keeps Pool scheduling efficient for 100k+-task sweeps;
+        # too small → IPC overhead, too large → poor work-stealing at tail
+        chunksize = max(1, len(worker_args) // (n_workers * 32))
+        with mp.Pool(
+            processes=n_workers,
+            initializer=_worker_init,
+            initargs=(today_date,),
+        ) as pool:
+            it = pool.imap_unordered(_worker_run, worker_args, chunksize=chunksize)
+            if show_progress:
+                from tqdm import tqdm
+                it = tqdm(it, total=len(worker_args), desc="sweep", unit="cell")
+            for (task_args, result) in it:
+                _handle(task_args, result)
+    else:
+        it = tasks
+        if show_progress:
+            from tqdm import tqdm
+            it = tqdm(it, total=len(tasks), desc="sweep", unit="cell")
+        for (s, sym, exp, eo, xo) in it:
+            result = sweep_one(
+                s, sym, exp, eo, xo,
+                today_fn=today_fn, offline=offline,
+            )
+            _handle((s, sym, exp, eo, xo), result)
 
     if not rows:
         # Empty sweep — preserve canonical column schema so downstream
