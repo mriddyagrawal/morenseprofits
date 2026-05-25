@@ -1,12 +1,13 @@
 """Phase 7 — wide-grid sweep for full-resolution heatmap.
 
-Same Phase-6 universe (5 blue chips × 24 monthly expiries 2023-2024 ×
-3 short-vol strategies) but with the entry/exit grid expanded to
-45 × 16 — covering T-45 to T-1 entry and T-15 to T-0 exit.
+Universe matches the prefetch (10 blue chips × 25 monthly expiries
+2024-05 → 2026-05 × 3 short-vol strategies) with the entry/exit grid
+expanded to 45 × 16 — covering T-45 to T-1 entry and T-15 to T-0 exit.
 
-Cells planned: 5 syms × 3 strats × 24 expiries × ~600 valid (e,x)
-pairs (entry > exit) ≈ 216,000 cells. Expected wall-clock <20 min
-on warm cache (Phase-6 + prefetch cached every contract needed).
+Cells planned: 10 syms × 3 strats × ~25 expiries × ~600 valid (e,x)
+pairs (entry > exit) ≈ 450,000 cells. Expected wall-clock ~10-15 min
+on 8 workers with a fully-warm cache (every contract pre-fetched by
+scripts/prefetch_universe.py).
 
 Heatmap UI auto-adapts via render_heatmaps reading whatever offsets
 are present in the sweep parquet — no Streamlit code changes needed.
@@ -25,11 +26,16 @@ from src.data import expiry_calendar  # noqa: E402
 from src.engine.sweeper import _compute_run_id, sweep_grid  # noqa: E402
 
 
-SYMBOLS = ["RELIANCE", "HDFCBANK", "INFY", "ICICIBANK", "TCS"]
+SYMBOLS = [
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
+    "SBIN", "AXISBANK", "KOTAKBANK", "BHARTIARTL", "LT",
+]   # matches scripts/prefetch_universe.py — 10 blue chips with cache
 STRATEGIES = ["short_straddle", "short_strangle", "iron_condor"]
 ENTRY_OFFSETS_TD = list(range(1, 46))   # T-45 ... T-1
 EXIT_OFFSETS_TD = list(range(0, 16))    # T-0  ... T-15
-TODAY_FN = lambda: date(2026, 5, 25)
+EXPIRY_FROM = date(2024, 5, 1)
+EXPIRY_TO = date(2026, 5, 31)
+TODAY_FN = lambda: date(2026, 5, 26)
 N_WORKERS = 8   # M1 Max has 8 perf cores; efficiency cores add little
 
 
@@ -44,13 +50,11 @@ def main() -> int:
     print(f"  entry_td    = T-{min(ENTRY_OFFSETS_TD)} … T-{max(ENTRY_OFFSETS_TD)} ({len(ENTRY_OFFSETS_TD)} values)")
     print(f"  exit_td     = T-{min(EXIT_OFFSETS_TD)} … T-{max(EXIT_OFFSETS_TD)} ({len(EXIT_OFFSETS_TD)} values)")
 
-    _h("Building expiry list (2023-01-01 → 2024-12-31)")
+    _h(f"Building expiry list ({EXPIRY_FROM.isoformat()} → {EXPIRY_TO.isoformat()})")
     all_expiries: set = set()
     for sym in SYMBOLS:
         try:
-            exps = expiry_calendar.monthly_expiries(
-                sym, date(2023, 1, 1), date(2024, 12, 31),
-            )
+            exps = expiry_calendar.monthly_expiries(sym, EXPIRY_FROM, EXPIRY_TO)
             print(f"  {sym}: {len(exps)} expiries")
             all_expiries.update(exps)
         except Exception as e:
