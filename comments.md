@@ -3306,6 +3306,81 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of a43f19a — chore(p6.5.cleanup-3): docstring polish + test fixture pattern + DESIGN doc updates
+
+**Verdict:** ✅ accept — **closes the entire remaining catalogue.**
+
+**Phase / commit goal (as I understood it):** Final cleanup wave. 7 items from the catalogue tail — all non-blocking docstring / spec-wording / test-style polish. No behavior changes; pure refactor + documentation.
+
+**What works — item-by-item closure:**
+
+1. **🔬 `MARGIN_TIER_B_CAVEAT` no longer claims "~10% discount"** ([src/web/caveats.py](src/web/caveats.py)). **Closes 7b12228 #2.** Replaced with operator-actionable: "Absolute ROI numbers are upper estimates — before treating any pair as 'production-ready', validate the margin block against your broker's actual SPAN file for the candidate trade." **Engineering judgment without fake precision.** The bias-direction wording (HIGH-VOL + LOW-OFFSET look BETTER) is preserved; only the unsupported quantitative claim is removed.
+
+2. **`empty_state.get_message` docstring acknowledges module-level streamlit import** ([src/web/empty_state.py](src/web/empty_state.py)). **Closes c6e3684 #1.** The function itself doesn't call streamlit, but you can't import the module without streamlit installed (because `import streamlit as st` is at module top). Docstring now honest about this; Phase-7 hardening (split into streamlit-free module) is named explicitly as a deferral.
+
+3. **`render_within_stock_rank` docstring explains the analytics-warning divergence** ([src/web/leaderboard.py](src/web/leaderboard.py)). **Closes 04647aa #1.** The function uses pandas boolean indexing instead of `rank_strategies()` for per-symbol ranking, so the analytics-layer 100%-suppression UserWarning doesn't fire here. Now explicit in docstring — future contributor reading the code knows WHY this path differs from `render_rank_table`'s call into `_rank_quiet(rank_strategies(...))`.
+
+4. **`render_headline` TOTAL NET P&L docstring acknowledges §2.5 wording divergence** ([src/web/leaderboard.py](src/web/leaderboard.py)). **Closes 452b503 #3.** Implementation uses whole-filter total (matches operator's "did this view make money?" question); subtitle counts ALL pairs. Both treatments defensible; the choice is now documented in code. Spec authoring can re-converge in DESIGN_SPEC §2.5 update if desired.
+
+5. **🔬 YoY line color: GREEN → STEELBLUE** ([src/web/trends.py:251](src/web/trends.py#L251)). **Closes 87a6707 #1.** `rgb(0, 100, 0)` (green) → `rgb(70, 130, 180)` (steelblue, neutral). **The y-axis labels + breakeven hline carry the sign signal honestly**; the line's job is direction-of-drift only, not direction-of-profitability. **No more "green line on a negative-ROI pair" misread.**
+
+6. **`tests/test_web_discover.py` refactored to `monkeypatch.setattr` pattern** ([tests/test_web_discover.py](tests/test_web_discover.py)). **Closes 334bada+5c801dd #1.** Two tests previously used `results_mod.RESULTS_DIR = tmp_path` + `importlib.reload(results_mod)` in `finally`. Now use the project-idiomatic `monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)` — auto-reverts on teardown; no reload dance; matches the convention established in 617878b for `_redirect_results` and 8893b81's `test_render_empty_calls_st_info`.
+
+7. **DESIGN_SPEC.md §1.5 cross-references 617878b** ([DESIGN/DESIGN_SPEC.md](DESIGN/DESIGN_SPEC.md)). **Closes the DESIGN §1.5 cross-reference flag.** Added: "Load-bearing prerequisite — 617878b's test-fixture redirect fix prevents test parquets from leaking into `data/results/`; if a future module imports `RESULTS_DIR` independently without updating both `_redirect_results` helpers, the mtime picker silently degrades." Future contributor reading §1.5 sees the hidden dependency.
+
+**Live-verified:**
+- `MARGIN_TIER_B_CAVEAT` no longer contains "~10%" or "10% before"; contains "broker" + "SPAN file" wording.
+- `grep` on `src/web/trends.py` confirms `rgb(70, 130, 180)` (steelblue) replaces `rgb(0, 100, 0)` (green).
+- `pytest tests/` → 489/489 full suite.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **Steelblue line ([rgb(70, 130, 180)](src/web/trends.py#L251)) is colorblind-friendly** — deuteranopia/protanopia friendly relative to green-red pairings. **Bonus accessibility win** beyond the asymmetric-conservatism fix.
+
+2. **`render_headline` TOTAL NET P&L docstring note is a "documented divergence"** rather than spec-or-code update. Defensible — pragmatic choice that preserves code-honesty without forcing a doc-edit roundtrip with the user. Future spec author can decide which side wins.
+
+3. **The "validate against your broker's actual SPAN file" wording in MARGIN_TIER_B_CAVEAT** is a strong operator-actionable disclosure. ✓ Better than the original "~10% discount" because it tells the operator WHAT to do (validate against broker SPAN), not just HOW MUCH to discount.
+
+**Catalogue status: COMPLETE.**
+
+| Closure | Items closed |
+|---|---|
+| 79d50d8 | 1 BLOCKER (caveat date) |
+| 772131b | 1 (sparkline color) |
+| 3d9cb13 | 7 (customdata strings, vectorization, rangemode, _rank_quiet, dark theme, _filter helper, tests) |
+| da43828 | 4 (column order, month labels, signed heatmap, render_caveats __all__) |
+| b82002d | 1 (StreamlitDuplicateElementKey) + 1 reviewer-miss acknowledged |
+| **a43f19a (this commit)** | **7 (MARGIN_TIER_B wording, get_message docstring, within_stock note, TOTAL N&L wording, YoY steelblue, monkeypatch refactor, DESIGN §1.5 cross-ref)** |
+
+**Running total: 22 items closed.** Every flag from my Phase-5-onwards review history has been addressed in code, docs, or tests. **The Phase-6 reviewer catalogue is empty.**
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ MARGIN_TIER_B now points operator to broker SPAN validation (instead of fake "~10% discount"); YoY line color no longer falsely signals positive on negative pairs.
+- **Documentation honesty**: ✓ docstrings now match code reality (get_message, within_stock_rank, total P&L semantic).
+- **Test idiomatic style**: ✓ monkeypatch pattern uniform across project.
+- **Cross-doc reference integrity**: ✓ DESIGN §1.5 names 617878b dependency.
+
+**What I tried:**
+- Read [git show a43f19a](git show a43f19a) — 6 files touched, 71/42 +/-.
+- Cross-checked the MARGIN_TIER_B_CAVEAT text — "~10%" gone; "broker's actual SPAN file" wording confirmed.
+- `grep` for color codes in trends.py — confirmed steelblue replaces green.
+- `pytest tests/` → 489/489.
+
+**Sequencing observation:** **Reviewer catalogue closed in 22 items over 6 commits** (79d50d8 → 772131b → 3d9cb13 → da43828 → b82002d → a43f19a). Every flag from the Phase-5/6 review stretch has a closing-commit traceable to a review block. **The reviewer-loop pattern operating at full discipline.**
+
+**Phase 6 remaining work:**
+- `chore(p6.5.verify)` — boot streamlit + browser-side visual verify (now unblocked by b82002d).
+- `chore(p6.5.tag)` — `git tag v0.6-ui`.
+
+After those two, **Phase 6 ships** and the v0.6-ui tag pins the artifact for handoff.
+
+**Next-commit suggestion:** **`chore(p6.5.verify)`**. Per b82002d's recommendation: boot `streamlit run app.py`, navigate all 4 tabs, screenshot, visual-confirm the 2024-07-01 caveat date renders, cross-check against DESIGN/*.png mockups.
+
+---
+
 ## Review of b82002d — fix(p6.5.caveats): tab-unique button keys — StreamlitDuplicateElementKey
 
 **Verdict:** ✅ accept
