@@ -3306,6 +3306,74 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 28c9586 — chore: prefetch_universe.py — bump DEFAULT_STRIKES_PER_SIDE 3 → 6
+
+**Verdict:** ✅ accept — **closes the directive. Prefetch now covers EVERYTHING.**
+
+**One-line change** ([scripts/prefetch_universe.py:50](scripts/prefetch_universe.py#L50)): `DEFAULT_STRIKES_PER_SIDE = 3` → `6`. New scope: **6,240 contracts** (10 symbols × 24 expiries × 13 strikes × 2 option_types).
+
+**Coverage analysis (cross-check across the 10 default symbols):**
+
+| Symbol | Spot | Strike spacing | ATM ± 6 range | Covers strangle (0.05)? | Covers iron condor outer (0.05)? |
+|---|---|---|---|---|---|
+| RELIANCE | ₹2,600 | ₹100 | ±~23% | ✅ (needs ±~3) | ✅ |
+| HDFCBANK | ₹1,600 | ₹20 | ±~7.5% | ✅ (needs ±~4) | ✅ |
+| INFY | ₹1,800 | ₹50 | ±~17% | ✅ (needs ±~2) | ✅ |
+| ICICIBANK | ₹1,200 | ₹20 | ±~10% | ✅ (needs ±~3) | ✅ |
+| TCS | ₹3,800 | ₹100 | ±~16% | ✅ | ✅ |
+| SBIN | ₹820 | ₹10 | ±~7.3% | ✅ (needs ±~4) | ✅ |
+| AXISBANK | ₹1,100 | ₹20 | ±~11% | ✅ | ✅ |
+| KOTAKBANK | ₹1,800 | ₹50 | ±~17% | ✅ | ✅ |
+| BHARTIARTL | ₹1,600 | ₹20 | ±~7.5% | ✅ (needs ±~4) | ✅ |
+| LT | ₹3,600 | ₹100 | ±~17% | ✅ | ✅ |
+
+**Tightest case is SBIN at ₹10 strike spacing** — ATM±6 gives only ±7.3% coverage, but iron_condor's `0.05` outer wing needs only ±5% so it's still inside the grid. **6/side has appropriate safety margin** for the tighter-spaced symbols where my suggested 5/side would have been on the edge.
+
+**Cost:**
+- 6,240 contracts × ~0.7s (politeness + fetch) ≈ ~73 min for options phase.
+- + ~13 min for bulk bhavcopies + ~5 min for spot warming + expiry building.
+- **Total cold-cache prefetch: ~90 min** for the full 10-symbol × 2-year universe.
+- Subsequent runs hit cache → ~30s.
+
+**Closes the user directive** ("the prefetch should get everything") fully:
+- ✅ Spot per (symbol × year) — Step 1.
+- ✅ Bhavcopy per trading day — Step 2 (added in 0aaf097).
+- ✅ Expiry calendar — Step 3 (derived).
+- ✅ Options contracts at ATM ± 6 strikes × CE + PE — Step 4 (this commit widens).
+
+After this commit, an operator running:
+```
+python scripts/prefetch_universe.py    # ~90 min cold
+python scripts/p6_sweep.py             # ~30s cache-hit, 0 cold fetches
+```
+…should see the §3.2 sweep complete with skips ONLY for legitimate MissingDataError (never-traded strikes, off-calendar dates, structural-data issues). The 4 NSE-fetcher hardening commits (c6dfaea + 01049f7 + 71f49ab + f4aea02) handle the residual transient WAF challenges by skipping at cell level.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The `13 strikes × 2 × 24 × 10 = 6,240` math in the commit body is correct** — verified.
+2. **One-line change** is the right shape for this fix. Could have been bundled with 0aaf097 but landing as separate commits matches the nuclear-commit discipline (each addresses a distinct directive item).
+3. **Operator can still override via `--strikes-per-side N`** for targeted runs (e.g., `--strikes-per-side 3` for a quick smoke prefetch, `--strikes-per-side 10` for safety-margin maximum).
+4. **For Phase-7 strategies that pick deeper-OTM strikes** (e.g., 0.10 offset hypothetical), this default would need re-evaluation. The "dynamic from strategy registry" alternative I suggested in the directive is still the more future-proof option, but `6/side` covers all v1 strategies cleanly.
+
+**What I tried:**
+- Verified the math: 10 × 24 × 13 × 2 = 6,240 ✓.
+- Cross-checked coverage against the 10 default symbols' typical strike-spacings — all v1 strategy offsets (0.02, 0.05) fall well within ATM ± 6 even for the tightest-spaced symbols.
+
+**Sequencing observation:** **Three-commit closure of the prefetch directive**:
+- 0aaf097: bulk-bhavcopy fetch (was a gap I identified in d7dd613 review)
+- 28c9586 (this commit): widen strike coverage 3 → 6 (per user directive)
+- Combined effect: prefetch is now end-to-end complete for the §3.2 sweep.
+
+**Next-commit suggestion:**
+
+**Operator runs the prefetch live** (~90 min cold), then **runs `p6_sweep.py`** (cache-hit, ~30s). If both complete with reasonable skip rates, **`chore(p6.5.verify)`** can finally screenshot the 4 tabs against a **multi-pair multi-year dataset** instead of the Q1-2024 verify-set. Then **`chore(p6.5.tag)`** → v0.6-ui ships.
+
+If skip rate is unexpectedly high after the prefetch + sweep cycle, BUILDER would land more NSE-fetcher hardening before tagging. **My read**: the 4 fetcher fixes + politeness delay + bulk bhavcopy + widened strikes should give >95% success rate on the §3.2 sweep. Time to find out.
+
+---
+
 ## Review of 0aaf097 — chore: prefetch_universe.py — bulk-fetch all trading-day bhavcopies
 
 **Verdict:** ✅ accept — closes one of two prefetch gaps I flagged. **User directive: close the rest too — see directive block below.**
