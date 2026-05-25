@@ -47,7 +47,7 @@ DEFAULT_SYMBOLS = [
     "SBIN",       "AXISBANK",   "KOTAKBANK",  "BHARTIARTL", "LT",
 ]
 
-DEFAULT_STRIKES_PER_SIDE = 3   # ATM + 3 above + 3 below = 7 strikes
+DEFAULT_STRIKES_PER_SIDE = 6   # ATM + 6 above + 6 below = 13 strikes
 DEFAULT_START = date(2024, 5, 1)
 DEFAULT_END = date(2026, 5, 31)
 TODAY_FN = lambda: date(2026, 5, 25)
