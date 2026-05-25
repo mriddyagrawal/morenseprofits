@@ -161,6 +161,38 @@ def render_headline(
 
 
 # ============================================================
+# Cell selection capture — Phase 7 drill-down
+# ============================================================
+
+def _capture_cell_selection(selected) -> None:
+    """Translate Plotly click-event payload into
+    ``st.session_state['mp_heatmap_selected_cell'] = (entry_td, exit_td)``.
+
+    Plotly heatmap clicks return ``x`` and ``y`` as tick labels like
+    "T-15"/"T-3"; parse the integer back out. Idempotent — repeated
+    clicks on the same cell are a no-op; clicking a new cell replaces
+    the prior selection."""
+    if selected is None:
+        return
+    pts = selected.get("selection", {}).get("points", []) if hasattr(
+        selected, "get"
+    ) else getattr(getattr(selected, "selection", None), "points", []) or []
+    if not pts:
+        return
+    pt = pts[0]
+    x_label = pt.get("x") if isinstance(pt, dict) else getattr(pt, "x", None)
+    y_label = pt.get("y") if isinstance(pt, dict) else getattr(pt, "y", None)
+    if not isinstance(x_label, str) or not isinstance(y_label, str):
+        return
+    try:
+        exit_td = int(x_label.lstrip("T-"))
+        entry_td = int(y_label.lstrip("T-"))
+    except (ValueError, AttributeError):
+        return
+    st.session_state["mp_heatmap_selected_cell"] = (entry_td, exit_td)
+
+
+# ============================================================
 # Dual heatmaps — Phase 6.3 commit 16 (feat(p6.3.pivot))
 # ============================================================
 
@@ -399,11 +431,24 @@ def render_heatmaps(
     )
 
     # Side-by-side render. Each chart claims its column.
+    # Value pane has on_select so clicking a cell drives the drilldown
+    # below (render_cell_drilldown reads mp_heatmap_selected_cell).
     cols = st.columns(2)
     with cols[0]:
-        st.plotly_chart(value_fig, use_container_width=True)
+        selected = st.plotly_chart(
+            value_fig,
+            use_container_width=True,
+            key="mp_heatmap_value_chart",
+            on_select="rerun",
+            selection_mode="points",
+        )
+        _capture_cell_selection(selected)
     with cols[1]:
-        st.plotly_chart(density_fig, use_container_width=True)
+        st.plotly_chart(
+            density_fig,
+            use_container_width=True,
+            key="mp_heatmap_density_chart",
+        )
 
     # std-bias tooltip text per DESIGN_SPEC §2.2 — surface as a small
     # caption below the panes since Plotly hovertemplates can't carry
@@ -425,3 +470,226 @@ def render_heatmaps(
             f"Lower the threshold via the sidebar slider to inspect "
             f"thin cells."
         )
+
+
+# ============================================================
+# Cell drill-down — Phase 7 (analyst exploration tool)
+# ============================================================
+
+def render_cell_drilldown(
+    df: pd.DataFrame,
+    *,
+    strategy: str | None,
+    symbol: str | None,
+) -> None:
+    """Drill-down panel for a heatmap cell the analyst clicked.
+
+    The heatmap aggregates ~24 expiries into a single colored cell;
+    the median hides the distribution. This view restores it: see
+    whether a cell's median is representative or whether it's hiding
+    fat tails, regime-specific behavior (e.g. only the 2024 expiries
+    worked), or one outlier carrying the average. Then drill into any
+    specific trade's legs, costs, and margin to understand WHY.
+
+    Selection lives in ``st.session_state['mp_heatmap_selected_cell']``
+    (a 2-tuple of int (entry_offset_td, exit_offset_td) populated by
+    the value-pane click handler). Per-row JSON columns
+    (``legs_json``, ``costs_breakdown_json``, ``margin_breakdown_json``)
+    carry the full priced detail — no re-pricing needed.
+    """
+    import json
+
+    if strategy is None or symbol is None or len(df) == 0:
+        return
+
+    sel = st.session_state.get("mp_heatmap_selected_cell")
+    st.markdown("---")
+    if sel is None:
+        st.markdown("### Cell drill-down")
+        st.caption(
+            "_Click any cell on the **Median ROI/yr** heatmap above to "
+            "see the underlying trades, distribution, and full per-leg "
+            "/ per-cost breakdown._"
+        )
+        return
+
+    entry_td, exit_td = sel
+    rows = df[
+        (df["strategy"] == strategy)
+        & (df["symbol"] == symbol)
+        & (df["entry_offset_td"] == entry_td)
+        & (df["exit_offset_td"] == exit_td)
+    ].copy().sort_values("expiry").reset_index(drop=True)
+
+    hdr_l, hdr_r = st.columns([5, 1])
+    with hdr_l:
+        st.markdown(
+            f"### Cell drill-down — {strategy} × {symbol}: "
+            f"entry T-{entry_td} → exit T-{exit_td}"
+        )
+    with hdr_r:
+        if st.button("Clear", key="mp_heatmap_clear_drilldown"):
+            st.session_state.pop("mp_heatmap_selected_cell", None)
+            st.rerun()
+
+    if len(rows) == 0:
+        st.info(
+            f"No trades for (T-{entry_td}, T-{exit_td}) on {strategy} × "
+            f"{symbol} after current filters. Pick another cell."
+        )
+        return
+
+    # ---- Summary stats row -----------------------------------
+    from src.web._format import format_inr
+    n = len(rows)
+    pnl_series = rows["net_pnl"]
+    roi_series = rows["roi_pct_annualized"]
+    n_win = int((pnl_series > 0).sum())
+    s = st.columns(6)
+    s[0].metric("N trades", f"{n}")
+    s[1].metric(
+        "Win rate", format_pct(100.0 * n_win / max(n, 1))
+    )
+    s[2].metric(
+        "Median ROI/yr",
+        format_pct(float(roi_series.median()), signed=True, annualized=True),
+    )
+    s[3].metric(
+        "Mean ROI/yr",
+        format_pct(float(roi_series.mean()), signed=True, annualized=True),
+    )
+    s[4].metric(
+        "Best ROI/yr",
+        format_pct(float(roi_series.max()), signed=True, annualized=True),
+    )
+    s[5].metric(
+        "Worst ROI/yr",
+        format_pct(float(roi_series.min()), signed=True, annualized=True),
+    )
+
+    s2 = st.columns(4)
+    s2[0].metric(
+        "Total net P&L", format_inr(float(pnl_series.sum()))
+    )
+    s2[1].metric(
+        "Best single trade", format_inr(float(pnl_series.max()))
+    )
+    s2[2].metric(
+        "Worst single trade", format_inr(float(pnl_series.min()))
+    )
+    s2[3].metric(
+        "Std ROI/yr",
+        f"±{float(roi_series.std(ddof=0)):.1f}%"
+        if n > 1 else "—",
+    )
+
+    # ---- ROI distribution mini-chart -------------------------
+    # Lets the analyst see at a glance whether the cell's median is
+    # representative or whether it's hiding fat tails / regime split.
+    dist_fig = go.Figure()
+    dist_fig.add_trace(go.Bar(
+        x=rows["expiry"].dt.strftime("%Y-%m"),
+        y=roi_series,
+        marker_color=[
+            "#2ca02c" if v > 0 else "#d62728" for v in roi_series
+        ],
+        text=[f"{v:+.0f}%" for v in roi_series],
+        textposition="outside",
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "ROI/yr: %{y:+.1f}%<br>"
+            "<extra></extra>"
+        ),
+    ))
+    dist_fig.add_hline(
+        y=float(roi_series.median()),
+        line_dash="dash",
+        line_color="#666",
+        annotation_text=f"median {float(roi_series.median()):+.0f}%/yr",
+        annotation_position="top right",
+    )
+    dist_fig.update_layout(
+        title="ROI/yr per expiry — outlier + regime spotter",
+        xaxis_title="Expiry",
+        yaxis_title="ROI/yr (%)",
+        height=280,
+        margin=dict(l=60, r=40, t=50, b=40),
+        showlegend=False,
+    )
+    st.plotly_chart(
+        dist_fig,
+        use_container_width=True,
+        key="mp_heatmap_drilldown_roi_dist",
+    )
+
+    # ---- Per-trade table -------------------------------------
+    table = pd.DataFrame({
+        "Expiry": rows["expiry"].dt.strftime("%Y-%m-%d"),
+        "Entry date": rows["entry_date"].dt.strftime("%Y-%m-%d"),
+        "Exit date": rows["exit_date"].dt.strftime("%Y-%m-%d"),
+        "Hold (TD)": rows["hold_trading_days"],
+        "Spot entry": rows["entry_spot"].round(2),
+        "Spot exit": rows["exit_spot"].round(2),
+        "Gross P&L": rows["gross_pnl"].round(2),
+        "Costs": rows["costs"].round(2),
+        "Net P&L": rows["net_pnl"].round(2),
+        "ROI (%)": rows["roi_pct"].round(2),
+        "ROI/yr (%)": rows["roi_pct_annualized"].round(1),
+        "Margin at entry": rows["margin_at_entry"].round(0),
+    })
+    st.markdown("**Per-expiry trades** (sortable — click column headers)")
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ---- Expandable per-trade legs + cost/margin breakdowns --
+    st.markdown(
+        "**Per-trade detail** — click an expiry below to inspect "
+        "legs, costs, and margin"
+    )
+    for i, row in rows.iterrows():
+        exp_label = row["expiry"].strftime("%Y-%m-%d")
+        roi_lbl = f"{row['roi_pct_annualized']:+.1f}%/yr"
+        pnl_lbl = format_inr(float(row["net_pnl"]))
+        with st.expander(
+            f"Expiry {exp_label} — Net P&L {pnl_lbl} ({roi_lbl})"
+        ):
+            # Legs
+            try:
+                legs = json.loads(row["legs_json"])
+                legs_df = pd.DataFrame(legs)
+                st.markdown("**Legs**")
+                st.dataframe(legs_df, use_container_width=True, hide_index=True)
+            except (ValueError, TypeError):
+                st.warning("legs_json malformed for this row.")
+
+            cols_bd = st.columns(2)
+            with cols_bd[0]:
+                st.markdown("**Costs breakdown** (₹)")
+                try:
+                    cb = json.loads(row["costs_breakdown_json"])
+                    cb_df = pd.DataFrame(
+                        [(k, round(v, 2)) for k, v in cb.items()],
+                        columns=["component", "amount"],
+                    )
+                    st.dataframe(
+                        cb_df, use_container_width=True, hide_index=True
+                    )
+                except (ValueError, TypeError):
+                    st.warning("costs_breakdown_json malformed.")
+            with cols_bd[1]:
+                st.markdown("**Margin breakdown** (₹)")
+                try:
+                    mb = json.loads(row["margin_breakdown_json"])
+                    mb_df = pd.DataFrame(
+                        [(k, round(v, 4) if isinstance(v, float) else v)
+                         for k, v in mb.items()],
+                        columns=["component", "value"],
+                    )
+                    st.dataframe(
+                        mb_df, use_container_width=True, hide_index=True
+                    )
+                except (ValueError, TypeError):
+                    st.warning("margin_breakdown_json malformed.")

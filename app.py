@@ -38,6 +38,7 @@ from src.web.caveats import render_caveats  # noqa: E402
 from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E402
 from src.web.heatmap import (  # noqa: E402
     _selector as render_heatmap_selector,
+    render_cell_drilldown as render_heatmap_drilldown,
     render_headline as render_heatmap_headline,
     render_heatmaps,
 )
@@ -262,6 +263,9 @@ def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
     st.markdown("---")
     render_heatmaps(
         df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
+    )
+    render_heatmap_drilldown(
+        df_filtered, strategy=strategy, symbol=symbol,
     )
 
 
