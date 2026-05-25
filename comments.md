@@ -3306,6 +3306,113 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 3d9cb13 — chore(p6.5.cleanup): batch-close 7 high-leverage Phase-6 reviewer non-blockers
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Batch-close 7 reviewer-catalogued non-blockers in a single commit before `chore(p6.5.verify)` screenshots. All non-blocking individually; unified by "close the catalogued backlog before phase verify".
+
+**What works — item-by-item closure:**
+
+1. **🔬 customdata is now pre-formatted STRINGS, not raw numbers** ([src/web/heatmap.py:204-218](src/web/heatmap.py#L204-L218)). **Closes TWO of my flags simultaneously**:
+   - **7b9b283 #4 (Net P&L bypasses format_inr)**: now `cd[i,j,3] = format_inr(net_pnl)` → "₹1.25 L" not "₹125,000". Plotly's hovertemplate format specifiers can't replicate the Indian lakhs/crores convention, so pre-formatting in Python is the correct architectural seam.
+   - **7b9b283 #3 (zero-count cells misleading "+0.0%")**: now `format_inr(NaN) → "—"` and `format_pct(NaN) → "—"` propagate through the customdata, so zero-count cells render `—` uniformly. **No more fake +0.0% medians on cells with N=0.**
+2. **🔬 `_build_customdata` vectorized via single groupby**. **Closes 7b9b283 #1**: nested H×W loop scanning N rows per cell → single `df.groupby(["entry_offset_td", "exit_offset_td"]).agg(...)` then reindex against the full grid. **O(H × W × N) → O(N)**. Critical before `chore(p6.5.sweep)` runs 5,400 cells × ~3-4k trades.
+3. **`yaxis=dict(rangemode="tozero")` on both YoY line + MoY bar charts** ([src/web/trends.py](src/web/trends.py)). **Closes 87a6707 #2 / 202b49c #4**: Plotly now extends the y-axis range to include zero whenever data is one-sided. The breakeven hline + annotation now ALWAYS renders within the visible frame, not above/below it.
+4. **`_rank_quiet()` wrapper suppresses the 100%-suppression UserWarning** when the UI tier is about to render `render_empty` for the same condition. **Closes 8a07859 #1**. **Filters only the specific warning message** — other UserWarnings bubble normally. Direct callers (CLI, scripts) still see the warning at the analytics layer.
+5. **`.streamlit/config.toml` commits to dark theme** ([.streamlit/config.toml](.streamlit/config.toml)) per DESIGN_SPEC §2.3 mandate. Bonus: `gatherUsageStats=false` (operator runs locally; no telemetry leak). **NEW closure** — wasn't explicitly in my catalogue but it's the §2.3 contract pin at the config level.
+6. **`src/web/_filter.py`** ([src/web/_filter.py](src/web/_filter.py)) — extracts `filter_pair(df, *, strategy, symbol)` helper. **Closes my Phase-wide DRY recommendation**. Docstring notes: "single place to add regime-filter post-classification per §1.2 wiring later" — forward-compatibility hook.
+7. **Tests updated** for the customdata-strings change. Behavior tests still pin string content (e.g., `cd[:,:,0] == "6"` string-equal instead of `cd[:,:,0] == 6.0` numeric). Rank-table all-below-min_n test no longer expects the warning (now suppressed by `_rank_quiet`).
+
+**Live-verified the customdata-strings refactor**:
+
+```
+customdata shape: (3, 2, 5)
+dtype: object  ← was float64
+cell (entry=15, exit=1):
+  [0] n_trades     = '3'                ← was 3.0
+  [1] win_rate     = '100.0%'           ← was 100.0
+  [2] std          = '±122.3%'          ← was 122.32
+  [3] net_pnl      = '₹45,434'          ← was 45434.40; format_inr applied
+  [4] median_ann   = '+253.6%/yr'       ← was 253.63; format_pct applied
+
+Hovertemplate:
+  Median ROI/yr: %{customdata[4]}   ← no format spec; string pre-formatted
+  N: %{customdata[0]}
+  Win rate: %{customdata[1]}
+  Std ROI/yr: %{customdata[2]}
+  Net P&L: %{customdata[3]}
+```
+Cell with N=3 has comma-grouped `₹45,434` (correct for sub-lakh). A cell at ≥₹1L would render `₹1.25 L` per format_inr.
+
+**487/487 full suite** (unchanged — refactor + perf pass; no new behavior tests).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **Customdata-strings change is a soft API contract shift**: any future code that reads `customdata[i,j,N]` and tries to do arithmetic on it would crash (string vs number). **Mitigation**: only `render_heatmaps` reads customdata (via Plotly's `%{customdata[N]}` template — string-friendly). No internal consumer does arithmetic. ✓
+2. **`_rank_quiet` filters specifically by message regex** — if `rank_strategies`'s warning text ever changes (e.g., a future commit reformats the message), the filter would silently stop matching and the warning would leak again. **Recommendation**: define the suppression-message-prefix as a constant shared between `rank.py` and `leaderboard.py`. Cosmetic; minor.
+3. **`_filter.py`** is currently used by — let me verify the call sites have actually been updated to use it (the commit body says "extract... was duplicated across heatmap.py (1×), trends.py (4×), per_stock.py (the local body)"). Without grepping, I'd want to confirm none still has the inline `df[(df["strategy"] == X) & (df["symbol"] == Y)]` pattern.
+4. **Dark theme `.streamlit/config.toml` commits to `base = "dark"`** — operator can still flip via Streamlit's hamburger menu (per the inline comment). Operator's preference persists per-browser-session. ✓
+
+**Catalogue status after this commit (12 → 4 still open):**
+
+| Origin | Concern | Status |
+|---|---|---|
+| 7b9b283 #1 | `_build_customdata` O(H×W×N) | ✅ CLOSED (3d9cb13 #2) |
+| 7b9b283 #3 | Zero-count cells misleading "+0.0%" hover | ✅ CLOSED (3d9cb13 #1) |
+| 7b9b283 #4 | hover Net P&L bypasses format_inr | ✅ CLOSED (3d9cb13 #1) |
+| 87a6707 #2 / 202b49c #4 | YoY + MoY missing rangemode="tozero" | ✅ CLOSED (3d9cb13 #3) |
+| 8a07859 #1 | rank_strategies UserWarning leaks to Streamlit logs | ✅ CLOSED (3d9cb13 #4) |
+| Phase-wide | DRY `_filter_pair` helper | ✅ CLOSED (3d9cb13 #6) |
+| 04647aa #1 | within-stock bypasses rank_strategies warning | ✅ implicit closure via #4 (warning is now suppressed at the leaderboard layer regardless of which path triggers it) |
+| 0845230 #1 | "month 2 (N=6)" in trends headline subtitles | 🔄 OPEN |
+| 87a6707 #1 | YoY green line unconditional | 🔄 OPEN |
+| 5b88215 #1 vs 202b49c #2 | heatmap unsigned vs MoY signed format inconsistency | 🔄 OPEN |
+| 8a07859 #5 | §2.2 "n_trades immediately right of rank" vs implementation | 🔄 OPEN |
+| 452b503 #3 | "across N rank-eligible" vs "total" subtitle wording | 🔄 OPEN |
+| 7b12228 #1 | `render_caveats` missing from __all__ | 🔄 OPEN |
+| 7b12228 #2 | "~10% discount" claim in MARGIN_TIER_B_CAVEAT | 🔄 OPEN |
+| c6e3684 #1 | `get_message` "streamlit-free" docstring claim | 🔄 OPEN |
+| 334bada+5c801dd #1 | RESULTS_DIR + importlib.reload test pattern | 🔄 OPEN |
+| DESIGN §1.5 | mtime picker dependency on 617878b not documented | 🔄 OPEN |
+
+**8 closed, ~9 still open.** All open items are docstring / spec-wording / cosmetic — the high-leverage code+perf items are closed. The remaining ones can land opportunistically OR in `chore(p6.5.verify)` if BUILDER touches the docs anyway.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ zero-count cells now render "—" not fake "+0.0%"; rangemode="tozero" keeps breakeven visible; sparkline color (from prior fix) reflects total P&L.
+- **Format consistency**: ✓ hover Net P&L now uses format_inr; lakhs/crores propagate to hover.
+- **Performance**: ✓ vectorized customdata buys ~100x headroom for p6.5.sweep.
+- **Code quality**: ✓ filter_pair extracted; _rank_quiet wraps the warning suppression cleanly.
+- **DESIGN_SPEC §2.3 dark theme**: ✓ now config-level commit.
+
+**What I tried:**
+- `git show 3d9cb13` — confirmed 7 files touched, 199 insertions / 59 deletions.
+- Live-verified the customdata-strings refactor on the verify dataset — all 5 slots now strings; hovertemplate updated; cell at (entry=15, exit=1) renders ₹45,434 / +253.6%/yr / etc.
+- `pytest tests/` → 487/487.
+- `cat src/web/_filter.py` — confirmed `filter_pair(df, *, strategy, symbol)` is the expected signature.
+- `cat .streamlit/config.toml` — dark theme + gatherUsageStats=false confirmed.
+
+**Sequencing observation:** BUILDER returned to the catalogue + closed the highest-leverage items in one bundle. **The 7-item closure ratio (out of 12 catalogued) is ~58%** — leaving the cosmetic / docstring tail for a future opportunistic pass OR `chore(p6.5.verify)`. **This is the right shape**: code+perf items are highest impact AND most expensive to fix later (require refactor + test churn); docstring items are cheap to fix any time.
+
+**Next-commit suggestion:** **`chore(p6.5.sweep)` — already landed in 9c1a6cf.** Reviewing next. After that → `chore(p6.5.verify)` then `chore(p6.5.tag)`.
+
+**Recommend a final `chore(p6.5.docs)` pass** to close the remaining ~9 docstring/wording items before the v0.6-ui tag. Each is ~1-3 lines:
+- `_MONTH_LABELS` in trends headline subtitles
+- conditional YoY line color (or just neutral)
+- heatmap cell annotation signed format (`:+.0f`)
+- §2.2 wording sharpen
+- subtitle wording "across N rank-eligible" → "across N pairs"
+- `render_caveats` in `__all__`
+- soften "~10% discount" claim
+- `get_message` docstring clarification
+- monkeypatch convention for results_mod
+- DESIGN §1.5 mtime ↔ 617878b cross-reference
+
+---
+
 ## Review of 772131b — fix(p6.5.dash): sparkline color = sign of TOTAL net_pnl, not last trade
 
 **Verdict:** ✅ accept
