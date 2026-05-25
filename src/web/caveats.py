@@ -85,13 +85,21 @@ def _maybe_init_state() -> None:
         st.session_state[DISMISS_KEY] = False
 
 
-def render_caveats_strip() -> None:
+def render_caveats_strip(tab_id: str = "default") -> None:
     """Render three side-by-side caveat cards at the top of a tab.
 
     Per DESIGN_SPEC §1.4: ALWAYS-visible mode. Three columns, one
     caveat each, plus a single dismiss button that flips
     ``st.session_state[DISMISS_KEY] = True`` for the rest of the
     session (subsequent tabs render the collapsed banner instead).
+
+    ``tab_id`` is a per-tab namespace suffix for the dismiss button's
+    widget key. Streamlit requires unique keys per widget across the
+    whole app; since render_caveats_strip is called from EVERY tab
+    (4×), a shared key like "mp_caveats_dismiss_btn" raises
+    StreamlitDuplicateElementKey on the 2nd tab. tab_id solves it
+    without touching the shared dismiss STATE (which IS app-global
+    by design — dismiss on one tab dismisses for all).
 
     Returns ``None`` — Streamlit side-effect."""
     _maybe_init_state()
@@ -112,17 +120,21 @@ def render_caveats_strip() -> None:
     pad, dismiss = st.columns([5, 1])
     with dismiss:
         if st.button("Read once, then dismiss",
-                     key="mp_caveats_dismiss_btn",
+                     key=f"mp_caveats_dismiss_btn_{tab_id}",
                      help="Collapses the row to a slim banner for the "
                           "rest of this session. Browser refresh re-expands."):
             st.session_state[DISMISS_KEY] = True
             st.rerun()
 
 
-def render_caveats_collapsed() -> None:
+def render_caveats_collapsed(tab_id: str = "default") -> None:
     """Render the slim single-line "⚠ 3 active caveats — click to
     expand" banner used after dismiss. Clicking re-expands the strip
     for the rest of the session.
+
+    ``tab_id`` is the per-tab namespace suffix for the expand button's
+    widget key. Same reason as render_caveats_strip — Streamlit's
+    per-widget key uniqueness vs the per-tab rendering pattern.
 
     Returns ``None`` — Streamlit side-effect."""
     _maybe_init_state()
@@ -135,19 +147,23 @@ def render_caveats_collapsed() -> None:
         )
     with cols[1]:
         if st.button("Expand",
-                     key="mp_caveats_expand_btn",
+                     key=f"mp_caveats_expand_btn_{tab_id}",
                      help="Re-show the three caveat cards above."):
             st.session_state[DISMISS_KEY] = False
             st.rerun()
 
 
-def render_caveats() -> None:
+def render_caveats(tab_id: str = "default") -> None:
     """Top-level helper called by every tab. Renders the strip OR the
     collapsed banner depending on session-state. Always renders one or
     the other — satisfies PLAN §3 Phase-6.5 exit criterion ('caveats
-    banner always visible')."""
+    banner always visible').
+
+    ``tab_id`` propagates to the strip/collapsed helper so each tab's
+    button widgets get unique keys (prevents StreamlitDuplicateElementKey
+    when 4 tabs all render the caveats simultaneously per §1.4)."""
     _maybe_init_state()
     if st.session_state[DISMISS_KEY]:
-        render_caveats_collapsed()
+        render_caveats_collapsed(tab_id=tab_id)
     else:
-        render_caveats_strip()
+        render_caveats_strip(tab_id=tab_id)

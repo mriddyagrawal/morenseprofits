@@ -227,7 +227,7 @@ def _placeholder(tab_name: str, next_commit: str) -> None:
 
 
 def _render_leaderboard_tab(df_filtered: pd.DataFrame) -> None:
-    render_caveats()
+    render_caveats(tab_id="leaderboard")
     st.markdown("## Leaderboard")
     min_n = int(st.session_state["mp_min_n"])
     render_leaderboard_headline(df_filtered, min_n=min_n)
@@ -242,7 +242,7 @@ def _render_leaderboard_tab(df_filtered: pd.DataFrame) -> None:
 
 
 def _render_per_stock_tab(df_filtered: pd.DataFrame) -> None:
-    render_caveats()
+    render_caveats(tab_id="per_stock")
     st.markdown("## Per-stock")
     min_n = int(st.session_state["mp_min_n"])
     symbol = render_per_stock_switcher(df_filtered)
@@ -252,7 +252,7 @@ def _render_per_stock_tab(df_filtered: pd.DataFrame) -> None:
 
 
 def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
-    render_caveats()
+    render_caveats(tab_id="heatmap")
     st.markdown("## Heatmap")
     min_n = int(st.session_state["mp_min_n"])
     strategy, symbol = render_heatmap_selector(df_filtered)
@@ -266,7 +266,7 @@ def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
 
 
 def _render_trends_tab(df_filtered: pd.DataFrame) -> None:
-    render_caveats()
+    render_caveats(tab_id="trends")
     st.markdown("## Trends")
     min_n = int(st.session_state["mp_min_n"])
     strategy, symbol = render_trends_selector(df_filtered)

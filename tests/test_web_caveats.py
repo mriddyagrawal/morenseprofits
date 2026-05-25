@@ -92,15 +92,81 @@ def test_all_three_caveats_are_distinct_strings():
 
 
 def test_caveats_module_exports_expected_names():
-    """Public API: the three constants + the three render helpers +
+    """Public API: the three constants + the four render helpers +
     the dismiss-key. Pinned in __all__."""
     from src.web import caveats
     expected = {
         "MULTIPLE_COMPARISONS_CAVEAT",
         "SURVIVORSHIP_CAVEAT",
         "MARGIN_TIER_B_CAVEAT",
+        "render_caveats",            # top-level dispatcher
         "render_caveats_strip",
         "render_caveats_collapsed",
         "DISMISS_KEY",
     }
     assert expected.issubset(set(caveats.__all__))
+
+
+def test_render_caveats_button_keys_unique_per_tab(monkeypatch):
+    """LOAD-BEARING regression: Streamlit raises
+    StreamlitDuplicateElementKey when 4 tabs each render
+    render_caveats_strip() with a shared button key. The tab_id
+    kwarg must produce distinct widget keys per call.
+
+    Without this fix the app crashed the moment an operator navigated
+    from Leaderboard to any other tab. Pinned here so a future
+    refactor that drops the tab_id parameter is caught at test time."""
+    captured_keys: list[str] = []
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n_or_spec):
+        n = n_or_spec if isinstance(n_or_spec, int) else len(n_or_spec)
+        return [_NullCtx() for _ in range(n)]
+
+    def fake_button(label, key=None, **kw):
+        captured_keys.append(key)
+        return False  # never "clicked"
+
+    import src.web.caveats as cav
+    monkeypatch.setattr(cav.st, "columns", fake_columns)
+    monkeypatch.setattr(cav.st, "button", fake_button)
+    monkeypatch.setattr(cav.st, "markdown", lambda *a, **k: None)
+    monkeypatch.setattr(cav.st, "caption", lambda *a, **k: None)
+    monkeypatch.setattr(cav.st, "warning", lambda *a, **k: None)
+
+    # Render the strip for all 4 tabs (the production call pattern)
+    for tab in ("leaderboard", "per_stock", "heatmap", "trends"):
+        cav.render_caveats_strip(tab_id=tab)
+    # 4 dismiss buttons, all with unique keys
+    assert len(captured_keys) == 4
+    assert len(set(captured_keys)) == 4, (
+        f"button keys must be unique per tab; got {captured_keys}"
+    )
+    # Each key carries its tab name for grep-ability
+    for tab, key in zip(
+        ("leaderboard", "per_stock", "heatmap", "trends"), captured_keys,
+    ):
+        assert tab in key
+
+
+def test_render_caveats_default_tab_id_still_works(monkeypatch):
+    """Backward-compat: calling without tab_id should not crash.
+    Single-tab apps / standalone use of caveats module shouldn't
+    require knowledge of the tab-namespace pattern."""
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    import src.web.caveats as cav
+    monkeypatch.setattr(cav.st, "columns",
+                        lambda n: [_NullCtx() for _ in
+                                   range(n if isinstance(n, int) else len(n))])
+    monkeypatch.setattr(cav.st, "button", lambda *a, **k: False)
+    monkeypatch.setattr(cav.st, "markdown", lambda *a, **k: None)
+    monkeypatch.setattr(cav.st, "caption", lambda *a, **k: None)
+    monkeypatch.setattr(cav.st, "warning", lambda *a, **k: None)
+    # Should not raise
+    cav.render_caveats_strip()
+    cav.render_caveats_collapsed()
