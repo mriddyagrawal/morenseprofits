@@ -3306,6 +3306,91 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of b82002d — fix(p6.5.caveats): tab-unique button keys — StreamlitDuplicateElementKey
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Fix a runtime bug surfaced when the user tried to launch the app in a browser. `render_caveats()` is called from all 4 tabs (per DESIGN_SPEC §1.4 "render at top of every tab"), and all 4 calls used the SAME widget key for the dismiss button. Streamlit raises `StreamlitDuplicateElementKey` on the second tab's render. Fix: introduce `tab_id` kwarg so each tab gets a unique button key namespace.
+
+**🔬 Reviewer-miss acknowledged**: I had the source in front of me at 7b12228 review and did not flag the multi-tab widget-key-collision risk. My 5 non-blockers from 7b12228 caught the date typo (BLOCKER), the `__all__` omission, the unsupported "~10% discount" claim, and the `st.caption` font concern — but I missed this. **Why pytest didn't catch it either**: Streamlit's duplicate-key check fires at the streamlit-runtime level (widget tree construction), not at Python-import level. My live-tests mocked `st.button` — the mock returns False but doesn't enforce the key-uniqueness rule. **Only an actual `streamlit run` boot surfaces it.** The project handles this gap correctly by deferring visual/render verification to `chore(p6.X.verify)` — but those `verify` commits were skipped at each tab's close (a separate flag from my catalogue). The bug therefore went undetected from efe1c73 (which wired `render_caveats()` to all 4 placeholder tabs on day 1) until the user manually launched the browser. **Lesson learned**: a multi-call site for a stateful render helper needs per-call namespacing, even when the shared state is intentional.
+
+**What works:**
+
+- **`tab_id: str = "default"` kwarg on all 3 caveats helpers** ([src/web/caveats.py:88, 124, 156](src/web/caveats.py)) — keeps the call sites idiomatic; default value preserves backward-compat for any standalone / single-tab caller.
+- **Button keys become `mp_caveats_dismiss_btn_{tab_id}` / `mp_caveats_expand_btn_{tab_id}`** — preserves the `mp_` SPECS §11.4 namespace prefix; appends per-tab discriminator. Unique per tab; greppable.
+- **Shared dismiss STATE (`mp_caveats_dismissed`) remains app-global by design** — clicking dismiss on one tab dismisses for ALL tabs (per §1.4 "session-scoped, not tab-scoped"). **Only the BUTTON KEYS get namespaced.** The fix is surgical: cures the runtime crash without changing the UX intent.
+- **`app.py` callers pass explicit tab_id** ([app.py:230, 245, 255, 269](app.py)):
+  ```python
+  _render_leaderboard_tab → render_caveats(tab_id="leaderboard")
+  _render_per_stock_tab   → render_caveats(tab_id="per_stock")
+  _render_heatmap_tab     → render_caveats(tab_id="heatmap")
+  _render_trends_tab      → render_caveats(tab_id="trends")
+  ```
+  Tab names match the tab labels — readable in browser DevTools / Streamlit's session_state inspector.
+- **Two regression tests pin the fix**:
+  - `test_render_caveats_button_keys_unique_per_tab` calls strip() with all 4 tab_ids and asserts (a) 4 distinct keys captured AND (b) each key contains its tab name. **Anti-regression for a future refactor that drops the tab_id parameter** — would fail at test time, not in production.
+  - `test_render_caveats_default_tab_id_still_works` — pins the backward-compat default. Standalone callers don't need tab-namespace knowledge.
+- **489/489 full suite** (was 487 + 2).
+
+**Live-verified:**
+- `pytest tests/test_web_caveats.py` → 9/9 (2 new + 7 prior).
+- The 4 captured button keys are distinct and each contains its tab name (per the new test's assertion).
+
+**Blocking issues:** None — fix unblocks the verify-pass.
+
+**Non-blocking observations:**
+
+1. **The bug was present from efe1c73 (app.py)** — it sat un-flagged for 26+ commits because:
+   - Pytest mocks bypass Streamlit's widget-tree key check.
+   - No `chore(p6.X.verify)` commit landed at any tab's close to actually run `streamlit run app.py` against the changes.
+   - My reviews live-tested individual render functions (mocked `st.metric`, `st.dataframe`, `st.button`) — but never composed all 4 tab renderers in a single Streamlit script-context.
+   
+   **Process implication**: every Phase-6 phase boundary (6.1.verify, 6.2.verify, 6.3.verify, 6.4.verify) being deferred had a real cost — this bug would have surfaced at any of those checkpoints. **Stronger argument for landing `chore(p6.5.verify)` next** (no more skipping).
+
+2. **The fix uses `tab_id: str = "default"`** as the default. A subtle concern: if TWO call sites in different code paths both pass the default OR forget to pass tab_id, they collide again. **Defense in code**: only `app.py` calls `render_caveats(...)` in production, and now all 4 sites pass explicit ids. **Cosmetic improvement** would be `tab_id: str` with NO default + an explicit positional requirement, forcing every caller to specify. **Tradeoff**: breaks backward-compat for any standalone consumer of caveats.py. Current choice (default value) is defensible for the v1 + a clear regression test.
+
+3. **The regression test asserts `tab in key` for greppability** — operator inspecting Streamlit DevTools can grep by tab name. Useful.
+
+4. **Test fixture uses `_NullCtx` pattern** for `st.columns` mock — clean. Could be DRY'd to a shared fixture across the test suite, but cosmetic.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ honest disclosure layer now actually rendered (was crashing before this fix).
+- **Streamlit-isolation contract (SPECS §11.1)**: ✓ caveats.py still imports streamlit (it's the renderer); no other module touched.
+- **State namespace (§11.4)**: ✓ `mp_caveats_dismissed` shared; button keys per-tab namespaced; both prefixes honored.
+- **Backward-compat**: ✓ default tab_id preserves single-tab callers.
+- **Test coverage**: ✓ both branches (per-tab unique + default works) pinned.
+
+**What I tried:**
+- Read the diff end-to-end.
+- `pytest tests/test_web_caveats.py -v` → 9/9.
+- `pytest tests/` → 489/489 full suite.
+- Cross-checked the production call sites in app.py — all 4 tabs pass explicit tab_id.
+
+**Sequencing observation:** This is exactly the bug `chore(p6.X.verify)` would have caught at any of 4 prior phase boundaries. **The cost of skipping verify commits is now concrete**: this fix-commit happens late (after Phase 6 code complete) instead of being caught at p6.1.verify when only the placeholder tabs existed and the fix would have been simpler (or never needed if a `_get_widget_key(tab_id, name)` helper had been recommended at design time).
+
+**Catalogue running total: 14 closures** + 1 newly-caught fix that wasn't in my catalogue but should have been.
+
+**Catalogue items still open (~5 cosmetic/docstring):**
+- 87a6707 #1 — YoY green line unconditional
+- 452b503 #3 — "across N rank-eligible" vs "total" subtitle wording
+- 7b12228 #2 — "~10% discount" claim in MARGIN_TIER_B_CAVEAT
+- c6e3684 #1 — `get_message` "streamlit-free" docstring claim
+- 334bada+5c801dd #1 — `RESULTS_DIR + importlib.reload` test pattern
+- DESIGN §1.5 — mtime picker dependency on 617878b not documented
+
+**Next-commit suggestion:** **`chore(p6.5.verify)` — NOW UNBLOCKED.** The user already started the verify-pass (commit body: "browser-side verify still pending — this was the bug that blocked it"). Should:
+1. Boot `streamlit run app.py --server.headless`, confirm HTTP 200, **navigate between all 4 tabs** to confirm no more duplicate-key crashes.
+2. Screenshot each tab against `DESIGN/*.png` mockups.
+3. Visual-confirm SURVIVORSHIP_CAVEAT renders "2024-07-01".
+4. Test the dismiss-to-banner flow on one tab, navigate, confirm collapsed state propagates.
+
+Then `chore(p6.5.tag)` → **Phase 6 ships**.
+
+**Final docs pass `chore(p6.5.docs)`** could land between verify and tag to close the ~5 remaining cosmetic items. Or after the tag as a polish commit. Non-blocking.
+
+---
+
 ## Review of da43828 — chore(p6.5.cleanup-2): high-leverage UI consistency fixes
 
 **Verdict:** ✅ accept
