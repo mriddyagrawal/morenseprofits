@@ -3306,6 +3306,48 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 177d0f9 — fix: p7_wide_sweep — universe matches prefetch (10 syms × 2024-05→2026-05)
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal:** Wide-sweep was using the 5-symbol × 2023-2024 universe (the original Phase-6 §3.2 scope) but the **prefetch covered 10 symbols × 2024-05 → 2026-05**. Wide-sweep was thus partially fetching new contracts vs cache-hitting. This commit aligns the two scripts: wide-sweep now uses the prefetch's universe verbatim, so every cell is a cache-hit.
+
+**What works:**
+
+- **Universe matches prefetch exactly**: 10 symbols (RELIANCE, HDFCBANK, ICICIBANK, INFY, TCS, SBIN, AXISBANK, KOTAKBANK, BHARTIARTL, LT) — same list as `prefetch_universe.py`.
+- **Expiry window matches prefetch**: 2024-05-01 → 2026-05-31 — same as prefetch defaults.
+- **`EXPIRY_FROM` / `EXPIRY_TO` lifted to module-level constants** (not inline `date(...)`) — readable, easy to tune.
+- **Inline comment cross-references prefetch**: "matches scripts/prefetch_universe.py — 10 blue chips with cache".
+- **Cells planned: 450k** (vs prior 216k). Math: 10 syms × 3 strats × ~25 expiries × 600 valid (e,x) pairs ≈ 450,000. ✓
+- **`TODAY_FN = lambda: date(2026, 5, 26)`** — bumped to actual today (was 2026-05-25).
+- **Wall-clock estimate**: ~10-15 min on 8 workers with warm cache. Plausible given the parallel speedup × cache-hit per-cell cost (~1ms).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Universe constants duplicated across `prefetch_universe.py` and `p7_wide_sweep.py`**. The two scripts will silently drift if one is edited without the other. **Fix options**:
+   - Move `SYMBOLS`, `EXPIRY_FROM`, `EXPIRY_TO` to `src/universe/sweep_universe.py` as canonical constants; both scripts import.
+   - Or just rely on the cross-reference comment as a manual sync.
+   The comment alone is fragile (manual sync); a shared module is the real fix. Cosmetic for v1 but worth flagging for Phase-7 polish.
+
+2. **N_WORKERS=8 still hardcoded** (carry-over from ef522aa flag). For non-M1-Max machines, this is wrong. Worth bumping to `os.cpu_count() - 2` or similar.
+
+3. **`TODAY_FN = lambda: date(2026, 5, 26)`** — frozen sentinel. Reproducible but goes stale; matches the prefetch's sentinel pattern. ✓ Consistent.
+
+**Domain / correctness checks:**
+
+- **Cache alignment**: ✓ universe matches prefetch — should be 0 cold fetches.
+- **Determinism**: ✓ run_id derived from logical inputs; same universe + grid → same run_id.
+
+**Carry-over open flags:**
+- ⚠ **Skips-ordering determinism bug** from a27f9a7 review — STILL OPEN.
+- ⚠ **`chore(p6.5.tag)` missing** — Flag 1 from a745c89, STILL OPEN. Now **7 commits pre-tag**.
+
+**Next-commit suggestion:** Same as before — `fix(p4.5)` for the skips-ordering bug + `chore(p6.5.tag)`. Then continue Phase 7 or run the wide sweep + screenshot verify.
+
+---
+
 ## Review of a27f9a7 + ef522aa — feat: sweep_grid gains multiprocessing.Pool + p7_wide_sweep uses 8-worker parallel
 
 **Verdict:** ⚠ **accept-with-followup** — **real determinism bug**: skips parquet rows are written in completion-order (random under parallel) rather than canonical order. Violates the docstring's "byte-identical regardless of n_workers" claim and SPECS §6c.3 for the SKIPS parquet specifically. Fix is trivial; flagging for a single-commit follow-up.
