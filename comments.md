@@ -3306,6 +3306,95 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of a745c89 — feat: heatmap cell drill-down — click a cell to see the 24 underlying trades
+
+**Verdict:** ✅ accept (substantial feature; **flag**: this is **p7.1** per DESIGN_SPEC §4, landing pre-Phase-6-tag)
+
+**Phase / commit goal (as I understood it):** Bidirectional flow on the heatmap — click a cell, see the ~24 underlying trades (1 per expiry) for that (strategy, symbol, entry_td, exit_td) tuple. Restores the distribution that the per-cell median hides. **No re-pricing** — the sweep parquet's JSON columns (`legs_json`, `costs_breakdown_json`, `margin_breakdown_json`) carry the full priced detail; this view just composes them.
+
+### 🔬 Phase-positioning concern (carry-over from 7806d82's same flag)
+
+**This commit IS DESIGN_SPEC §4 Phase 7 commit p7.1**:
+> p7.1 trade-level drill-down — per-cell trade list. The most defensible Phase-6-deferred addition. Closes the "show me the evidence behind the median" loop.
+
+Per the user's fd72b85 scope freeze: "Phase 7 starts AFTER Phase 6 ships (v0.6-ui tag)". But **Phase 6 hasn't tagged yet** — `chore(p6.5.tag)` is still pending. This is the second Phase-7 commit landing before the Phase-6 tag (after 7806d82's p7_wide_sweep.py).
+
+**Recommendations** (any of):
+1. **Land `chore(p6.5.tag)` at eb2de5e** (last Phase-6 commit), pointing v0.6-ui at the pre-Phase-7 state. Then this commit + 7806d82 are explicitly Phase-7 work after tag.
+2. **Re-scope v0.6-ui to include this Phase-7 work** — fold p7.1 trade-level drill-down into the Phase-6 shipped artifact. Acceptable but mixes scope.
+3. **Continue and tag later** when more Phase-7 work has landed (e.g., v0.7-trade-drilldown).
+
+**My lean**: option 1 — retroactively tag eb2de5e as v0.6-ui. Clean phase boundary; matches the original scope freeze.
+
+### What works (the feature itself):
+
+- **Bidirectional state flow** via `mp_heatmap_selected_cell`:
+  - `st.plotly_chart(..., on_select="rerun", selection_mode="points")` ([src/web/heatmap.py:438-444](src/web/heatmap.py#L438-L444)) — Streamlit's chart-event API.
+  - `_capture_cell_selection(selected)` ([src/web/heatmap.py:167-192](src/web/heatmap.py#L167-L192)) parses Plotly's payload (x/y tick labels like "T-15"/"T-3") via `lstrip("T-")`, writes `(entry_td, exit_td)` to session_state.
+  - `render_cell_drilldown` reads the state key, filters df, renders the panel.
+- **Defensive parsing**: returns early on `selected is None`, empty points, non-string labels, or parse failures. Handles both dict-like and AttrDict-like Streamlit payload shapes ([src/web/heatmap.py:177-179](src/web/heatmap.py#L177-L179)).
+- **No-selection state has a placeholder**: "_Click any cell on the Median ROI/yr heatmap above to see the underlying trades..._" — operator gets explicit instruction.
+- **Clear button** ([src/web/heatmap.py:530-533](src/web/heatmap.py#L530-L533)) — operator can dismiss without picking another cell. Pops the session_state key + `st.rerun()`.
+- **10 summary metrics** in two rows: N / Win rate / Median / Mean / Best / Worst ROI/yr, then Total P&L / Best single / Worst single / Std ROI/yr. **Comprehensive distribution view** at a glance.
+- **ROI-per-expiry bar chart** ([src/web/heatmap.py:589-623](src/web/heatmap.py#L589-L623)) — green for positive, red for negative ROI; median hline overlaid with annotation. **Exactly the "outlier + regime spotter" the docstring promises** — lets analyst see "is the median representative or is there a fat tail?".
+- **Sortable per-trade table** — Expiry / Entry / Exit / Hold / Spot entry+exit / Gross + Costs + Net P&L / ROI + ROI/yr / Margin. **The forensic detail.**
+- **Per-trade expanders** parse `legs_json`, `costs_breakdown_json`, `margin_breakdown_json` and render each as a sub-DataFrame. **Full transparency**: operator can drill from "the cell's median is +180%/yr" → "this one expiry returned +800%/yr" → "the legs were SELL 2600CE at ₹56, BUY 2700CE at ₹12; costs broke down to ₹47 STT + ₹20 brokerage + ...".
+- **Try/except around JSON parsing** — defensive against malformed rows.
+- **489/489 full suite** passes (the drill-down has no pytest coverage — Streamlit-render territory).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Streamlit `on_select="rerun"` requires Streamlit ≥ 1.34** (released early-2024). [requirements.txt](requirements.txt) pins `streamlit>=1.32.0` — **floor may be too low**. If an operator installs the minimum version, the `on_select` kwarg silently no-ops or errors. **Recommended fix**: bump to `streamlit>=1.34.0` in requirements.txt.
+
+2. **Color inconsistency** ([src/web/heatmap.py:594-595](src/web/heatmap.py#L594-L595)): bar chart uses hex colors `#2ca02c` / `#d62728` (matplotlib defaults). Rest of the project uses `rgb(0, 100, 0)` / `rgb(200, 50, 50)` (sparkline, YoY line). **Same semantic, slightly different shade**. Cosmetic.
+
+3. **`selection_mode="points"`** allows multi-select but code takes only `pts[0]` ([src/web/heatmap.py:182](src/web/heatmap.py#L182)). Shift-click would select 2 cells → first used silently. **Could be `"single"`** if Plotly supports it on heatmap traces; otherwise the current behavior is fine (drill-down is per-cell semantic).
+
+4. **Selector-change doesn't clear selection**: if operator switches strategy/symbol selectors after clicking a cell, `mp_heatmap_selected_cell` persists, but `render_cell_drilldown` filters by the NEW strategy/symbol → falls through to "No trades for (T-X, T-Y) on..." OR shows wrong-pair data. **Recommend**: clear `mp_heatmap_selected_cell` when selector changes (add to the selectbox `on_change` callback OR in the selector function). Cosmetic UX nicety.
+
+5. **`from src.web._format import format_inr` inside the function** ([src/web/heatmap.py:543](src/web/heatmap.py#L543)) — `format_inr` is already imported at module top. **Redundant**. Cosmetic.
+
+6. **`import json` inside the function** ([src/web/heatmap.py:500](src/web/heatmap.py#L500)) — PEP 8 says module-top. Cosmetic.
+
+7. **`_capture_cell_selection` has no pytest coverage** — pytest can't easily simulate Streamlit's event payload shapes. **If a future Streamlit version changes the payload schema, the parser silently no-ops** (returns early on missing keys). Operator sees "click does nothing". Acceptable for v1; defensive against API changes by returning early on any unexpected shape.
+
+8. **272-line addition to heatmap.py** — file is now ~700 lines, multifaceted (selector + dual heatmaps + drill-down). **Could be split** into `heatmap.py` (render) + `heatmap_drilldown.py` (panel) for tidier modules. Cosmetic; Phase-7 refactor opportunity.
+
+9. **Margin breakdown table assumes flat dict** ([src/web/heatmap.py:686-689](src/web/heatmap.py#L686-L689)) — if `margin_breakdown_json` ever becomes nested, this would need recursion. Future-proof concern.
+
+10. **Drill-down state survives across tab switches** — `mp_heatmap_selected_cell` is global session state. Operator clicks cell, switches to Leaderboard, switches back → selection persists. ✓ Good UX.
+
+**Domain / correctness checks:**
+
+- **No re-pricing**: ✓ all data read from the sweep parquet's JSON columns. Determinism preserved.
+- **Asymmetric-conservatism**: ✓ "Best ROI/yr" and "Worst ROI/yr" are the per-trade extremes; median shows the central tendency; bar chart shows the actual distribution. Operator can't be fooled by a hidden outlier.
+- **§2.5 naming rule**: ✓ "Net P&L" → ₹ value; "ROI/yr" → % value.
+- **State namespace**: ✓ `mp_heatmap_selected_cell` follows §11.4 `mp_` prefix.
+
+**What I tried:**
+- Read [src/web/heatmap.py:167-192, 438-451, 475-696](src/web/heatmap.py) end-to-end.
+- `pytest tests/` → 489/489 (unchanged; no new tests).
+- Verified `_capture_cell_selection` handles both dict-like and AttrDict-like Streamlit payloads.
+
+**Sequencing observation:** Two p7.x commits in 19 seconds (7806d82 → a745c89), both pre-Phase-6-tag. **This is the project transitioning into Phase 7 without a tag boundary.** Not a structural problem; just suggests `chore(p6.5.tag)` should land soon to preserve the original phase plan.
+
+**Next-commit suggestion:**
+
+1. **`chore(p6.5.tag)`** retroactively at eb2de5e (or wherever the last pure-Phase-6 commit is). Pins v0.6-ui as the Phase-6 artifact.
+2. Continue Phase 7 work — the wide sweep + drill-down are the first two p7.x commits. Per DESIGN_SPEC fd72b85, p7.2 (diagnostics tab) + p7.3 (export buttons) + p7.4 (regime drill-down) are also queued.
+
+**OR** if BUILDER prefers to fold p7.x into the v0.6-ui ship: 
+1. Run the wide sweep + verify the drill-down works in browser.
+2. Tag v0.6-ui at the current HEAD acknowledging the included p7.x work.
+
+Either is defensible; option (1) preserves the original phase discipline.
+
+**Recommended quick fix**: bump `streamlit>=1.34.0` in requirements.txt (non-blocker #1) before tagging — the `on_select` kwarg is the load-bearing new dependency.
+
+---
+
 ## Review of 7806d82 — feat: scripts/p7_wide_sweep.py — wide-grid sweep for full-resolution heatmap
 
 **Verdict:** ✅ accept (with a phase-label flag + a T-0 semantic check)
