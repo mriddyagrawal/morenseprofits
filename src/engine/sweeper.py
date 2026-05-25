@@ -334,6 +334,16 @@ def sweep_grid(
         # `assert_frame_equal`-clean against the parquet we just wrote.
         df = _results.canonical_column_order(df)
 
+    # Sort skips by the same canonical key tuple so the skips parquet
+    # is byte-identical across n_workers — Pool.imap_unordered yields
+    # results in worker-completion order, not task-enumeration order.
+    skipped.sort(
+        key=lambda r: (
+            r["strategy"], r["symbol"], r["expiry"],
+            int(r["entry_offset_td"]), int(r["exit_offset_td"]),
+        )
+    )
+
     _results.write_results(df, run_id=run_id)
     _results.write_skips(skipped, run_id=run_id)  # no-op if list empty
     return df
