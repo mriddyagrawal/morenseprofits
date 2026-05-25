@@ -3306,6 +3306,56 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of b41e047 — fix: sort skips by canonical key before write — Pool.imap_unordered determinism
+
+**Verdict:** ✅ accept — **closes the determinism bug from my a27f9a7 review.**
+
+**Phase / commit goal:** Close the skips-ordering bug I flagged in a27f9a7. In parallel mode (`n_workers > 1`), skip rows arrived in worker-completion order; the `*_skipped.parquet` byte-content differed across runs. Fix mirrors the rows-sort: sort the skipped list by the canonical key tuple before `write_skips`.
+
+**What works:**
+
+- **Implementation matches my recommendation verbatim** ([src/engine/sweeper.py:337-343](src/engine/sweeper.py#L337-L343)):
+  ```python
+  skipped.sort(
+      key=lambda r: (
+          r["strategy"], r["symbol"], r["expiry"],
+          int(r["entry_offset_td"]), int(r["exit_offset_td"]),
+      )
+  )
+  ```
+  Same canonical key as the results parquet's `sort_values([...])` call. ✓
+- **In-place `.sort()`** — efficient; avoids creating a sorted copy. The list is local to `sweep_grid` and discarded after `write_skips` runs.
+- **`int()` casts on the offset values** — defensive against numpy.int64 vs Python int comparison quirks during sort. ✓
+- **Single-threaded callers see no change** — commit body explicitly notes "their skips list was already in canonical task order" so the sort is a no-op for n_workers=1.
+- **Comment captures the WHY** ([src/engine/sweeper.py:337-339](src/engine/sweeper.py#L337-L339)): "Pool.imap_unordered yields results in worker-completion order, not task-enumeration order". Future contributor reading this understands the determinism rationale.
+- **489/489 full suite passes** — existing tests unaffected; sort is idempotent on already-sorted single-threaded lists.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 No regression test added.** My a27f9a7 review recommended `test_sweep_grid_parallel_matches_serial` alongside the fix — a test that runs `sweep_grid(n_workers=1)` vs `sweep_grid(n_workers=4)` on a fixture with skips and asserts both `*_skipped.parquet`s are `pd.testing.assert_frame_equal`-clean. **Without this test, a future refactor that drops the sort line silently regresses the determinism property.** Single-threaded testing wouldn't catch it; the bug is parallel-path-specific. Recommend a follow-up commit `test(p4.5): sweep_grid parallel matches serial — skips ordering regression` (~15 lines).
+
+2. **`skipped.sort(...)` is in-place mutation** — the `skipped` variable is local; nothing else aliases it; safe.
+
+3. **Reviewer→builder attribution explicit**: "Reviewer flag on a27f9a7". The loop pattern is well-established.
+
+**Domain / correctness checks:**
+
+- **SPECS §6c.3 byte-identicality**: ✓ now holds for BOTH results AND skips parquets across n_workers.
+- **Backward-compat**: ✓ single-threaded behavior unchanged.
+- **Sort key matches results-parquet sort key**: ✓ same (strategy, symbol, expiry, entry_offset_td, exit_offset_td) tuple.
+
+**Carry-over open flags:**
+- ⚠ **`chore(p6.5.tag)` STILL missing** (now ~8 commits pre-tag). Phase-6/Phase-7 boundary increasingly muddied. This is the only remaining structural flag.
+- 🔬 **Regression test for the parallel-skips fix** — flagged here.
+
+**Next-commit suggestion:** **`chore(p6.5.tag)`** at the appropriate Phase-6 commit (eb2de5e candidate), OR fold p7.x into v0.6-ui and retag. Long overdue. After that, continue Phase 7.
+
+**OR** add the parallel-skips regression test (non-blocker #1 above) before the tag — bundling the test into a small follow-up commit closes the test-coverage gap before more code lands on top.
+
+---
+
 ## Review of 177d0f9 — fix: p7_wide_sweep — universe matches prefetch (10 syms × 2024-05→2026-05)
 
 **Verdict:** ✅ accept
