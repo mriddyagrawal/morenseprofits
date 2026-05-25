@@ -3306,6 +3306,214 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of f4aea02 — fix(p6.5.opts): graceful skip on NSE rate-limit + politeness delay
+
+**Verdict:** ✅ accept — **closes my c6dfaea non-blocker #2 directly.**
+
+**Phase / commit goal (as I understood it):** Final hardening of the direct NSE fetcher. Two changes:
+
+1. **`time.sleep(0.5)` politeness delay** before each fetch ([src/data/options_loader.py:144-149](src/data/options_loader.py#L144-L149)):
+   ```python
+   # Politeness delay — NSE rate-limits aggressively when burst-hit.
+   # ~500ms between contract fetches keeps us well under the WAF
+   # threshold observed during the Phase-6 sweep.
+   time.sleep(0.5)
+   ```
+   **Closes my c6dfaea non-blocker #2** (no global rate-limiter). Adds ~45 min to a 5,400-cell cold-cache sweep (0.5s × 5,400 = ~45 min) but cuts WAF challenges dramatically. **Documented with WHY**: "observed during the Phase-6 sweep" — empirical, not theoretical.
+
+2. **`try/except (ReadTimeout, ConnectionError)` around BOTH HTTP calls** ([src/data/options_loader.py:159-172, 189-202](src/data/options_loader.py#L159-L202)):
+   - Cookie pre-fetch: timeout / connection error → `MissingDataError` with diagnostic message.
+   - Derivatives GET: same handling.
+   **Sweeper's skip-loop catches both** so a single cell's rate-limit doesn't abort the whole run. **Critical for long sweeps**: previously these would have raised uncaught and aborted at the first transient blip.
+
+**What works:**
+
+- **Per-fetch politeness instead of global rate-limiter** — simpler than implementing a token-bucket; ~500ms is empirically tested. ✓ Pragmatic choice over over-engineering.
+- **`from e` clause preserves the original exception chain** — operator debugging sees both the wrapping MissingDataError + the underlying ReadTimeout/ConnectionError. Loud-failure discipline.
+- **Diagnostic message names the specific exception type** (`type(e).__name__`) — operator distinguishes ReadTimeout (extended NSE delay) from ConnectionError (DNS / TCP problem) in the skip-log without re-reading code.
+- **Both cookie + derivatives calls handled symmetrically** — no half-fixed paths.
+- **Comment explicitly documents the perf vs honesty tradeoff**: "Per-fetch cost is small (single-shot serial), so a small sleep here doesn't hurt operator ergonomics." ✓
+- **`MissingDataError` raise on transient blip** keeps the cell in the skip-log with a specific reason — operator can rerun and the cache layer ensures previously-successful cells short-circuit.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The 0.5s sleep is hardcoded as a literal** ([src/data/options_loader.py:149](src/data/options_loader.py#L149)). Could be a module-level constant `_NSE_POLITENESS_DELAY_S = 0.5` for easy tuning. Cosmetic.
+
+2. **No exponential backoff on retry** — but there's also NO retry: a rate-limited cell becomes a skip directly. **Defensible**: re-running the sweep with `force=False` lets the cache layer short-circuit successful cells, and skipped cells get re-attempted naturally on subsequent runs. Avoids the complexity of in-loop backoff. **Phase-7 alternative**: add `tenacity`-style retry with backoff on the skip path. Not blocking.
+
+3. **0.5s × 5,400 cells = 45 min added** — operator should budget for cold-cache sweeps taking ~60-75 min (was ~20-30 min per DESIGN_SPEC §3.2 estimate). **Worth updating DESIGN_SPEC §3.2 timing estimate** to reflect the politeness delay. Cosmetic doc-touch.
+
+**Closure of carried-forward flag:**
+
+| Origin | Concern | Closing commit |
+|---|---|---|
+| c6dfaea #2 | no global rate-limiter for 5,400 cells | **f4aea02 (this commit)** |
+
+c6dfaea non-blocker #1 (Chrome v144 hardcoded) and #3 (cookie pre-fetch doubles HTTP per call) remain open — both monitoring concerns, not actionable in code.
+
+**What I tried (read-only — bash still rate-limited):**
+- Read [src/data/options_loader.py:144-202](src/data/options_loader.py#L144-L202) for the politeness delay + try/except blocks.
+- Confirmed both HTTP call sites (cookie + derivatives) have symmetric error handling.
+
+**Next-commit suggestion (carry-over):** Re-run `p6_sweep.py` after this fourth fix; if it completes, `chore(p6.5.verify)` can screenshot against the rich §3.2 dataset. If WAF challenges still surface on a fraction of cells, the skip-rate metric in the script's output tells the operator how serviceable the dataset is.
+
+After successful sweep → `chore(p6.5.verify)` + `chore(p6.5.tag)`.
+
+---
+
+## Review of 01049f7 + 71f49ab — fix(p6.5.opts) ×2: NSE fetcher correctness follow-ups
+
+**Verdict:** ✅ accept (both commits, paired)
+
+**Phase / commit goal (as I understood it):** Two correctness follow-ups to c6dfaea's direct NSE fetcher, surfaced by re-running `p6_sweep.py` against the new path. Each is a specific bug the new direct-fetch path exposes that jugaad's old path silently swallowed via `apply(np_int)` and lazy date parsing.
+
+**01049f7 — Tolerate partial NSE rows** ([src/data/options_loader.py:273-294](src/data/options_loader.py#L273-L294)):
+
+NSE occasionally returns settlement-only rows where `FH_MARKET_LOT` / `FH_TOT_TRADED_QTY` / `FH_CLOSING_PRICE` are empty strings (no trading occurred that day for the contract). Jugaad's old path silently coerced empties to garbage ints via `apply(np_int)`. The direct-fetch path didn't — it raised on the empty string.
+
+**Fix:**
+```python
+for col in ("strike", "open", "high", "low", "close", "ltp", "settle_price"):
+    df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+# Essential-row filter
+df["lot_size"] = pd.to_numeric(df["lot_size"], errors="coerce")
+df["volume"]   = pd.to_numeric(df["volume"], errors="coerce")
+df = df.dropna(subset=["lot_size", "volume", "close"]).copy()
+if len(df) < pre_n:
+    warnings.warn(f"[options_loader] dropped {pre_n - len(df)} partial row(s) ...")
+```
+
+**What works:**
+- **`errors="coerce"`** for the float columns — dirty values (whitespace, "—", empty strings) become NaN instead of raising. ✓ Defensive.
+- **Essential-row dropna**: rows missing `lot_size` OR `volume` OR `close` are unusable (can't price), so drop them. Other missing fields (e.g., `open`/`high`/`low`) stay NaN — caller decides whether to use ltp / settle_price as fallback.
+- **Visible warning** when rows are dropped — operator sees `[options_loader] dropped N partial row(s) from SYMBOL (missing lot_size / volume / close — typically NSE settlement-only rows with no trade data).` **Asymmetric-conservatism**: silent-drop is exactly what jugaad did and what this fix replaces; the warning makes the drop visible.
+- **`stacklevel=2`** on the warning so it surfaces at the caller's frame.
+- **Comment explains the WHY** ([src/data/options_loader.py:279-283](src/data/options_loader.py#L279-L283)): "jugaad's old path silently swallowed via apply(np_int)". Future contributor reading the code understands the historical context.
+
+**71f49ab — Parse NSE date strings** ([src/data/options_loader.py:218-224](src/data/options_loader.py#L218-L224)):
+
+NSE returns DATE / EXPIRY as `"27-Mar-2024"` strings (DD-Mon-YYYY with abbreviated month). Pandas' default `to_datetime` infers `%B` (full month name) → crashes on `"Mar"`. Jugaad did this via `ut.np_date.apply` (per-row); we do it vectorized.
+
+**Fix:**
+```python
+df["DATE"]   = pd.to_datetime(df["DATE"],   format="%d-%b-%Y")
+df["EXPIRY"] = pd.to_datetime(df["EXPIRY"], format="%d-%b-%Y")
+```
+
+**What works:**
+- **Explicit `format="%d-%b-%Y"`** — pinned to NSE's actual format. Prevents pandas' auto-inference from going wrong on abbreviated months.
+- **Vectorized** instead of per-row `.apply` — same correctness, better perf at scale.
+- **Comment explains the format choice** ([src/data/options_loader.py:219-222](src/data/options_loader.py#L219-L222)): "%b prevents pandas from auto-inferring %B (full month name)". ✓
+
+**Both fixes share a pattern**: jugaad's old code silently handled NSE quirks via `apply(...)` patterns; the new direct-fetch path's vectorized code surfaces them as errors. **The fixes adopt the same defensive behavior at the vectorized layer** — same end result, faster execution, more explicit failure modes.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **`warnings.warn` instead of `logging.warning`**: ✓ matches `warn_fetch` discipline at the top of the file. Streamlit picks up warnings; CLI shows them.
+2. **Dropping rows by `["lot_size", "volume", "close"]` columns** — defensible. Could also include `settle_price` (used for some price models), but `close` is the v1 price column per SPECS §2.2. If a future strategy wants settle_price-based pricing, expand the dropna.
+3. **The two fixes land as separate commits** — both touch `options_loader.py` but at different functions / line ranges. Nuclear-commit discipline preserved. Could have been one combined commit; the split is fine.
+
+**What I tried (read-only — bash was temporarily unavailable):**
+- Read [src/data/options_loader.py:60-180](src/data/options_loader.py) for c6dfaea's fetcher.
+- Read [src/data/options_loader.py:180-327](src/data/options_loader.py) for both follow-up fixes.
+- Cross-checked the `_normalize` function — partial-row dropna + visible warning + vectorized date parsing all in place.
+- (Could not run `pytest tests/` while bash was rate-limited — commit body claims 489/489 still passing for both follow-ups.)
+
+**Sequencing observation:** Three commits in rapid succession (c6dfaea → 01049f7 → 71f49ab) — the BUILDER ran the sweep, hit bug, fixed, ran again, hit next bug, fixed. **This is the "loud failure → fix" pattern operating on a live data-layer integration**. Each commit fixes a specific edge case the previous one exposed. The cumulative effect: a hardened NSE fetcher that handles WAF, partial rows, and date formats correctly.
+
+**Next-commit suggestion:** Re-run `p6_sweep.py` once more — if it completes without crash, the §3.2 sweep is unblocked and `chore(p6.5.verify)` can screenshot against the rich multi-pair dataset. If a 4th bug surfaces, another fix; if not, proceed.
+
+After successful sweep → `chore(p6.5.verify)` + `chore(p6.5.tag)`.
+
+---
+
+## Review of c6dfaea — fix(p6.5.opts): direct NSE derivatives fetcher, replaces jugaad's wrapper
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the JSONDecodeError that crashed `p6_sweep.py` in 9c1a6cf. Root-cause-driven fix at the data-layer: replace `jugaad_data.nse.derivatives_df` with a direct NSE endpoint fetcher (`_direct_derivatives_df`) that avoids three specific jugaad failure modes. Surgical scope — only the OPTSTK derivatives path is replaced; jugaad stays for stock_df + bhavcopy_fo_raw.
+
+**Three root causes correctly identified and addressed:**
+
+1. **Module-level shared `NSEHistory()` session** ([src/data/options_loader.py:49-52](src/data/options_loader.py#L49-L52) comment) — jugaad creates one `Session()` at import time; once NSE flags it (rate-limit, WAF), every subsequent call dies until the Python process restarts. **Fix**: fresh `requests.Session()` per call in `_direct_derivatives_df`.
+2. **`derivatives_raw` uses `ThreadPoolExecutor(max_workers=2)` + date chunking** → 2 parallel API hits per single contract fetch, bot-like to NSE's WAF. **Fix**: one serial GET per call.
+3. **No retry / non-JSON handling** — when NSE returns its WAF challenge HTML, `self.r.json()` raises `JSONDecodeError` uncaught. **Fix**: content-type check + try/except around `r.json()` → both branches raise `MissingDataError` so the sweeper's skip-loop records the cell as a skip instead of crashing.
+
+**What works:**
+
+- **Surgical replacement scope**: only the OPTSTK endpoint replaced. Jugaad stays for `stock_df` + `bhavcopy_fo_raw` ("those paths don't share the failure mode — different jugaad classes, different endpoints"). **Minimum-blast-radius substitution.**
+- **`derivatives_df` module-private wrapper** ([src/data/options_loader.py:~270](src/data/options_loader.py)) preserves the call-site signature inside `_fetch_contract_lifetime` — no diff at the call point. **Zero call-site churn.**
+- **Cookie pre-fetch from `/report-detail/eq_security`** before the API GET — necessary because NSE validates session cookies set by the report page. Without this, the API returns 401 / HTML challenge.
+- **Headers mirror Chrome-on-macOS exactly** ([src/data/options_loader.py:78-94](src/data/options_loader.py#L78-L94)) — NSE's WAF is sensitive to header signatures. Mirroring jugaad's UA + the full sec-ch-ua suite is the right defensive choice.
+- **`FH_* → jugaad` column rename** ([src/data/options_loader.py:99-117](src/data/options_loader.py#L99-L117)) — `_NSE_TO_JUGAAD_COLS` mapping returns a DataFrame in jugaad's exact shape so `_normalize()` (downstream) doesn't need a change. **Interface compatibility preserved.**
+- **Content-type check + `try/except ValueError`** on `r.json()` ([src/data/options_loader.py:191-209](src/data/options_loader.py)) — distinguishes "JSON parse error" (transient, treated as MissingDataError) from "network error" (operator-actionable, propagates). Right discipline.
+- **`OptionsFormatError` on missing FH_* columns** — defensive against future NSE schema changes. **Loud failure** so schema drift surfaces immediately, not silently.
+- **`body.get("data", [])` empty-rows handling** — never-traded strikes return an empty DataFrame in jugaad's shape; downstream logic unchanged.
+- **`verify=True` explicit** — no SSL bypass.
+- **489/489 full suite** (pure substitution; no test changes needed — interface compatible).
+
+**Smoke-test claim**: "the exact URL the user shared (PNB 100 CE Mar-2024) — 30 rows returned with correct columns matching options_final_headers." User-validated against a known-good contract.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Header signature drift risk**: Chrome version (`Chromium";v="144"`, `Chrome/144.0.0.0`) is hardcoded in `_NSE_HEADERS`. **If NSE's WAF starts checking for current Chrome stable** (e.g., bumps to 145+), every fetch becomes a WAF challenge. **Mitigation options**:
+   - Periodic header refresh (manual; Phase-7 hardening).
+   - Read Chrome version from a config file.
+   - Accept the drift; just be aware that this is a brittle external-API integration.
+   
+   **Acceptable for v1** — jugaad has the same pattern. The risk is monitoring, not architecture.
+
+2. **🔬 No global rate-limiter between calls**: each `_direct_derivatives_df` invocation creates a fresh Session, but the sweeper still calls it ~5,400 times in a row. **NSE may flag the IP** even with fresh sessions if request rate is too high. **For the §3.2 cold-cache sweep**:
+   - 5,400 calls × 2 HTTP requests each (cookie + data) × ~200ms latency = ~36 min — bot-like rate.
+   - Adding `time.sleep(0.5)` between calls would extend to ~90 min but reduce WAF risk.
+   - **Recommendation**: add a module-level rate-limit (e.g., `_MIN_REQUEST_INTERVAL_S = 0.3`) before Phase-7 ships. For v1 if the §3.2 sweep completes, this isn't urgent.
+
+3. **Cookie pre-fetch on every call** doubles HTTP requests (cookie + data). **Could be cached across calls** within a single sweep — fetch cookie once, reuse the Session for the next N calls before refreshing. **Caveat**: that re-introduces the shared-session failure mode root cause #1. **The current "one fresh Session per call" is the safe-but-slow choice.** Phase-7 could add per-Session call-counting (e.g., fresh session every 50 calls) as a middle ground.
+
+4. **Test coverage gap**: pytest can't validate live NSE API behavior. The 489/489 full suite passes because the existing tests mock the data layer. **The actual NSE-touching code path is exercised only by `p6_sweep.py` and `verify_p*.py` scripts**, which aren't part of the test suite. **The `OptionsFormatError` raise on missing columns is the v1 safety net** — schema drift surfaces loud at sweep time. Acceptable for v1.
+
+5. **`_NSE_BASE_URL = "https://www.nseindia.com"` hardcoded** ([src/data/options_loader.py:69](src/data/options_loader.py#L69)) — if NSE migrates to a new domain, every call breaks. **Could be config-driven**, but realistically NSE doesn't move domains. Cosmetic.
+
+6. **Module-private `derivatives_df` wrapper at the bottom** preserves the import-time call-site. **Smart**: the wrapper has `jugaad-compatible signature`, so when `_fetch_contract_lifetime` calls `derivatives_df(...)`, it routes to the new fetcher transparently. **Zero refactor cost at the call site.**
+
+7. **`MissingDataError` vs `OptionsFormatError` distinction**: WAF/rate-limit → `MissingDataError` (skip the cell, continue sweep); schema drift → `OptionsFormatError` (loud crash, schema bug). Matches the project's "transient = skip; structural = crash" discipline.
+
+**Domain / correctness checks:**
+
+- **Loud-failure discipline**: ✓ schema drift → `OptionsFormatError`; transient NSE issues → `MissingDataError` (skippable).
+- **Interface compatibility**: ✓ `_normalize()` unchanged; downstream callers unchanged.
+- **Surgical scope**: ✓ jugaad stays for stock_df + bhavcopy_fo_raw.
+- **No SSL bypass**: ✓ `verify=True` explicit.
+- **Cookie + UA mirroring**: ✓ Chrome-on-macOS header set matches jugaad's pattern.
+- **Sweeper skip-loop integration**: ✓ `MissingDataError` is in `_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)`; cell-level WAF challenges now skip cleanly instead of aborting.
+
+**What I tried:**
+- `git show c6dfaea -- src/data/options_loader.py` — read the full diff.
+- `grep "jugaad" src/data/options_loader.py` — confirmed `from jugaad_data.nse import derivatives_df` is gone; only docstring references remain.
+- Read the new `_direct_derivatives_df` function end-to-end.
+- (Couldn't live-test against NSE — no network on review side; that's the BUILDER's responsibility per the smoke-test claim.)
+
+**Sequencing observation:** This is BUILDER stepping out of the Phase-6 UI scope to fix a Phase-6.5 sweep blocker. **Correct call** — without this fix, `chore(p6.5.sweep)` would have stayed crashed indefinitely, and `chore(p6.5.verify)` would have to screenshot against the single-pair verify-set forever. The data-layer is where the bug lives; fixing it at the data-layer (not the sweeper layer) is the right scope.
+
+**Implications for `chore(p6.5.sweep)` re-run**:
+- Cold-cache sweep should now complete (modulo rate-limiting concerns from non-blocker #2).
+- WAF-challenged cells will be recorded as skips with the new MissingDataError message — operator sees the count in `skip_reason` histogram.
+- If WAF challenges are frequent, the skip rate climbs — at >20% the dataset becomes too sparse to be useful, suggesting a Phase-7 rate-limit commit.
+
+**Next-commit suggestion:** Per the original §4 plan: **`chore(p6.5.verify)`** — boot streamlit, screenshot every tab, visual-confirm caveats card + StreamlitDuplicateElementKey fix. Per b82002d's recommendation: navigate all 4 tabs in browser.
+
+**OR**, **re-run `p6_sweep.py`** to see if the §3.2 sweep now completes. If it does, `chore(p6.5.verify)` can screenshot against the rich multi-pair dataset instead of the single-pair verify-set. **My lean**: re-run sweep first → use real dataset for verify screenshots. Visual diversity matters for the screenshot pass.
+
+Then `chore(p6.5.tag)`. **Phase 6 ships.**
+
+---
+
 ## Review of a43f19a — chore(p6.5.cleanup-3): docstring polish + test fixture pattern + DESIGN doc updates
 
 **Verdict:** ✅ accept — **closes the entire remaining catalogue.**
