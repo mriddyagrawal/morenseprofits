@@ -215,6 +215,13 @@ def _direct_derivatives_df(
             f"{int(strike_price)}-{option_type}. Schema may have changed."
         )
     df = df[needed].rename(columns=_NSE_TO_JUGAAD_COLS)
+    # Parse date strings into datetime64 to match jugaad's contract.
+    # NSE returns DD-Mon-YYYY ("27-Mar-2024") — explicit %b format
+    # prevents pandas from auto-inferring %B (full month name) and
+    # crashing on the abbreviated form. Jugaad did this via
+    # ut.np_date.apply; we do it once via vectorized to_datetime.
+    df["DATE"] = pd.to_datetime(df["DATE"], format="%d-%b-%Y")
+    df["EXPIRY"] = pd.to_datetime(df["EXPIRY"], format="%d-%b-%Y")
     return df
 
 
