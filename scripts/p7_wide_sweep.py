@@ -30,6 +30,7 @@ STRATEGIES = ["short_straddle", "short_strangle", "iron_condor"]
 ENTRY_OFFSETS_TD = list(range(1, 46))   # T-45 ... T-1
 EXIT_OFFSETS_TD = list(range(0, 16))    # T-0  ... T-15
 TODAY_FN = lambda: date(2026, 5, 25)
+N_WORKERS = 8   # M1 Max has 8 perf cores; efficiency cores add little
 
 
 def _h(s: str) -> None:
@@ -71,7 +72,7 @@ def main() -> int:
     )
     print(f"  run_id (sha-trunc): {run_id}")
 
-    _h("Running sweep (force=False; cache-hit short-circuits)")
+    _h(f"Running sweep (n_workers={N_WORKERS}; force=False; cache-hit short-circuits)")
     t0 = time.perf_counter()
     df = sweep_grid(
         strategies=STRATEGIES,
@@ -82,6 +83,8 @@ def main() -> int:
         today_fn=TODAY_FN,
         offline=False,
         force=False,
+        n_workers=N_WORKERS,
+        show_progress=True,
     )
     t_total = time.perf_counter() - t0
     _h(f"Sweep complete — {t_total:.1f}s ({t_total / max(n_cells_planned, 1) * 1000:.1f}ms/cell wall-clock)")
