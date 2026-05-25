@@ -32,8 +32,6 @@ from typing import Callable, Literal
 import pandas as pd
 import requests
 
-from jugaad_data.nse import derivatives_df
-
 from src.data import cache
 from src.data.errors import MissingDataError, OfflineCacheMiss, OptionsFormatError
 from src.data.offline import effective_offline
@@ -43,6 +41,199 @@ from src.data.telemetry import warn_fetch
 # NSE lists stock options ~3 months ahead. 120 days covers every
 # realistic listing window with margin.
 _LIFETIME_DAYS_BACK = 120
+
+
+# ============================================================
+# Direct NSE derivatives fetcher — replaces jugaad's derivatives_df
+# ============================================================
+# Why we bypass jugaad for THIS endpoint specifically:
+#   1. Jugaad creates a single module-level NSEHistory() and reuses
+#      its Session across every call site in our codebase. When NSE
+#      flags one session (rate-limit, WAF), ALL subsequent calls fail
+#      with JSONDecodeError until the process restarts.
+#   2. Jugaad's `derivatives_raw` uses ThreadPoolExecutor with workers=2
+#      and chunks by date — so a single contract fetch can trigger
+#      2 parallel API hits, which NSE's WAF reads as bot-like.
+#   3. There's no retry logic for the "non-JSON response" case (which
+#      happens when NSE returns its WAF challenge HTML).
+#
+# Our replacement: fresh requests.Session per fetch, single-shot
+# cookie pre-fetch from /report-detail/eq_security, then ONE GET to
+# /api/historicalOR/foCPV. If the response isn't JSON, we treat it
+# as MissingDataError so the sweeper's skip-loop catches it instead
+# of crashing. Same URL pattern jugaad uses; same JSON shape parsed.
+#
+# We KEEP jugaad as a dependency for stock_df + bhavcopy_fo_raw —
+# those paths don't share this failure mode.
+
+_NSE_BASE_URL = "https://www.nseindia.com"
+_NSE_COOKIE_PATH = "/report-detail/eq_security"
+_NSE_DERIVATIVES_PATH = "/api/historicalOR/foCPV"
+
+# Headers mirror jugaad's exactly (matches modern Chrome on macOS).
+# NSE's WAF is sensitive to header signatures.
+_NSE_HEADERS = {
+    "accept": "*/*",
+    "accept-encoding": "deflate, br, zstd",
+    "accept-language": "en-IN,en-US;q=0.9,en-GB;q=0.8,en;q=0.7",
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
+    "priority": "u=1, i",
+    "referer": "https://www.nseindia.com/report-detail/eq_security",
+    "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+    ),
+}
+
+# Column mapping: NSE's FH_* fields → jugaad's "DATE / EXPIRY / ..."
+# headers, so _normalize() can rename them to SPECS §2.2 columns
+# unchanged. Order matches jugaad's options_final_headers.
+_NSE_TO_JUGAAD_COLS = {
+    "FH_TIMESTAMP": "DATE",
+    "FH_EXPIRY_DT": "EXPIRY",
+    "FH_OPTION_TYPE": "OPTION TYPE",
+    "FH_STRIKE_PRICE": "STRIKE PRICE",
+    "FH_OPENING_PRICE": "OPEN",
+    "FH_TRADE_HIGH_PRICE": "HIGH",
+    "FH_TRADE_LOW_PRICE": "LOW",
+    "FH_CLOSING_PRICE": "CLOSE",
+    "FH_LAST_TRADED_PRICE": "LTP",
+    "FH_SETTLE_PRICE": "SETTLE PRICE",
+    "FH_TOT_TRADED_QTY": "TOTAL TRADED QUANTITY",
+    "FH_MARKET_LOT": "MARKET LOT",
+    "FH_TOT_TRADED_VAL": "PREMIUM VALUE",
+    "FH_OPEN_INT": "OPEN INTEREST",
+    "FH_CHANGE_IN_OI": "CHANGE IN OI",
+    "FH_SYMBOL": "SYMBOL",
+}
+
+
+def _direct_derivatives_df(
+    *,
+    symbol: str,
+    from_date: date,
+    to_date: date,
+    expiry_date: date,
+    instrument_type: str,
+    strike_price: float,
+    option_type: str,
+) -> pd.DataFrame:
+    """Fetch one OPTSTK contract's EOD history directly from NSE.
+
+    Drop-in replacement for ``jugaad_data.nse.derivatives_df`` that
+    avoids the failure modes documented above. Returns a pandas
+    DataFrame with the same column names jugaad would produce, so
+    ``_normalize()`` can rename to SPECS §2.2 columns unchanged.
+
+    Raises ``MissingDataError`` if NSE returns a non-JSON body
+    (typically a WAF challenge page, rate-limit page, or 4xx with
+    HTML error) — sweeper's skip-loop catches this and records the
+    cell as a skip with the reason, instead of crashing the whole run.
+    Network-level failures (ConnectionError, Timeout) propagate
+    unchanged — those are operator-actionable retries, not
+    structural-data failures.
+    """
+    sess = requests.Session()
+    sess.headers.update(_NSE_HEADERS)
+
+    # Cookie pre-fetch: NSE sets session cookies on its report pages
+    # which it then validates on the API. Without this we get a 401
+    # or HTML challenge.
+    sess.get(
+        _NSE_BASE_URL + _NSE_COOKIE_PATH,
+        timeout=30,
+        verify=True,
+    )
+
+    # Format params exactly as NSE expects (matches jugaad's format
+    # specifiers): from/to in DD-MM-YYYY, expiry in DD-MMM-YYYY
+    # uppercase, strike as "{:.2f}".
+    params = {
+        "symbol": symbol.upper(),
+        "from": from_date.strftime("%d-%m-%Y"),
+        "to": to_date.strftime("%d-%m-%Y"),
+        "expiryDate": expiry_date.strftime("%d-%b-%Y").upper(),
+        "instrumentType": instrument_type,
+        "year": from_date.year,
+    }
+    if "OPT" in instrument_type:
+        params["strikePrice"] = f"{strike_price:.2f}"
+        params["optionType"] = option_type
+
+    r = sess.get(
+        _NSE_BASE_URL + _NSE_DERIVATIVES_PATH,
+        params=params,
+        timeout=30,
+        verify=True,
+    )
+
+    # NSE returns 200 even on WAF challenge — the body distinguishes.
+    # JSON content-type means real data; HTML means challenge / error.
+    content_type = r.headers.get("content-type", "").lower()
+    if "application/json" not in content_type:
+        raise MissingDataError(
+            f"NSE returned non-JSON ({content_type or 'no content-type'}; "
+            f"status={r.status_code}) for {symbol} {expiry_date} "
+            f"{int(strike_price)}-{option_type}. Likely WAF challenge or "
+            f"rate-limit; treating as missing data for sweep purposes."
+        )
+
+    try:
+        body = r.json()
+    except ValueError as e:
+        raise MissingDataError(
+            f"NSE response was not parseable JSON for {symbol} "
+            f"{expiry_date} {int(strike_price)}-{option_type}: {e}"
+        ) from e
+
+    rows = body.get("data", [])
+    if not rows:
+        # Empty array means NSE has no record for this contract —
+        # may be a never-traded strike. The caller's "empty fetch
+        # → MissingDataError" branch handles this case; for now we
+        # return an empty DataFrame in jugaad's shape so the caller's
+        # downstream logic stays unchanged.
+        return pd.DataFrame(columns=list(_NSE_TO_JUGAAD_COLS.values()))
+
+    df = pd.DataFrame(rows)
+    # Some FH_* columns may be absent if NSE changed its schema; the
+    # ones we need are pinned in _NSE_TO_JUGAAD_COLS. Select +
+    # rename in one shot to match jugaad's options_final_headers.
+    needed = list(_NSE_TO_JUGAAD_COLS.keys())
+    missing_cols = [c for c in needed if c not in df.columns]
+    if missing_cols:
+        raise OptionsFormatError(
+            f"NSE response missing expected columns "
+            f"{missing_cols} for {symbol} {expiry_date} "
+            f"{int(strike_price)}-{option_type}. Schema may have changed."
+        )
+    df = df[needed].rename(columns=_NSE_TO_JUGAAD_COLS)
+    return df
+
+
+# Keep the old name as the call-site alias so the existing
+# `derivatives_df(...)` call inside `_fetch_contract_lifetime` works
+# unchanged after the import-statement rewire below.
+def derivatives_df(symbol, from_date, to_date, expiry_date,
+                   instrument_type, strike_price=None, option_type=None):
+    """Module-private wrapper preserving the jugaad-compatible signature.
+    Routes to ``_direct_derivatives_df`` (our replacement)."""
+    return _direct_derivatives_df(
+        symbol=symbol,
+        from_date=from_date,
+        to_date=to_date,
+        expiry_date=expiry_date,
+        instrument_type=instrument_type,
+        strike_price=strike_price,
+        option_type=option_type,
+    )
 
 
 # jugaad column → SPECS §2.2 column
