@@ -24,6 +24,7 @@ commit for the discovery). No IST shift needed; ``_normalize`` asserts
 from __future__ import annotations
 
 import io
+import time
 import warnings
 import zipfile
 from datetime import date, datetime, timedelta
@@ -140,17 +141,35 @@ def _direct_derivatives_df(
     unchanged — those are operator-actionable retries, not
     structural-data failures.
     """
+    # Politeness delay — NSE rate-limits aggressively when burst-hit.
+    # ~500ms between contract fetches keeps us well under the WAF
+    # threshold observed during the Phase-6 sweep. Per-fetch cost is
+    # small (single-shot serial), so a small sleep here doesn't hurt
+    # operator ergonomics.
+    time.sleep(0.5)
+
     sess = requests.Session()
     sess.headers.update(_NSE_HEADERS)
 
     # Cookie pre-fetch: NSE sets session cookies on its report pages
     # which it then validates on the API. Without this we get a 401
-    # or HTML challenge.
-    sess.get(
-        _NSE_BASE_URL + _NSE_COOKIE_PATH,
-        timeout=30,
-        verify=True,
-    )
+    # or HTML challenge. Transient failures (ReadTimeout when NSE
+    # rate-limits or briefly degrades) map to MissingDataError so the
+    # sweep skip-loop continues — partial parquet beats no parquet.
+    try:
+        sess.get(
+            _NSE_BASE_URL + _NSE_COOKIE_PATH,
+            timeout=30,
+            verify=True,
+        )
+    except (requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError) as e:
+        raise MissingDataError(
+            f"NSE cookie pre-fetch failed ({type(e).__name__}) for "
+            f"{symbol} {expiry_date} {int(strike_price)}-{option_type}; "
+            f"likely rate-limit or transient. Treating as missing for "
+            f"sweep purposes."
+        ) from e
 
     # Format params exactly as NSE expects (matches jugaad's format
     # specifiers): from/to in DD-MM-YYYY, expiry in DD-MMM-YYYY
@@ -167,12 +186,20 @@ def _direct_derivatives_df(
         params["strikePrice"] = f"{strike_price:.2f}"
         params["optionType"] = option_type
 
-    r = sess.get(
-        _NSE_BASE_URL + _NSE_DERIVATIVES_PATH,
-        params=params,
-        timeout=30,
-        verify=True,
-    )
+    try:
+        r = sess.get(
+            _NSE_BASE_URL + _NSE_DERIVATIVES_PATH,
+            params=params,
+            timeout=30,
+            verify=True,
+        )
+    except (requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError) as e:
+        raise MissingDataError(
+            f"NSE derivatives endpoint failed ({type(e).__name__}) for "
+            f"{symbol} {expiry_date} {int(strike_price)}-{option_type}; "
+            f"likely rate-limit or transient."
+        ) from e
 
     # NSE returns 200 even on WAF challenge — the body distinguishes.
     # JSON content-type means real data; HTML means challenge / error.
