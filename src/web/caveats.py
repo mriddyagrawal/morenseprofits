@@ -73,9 +73,9 @@ MARGIN_TIER_B_CAVEAT = (
     "straddle 0.60, iron condor 0.35) look BETTER here than on production "
     "margin, because real SPAN computes a tighter portfolio offset for "
     "well-correlated multi-leg structures. Cross-strategy ranking remains "
-    "directionally sound (caveat caught at ~10-15% bias post Tier-B); "
-    "absolute ROI numbers should be discounted by ~10% before treating "
-    "any pair as 'production-ready'."
+    "directionally sound. Absolute ROI numbers are upper estimates — "
+    "before treating any pair as 'production-ready', validate the margin "
+    "block against your broker's actual SPAN file for the candidate trade."
 )
 
 

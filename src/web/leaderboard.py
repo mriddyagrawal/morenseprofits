@@ -109,6 +109,14 @@ def render_headline(df: pd.DataFrame, *, min_n: int) -> None:
         )
 
     # === Card 3 — TOTAL NET P&L ==============================
+    # Sum across ALL filtered trades — including thin-N pairs the
+    # ranker suppresses — so the operator's "did this filter view
+    # make money overall?" question is answered honestly. The
+    # subtitle counts ALL pairs (not just rank-eligible) to match.
+    # This is a minor wording divergence from DESIGN_SPEC §2.5
+    # ("across N rank-eligible cells") — implementation chose
+    # whole-filter honesty over rank-window restriction. Documented
+    # in DESIGN_SPEC §9 followup; either treatment is defensible.
     total_pnl = float(df["net_pnl"].sum())
     with cols[2]:
         st.metric(
@@ -292,6 +300,16 @@ def render_within_stock_rank(df: pd.DataFrame, *, min_n: int) -> None:
     Empty-state paths mirror render_rank_table:
       - 0 rows → leaderboard_no_rows_after_filters
       - all-below-min_n → leaderboard_all_below_min_n
+
+    Implementation note: this function DOES NOT call
+    ``rank_strategies`` (unlike ``render_rank_table``). It filters via
+    pandas ``.query``-equivalent comparison then assigns per-symbol
+    ranks via ``groupby("symbol").cumcount() + 1``. Consequence: the
+    analytics-layer 100%-suppression UserWarning does NOT fire on the
+    all-below-min_n branch here (different code path, no rank_strategies
+    invocation). The UI tier still routes to the canonical
+    leaderboard_all_below_min_n empty-state message via render_empty —
+    same operator experience, different internals.
     """
     if len(df) == 0:
         render_empty("leaderboard_no_rows_after_filters")

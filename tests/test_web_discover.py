@@ -133,37 +133,39 @@ def test_read_missing_parquet_raises(tmp_path: Path):
         read_sweep_with_skips(tmp_path / "missing.parquet")
 
 
-def test_read_returns_empty_skips_when_companion_missing(tmp_path: Path):
+def test_read_returns_empty_skips_when_companion_missing(
+    tmp_path: Path, monkeypatch
+):
     """Sweep parquet exists; no companion skips. read_sweep_with_skips
     returns the canonical empty skips frame (NOT None) so callers can
-    .groupby unconditionally."""
+    .groupby unconditionally.
+
+    Uses monkeypatch.setattr per the project's standard isolation
+    convention — auto-reverts on test teardown (no importlib.reload
+    dance needed)."""
     p = _write_parquet(tmp_path / "sweep_xyz.parquet")
-    # Need to patch results_path/skips_path to look in tmp_path, not the
-    # real RESULTS_DIR. Easier: write the parquet at the canonical path
-    # in tmp_path and patch RESULTS_DIR via monkeypatch.
-    # ...but the discover module derives skips_path from results.RESULTS_DIR.
-    # So we patch that here.
+    # results.skips_path derives from results.RESULTS_DIR — point it
+    # at tmp_path so the helper looks for the companion alongside the
+    # test parquet, not in the real cache.
     from src.engine import results as results_mod
-    results_mod.RESULTS_DIR = tmp_path  # safe — test isolation per fixture
-    try:
-        df, skips = read_sweep_with_skips(p)
-        assert len(df) == 1
-        assert isinstance(skips, pd.DataFrame)
-        # Canonical schema preserved
-        assert list(skips.columns) == list(SKIPS_COLUMNS)
-        assert len(skips) == 0
-        # Composability: groupby on empty frame doesn't raise
-        skips.groupby("skip_reason").size()
-    finally:
-        # Re-import to restore the original RESULTS_DIR
-        import importlib
-        importlib.reload(results_mod)
+    monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)
+
+    df, skips = read_sweep_with_skips(p)
+    assert len(df) == 1
+    assert isinstance(skips, pd.DataFrame)
+    # Canonical schema preserved
+    assert list(skips.columns) == list(SKIPS_COLUMNS)
+    assert len(skips) == 0
+    # Composability: groupby on empty frame doesn't raise
+    skips.groupby("skip_reason").size()
 
 
-def test_read_returns_populated_skips_when_companion_present(tmp_path: Path):
-    """Both parquets present → both returned."""
+def test_read_returns_populated_skips_when_companion_present(
+    tmp_path: Path, monkeypatch
+):
+    """Both parquets present → both returned. Same monkeypatch.setattr
+    isolation pattern as the missing-companion test."""
     p = _write_parquet(tmp_path / "sweep_xyz.parquet")
-    # Write a companion skips parquet matching the canonical schema
     skips_df = pd.DataFrame([{
         "run_id": "xyz",
         "strategy": "short_straddle",
@@ -177,15 +179,12 @@ def test_read_returns_populated_skips_when_companion_present(tmp_path: Path):
     skips_df.to_parquet(companion, index=False)
 
     from src.engine import results as results_mod
-    results_mod.RESULTS_DIR = tmp_path
-    try:
-        df, skips = read_sweep_with_skips(p)
-        assert len(df) == 1
-        assert len(skips) == 1
-        assert skips.iloc[0]["skip_reason"] == "MissingDataError"
-    finally:
-        import importlib
-        importlib.reload(results_mod)
+    monkeypatch.setattr(results_mod, "RESULTS_DIR", tmp_path)
+
+    df, skips = read_sweep_with_skips(p)
+    assert len(df) == 1
+    assert len(skips) == 1
+    assert skips.iloc[0]["skip_reason"] == "MissingDataError"
 
 
 def test_non_canonical_filename_falls_back_to_empty_skips(tmp_path: Path):

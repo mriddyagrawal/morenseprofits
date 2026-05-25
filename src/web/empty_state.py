@@ -113,7 +113,13 @@ def render_empty(reason: Reason, **ctx) -> None:
 
 
 def get_message(reason: Reason, **ctx) -> str:
-    """Streamlit-free accessor for the canonical message. Used by
-    unit tests + by Phase-7 export buttons that may want to render
-    the message in a non-Streamlit surface (e.g., a CSV header note)."""
+    """Return the canonical message string for a reason key without
+    touching Streamlit (no st.info call). The FUNCTION itself doesn't
+    invoke Streamlit, but importing this module DOES — ``import
+    streamlit as st`` runs at module-import time because
+    ``render_empty`` needs it. So a true "streamlit-free" import path
+    isn't available here; consumers running in a non-Streamlit
+    context (e.g., a CSV export header) still need streamlit installed.
+    Phase-7 hardening can move the message templates to a sibling
+    streamlit-free module if that constraint matters operationally."""
     return _format_message(reason, **ctx)

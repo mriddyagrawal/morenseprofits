@@ -80,6 +80,8 @@ Three cards, left → right:
 
 **Why not "largest by row count":** a stale-but-big historical sweep would silently outrank the one the operator just produced. mtime matches the mental model "the sweep I just ran."
 
+**Load-bearing prerequisite — `617878b` test-fixture redirect fix:** the mtime picker assumes `data/results/` contains only operator-produced sweeps. If tests leak 0-1-row parquets into the real cache (which they did before `617878b`), the mtime picker would happily return the freshest leak instead of a real sweep. The fix made `_redirect_results` patch BOTH `sweeper_mod.RESULTS_DIR` AND `results_mod.RESULTS_DIR` — closing the leak path. If a future contributor adds a new module that imports `RESULTS_DIR` independently, both `_redirect_results` helpers in `tests/test_sweeper.py` + `tests/test_iron_condor.py` must be updated. The mtime picker is silently fragile to that mistake; consider this comment the canary.
+
 ## 2. Visualization decisions
 
 ### 2.1 Heatmap library — Plotly

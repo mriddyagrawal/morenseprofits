@@ -240,11 +240,15 @@ def render_yoy(
     medians = eligible["median_roi_pct_annualized"].astype(float).tolist()
     n_per_year = eligible["n_trades"].astype(int).tolist()
 
+    # Neutral steelblue — was green before, but that miscolored
+    # negative-ROI pair trends as positive-looking. The y-axis tick
+    # labels + the breakeven hline carry the sign signal honestly;
+    # the line's job is only to show direction-of-drift over time.
     fig = go.Figure(data=go.Scatter(
         x=years,
         y=medians,
         mode="lines+markers",
-        line=dict(color="rgb(0, 100, 0)", width=3),
+        line=dict(color="rgb(70, 130, 180)", width=3),  # steelblue, neutral
         marker=dict(size=10),
         # Custom hover: surface N alongside median so a "decay" call
         # can be sanity-checked against sample size per the
