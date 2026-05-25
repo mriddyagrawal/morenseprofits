@@ -24,6 +24,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from src.analytics.aggregate import summarize_by_month, summarize_by_year
+from src.web._filter import filter_pair
 from src.web._format import format_pct
 from src.web.empty_state import render_empty
 
@@ -100,7 +101,7 @@ def render_headline(
                           delta_color="off")
         return
 
-    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    pair = filter_pair(df, strategy=strategy, symbol=symbol)
     if len(pair) == 0:
         for col, label in zip(cols, _HEADLINE_LABELS):
             with col:
@@ -223,7 +224,7 @@ def render_yoy(
         render_empty("leaderboard_no_rows_after_filters")
         return
 
-    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    pair = filter_pair(df, strategy=strategy, symbol=symbol)
     if len(pair) == 0:
         st.info(f"No trades for {strategy} × {symbol}.")
         return
@@ -266,6 +267,11 @@ def render_yoy(
         height=380,
         margin=dict(l=60, r=40, t=50, b=50),
         showlegend=False,
+        # Anchor y-axis at 0 — anti-misleading-zoom per DESIGN_SPEC §10
+        # step 4 spirit (a small drift on (40%, 60%) shouldn't read as
+        # dramatic). rangemode="tozero" includes 0 in the range whenever
+        # data is one-sided; preserves auto-fit on mixed-sign data.
+        yaxis=dict(rangemode="tozero"),
     )
     fig.add_hline(
         y=0, line_dash="dot", line_color="gray",
@@ -305,7 +311,7 @@ def render_yoy_n(
     """
     if len(df) == 0 or strategy is None or symbol is None:
         return  # main yoy already rendered empty-state; sidecar silent
-    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    pair = filter_pair(df, strategy=strategy, symbol=symbol)
     if len(pair) == 0:
         return
     yearly = summarize_by_year(pair)
@@ -385,7 +391,7 @@ def render_moy(
     if len(df) == 0 or strategy is None or symbol is None:
         return  # tab-level no-data state already rendered upstream
 
-    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
+    pair = filter_pair(df, strategy=strategy, symbol=symbol)
     if len(pair) == 0:
         return
 
@@ -435,6 +441,9 @@ def render_moy(
         height=420,
         margin=dict(l=60, r=60, t=50, b=50),
         showlegend=False,
+        # Same anti-auto-zoom anchor as YoY — 0 always in range when
+        # data is one-sided (all-positive or all-negative months).
+        yaxis=dict(rangemode="tozero"),
     )
     st.plotly_chart(fig, use_container_width=True)
     st.caption(

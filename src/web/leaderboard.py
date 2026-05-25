@@ -15,6 +15,8 @@ bug (rupees mislabeled as percentage).
 """
 from __future__ import annotations
 
+import warnings
+
 import pandas as pd
 import streamlit as st
 
@@ -22,6 +24,26 @@ from src.analytics.aggregate import summarize_by_stock_strategy
 from src.analytics.rank import rank_strategies
 from src.web._format import format_inr, format_pct
 from src.web.empty_state import render_empty
+
+
+def _rank_quiet(summary_df: pd.DataFrame, *, min_n: int) -> pd.DataFrame:
+    """Wrapper around rank_strategies that suppresses the analytics-
+    layer "all rows suppressed" UserWarning when the UI tier is
+    about to render render_empty for the same condition. The warning
+    is correct behavior for direct callers / CLI consumers; in the
+    Streamlit UI the operator already sees the explicit empty-state
+    message, and the warning would just pollute server logs.
+
+    Only the suppression-specific warning is silenced; other warnings
+    bubble normally.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"rank_strategies: all .* input rows suppressed",
+            category=UserWarning,
+        )
+        return rank_strategies(summary_df, min_n=min_n)
 
 
 def render_headline(df: pd.DataFrame, *, min_n: int) -> None:
@@ -133,7 +155,7 @@ def render_rank_table(df: pd.DataFrame, *, min_n: int) -> None:
 
     summary = summarize_by_stock_strategy(df)
     n_pairs_total = int(len(summary))
-    ranked = rank_strategies(summary, min_n=min_n)
+    ranked = _rank_quiet(summary, min_n=min_n)
     if len(ranked) == 0:
         render_empty(
             "leaderboard_all_below_min_n",

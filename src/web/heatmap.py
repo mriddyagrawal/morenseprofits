@@ -30,6 +30,7 @@ import streamlit as st
 
 from src.analytics.aggregate import MIN_N_FOR_RANKING
 from src.analytics.heatmap import pivot_counts, pivot_window
+from src.web._filter import filter_pair
 from src.web._format import format_pct
 from src.web.empty_state import render_empty
 
@@ -177,45 +178,79 @@ def _build_customdata(
     entry_index,
     exit_columns,
 ):
-    """Build a (H, W, 5) numpy-style array of per-cell stats for
-    Plotly's customdata channel:
+    """Build a (H, W, 5) per-cell-stats array of STRINGS for Plotly's
+    customdata channel:
 
-        customdata[i][j] = [n_trades, win_rate_pct, std_roi_pct_ann,
-                            total_net_pnl, median_roi_pct_ann]
+        customdata[i][j] = [n_trades_str, win_rate_str, std_roi_str,
+                            total_net_pnl_str, median_roi_str]
 
     Aligned with the value/density heatmap grids (entry rows × exit
-    columns). Cells with no trades carry zeros — hover renders
-    accordingly. The (i, j) iteration order matches the pivot's
-    .index / .columns so customdata aligns row-for-row, col-for-col.
+    columns).
 
-    NOTE: the median ROI is computed PER CELL (not per pair) so it
-    matches what the value heatmap renders — fold by the cell's
-    own trades, not by the overall pair's. Matches the value pane's
-    pivot_window aggregation.
+    All values are PRE-FORMATTED strings — never bare numbers — so
+    the hovertemplate can interpolate them directly without Plotly's
+    own format specifiers. Rationale:
+
+      - format_inr's lakhs/crores notation requires Python logic
+        Plotly's %{customdata[N]:,.0f} can't replicate (would
+        break §2.7 contract for cells in the L / Cr range).
+      - Empty cells (no trades) render as "—" universally — fixes
+        the "Median ROI/yr: +0.0%" mislead for zero-count cells.
+
+    Implementation: vectorized via a single groupby + reindex,
+    replaces the prior O(H × W × N) nested-loop filter — important
+    once the sweep grows past a hundred cells.
     """
     import numpy as np
 
-    # Filter to the (strategy, symbol) pair once.
-    pair = df[(df["strategy"] == strategy) & (df["symbol"] == symbol)]
-    H, W = len(entry_index), len(exit_columns)
-    out = np.zeros((H, W, 5), dtype=float)
+    from src.web._format import format_inr, format_pct
 
+    pair = filter_pair(df, strategy=strategy, symbol=symbol)
+    H, W = len(entry_index), len(exit_columns)
+
+    # Vectorized per-cell stats via single groupby — replaces the
+    # nested H×W loop. Each (entry, exit) gets one summary row.
+    if len(pair) > 0:
+        grouped = pair.groupby(["entry_offset_td", "exit_offset_td"])
+        stats = pd.DataFrame({
+            "n": grouped.size(),
+            "n_win": (pair["net_pnl"] > 0).groupby(
+                [pair["entry_offset_td"], pair["exit_offset_td"]]
+            ).sum(),
+            "std": grouped["roi_pct_annualized"].std(ddof=0),
+            "total_pnl": grouped["net_pnl"].sum(),
+            "median_roi": grouped["roi_pct_annualized"].median(),
+        }).reset_index()
+        stats["win_rate"] = 100.0 * stats["n_win"] / stats["n"]
+        # Index lookup by (entry, exit) tuple
+        stats = stats.set_index(["entry_offset_td", "exit_offset_td"])
+    else:
+        stats = pd.DataFrame()
+
+    out = np.empty((H, W, 5), dtype=object)
     for i, e in enumerate(entry_index):
         for j, x in enumerate(exit_columns):
-            cell = pair[
-                (pair["entry_offset_td"] == e)
-                & (pair["exit_offset_td"] == x)
-            ]
-            n = len(cell)
-            if n == 0:
-                continue
-            n_win = int((cell["net_pnl"] > 0).sum())
-            out[i, j, 0] = float(n)
-            out[i, j, 1] = 100.0 * n_win / n if n else 0.0
-            # ddof=0 to match aggregate.py's std convention
-            out[i, j, 2] = float(cell["roi_pct_annualized"].std(ddof=0))
-            out[i, j, 3] = float(cell["net_pnl"].sum())
-            out[i, j, 4] = float(cell["roi_pct_annualized"].median())
+            if (e, x) in stats.index:
+                row = stats.loc[(e, x)]
+                n_val = int(row["n"])
+                out[i, j, 0] = f"{n_val}"
+                out[i, j, 1] = format_pct(float(row["win_rate"]))
+                out[i, j, 2] = (
+                    f"±{float(row['std']):.1f}%"
+                    if pd.notna(row["std"]) else "—"
+                )
+                out[i, j, 3] = format_inr(float(row["total_pnl"]))
+                out[i, j, 4] = format_pct(
+                    float(row["median_roi"]), signed=True, annualized=True,
+                )
+            else:
+                # Zero-count cell — every field "—" so hover doesn't
+                # mislead with "Median ROI/yr: +0.0%" on no data.
+                out[i, j, 0] = "0"
+                out[i, j, 1] = "—"
+                out[i, j, 2] = "—"
+                out[i, j, 3] = "—"
+                out[i, j, 4] = "—"
     return out
 
 
@@ -312,11 +347,11 @@ def render_heatmaps(
         customdata=custom,
         hovertemplate=(
             "<b>entry %{y}, exit %{x}</b><br>"
-            "Median ROI/yr: %{z:+.1f}%<br>"
+            "Median ROI/yr: %{customdata[4]}<br>"
             "N: %{customdata[0]}<br>"
-            "Win rate: %{customdata[1]:.1f}%<br>"
-            "Std ROI/yr: ±%{customdata[2]:.1f}%<br>"
-            "Net P&L: ₹%{customdata[3]:,.0f}"
+            "Win rate: %{customdata[1]}<br>"
+            "Std ROI/yr: %{customdata[2]}<br>"
+            "Net P&L: %{customdata[3]}"
             "<extra></extra>"
         ),
     ))
@@ -348,8 +383,8 @@ def render_heatmaps(
         hovertemplate=(
             "<b>entry %{y}, exit %{x}</b><br>"
             "N: %{z}<br>"
-            "Median ROI/yr: %{customdata[4]:+.1f}%<br>"
-            "Win rate: %{customdata[1]:.1f}%"
+            "Median ROI/yr: %{customdata[4]}<br>"
+            "Win rate: %{customdata[1]}"
             "<extra></extra>"
         ),
     ))

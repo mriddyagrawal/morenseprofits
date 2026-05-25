@@ -286,7 +286,12 @@ def test_cells_have_customdata_for_hover_tooltips(captured_charts):
     """LOAD-BEARING per DESIGN_SPEC §2.5: per-cell hover tooltips
     must compose (n_trades, win_rate, std, total_net_pnl, median).
     Customdata is the Plotly channel; verify it's populated and
-    correctly aligned with each cell."""
+    correctly aligned with each cell.
+
+    After p6.5.cleanup: customdata is STRINGS (pre-formatted via
+    format_inr / format_pct) so hover renders ₹X.XX L / Cr correctly
+    via raw interpolation, NOT Plotly format specifiers (which can't
+    do lakhs/crores). Zero-count cells render '—' universally."""
     # 2x2 grid, n=6 each, varied roi to make customdata distinguishable
     rows = []
     for e in (15, 10):
@@ -298,32 +303,44 @@ def test_cells_have_customdata_for_hover_tooltips(captured_charts):
     value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
     trace = value_fig.data[0]
     cd = trace.customdata
-    # Shape: (H, W, 5)
+    # Shape: (H, W, 5) — object dtype (strings)
     assert cd.shape == (2, 2, 5)
-    # All visible cells have N=6
-    assert (cd[:, :, 0] == 6).all()
-    # All winning trades → win_rate = 100%
-    assert (cd[:, :, 1] == 100.0).all()
+    # All visible cells have N=6 (rendered as "6" string)
+    assert (cd[:, :, 0] == "6").all()
+    # All winning trades → win_rate = 100% (rendered as "100.0%" string)
+    assert (cd[:, :, 1] == "100.0%").all()
 
 
 def test_hover_template_includes_all_load_bearing_fields(captured_charts):
     """The hovertemplate string must reference every key field per
     DESIGN_SPEC §2.5. Pin the field set so a future template edit
-    doesn't drop "N" or "Std" silently."""
+    doesn't drop "N" or "Std" silently.
+
+    After p6.5.cleanup: currency/percent SYMBOLS now come from the
+    pre-formatted customdata strings, not from the template format
+    specifiers. So the template no longer contains ₹/% literals —
+    the formatted strings interpolated via %{customdata[N]} do."""
     rows = [_row(entry=e, exit_=x, roi_pct_annualized=50.0)
             for e in (15, 10) for x in (3, 1) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
-    tmpl = value_fig.data[0].hovertemplate
-    # Required fields per §2.5
+    trace = value_fig.data[0]
+    tmpl = trace.hovertemplate
+    # Required field labels per §2.5
     assert "Median ROI/yr" in tmpl
     assert "N:" in tmpl
     assert "Win rate" in tmpl
     assert "Std ROI/yr" in tmpl
     assert "Net P&L" in tmpl
-    # Currency + percent prefixes preserved
-    assert "₹" in tmpl
-    assert "%" in tmpl
+    # Currency / percent symbols now live inside the customdata
+    # strings — check at least one cell's pre-formatted Net P&L
+    # carries the rupee glyph.
+    cd = trace.customdata
+    sample_pnl = cd[0][0][3]  # first cell's Net P&L string
+    assert "₹" in sample_pnl
+    # Win-rate cell carries %
+    sample_win = cd[0][0][1]
+    assert "%" in sample_win
 
 
 def test_density_pane_hover_references_value_via_customdata(captured_charts):

@@ -1,0 +1,22 @@
+# Streamlit theme config — Phase-6 UI.
+# DESIGN_SPEC §2.3 commits to a dark theme so the diverging RdYlGn
+# colormaps + Blues density panes read correctly. Light theme would
+# fight the saturated colors and the green/red profitability cues
+# would lose contrast on a bright background.
+
+[theme]
+base = "dark"
+# Default Streamlit dark-theme values are fine; leave the rest unset
+# so palette decisions stay centralized at Plotly trace configuration
+# (we don't want a competing color authority).
+
+[server]
+# Suppress the "Press 'm' to navigate" tutorial-style help on launch —
+# repeats every reload, distracting during dev.
+headless = false
+
+[browser]
+# Per the project's pinned policy (DESIGN_SPEC §6 dependency table —
+# "pin in requirements.txt to versions that produced a passing test
+# suite"), opt out of telemetry. Operator runs locally.
+gatherUsageStats = false

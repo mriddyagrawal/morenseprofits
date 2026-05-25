@@ -223,14 +223,18 @@ def test_rank_table_empty_frame_renders_no_rows_message(captured_table):
 
 def test_rank_table_all_below_min_n_shows_correct_empty_state(captured_table):
     """≥1 pair exists but ALL below min_n → leaderboard_all_below_min_n
-    message with n_pairs + min_n interpolated."""
-    # One pair (S, X), n=2 trades, below min_n=5
+    message with n_pairs + min_n interpolated.
+
+    rank_strategies' analytics-layer 100%-suppression UserWarning is
+    SILENCED here by the _rank_quiet wrapper (see leaderboard.py) —
+    the UI tier already renders the explicit empty-state message;
+    letting the warning leak would pollute Streamlit server logs."""
     rows = [_row(strategy="S", symbol="X")] * 2
-    # rank_strategies fires its own 100%-suppression UserWarning when
-    # called in this state — that warning is the correct behavior at
-    # the analytics layer (caught + silenced here because the UI tier
-    # surfaces the same intent via render_empty instead).
-    with pytest.warns(UserWarning, match="suppressed"):
+    # Should NOT warn — _rank_quiet swallows the specific
+    # "all input rows suppressed" UserWarning at the UI tier.
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")  # promote any warning to exception
         render_rank_table(pd.DataFrame(rows), min_n=5)
     kinds = [e["kind"] for e in captured_table]
     assert "info" in kinds
