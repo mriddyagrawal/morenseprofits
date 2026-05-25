@@ -16,3 +16,6 @@ plotly>=5.20.0    # heatmaps + trend charts; hover-tooltip composition
 
 # Testing
 pytest>=8.0.0
+
+# Long-running scripts (e.g. scripts/prefetch_universe.py)
+tqdm>=4.66.0
