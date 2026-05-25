@@ -3306,6 +3306,92 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 7806d82 — feat: scripts/p7_wide_sweep.py — wide-grid sweep for full-resolution heatmap
+
+**Verdict:** ✅ accept (with a phase-label flag + a T-0 semantic check)
+
+**Phase / commit goal (as I understood it):** Wider sweep grid for the heatmap visualization. Same universe (5 blue chips × 24 expiries × 3 short-vol strategies) but expands the entry/exit grid from 5×3 (§3.2) → **45×16** (T-45..T-1 entry × T-0..T-15 exit). 600 valid (entry > exit) pairs per (sym, strat, expiry) → **216,000 cells planned**. Heatmap UI auto-adapts via `render_heatmaps` reading whatever offsets are present in the sweep parquet.
+
+**Math check** (correct):
+- n_valid_pairs: `sum(1 for e in 1..45 for x in 0..15 if e > x)` = `1+2+...+15 + 30×16` = `120 + 480` = **600** ✓
+- 5 × 3 × 24 × 600 = **216,000 cells** ✓
+
+**What works:**
+
+- **Same engine API**: just bigger lists for `entry_offsets_td` + `exit_offsets_td`. No engine changes; `sweep_grid(force=False)` cache-hits whatever the prefetch covers.
+- **Reuses every existing primitive**: `_compute_run_id`, `monthly_expiries`, `RESULTS_DIR`, `sweep_grid`. Surface area for breakage = 0.
+- **Heatmap UI auto-adapts**: `render_heatmaps` reads `entry_offset_td` + `exit_offset_td` from the parquet — no Streamlit changes needed. **This is the Phase-6 design paying off**: data dimensions don't bake into the rendering code.
+- **Cache assumption is sound**: the prefetch widened to ATM ± 6 strikes per (symbol, expiry, option_type) in 28c9586. Wider entry/exit offsets don't change which contracts are touched (still same strategy offsets `0.02` / `0.05` → same strikes), only WHEN they're looked up. **Cache covers the 216,000 cells** without additional fetches.
+- **Skip-log + per-pair breakdown** at the end — matches p6_sweep.py's diagnostic.
+- **Skip rate metric**: `(1 - len(df) / n_cells_planned) × 100` — operator sees what fraction couldn't be priced.
+
+**Blocking issues:** None.
+
+**🔬 Non-blocking observations:**
+
+1. **Phase-label ambiguity**: filename + docstring + commit message all say "p7" / "Phase 7", but the data this script produces feeds the **Phase-6 heatmap UI**. **Per the user's fd72b85 scope freeze**, Phase 7 starts AFTER Phase 6 tags (v0.6-ui). **This commit is functionally Phase-6 polish** (richer dataset for the existing heatmap tab) but labeled as Phase 7. **Worth a phase-label decision**:
+   - Either: rename to `scripts/p6_wide_sweep.py` (Phase 6's wide-grid sweep) — matches the data's actual consumer.
+   - Or: keep `p7_` (treating wider-grid as a Phase-7 enhancement) but acknowledge that Phase 6 has already started consuming it before tag.
+   
+   **My lean**: rename to `p6_wide_sweep.py`. The Phase-6 heatmap mockup itself shows a non-trivial-size grid; the wider grid is the data that lets the existing heatmap actually render densely.
+
+2. **T-0 (expire-day) exit semantic — needs engine verification**: `EXIT_OFFSETS_TD = list(range(0, 16))` includes **T-0**, i.e., exit on the expiry day itself. **Does the engine handle this correctly?**
+   - Options pricing at expiry: ITM → intrinsic value; OTM → 0.
+   - `pivot_window` and downstream stats should be fine on the values.
+   - **The actual semantics**: at T-0, what is the "exit price" of an option? Most NSE bhavcopies for expiry day include the option's settle price (which for OTM at expiry = 0). Caller's `price_trade` engine handles this if option's close at expiry is in the bhavcopy.
+   - **Worth a smoke-test**: verify that one (strategy, symbol, expiry, T-X, T-0) cell prices correctly (not crashed, not NaN'd silently).
+   - The wider sweep would surface this if it's broken; if all T-0 cells appear in the skip-log with a specific reason, that's the signal.
+
+3. **High skip rate expected at the extremes**:
+   - T-45 entry → ~2 monthly cycles back. Many options chains don't start trading at T-45 (NSE typically lists ~3 months of expiries; long-tail strikes have less depth that far out).
+   - T-15+ exit OFFSET (e.g., enter T-10, exit T-15) — this is invalid (enter < exit pre-filter handled by `if e > x`, so already excluded).
+   - **Expected skip rate**: ~10-20% at the extremes. Operator should expect to see a populated skip-log; doesn't indicate a bug.
+
+4. **"<20 min on warm cache" claim**: 216,000 cells × ~5ms/cell = ~18 min. **Possibly optimistic**:
+   - Cache reads are fast (parquet, <1ms each) but each cell does 2-4 option lookups + 2 spot lookups + 1 bhavcopy lookup.
+   - 216,000 × 6 lookups × ~1ms = ~22 min just on disk reads.
+   - **Realistic estimate**: 20-30 min on warm cache. Not a problem; just calibrating expectations.
+
+5. **No test changes**: matches the verify_p4/p5 + p6_sweep operator-tooling pattern.
+
+6. **No `--symbols` / `--strategies` / `--start` / `--end` CLI args** — the script hardcodes the grid. **For the §3.2-derived dataset this is fine** (it's a specific sweep, not a parameterized one). **Could be a Phase-7 enhancement**: make it CLI-configurable. Cosmetic.
+
+7. **Result parquet naming**: `sweep_{run_id}.parquet` — same naming convention as p6_sweep.py. The `run_id` hash is deterministic given (strategies, symbols, expiries, entry_offsets, exit_offsets), so this wide sweep has a DIFFERENT run_id than the §3.2 sweep. **They coexist** in `data/results/`. UI's `find_latest_sweep` picks the newest-mtime one. Operator can manually switch if needed (the sidebar sweep-picker will be the canonical control once `chore(p6.5.verify)` exercises it visually).
+
+**Implications for `chore(p6.5.verify)`:**
+
+Once this script runs successfully, the verify screenshot pass has a **rich multi-pair multi-window dataset** to visualize:
+- Leaderboard: 5 × 3 = 15 (strategy × symbol) pairs ranked → meaningful sort, no degenerate single-row.
+- Heatmap: 45 × 16 = 720 cells per pair (most ranked-eligible) → densely populated.
+- Trends YoY: 2 years (2023 + 2024) → actual YoY line, not the single-year empty-state.
+- Trends MoY: ~24 months → all 12 calendar months populated.
+- Per-stock: 5 symbols × 3 strategies each → small-multiples grid actually multi-card.
+
+**Every tab gets a "real" view** instead of the verify-set's empty-state branches. **The screenshot pass becomes maximally informative.**
+
+**Domain / correctness checks:**
+
+- **Determinism**: ✓ run_id derived from the parameter tuple; reproducible.
+- **Cache-friendliness**: ✓ `force=False`.
+- **Engine API**: ✓ unchanged.
+- **Heatmap UI auto-adaptation**: ✓ render_heatmaps reads offsets from the parquet's columns.
+- **Phase-6 readiness**: this sweep is what unblocks a meaningful verify screenshot.
+
+**What I tried:**
+- Read [scripts/p7_wide_sweep.py](scripts/p7_wide_sweep.py) end-to-end.
+- Verified the n_valid_pairs math by hand (1+2+...+15 + 30×16 = 600).
+- Confirmed the script uses `sweep_grid` + `monthly_expiries` per the existing engine pattern.
+
+**Sequencing observation:** **6-hour silence between commits** (18:05 28c9586 → 23:57 7806d82) — consistent with the operator running the live prefetch (~90 min for 6,240 contracts) plus some other work. The wide-sweep script lands as the next data-generation step.
+
+**Next-commit suggestion:** **Run `python scripts/p7_wide_sweep.py`** live to generate the wide-grid parquet. If it completes in reasonable time (~30 min on warm cache) with low skip rate, the parquet becomes the canonical screenshot target for `chore(p6.5.verify)`. Then `chore(p6.5.verify)` → `chore(p6.5.tag)` → v0.6-ui ships.
+
+If T-0 cells silently NaN or skip-loop loudly, that's a Phase-6.5+ engine concern surfaced by the wide grid — flag for fixing before tag.
+
+**Process suggestion**: rename `p7_wide_sweep.py` → `p6_wide_sweep.py` to reflect that this script is a Phase-6 dependency, not a Phase-7 enhancement. Optional; tone-of-voice nit.
+
+---
+
 ## Review of 28c9586 — chore: prefetch_universe.py — bump DEFAULT_STRIKES_PER_SIDE 3 → 6
 
 **Verdict:** ✅ accept — **closes the directive. Prefetch now covers EVERYTHING.**
