@@ -248,6 +248,29 @@ def test_dashboard_empty_routes_through_empty_state(captured_dash):
     assert "filters" in info["msg"].lower()
 
 
+def test_dashboard_sparkline_color_by_total_not_last_trade(captured_dash):
+    """LOAD-BEARING per d7e511d review: sparkline color must reflect
+    TOTAL P&L sign, NOT just the last trade's. A strategy that won
+    17 trades + lost the 18th has positive total and must NOT render
+    as red. Inverse test: strategy with 17 losses + 1 small win has
+    negative total and must NOT render as green."""
+    from src.web.per_stock import _sparkline_figure
+
+    # Won 17 × ₹100 = +₹1700, lost ₹50 on the 18th → total = +₹1650
+    mostly_winning = [100.0] * 17 + [-50.0]
+    fig_win = _sparkline_figure(mostly_winning)
+    assert "0, 100, 0" in fig_win.data[0].line.color  # green
+
+    # Lost 17 × ₹100 = -₹1700, won ₹50 on the 18th → total = -₹1650
+    mostly_losing = [-100.0] * 17 + [50.0]
+    fig_lose = _sparkline_figure(mostly_losing)
+    assert "200, 50, 50" in fig_lose.data[0].line.color  # red
+
+    # Zero total → green (>= 0 path)
+    fig_zero = _sparkline_figure([10.0, -10.0])
+    assert "0, 100, 0" in fig_zero.data[0].line.color
+
+
 def test_dashboard_sparkline_omitted_when_lt_2_trades(captured_dash):
     """A strategy with 0-1 trades for the selected symbol gets a
     "_sparkline needs ≥2 trades_" caption instead of a chart."""

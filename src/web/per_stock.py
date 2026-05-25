@@ -193,9 +193,16 @@ def _sparkline_figure(net_pnls: list[float]) -> go.Figure:
     by sweep iteration order (since trade-date sorting isn't a
     natural axis for cross-cell collections — trades from different
     expiries interleave). For Phase-7 trade-level drill-down, the
-    sparkline order will switch to entry_date sort."""
-    color = "rgb(0, 100, 0)" if (net_pnls and net_pnls[-1] >= 0) \
-            else "rgb(200, 50, 50)"
+    sparkline order will switch to entry_date sort.
+
+    Color is based on the SUM of net_pnls — not the last trade.
+    A strategy that won 17 trades and lost the 18th would
+    misleadingly render red under a "last trade" rule, but its
+    total-P&L story (which the card's headline metrics tell) is
+    decisively green. Sum matches the card's "Total P&L" story.
+    """
+    total = sum(net_pnls) if net_pnls else 0.0
+    color = "rgb(0, 100, 0)" if total >= 0 else "rgb(200, 50, 50)"
     fig = go.Figure(data=go.Scatter(
         y=net_pnls,
         mode="lines",
