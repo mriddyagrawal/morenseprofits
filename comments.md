@@ -3306,6 +3306,74 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 5f28f1b + 78e20d5 — chore: suppress options_loader partial-row noise in workers + main
+
+**Verdict:** ✅ accept (both commits, paired)
+
+**Phase / commit goal:** The `options_loader` `"[options_loader] dropped N partial row(s)"` UserWarning fires once per NSE fetch (per the 01049f7 partial-row tolerance fix). At 450k cells in the wide sweep, that's a torrent of stderr noise drowning out tqdm's progress bar. **Fix has to land in two places** because `mp.Pool` spawn semantics don't inherit warning filters from the main process — workers re-import modules cold.
+
+### 5f28f1b — worker-side filter in `_worker_init`
+
+**What works:**
+- **Filter narrowly-scoped via regex** ([src/engine/sweeper.py:78-82](src/engine/sweeper.py#L78-L82)): `message=r".*dropped \d+ partial row.*", category=UserWarning`. Doesn't blanket-silence all UserWarnings — only this specific informational message.
+- **Co-located with the existing `_WORKER_TODAY` initialization** in `_worker_init`. Single source for worker-process setup.
+- **Docstring updated** to mention the WHY: "purely informational... fires once per NSE fetch... see options_loader line 316 for the source". Future contributor knows what's being suppressed and where to find it.
+- **`import warnings` inside the function** (not module-top) — acceptable because the import is cheap and the function is per-worker-once, not per-task.
+
+### 78e20d5 — main-process filter at `p7_wide_sweep.py` script top
+
+**What works:**
+- **Mirrors the worker filter exactly** — same regex, same category. Workers and main process both silent.
+- **Script-top placement** ([scripts/p7_wide_sweep.py:24-32](scripts/p7_wide_sweep.py#L24-L32)): runs at import time, persists for the whole script.
+- **Comment cross-references the worker-side filter** ("Workers re-set this filter via sweeper._worker_init since spawn() doesn't inherit warning state") — explains the two-place duplication.
+
+**Live-verified**: 489/489 still passes. No test-output changes; existing tests don't trigger the partial-row warning.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Filter regex duplicated in two files** — if the warning message ever changes in `options_loader.py`, both filters silently stop matching and the noise returns. **Cosmetic DRY opportunity**: define `_PARTIAL_ROW_WARNING_REGEX = r".*dropped \d+ partial row.*"` in `src/data/options_loader.py` (the warning's source) and import in both consumers. ~3 lines; mostly future-proofing for Phase-7+ refactors.
+
+2. **Filter is set in `p7_wide_sweep.py` but NOT in `p6_sweep.py` or `verify_p*.py`** — those scripts may show the same noise if they ever fire many partial-row warnings. **Acceptable**: p6_sweep is smaller scope; verify scripts are operator-visible contexts where the warning is useful. Operator can copy the filter into p6_sweep if needed; documented pattern.
+
+3. **`import warnings` inside `_worker_init`** ([src/engine/sweeper.py:75](src/engine/sweeper.py#L75)) — PEP 8 says module-top. The other `warnings` usage in sweeper.py would need to be checked; if not used elsewhere at module-top, inline import is fine.
+
+4. **Two commits in 11 seconds** — split is defensible per nuclear-commit discipline (worker-side vs script-side). Could have been one commit; either shape works.
+
+**Why this scope-narrow regex matches the right warnings:**
+
+```
+"[options_loader] dropped 1 partial row from RELIANCE..."  → matches ✓
+"[options_loader] dropped 12 partial rows from HDFCBANK..." → matches ✓
+"[options_loader] dropped 0 partial rows..."               → matches ✓ (but doesn't fire anyway)
+"[options_loader] some OTHER warning..."                   → no match ✓
+"some unrelated warning"                                   → no match ✓
+```
+The `\d+` requires at least one digit; the literal `dropped` + `partial row` anchors the pattern. **No false-positive suppression of other warnings.** ✓
+
+**Domain / correctness checks:**
+- **Loud-failure discipline preserved**: only THIS specific informational warning is silenced; everything else (real errors, other warnings) bubbles up.
+- **Backward-compat**: ✓ single-threaded callers without main-process filter still see the warnings (intentional — fine in REPL / dev contexts).
+- **Worker-spawn pickling**: ✓ no functions/lambdas crossed; `_worker_init` runs cold in each worker.
+
+**Carry-over open flags:**
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now **~10 commits pre-tag**. The phase boundary is increasingly hypothetical.
+- 🔬 **No regression test for parallel-skips determinism** (b41e047 follow-up flag).
+
+**Next-commit suggestion:** Either run the wide sweep live now (everything is in place: NSE fetcher hardened, prefetch covers everything, parallel sweep works, skips deterministic, warnings silenced) — OR land `chore(p6.5.tag)` first to lock the Phase-6 boundary.
+
+**Operator's checklist for running the wide sweep cleanly:**
+1. ✅ Prefetch ran (6,240 contracts cached)
+2. ✅ NSE fetcher hardened (4 fix commits + politeness delay)
+3. ✅ Parallel sweep with deterministic results+skips parquets
+4. ✅ Warnings silenced (clean tqdm output)
+5. Run: `python scripts/p7_wide_sweep.py` → expect ~10-15 min on 8 workers
+6. Once parquet exists → `streamlit run app.py` → screenshot 4 tabs against mockups
+7. `chore(p6.5.verify)` + `chore(p6.5.tag)`
+
+---
+
 ## Review of b41e047 — fix: sort skips by canonical key before write — Pool.imap_unordered determinism
 
 **Verdict:** ✅ accept — **closes the determinism bug from my a27f9a7 review.**
