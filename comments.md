@@ -3306,6 +3306,83 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of d7dd613 — chore: scripts/prefetch_universe.py — bulk-cache options for future sweeps
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Standalone operator-tooling primitive. Pre-warms the cache so subsequent `p6_sweep.py` runs are cache-hits (~30-60s) instead of cold-cache (~60-75 min with politeness delay). Separates bandwidth-intensive prefetch from analysis-intensive sweep — different concerns, different cadences.
+
+**What works — design:**
+
+- **Three sequential phases** ([scripts/prefetch_universe.py:140-273](scripts/prefetch_universe.py#L140-L273)):
+  1. Pre-warm spot data per (symbol × year).
+  2. Build per-symbol monthly expiry list.
+  3. For each (symbol, expiry): read reference-day bhavcopy → pick ATM ± N strikes → fetch CE + PE for each.
+- **Cache-first via `options_loader.load_option`** — reuses the production cache path; doesn't reimplement. Resumable: re-runs skip already-cached contracts and only fetch gaps. **Right resumability pattern** given the rate-limit reality.
+- **ATM ± N strike picker** ([scripts/prefetch_universe.py:84-104](scripts/prefetch_universe.py#L84-L104)) — handles thin grids + edge-of-grid cases (still returns up to 2N+1 strikes biased to the available side).
+- **Reference-day picker** ([scripts/prefetch_universe.py:60-81](scripts/prefetch_universe.py#L60-L81)) — mid-cycle (expiry-25d to expiry-1d) preferred; fallback to nearest available `<= expiry`. **Walks back up to 10 days** to handle weekends + short holidays.
+- **CLI override flags** — `--symbols`, `--strikes-per-side`, `--start`, `--end`. Operator can subset for targeted runs.
+- **tqdm progress bars** at every phase — operator-friendly during the ~2-hour run.
+- **Skip log** distinguishes `MissingDataError` (transient/WAF) from other exceptions (structural). Operator can tell at glance which class dominates.
+- **Exit-code reflects skip rate**: `return 0 if (skipped) < 0.1 * expected_contracts else 1` ([scripts/prefetch_universe.py:291](scripts/prefetch_universe.py#L291)). CI-friendly; >10% skip → non-zero exit suggests re-running.
+- **`warnings.catch_warnings(); simplefilter("ignore")`** suppresses the per-symbol "dropped N partial rows" warnings from 01049f7 — operator sees the aggregate summary at end, not 3,360 line items.
+- **`requirements.txt: tqdm>=4.66.0`** added with the script — dependency declared.
+
+**Default scope is well-chosen** ([scripts/prefetch_universe.py:50-53](scripts/prefetch_universe.py#L50-L53)):
+- 10 NSE F&O blue chips (covers DESIGN_SPEC §3.2's 5 + 5 future expansion)
+- 2 years (2024-05 → 2026-05) — exercises YoY trend tab
+- Strikes-per-side = 3 → 7 strikes per (symbol, expiry, option_type)
+- 10 × ~24 × 7 × 2 = **~3,360 contracts**
+
+At 0.5s politeness delay + ~200ms per call = ~700ms × 3,360 = ~40 min IF every cell is a fresh fetch. **Defaults are conservative and accurate**.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **`import pandas as pd` inside the for-loop** ([scripts/prefetch_universe.py:225](scripts/prefetch_universe.py#L225)) — PEP 8 says module-top. Cosmetic.
+2. **`TODAY_FN = lambda: date(2026, 5, 25)`** — same frozen-sentinel as p6_sweep.py. Goes stale in 2027 but defensible for reproducibility.
+3. **10% skip threshold for non-zero exit** is hardcoded. Could be a flag `--max-skip-rate=0.1`. Cosmetic.
+4. **Reference-day walk-back is 10 days** ([scripts/prefetch_universe.py:209](scripts/prefetch_universe.py#L209)). For most expiries this is plenty; only a >10-day market-holiday stretch would fail. Indian market holidays max out at ~5 consecutive days (Diwali / extended weekends). Cosmetic.
+5. **Strike-grid filtering duplicates the SPECS §5 filter logic** ([scripts/prefetch_universe.py:226-232](scripts/prefetch_universe.py#L226-L232)) — same as `src.strategies._strikes.load_available_strikes`. **DRY opportunity**: call the existing helper. Minor.
+6. **Operator running this on a fresh checkout needs to install tqdm** — the new requirements.txt entry handles that. ✓
+7. **No flag for politeness delay override** — `_NSE_POLITENESS_DELAY_S` is hardcoded at 0.5s in options_loader. If an operator wants to test with 0s during dev, they'd need to patch the source. Cosmetic; Phase-7 hardening.
+
+**Strategic value:**
+
+The BUILDER's 4-hour silence between commits makes sense if they were running this script live to pre-populate the cache. **Cache-state is now operator-controlled**:
+- One-time ~2-hour prefetch (overnight).
+- Subsequent `p6_sweep.py` runs cache-hit and finish in seconds.
+- `chore(p6.5.verify)` can finally screenshot against a rich multi-pair dataset.
+
+**Workflow now operational**:
+```
+prefetch_universe.py  → populates cache (one-time, ~2 hours)
+p6_sweep.py           → produces sweep_<run_id>.parquet (~30s cache-hit)
+streamlit run app.py  → visualizes the parquet
+chore(p6.5.verify)    → screenshots each tab against mockups
+chore(p6.5.tag)       → v0.6-ui ships
+```
+
+**What I tried:**
+- Read [scripts/prefetch_universe.py](scripts/prefetch_universe.py) end-to-end.
+- Confirmed `tqdm>=4.66.0` added to requirements.txt.
+- Cross-checked the 3 phases against the cache layer: spot_loader, bhavcopy_fo_loader, options_loader.load_option — all production-path. ✓
+- No tests added — script is operator tooling, matches the verify_p4.py / verify_p5.py / p6_sweep.py pattern.
+
+**Sequencing observation:** This is the missing piece between "the NSE fetcher works on individual calls" (4 fix commits) and "the §3.2 sweep produces a real dataset". **The fix-then-prefetch-then-sweep chain is now complete**:
+- c6dfaea + 01049f7 + 71f49ab + f4aea02: fetcher hardened.
+- d7dd613 (this commit): prefetch primitive.
+- (Pending) re-run `p6_sweep.py` against warm cache: should complete fast.
+- (Pending) `chore(p6.5.verify)` against rich multi-pair sweep parquet.
+- (Pending) `chore(p6.5.tag)` → Phase 6 ships.
+
+**Next-commit suggestion:** Either (a) the operator runs `prefetch_universe.py` overnight → `p6_sweep.py` → `chore(p6.5.verify)` chain, OR (b) BUILDER lands one more `chore(p6.5.verify)` against the current single-pair Q1-2024 verify-set if waiting for the prefetch run isn't desirable. **My lean**: do (a) — the screenshot pass benefits hugely from visual diversity (multi-pair leaderboard, multi-year YoY line, populated heatmap cells). The 2-hour prefetch wait is a one-time cost for Phase 6's permanent v0.6-ui artifact.
+
+After the screenshot verify → `chore(p6.5.tag)` → **Phase 6 ships**.
+
+---
+
 ## Review of f4aea02 — fix(p6.5.opts): graceful skip on NSE rate-limit + politeness delay
 
 **Verdict:** ✅ accept — **closes my c6dfaea non-blocker #2 directly.**
