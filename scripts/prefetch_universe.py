@@ -33,7 +33,7 @@ sys.path.insert(0, str(REPO))
 
 from tqdm import tqdm  # noqa: E402
 
-from src.data import bhavcopy_fo_loader, expiry_calendar, options_loader, spot_loader  # noqa: E402
+from src.data import bhavcopy_fo_loader, expiry_calendar, options_loader, spot_loader, trading_calendar  # noqa: E402
 from src.data.errors import MissingDataError  # noqa: E402
 
 
@@ -125,6 +125,16 @@ def main() -> int:
         default=DEFAULT_END.isoformat(),
         help=f"Expiry range end (ISO date, default {DEFAULT_END.isoformat()})",
     )
+    ap.add_argument(
+        "--bulk-bhavcopies", action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Bulk-fetch ALL trading-day bhavcopies in the date range "
+            "(default: on). Future-proofs the cache for any sweep grid "
+            "later. Cheap (~13 min for a 2-year window, ~250MB disk). "
+            "Pass --no-bulk-bhavcopies for cherry-pick behavior."
+        ),
+    )
     args = ap.parse_args()
 
     symbols: list[str] = args.symbols
@@ -163,9 +173,51 @@ def main() -> int:
             print(f"    skip: {sym} {y} ({err})")
 
     # ============================================================
-    # Step 2 — build per-symbol expiry list
+    # Step 2 — bulk-fetch all trading-day bhavcopies (optional)
     # ============================================================
-    _h("Step 2 — build expiry list per symbol")
+    # Why bulk? Bhavcopies are shared across all 40 symbols (one zip
+    # per trading day contains every option contract). Fetching them
+    # all up-front future-proofs the cache for ANY sweep grid the
+    # operator runs later — extended heatmaps (T-40 entries), deeper
+    # OTM strategies, regime-filtered re-sweeps. Cheap relative to
+    # the per-contract options fetch.
+    #
+    # Trading days are derived from RELIANCE's spot data via
+    # trading_calendar — requires Step 1's spot warming to have run.
+    if args.bulk_bhavcopies:
+        _h("Step 2 — bulk-fetch trading-day bhavcopies")
+        try:
+            tdays = trading_calendar.trading_days(
+                args.start, args.end, today_fn=TODAY_FN,
+            )
+            print(f"  trading days in range: {len(tdays)}")
+        except Exception as e:
+            print(f"  ⚠ couldn't build trading-day list ({type(e).__name__}: {e})")
+            print(f"  skipping bulk-bhavcopy step; "
+                  f"strike-discovery in Step 4 will lazily fetch as needed")
+            tdays = []
+
+        n_bhav_fetched = 0
+        n_bhav_skipped = 0
+        for td in tqdm(tdays, desc="bhavcopies", unit="day"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    bhavcopy_fo_loader.load_bhavcopy_fo(td)
+                n_bhav_fetched += 1
+            except Exception as e:
+                n_bhav_skipped += 1
+        print(f"  bhavcopies loaded (cache-hit or fresh): {n_bhav_fetched}/{len(tdays)}")
+        if n_bhav_skipped:
+            print(f"  skipped: {n_bhav_skipped} (typically NSE holidays / no-data days)")
+    else:
+        _h("Step 2 — bulk-fetch trading-day bhavcopies  [SKIPPED via --no-bulk-bhavcopies]")
+        print(f"  strike-discovery in Step 4 will lazily fetch bhavcopies as needed")
+
+    # ============================================================
+    # Step 3 — build per-symbol expiry list
+    # ============================================================
+    _h("Step 3 — build expiry list per symbol")
     expiries_by_symbol: dict[str, list[date]] = {}
     for sym in tqdm(symbols, desc="expiries", unit="symbol"):
         try:
@@ -178,9 +230,9 @@ def main() -> int:
     print(f"  total (symbol, expiry) pairs: {total_pairs}")
 
     # ============================================================
-    # Step 3 — for each (symbol, expiry), pick strikes + fetch
+    # Step 4 — for each (symbol, expiry), pick strikes + fetch
     # ============================================================
-    _h("Step 3 — fetch CE + PE for ATM ± N strikes per (symbol, expiry)")
+    _h("Step 4 — fetch CE + PE for ATM ± N strikes per (symbol, expiry)")
     expected_contracts = total_pairs * n_strikes * 2
     print(f"  expected contracts: {expected_contracts}")
     print(f"  (cache-first — already-cached contracts skip immediately)")
