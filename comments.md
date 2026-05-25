@@ -3306,6 +3306,77 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 772131b — fix(p6.5.dash): sparkline color = sign of TOTAL net_pnl, not last trade
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close the d7e511d review's only non-blocking flag — the sparkline-color misleading-visual-semantic bug. 1-character fix (`net_pnls[-1]` → `sum(net_pnls)`) + a regression test pinning all three branches.
+
+**What works:**
+
+- **Implementation matches my recommendation verbatim** ([src/web/per_stock.py:204-205](src/web/per_stock.py#L204-L205)):
+  ```python
+  total = sum(net_pnls) if net_pnls else 0.0
+  color = "rgb(0, 100, 0)" if total >= 0 else "rgb(200, 50, 50)"
+  ```
+  - `if net_pnls else 0.0` guards empty list (defensive against future caller passing `[]`).
+  - `total >= 0` semantic matches the original `net_pnls[-1] >= 0` semantic — zero-total stays green (consistent with "no loss" reading).
+- **Docstring upgraded** with the WHY ([src/web/per_stock.py:196-202](src/web/per_stock.py#L196-L202)) — explains the previous misleading semantic AND why sum-based color is correct ("matches the card's Total P&L story"). **Future contributor can't re-introduce the bug without first understanding why it was wrong.**
+- **Regression test pins ALL THREE BRANCHES** ([tests/test_web_per_stock.py:251-271](tests/test_web_per_stock.py#L251-L271)):
+  - mostly-winning-with-final-loss (17 × ₹100 wins, 1 × -₹50 loss → total +₹1650) → GREEN
+  - mostly-losing-with-final-win (17 × -₹100 losses, 1 × +₹50 win → total -₹1650) → RED
+  - zero-total → GREEN (`>= 0` path)
+- **Reviewer-loop attribution explicit** in commit body: "Reviewer-flagged (d7e511d review, non-blocking)" — pattern is now established discipline.
+
+**Live-verified all 4 branches:**
+
+```
+mostly winning (+1650 total, ends -50):  rgb(0, 100, 0)   ← green ✓ (would have been RED under old logic)
+mostly losing (-1650 total, ends +50):   rgb(200, 50, 50) ← red ✓ (would have been GREEN under old logic)
+zero total (sum=0):                       rgb(0, 100, 0)   ← green (>= 0 path)
+empty list:                               rgb(0, 100, 0)   ← green (defensive default)
+```
+
+**487/487 full suite** (was 486 + 1).
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The fix surfaces a deeper consistency note**: card color is now derived from `sum(net_pnls)` (TOTAL P&L), the headline TOTAL NET P&L card is also derived from sum, the leaderboard's `total_net_pnl` column also from sum — **the project now uses "sum-based" as the canonical aggregate for cross-tab visual signals**. **`win_rate_pct` is a per-trade fraction** (different semantic — count-based, not sum-based). Worth a docstring note somewhere central (maybe DESIGN_SPEC §2.5 or §2.7) — "color signals reflect SUM net_pnl; count signals reflect win_rate_pct". Cosmetic; only matters if a future commit introduces a third color-signaling axis.
+
+2. **Empty-list branch returns green (the `>= 0` path on `total=0.0`)** — defensible. Operator hovering on a 0-trade card (which shouldn't render the sparkline anyway per the `len(strat_trades) >= 2` guard in `render_strategy_dashboard`) would see green. Edge case; not a real concern.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism**: ✓ color now reflects the operator's "did this make money?" question, not "what just happened last".
+- **Cross-tab visual consistency**: ✓ sum-based color matches sum-based Total P&L cards across tabs.
+- **Regression test coverage**: ✓ all 3 branches pinned (positive total ending in loss / negative total ending in win / zero total).
+- **Determinism**: ✓ sum is deterministic; no floating-point flakiness on the regression tests' integer values.
+
+**What I tried:**
+- Read the 1-line code change + regression test.
+- Live-verified 4 branches: mostly-winning-with-final-loss, mostly-losing-with-final-win, zero-total, empty-list.
+- `pytest tests/` → 487/487.
+
+**Sequencing observation:** Phase 6.5 closure status:
+- ✅ p6.5.headline (baec7f5)
+- ✅ p6.5.dash (d7e511d)
+- ✅ **fix(p6.5.dash) sparkline color** (772131b, this commit)
+- 🔄 p6.5.sweep (commit 24 per §4)
+- 🔄 p6.5.verify (commit 25)
+- 🔄 p6.5.tag (commit 26)
+
+**Reviewer-loop cycle time**: I flagged the bug at ~01:53 (in 40f77f2); the fix landed at 10:42 — ~8.5 hours later. Long-pause cycle, but the BUILDER returned to the catalogue and addressed the highest-priority item. The 12 non-blockers in my d7e511d catalogue still stand — this commit closes only #1 (sparkline color).
+
+**Next-commit suggestion:** **`chore(p6.5.cleanup)`** to batch-close the remaining 11 non-blockers in one doc-touch-heavy commit. Per my d7e511d review block's catalogue. After that → `chore(p6.5.sweep)` + `chore(p6.5.verify)` + `chore(p6.5.tag)`.
+
+**Alternative:** if BUILDER prefers to ship sooner, `chore(p6.5.sweep)` next — the 5-stock × 3-strategy × 2-year sweep takes ~20-30 min cold-cache and produces the first multi-pair dataset for `chore(p6.5.verify)` screenshots. Some of the non-blockers (sign-format inconsistency, month-label in headline) would be more visible on the multi-pair sweep, making the cleanup commit more focused if done AFTER the sweep.
+
+**My lean**: cleanup THEN sweep — cleaner doc state going into the screenshot pass. But either order works.
+
+---
+
 ## Review of d7e511d — feat(p6.5.dash): Per-stock small-multiples — card per strategy with sparklines
 
 **Verdict:** ✅ accept (with one subtle visual-meaning flag on the sparkline color logic)
