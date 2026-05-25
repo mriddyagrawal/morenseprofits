@@ -3306,6 +3306,74 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 2cea169 + c422f1e — feat: legs_json gains volume/OI + fix(deps): streamlit 1.32 → 1.34 (closes my Flag 2)
+
+**Verdict:** ✅ accept (both commits, paired)
+
+Two commits 10 seconds apart. The first adds liquidity transparency to the per-leg drill-down; the second closes my Flag 2 from the a745c89 review (streamlit version pin).
+
+### 2cea169 — feat: surface per-leg entry/exit volume + OI into legs_json
+
+**Phase / commit goal**: the drill-down per-trade leg table needed liquidity context. **Critical insight in commit body**: "Same flat 1% slippage charged either way per SPECS §4b, so thin legs are systematically under-priced in the cost model. Without surfacing volume/oi, the analyst can't even SEE which trades were on illiquid legs." — this is the **asymmetric-conservatism mandate operating at the analyst-tool layer**: surface the liquidity gap so the operator can mentally discount the ROI of low-volume legs.
+
+**What works:**
+
+- **`_pick_close_on` return signature widened**: `(close, lot_size)` → `(close, lot_size, volume, oi)` ([src/engine/pnl.py:56-90](src/engine/pnl.py#L56-L90)). Volume/OI default to `None` when columns absent (test fixtures use minimal frames; production loader frames per SPECS §2.3 always carry them).
+- **`pd.notna(r["volume"])` guard** before `int(r["volume"])` ([src/engine/pnl.py:86](src/engine/pnl.py#L86)) — defends against NaN values from upstream loader.
+- **`_price_one_leg` flows the new fields into the leg result dict** ([src/engine/pnl.py:156-160](src/engine/pnl.py#L156-L160)) → `entry_volume`, `exit_volume`, `entry_oi`, `exit_oi`. Names are clear; semantics in inline comment ("shares units; contracts = vol/lot_size").
+- **Backward-compat preserved**: old sweep parquets just lack the new keys; `pd.DataFrame([{"a":1}, {"a":1, "b":2}])` produces a 2-col frame with NaN for missing cells — pandas tolerates this natively. **The drill-down's `pd.DataFrame(legs)` auto-displays whatever columns are present**, so old parquets render the old 4-column leg table; new parquets render the 8-column leg table.
+- **489/489 full suite passes** — minimal test fixtures missing the new columns trigger the `None` default path. No test changes needed.
+- **Comment captures the WHY** of surfacing the fields ([src/engine/pnl.py:157-158](src/engine/pnl.py#L157-L158)): "Surfaces per-leg thinness so the drill-down can flag low-OI / zero-volume legs that the flat 1% slippage model under-charges." Future contributor reading this understands the operator's discount mental model.
+
+**Non-blocking observations:**
+
+1. **No test pinning that volume/oi PROPAGATES to the leg dict** — a future refactor that drops these fields wouldn't be caught at test time. Cosmetic: `assert "entry_volume" in leg` in an existing pnl test would close this gap. Minor.
+2. **Drill-down leg table gets wider** (4 → 8 columns per leg row). On iron condor (4 legs × 8 cols = 32 cells per leg-table-row × 24 trades-per-cell) the rendered table is wide. Streamlit auto-scrolls horizontally; visual check at `chore(p6.5.verify)` (still pending). Cosmetic.
+3. **Mixed-dtype column on old+new parquet concat**: `entry_volume` could be `Int64` (new rows) + `NaN` (old rows). Pandas handles this via nullable Int64. Acceptable.
+4. **For new sweeps, `entry_volume` and `exit_volume` are always populated** (production NSE-fetcher includes the columns). The `None` branch is only test-fixture territory. ✓
+
+---
+
+### c422f1e — fix(deps): bump streamlit pin 1.32 → 1.34
+
+**Verdict:** ✅ accept — **closes my Flag 2 from the a745c89 review directly.**
+
+**What works:**
+
+- **One-line edit** in `requirements.txt`: `streamlit>=1.32.0` → `streamlit>=1.34.0`.
+- **Inline comment captures WHY**: "on_select='rerun' on st.plotly_chart (heatmap cell drill-down click handler) requires ≥1.34.0; 1.32 silently ignored the kwarg → clicks did nothing."
+- **Reviewer→builder attribution**: commit body cites "Reviewer flag (Flag 2)". The loop pattern is now well-established.
+- **Defensive framing in commit body**: "Catches this at install time rather than at first-click silence" — the failure mode is explicit.
+
+**Blocking issues:** None.
+
+**Closes**: My Flag 2 from a745c89 review.
+
+**Carry-over: Flag 1 (the missing `chore(p6.5.tag)`) is STILL open.** With this commit, **3 p7.x commits have now landed pre-tag** (7806d82 + a745c89 + 2cea169). The Phase-6/Phase-7 boundary in git history is now muddier than before. **Recommended fix**: land `chore(p6.5.tag)` next, retroactively at the appropriate Phase-6 commit. Even better: NOW, after the streamlit pin bump, because the tag should pin a working set of dependencies. Tagging at eb2de5e (last pre-Phase-7 commit) would pin streamlit≥1.32 which can't actually run the (Phase-7) drill-down — but that's fine because eb2de5e doesn't HAVE the drill-down code. The pre-Phase-7-commit Phase-6 artifact is self-consistent.
+
+**Domain / correctness checks for the pair:**
+
+- **Asymmetric-conservatism**: ✓ volume/OI surfacing helps operator spot illiquid legs that the flat-slippage model under-charges.
+- **Backward-compat**: ✓ old parquets render without the new keys.
+- **Honest dependency declaration**: ✓ streamlit pin now matches the actual minimum.
+- **Loud-failure discipline**: pin bump catches at install time, not at "click does nothing" time.
+
+**What I tried:**
+- Read the diffs for both commits.
+- `pytest tests/` → 489/489.
+- Confirmed `_pick_close_on` widens cleanly; volume/oi None-default for minimal fixtures.
+- Cross-checked `requirements.txt` shows 1.34.0 floor.
+
+**Sequencing observation:** **Two commits in 10 seconds** — both touching different surfaces (data-layer pnl.py vs deps requirements.txt). Nuclear-commit discipline preserved: each has one purpose. The pair-pattern is becoming a project habit.
+
+**Next-commit suggestion:** **`chore(p6.5.tag)`** — NOW genuinely overdue. Either:
+1. Retroactively at eb2de5e (last pure-Phase-6 commit) — clean phase boundary.
+2. At current HEAD (acknowledging p7.x work is in v0.6-ui scope) — adjust DESIGN_SPEC §4 commit list to reflect this.
+
+Then Phase 7 continues: p7.2 diagnostics tab, p7.3 export buttons, p7.4 regime drill-down.
+
+---
+
 ## Review of a745c89 — feat: heatmap cell drill-down — click a cell to see the 24 underlying trades
 
 **Verdict:** ✅ accept (substantial feature; **flag**: this is **p7.1** per DESIGN_SPEC §4, landing pre-Phase-6-tag)
