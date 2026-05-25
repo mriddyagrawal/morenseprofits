@@ -11,6 +11,7 @@ The cache is the only persistence layer for raw NSE data. Every loader in
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
@@ -136,13 +137,22 @@ def write(path: Path, df: pd.DataFrame, *, overwrite: bool = False) -> None:
 
     Refuses to clobber an existing file unless `overwrite=True` (SPECS §7);
     loaders that re-fetch the current year's spot tail will pass overwrite=True.
+
+    Multi-writer safe — the tmp filename includes PID + a random suffix so
+    concurrent workers writing the SAME target path (e.g. 8 sweep workers
+    each refetching the open-year spot tail) don't collide on a shared
+    `.tmp`. POSIX rename is atomic on a single filesystem, so the last
+    rename wins cleanly; intermediate readers see either the OLD complete
+    file or the NEW complete file, never a torn write.
     """
     if path.exists() and not overwrite:
         raise WouldOverwriteError(
             f"{path} already exists; pass overwrite=True to clobber (SPECS §7)."
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(
+        f"{path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    )
     try:
         df.to_parquet(tmp, index=False)
         tmp.replace(path)
