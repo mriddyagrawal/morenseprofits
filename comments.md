@@ -3306,6 +3306,121 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of da43828 — chore(p6.5.cleanup-2): high-leverage UI consistency fixes
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal (as I understood it):** Close 4 more reviewer-catalogued items, all UI consistency fixes. Visual + behavioral parity across surfaces. Pure refactor + visual consistency — no new behavior tests.
+
+**What works — all 4 closures live-verified:**
+
+1. **Leaderboard column order: n_trades immediately right of rank**. **Closes 8a07859 #5** (DESIGN_SPEC §2.2 wording vs implementation drift).
+   ```
+   OLD: ['rank', 'strategy', 'symbol', 'n_trades', 'win_rate_pct', ...]
+   NEW: ['rank', 'n_trades', 'strategy', 'symbol', 'win_rate_pct', ...]
+   ```
+   **Operator-reading-order rationale**: scan rank → N to judge how seriously to take the row BEFORE reading strategy/symbol. The §2.2 contract literally says "n_trades visually prominent, immediately right of rank" — now honored.
+   Same change applied to `render_within_stock_rank` (rank_within_symbol followed by N).
+
+2. **Trends headline subtitles use `_MONTH_LABELS`**. **Closes 0845230 #1**.
+   ```
+   OLD: "month 2 (N=6)", "month 3 (N=6)", "month 2 (most consistent)"
+   NEW: "Feb (N=6)",     "Mar (N=6)",     "Feb (most consistent)"
+   ```
+   `_MONTH_LABELS` was already used in the MoY bar chart x-axis (per 202b49c); propagating to the headline subtitles closes the partial-closure flag. **Cross-surface consistency**: chart axis and headline cards now use the same month labels.
+
+3. **Heatmap value-pane cell text uses signed format**. **Closes 5b88215 #1 vs 202b49c #2** (sign-format inconsistency).
+   ```
+   OLD: "248%/yr"    (unsigned `:.0f`)
+   NEW: "+248%/yr"   (signed `:+.0f`)
+   ```
+   Matches MoY bars' "+269%" annotation. **At-a-glance scan**: green cells with leading `+` and red cells with `−` tell the same story across heatmap + MoY surfaces.
+
+4. **`render_caveats` added to `__all__`**. **Closes 7b12228 #1**.
+   ```python
+   __all__ = [
+       "MULTIPLE_COMPARISONS_CAVEAT", "SURVIVORSHIP_CAVEAT", "MARGIN_TIER_B_CAVEAT",
+       "render_caveats",                          # ← NEW
+       "render_caveats_strip", "render_caveats_collapsed", "DISMISS_KEY",
+   ]
+   ```
+   Docstring already claimed `render_caveats` as "top-level helper called by every tab"; the public API now matches the docstring claim.
+
+**Live-tested:**
+
+```
+Leaderboard column order: ['rank', 'n_trades', 'strategy', 'symbol', 'win_rate_pct',
+  'median_roi_pct_annualized', 'mean_roi_pct_annualized', 'std_roi_pct_annualized',
+  'total_net_pnl']
+  ← n_trades is position 1 ✓
+
+Trends headline subtitles:
+  ('Best month', '+269.3%/yr', 'Feb (N=6)')
+  ('Worst month', '+106.5%/yr', 'Mar (N=6)')
+  ('Tightest month std', '±94.3%/yr', 'Feb (most consistent)')
+  ('Latest year ROI', '+247.9%/yr', '2024 (no prior year for delta)')
+
+Heatmap value-pane cell text (first row): ['+113%/yr', '+254%/yr']
+  ← signed format ✓
+
+caveats.__all__: includes 'render_caveats' ✓
+```
+
+**487/487 full suite** (unchanged — refactor + visual consistency only).
+
+**Test updates landed**:
+- `test_rank_table_populated_renders_dataframe_with_canonical_columns` pins the new column order (n_trades at position 1).
+- Trends month tests now expect "Jan" / "Feb" / "Mar" in subtitles.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The change to leaderboard column order is operator-facing** — anyone with the prior column-order in muscle memory will need ~1 render to recalibrate. Acceptable; the new order is correct per spec.
+
+2. **`render_caveats` in `__all__` is consistent with my flag**, and the existing tests' `expected.issubset(...)` pattern means the new entry doesn't break the test. ✓
+
+**Catalogue status — running total of closures across the Phase 6 stretch:**
+
+| Closure SHA | Items closed | Items remaining |
+|---|---|---|
+| 79d50d8 | SURVIVORSHIP_CAVEAT date typo (BLOCKER) | — |
+| 772131b | sparkline color (1 item) | 11 of d7e511d catalogue |
+| 3d9cb13 | 7 items (customdata strings, vectorization, rangemode, _rank_quiet, dark theme, _filter helper, tests) | ~4 catalogue + 4 ancillary |
+| **da43828 (this commit)** | **4 items** (column order, month labels, signed heatmap, __all__) | **~5 ancillary cosmetic** |
+
+**Approximately 5 items still open**, all cosmetic / docstring / spec-wording:
+- 87a6707 #1 — YoY green line unconditional (mostly cosmetic; fires only on negative-ROI pairs)
+- 452b503 #3 — "across N rank-eligible" vs "total" subtitle wording (spec drift; either fix works)
+- 7b12228 #2 — "~10% discount" claim in MARGIN_TIER_B_CAVEAT (engineering judgment stated as precise number)
+- c6e3684 #1 — `get_message` "streamlit-free" docstring claim
+- 334bada+5c801dd #1 — `RESULTS_DIR + importlib.reload` test pattern
+- DESIGN §1.5 — mtime picker dependency on 617878b not documented
+
+**Domain / correctness checks:**
+
+- **Cross-surface visual consistency**: ✓ month labels uniform across MoY chart + Trends headline; sign-format uniform across heatmap cells + MoY bars + cards.
+- **Spec compliance**: ✓ §2.2 column order honored.
+- **Public API**: ✓ `__all__` matches docstring claims.
+- **Determinism**: ✓ no functional changes.
+
+**What I tried:**
+- Live-tested all 4 fixes against the verify dataset.
+- `pytest tests/` → 487/487.
+
+**Sequencing observation:** BUILDER is closing the catalogue methodically. **3d9cb13 closed the code+perf high-leverage items**; **da43828 closes the visual+API consistency items**; the remaining ~5 are pure docstring/spec polish. **A third small commit `chore(p6.5.docs)` could close the rest** in ~10-15 min, OR they can land in `chore(p6.5.verify)` if BUILDER touches the relevant docs.
+
+**Next-commit suggestion:** **`chore(p6.5.verify)`** per DESIGN_SPEC §4 commit 25.
+1. Boot `streamlit run app.py --server.headless` against the Q1-2024 verify-set.
+2. Screenshot each tab at `min_n=5` (load-bearing empty-state branches) AND `min_n=1` (actual values rendered).
+3. **Critical check**: the rendered SURVIVORSHIP_CAVEAT card shows "2024-07-01" — visual confirmation of the 79d50d8 date-fix.
+4. Cross-check against `DESIGN/leaderboard.png` / `per_stock.png` / `heatmap.png` / `trends.png` mockups.
+5. Note any intentional divergences in the commit body.
+
+After that → `chore(p6.5.tag)` — `git tag v0.6-ui`. **Phase 6 ships.**
+
+---
+
 ## Review of 9c1a6cf — chore(p6.5.sweep): script for the DESIGN_SPEC §3.2 first-real sweep
 
 **Verdict:** ✅ accept (script committed despite crashed run)
