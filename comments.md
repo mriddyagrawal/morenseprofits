@@ -3306,6 +3306,119 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 0aaf097 — chore: prefetch_universe.py — bulk-fetch all trading-day bhavcopies
+
+**Verdict:** ✅ accept — closes one of two prefetch gaps I flagged. **User directive: close the rest too — see directive block below.**
+
+**What works:**
+
+- **New Step 2 between spot-warming and expiry-building**: iterates `trading_calendar.trading_days(start, end)` and calls `bhavcopy_fo_loader.load_bhavcopy_fo` for each. Cache-first; idempotent on re-runs.
+- **~1.5s per day × ~500 trading days = ~12-13 min** for a 2-year window. ~250MB disk. **Cheap relative to options fetch** (~3,360 contracts × 0.7s ≈ ~40 min); bhavcopies are universe-wide (one ZIP / day covers every symbol × expiry × strike).
+- **`--bulk-bhavcopies` / `--no-bulk-bhavcopies`** CLI flag via `argparse.BooleanOptionalAction`. Default ON. Operator can disable for cherry-pick behavior; Step 4 still lazy-fetches bhavcopies for strike discovery either way.
+- **Defensive fallback**: if Step 1 spot warming failed (no network), Step 2 logs a warning and continues. Lazy fetch in Step 4 still covers strike discovery.
+- **Step renumbering** correctly updated (expiry-building → Step 3; options-fetch → Step 4). Progress bar per step.
+
+**Closes**: my d7dd613 gap #1 (bhavcopies for every trading day, not just reference-days-near-expiry). Sweeper's entry-date strike-grid lookup at T-15 / T-12 / T-9 etc. now cache-hits.
+
+**Still open** from my d7dd613 prefetch gap analysis:
+- **Wider strike coverage for OTM strategies** — `DEFAULT_STRIKES_PER_SIDE = 3` unchanged. Iron condor's `outer_offset_pct=0.05` picks strikes ~5% above/below spot, which for RELIANCE at ₹2,600 with ₹100 strike spacing = strike #5 from ATM. **Iron condor wings still cold-fetch on every cell** despite the bulk-bhavcopy step.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **`--bulk-bhavcopies` default = True** is the right call. Bhavcopies are cheap (universe-wide per fetch); turning bulk OFF only helps if the operator is on a slow link AND wants a tightly-targeted sweep.
+2. **`BooleanOptionalAction` for the flag** — clean argparse idiom; `--bulk-bhavcopies` AND `--no-bulk-bhavcopies` both work.
+3. **Comment block explaining "why bulk?"** ([scripts/prefetch_universe.py:178-184](scripts/prefetch_universe.py#L178-L184)) — captures the WHY: "future-proofs the cache for ANY sweep grid the operator runs later — extended heatmaps (T-40 entries), deeper OTM strategies, regime-filtered re-sweeps." Operator reading this 6 months from now knows the rationale.
+
+---
+
+## 📋 DIRECTIVE TO BUILDER (per user 2026-05-25): the prefetch should get EVERYTHING
+
+The user has stated explicitly: **"the prefetch should get everything"**. The bulk-bhavcopy addition in 0aaf097 closes one of three gaps I flagged in d7dd613 review. **The remaining gap must be closed** so that an operator running `prefetch_universe.py` end-to-end produces a cache that lets the §3.2 sweep (or any reasonable variation) run 100% cache-hit with zero cold fetches.
+
+### Gap remaining: wider strike coverage for OTM strategies
+
+**Current state**: `DEFAULT_STRIKES_PER_SIDE = 3` → ATM ± 3 strikes per (symbol, expiry, option_type) = 7 strikes.
+
+**The problem**: v1 strategies pick strikes at offsets that EXCEED this range:
+- **short_strangle**: `strike_offset_pct = 0.05` (default) → ATM ± ~5 strikes for blue chips with ₹100 spacing.
+- **long_strangle**: same offset semantics.
+- **iron_condor**: `inner_offset_pct = 0.02` (~2 strikes from ATM) AND `outer_offset_pct = 0.05` (~5 strikes from ATM). The OUTER wings get cold-fetched.
+- **short_straddle / long_straddle**: ATM only — covered by the existing prefetch.
+
+**Coverage matrix** for RELIANCE @ ₹2,600 with ₹100 strike spacing:
+
+| Strategy | Innermost strike used | Outermost strike used | Covered by ATM±3? |
+|---|---|---|---|
+| short_straddle | ATM | ATM | ✅ |
+| long_straddle | ATM | ATM | ✅ |
+| short_strangle | spot×(1−0.05) ≈ #5 below | spot×(1+0.05) ≈ #5 above | ❌ (need ±5) |
+| long_strangle | spot×(1−0.05) ≈ #5 below | spot×(1+0.05) ≈ #5 above | ❌ (need ±5) |
+| iron_condor | spot×(1−0.05) ≈ #5 below | spot×(1+0.05) ≈ #5 above | ❌ (need ±5) |
+
+**Recommended fix — bump `DEFAULT_STRIKES_PER_SIDE = 5`** (or higher for safety):
+
+```python
+DEFAULT_STRIKES_PER_SIDE = 5   # ATM + 5 above + 5 below = 11 strikes
+```
+
+**Cost analysis**: 11 strikes × 2 option_types × 24 expiries × 10 symbols = 5,280 contracts (vs current 3,360). Adds ~1,920 contracts × 0.7s = ~22 min to the prefetch run. **Acceptable** given the operator runs prefetch ~once and benefits from cache-only sweep runs forever after.
+
+**Even safer alternative — derive from strategy params dynamically**:
+
+```python
+# Compute strike coverage from the strategies that will be swept:
+from src.strategies.registry import get_strategy
+
+def _required_strike_offsets(strategy_names: list[str]) -> set[float]:
+    """Return the set of strike offset percentages used by the
+    given strategies' defaults (and any tunable params likely to
+    be swept). Used to expand the strike grid programmatically."""
+    offsets = {0.0}  # ATM always needed
+    for name in strategy_names:
+        strat = get_strategy(name)
+        # Each strategy class declares its default strike-offset(s)
+        # via class attributes or params dict.
+        if name in ("short_strangle", "long_strangle"):
+            offsets.update({0.05})
+        elif name == "iron_condor":
+            offsets.update({0.02, 0.05})
+    return offsets
+
+# Then convert offsets → strikes-per-side based on the symbol's
+# strike-spacing (which can be inferred from the bhavcopy grid).
+```
+
+This is more work than just bumping the constant; if BUILDER prefers the simpler fix, `DEFAULT_STRIKES_PER_SIDE = 5` is the right cheap solution.
+
+### Other prefetch completeness checks worth doing:
+
+1. **Verify Step 1 spot warming covers EXIT dates too**. Currently fetches per (symbol × year). If `--end 2026-05-31` and any sweep cell has an exit_date in May 2026, that's covered by the year-2026 fetch. ✓ Should be fine.
+
+2. **Are there any per-call NSE endpoints not yet pre-warmed?** The 6-item inventory I gave the user:
+   - ✅ Spot EOD (Step 1)
+   - ✅ Bhavcopy F&O (Step 2 — bulk now)
+   - ✅ Options EOD (Step 4 — current; needs the strike-coverage expansion)
+   - ✅ Expiry calendar (derived from bhavcopies; no extra fetch)
+   - ✅ Trading calendar (derived from spot; no extra fetch)
+   - ✅ Blue chip universe (static; no fetch)
+
+   **No new endpoints needed** — completing the prefetch is purely about the strike coverage expansion.
+
+3. **Smoke-test claim**: after the strike-coverage fix lands, the operator should be able to run:
+   ```
+   python scripts/prefetch_universe.py          # ~60 min cold
+   python scripts/p6_sweep.py                   # ~30s cache-hit, no fetches
+   ```
+   And the §3.2 sweep should report **0 skipped cells** (modulo legitimate MissingDataError for never-traded strikes).
+
+### Suggested commit: `chore(p6.5.prefetch.v2): wider strike coverage → ATM ± 5 strikes`
+
+Single-line constant bump (or the dynamic version above). Closes the last prefetch completeness gap.
+
+---
+
 ## Review of d7dd613 — chore: scripts/prefetch_universe.py — bulk-cache options for future sweeps
 
 **Verdict:** ✅ accept
