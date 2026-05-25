@@ -16,11 +16,23 @@ from __future__ import annotations
 
 import sys
 import time
+import warnings
 from datetime import date
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+# Suppress the noisy options_loader "dropped N partial row(s)" UserWarning
+# from drowning out tqdm's progress bar. The warning is informational —
+# it fires once per NSE fetch when settlement-only rows are filtered out.
+# Workers re-set this filter via sweeper._worker_init since spawn() doesn't
+# inherit warning state.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*dropped \d+ partial row.*",
+    category=UserWarning,
+)
 
 from src.data import expiry_calendar  # noqa: E402
 from src.engine.sweeper import _compute_run_id, sweep_grid  # noqa: E402
