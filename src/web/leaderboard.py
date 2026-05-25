@@ -166,8 +166,12 @@ def render_rank_table(df: pd.DataFrame, *, min_n: int) -> None:
     # Slice to the columns we display. The aggregator emits more (e.g.
     # mean_net_pnl, worst/best per trade) — leaderboard surface keeps it
     # tight; full table is accessible via the CSV export (Phase 7).
+    # Column order per DESIGN_SPEC §2.2: n_trades immediately right of
+    # rank. The operator scans rank → N to judge how seriously to take
+    # the row before reading the metrics; putting strategy/symbol in
+    # between would force a backtrack.
     display_cols = [
-        "rank", "strategy", "symbol", "n_trades",
+        "rank", "n_trades", "strategy", "symbol",
         "win_rate_pct",
         "median_roi_pct_annualized",
         "mean_roi_pct_annualized",
@@ -318,8 +322,10 @@ def render_within_stock_rank(df: pd.DataFrame, *, min_n: int) -> None:
         ["symbol", "rank_within_symbol"]
     ).reset_index(drop=True)
 
+    # Same §2.2 contract for the per-symbol leaderboard — N immediately
+    # right of the rank column (rank_within_symbol here).
     display_cols = [
-        "symbol", "rank_within_symbol", "strategy", "n_trades",
+        "symbol", "rank_within_symbol", "n_trades", "strategy",
         "win_rate_pct",
         "median_roi_pct_annualized",
         "mean_roi_pct_annualized",

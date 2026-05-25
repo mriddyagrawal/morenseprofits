@@ -126,7 +126,7 @@ def render_headline(
                 "Best month",
                 format_pct(best["median_roi_pct_annualized"],
                            signed=True, annualized=True),
-                f"month {int(best['month'])} (N={int(best['n_trades'])})",
+                f"{_MONTH_LABELS[int(best['month']) - 1]} (N={int(best['n_trades'])})",
                 delta_color="off",
             )
         else:
@@ -144,7 +144,7 @@ def render_headline(
                 "Worst month",
                 format_pct(worst["median_roi_pct_annualized"],
                            signed=True, annualized=True),
-                f"month {int(worst['month'])} (N={int(worst['n_trades'])})",
+                f"{_MONTH_LABELS[int(worst['month']) - 1]} (N={int(worst['n_trades'])})",
                 delta_color="off",
             )
         else:
@@ -162,7 +162,7 @@ def render_headline(
             st.metric(
                 "Tightest month std",
                 f"±{std_val:.1f}%/yr",
-                f"month {int(tightest['month'])} (most consistent)",
+                f"{_MONTH_LABELS[int(tightest['month']) - 1]} (most consistent)",
                 delta_color="off",
             )
         else:

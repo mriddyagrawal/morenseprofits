@@ -90,9 +90,10 @@ def test_best_and_worst_month_identified(captured_metrics):
     best = captured_metrics[0]
     worst = captured_metrics[1]
     assert "+50.0%/yr" in best["value"]
-    assert "month 1" in best["delta"]
+    # After cleanup-2: month rendered as "Jan" / "Feb" / ... via _MONTH_LABELS
+    assert "Jan" in best["delta"]
     assert "-20.0%/yr" in worst["value"]
-    assert "month 3" in worst["delta"]
+    assert "Mar" in worst["delta"]
 
 
 def test_tightest_month_std_card_identifies_lowest_std(captured_metrics):
@@ -106,9 +107,9 @@ def test_tightest_month_std_card_identifies_lowest_std(captured_metrics):
     )
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     tightest = captured_metrics[2]
-    # Month 1's std = 0 → "±0.0%/yr"; subtitle names month 1
+    # Month 1's std = 0 → "±0.0%/yr"; subtitle names "Jan" (post-cleanup-2)
     assert "±0.0%/yr" in tightest["value"]
-    assert "month 1" in tightest["delta"]
+    assert "Jan" in tightest["delta"]
     assert "consistent" in tightest["delta"].lower()
 
 

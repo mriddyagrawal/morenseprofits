@@ -252,8 +252,10 @@ def test_rank_table_populated_renders_dataframe_with_canonical_columns(captured_
     df_event = next((e for e in captured_table if e["kind"] == "dataframe"), None)
     assert df_event is not None
     df = df_event["df"]
+    # Column order per DESIGN_SPEC §2.2: n_trades immediately right of
+    # rank (operator scans rank → N to judge row before reading metrics).
     expected_cols = [
-        "rank", "strategy", "symbol", "n_trades",
+        "rank", "n_trades", "strategy", "symbol",
         "win_rate_pct",
         "median_roi_pct_annualized",
         "mean_roi_pct_annualized",

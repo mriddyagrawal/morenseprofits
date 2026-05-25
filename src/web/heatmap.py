@@ -334,10 +334,12 @@ def render_heatmaps(
         y=entry_ticks,
         colorscale="RdYlGn",      # diverging — see §2.3
         zmid=0,                   # white at breakeven
-        # Annotate each visible cell with its rounded value.
+        # Annotate each visible cell with its rounded value. Signed
+        # format (+248%/yr / -89%/yr) matches the MoY bar annotations
+        # for sign-format consistency across all annual-ROI surfaces.
         # NaN cells (masked) get blank annotations naturally.
         text=[[
-            f"{value_z[i][j]:.0f}%/yr" if value_z[i][j] == value_z[i][j] else ""
+            f"{value_z[i][j]:+.0f}%/yr" if value_z[i][j] == value_z[i][j] else ""
             for j in range(value_z.shape[1])
         ] for i in range(value_z.shape[0])],
         texttemplate="%{text}",

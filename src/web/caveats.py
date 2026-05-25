@@ -35,6 +35,7 @@ __all__ = [
     "MULTIPLE_COMPARISONS_CAVEAT",
     "SURVIVORSHIP_CAVEAT",
     "MARGIN_TIER_B_CAVEAT",
+    "render_caveats",            # top-level dispatcher — strip vs collapsed
     "render_caveats_strip",
     "render_caveats_collapsed",
     "DISMISS_KEY",
