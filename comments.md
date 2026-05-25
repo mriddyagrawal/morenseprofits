@@ -3306,6 +3306,90 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 9c1a6cf — chore(p6.5.sweep): script for the DESIGN_SPEC §3.2 first-real sweep
+
+**Verdict:** ✅ accept (script committed despite crashed run)
+
+**Phase / commit goal (as I understood it):** Run the §3.2 first-real sweep (5 stocks × 2 years × 3 strategies × 5 entry × 3 exit ≈ 5,400 cells). Commit the script regardless of run outcome so the §3.2 grid is documented as a runnable artifact, AND so the operator can re-trigger anytime.
+
+**What works:**
+
+- **Script accurately encodes the §3.2 plan** ([scripts/p6_sweep.py:31-35](scripts/p6_sweep.py#L31-L35)):
+  ```
+  SYMBOLS         = ["RELIANCE", "HDFCBANK", "INFY", "ICICIBANK", "TCS"]
+  STRATEGIES      = ["short_straddle", "short_strangle", "iron_condor"]
+  ENTRY_OFFSETS_TD = [15, 12, 9, 6, 3]
+  EXIT_OFFSETS_TD  = [3, 1, 0]
+  ```
+  Matches the §3.2 dimensions verbatim.
+- **`TODAY_FN = lambda: date(2026, 5, 25)`** — frozen date for reproducibility per the project's determinism discipline. ✓
+- **Expiry union across symbols** ([scripts/p6_sweep.py:55-66](scripts/p6_sweep.py#L55-L66)) — handles the case where different stocks have slightly different monthly-expiry exceptions. Defensive.
+- **`n_valid_pairs = sum(1 for e ... for x ... if e > x)`** ([scripts/p6_sweep.py:69-71](scripts/p6_sweep.py#L69-L71)) — excludes (entry, exit) where entry ≤ exit. Correct semantic (can't exit before entry).
+- **`sweep_grid(force=False)`** — cache-hit short-circuits on re-runs. Subsequent invocations cost ~30-60s instead of 20-30 min.
+- **Per-pair breakdown** ([scripts/p6_sweep.py:101-104](scripts/p6_sweep.py#L101-L104)) + **skip-log inspection by reason** ([scripts/p6_sweep.py:106-116](scripts/p6_sweep.py#L106-L116)) — operator gets the post-run diagnostic. Pre-implements the §3.2 verify expectations.
+- **Honest crash report in commit body** — full traceback context (`JSONDecodeError: Expecting value: line 1 column 1 (char 0)` from jugaad's `_derivatives → self.r.json()`); root-cause analysis (NSE returned non-JSON, likely HTML error or rate-limit page); two Phase-7 hardening items explicitly named and DEFERRED (not silently swept under the rug).
+
+**Blocking issues:** None.
+
+**The crash analysis is correct:**
+
+```
+_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)   ← line 50 of sweeper.py
+```
+
+JSONDecodeError isn't in the tuple, so the sweeper's `except _SKIPPABLE_ERRORS as e` branch doesn't catch it; the exception propagates up and aborts the run. **This is the correct loud-failure behavior** per the project's discipline — silent retries on parse failures would mask intermittent NSE issues.
+
+**Two Phase-7 hardening items correctly flagged** (NOT addressed in this commit, per nuclear-commit discipline):
+
+1. **options_loader retry-on-transient-decode-failure** — matches the bhavcopy_fo_loader timeout pattern from f337208. **My read**: should be a per-call retry with backoff (1-2 retries max) wrapping the `_derivatives` JSON parse. Phase-7 polish; matches the SPECS §6c "operator decides" pattern.
+
+2. **sweep_grid incremental writes** — would change the SPECS §6c.3 determinism contract (state of partial parquet affects subsequent runs). **My read**: the current atomic-write-at-end is the right v1 choice for determinism. Phase-7+ if/when operators ask for resumability.
+
+**Both deferrals are defensible.**
+
+**Implication for `chore(p6.5.verify)`:**
+
+Since no real-sweep parquet was written, **`chore(p6.5.verify)` will have to screenshot against the Q1-2024 single-pair verify-set** (`sweep_bde92aef8573.parquet`). **This is actually FINE per DESIGN_SPEC §3.1**: "design bugs surface on small data and force us to handle empty / thin cases gracefully." The verify-set hits every empty-state branch (single-year YoY, all-cells-masked heatmap, single-strategy per-stock dashboard). **Phase 6 ships against the verify-set; real-sweep is for Phase-7+ once the JSONDecodeError hardening lands.**
+
+**Non-blocking observations:**
+
+1. **`TODAY_FN = lambda: date(2026, 5, 25)`** is a frozen sentinel. **Reproducible** but goes stale once 2027 starts. If a future contributor reruns this script in 2027 it'll still emit `entry_date >= 2026-05-25` exclusions. **Acceptable for v1** — the script is dated to the §3.2 plan; for actual production sweeps the operator would parameterize `today_fn=date.today`. Cosmetic.
+
+2. **`from src.config import RESULTS_DIR` deep in `main()`** ([scripts/p6_sweep.py:107](scripts/p6_sweep.py#L107)) instead of at module-top — minor style nit. ✓ All imports work; PEP-8 says module-top.
+
+3. **No retry on the `expiry_calendar.monthly_expiries` calls** ([scripts/p6_sweep.py:58-65](scripts/p6_sweep.py#L58-L65)) — wrapped in bare `except Exception` which prints + continues. Defensive for one-off network blips at the expiry-fetch layer; doesn't help the sweep_grid-layer JSONDecodeError. Consistent with the project's "loud at deep layer; defensive at script layer" pattern. Acceptable.
+
+4. **Script bypasses the `verify_p4.py` / `verify_p5.py` naming convention** (`p6_sweep.py` vs `verify_p6.py`). Defensible — this is a *sweep* not a *verify*; runs the actual production grid, not a small sanity-check. Naming reflects intent.
+
+5. **JSONDecodeError will reproduce on any cold-cache rerun** until either (a) NSE happens to return JSON, OR (b) the options_loader retry logic lands. **Operator workflow**: re-run repeatedly OR wait for the Phase-7 hardening. Worth a `README.md` note for the script.
+
+**Domain / correctness checks:**
+
+- **Determinism**: ✓ `run_id` computed deterministically from (strategies, symbols, expiries, entry, exit); `today_fn` frozen.
+- **§3.2 grid encoded literally**: ✓ 5 × 3 × ~24 × 5×3 ≈ 5,400 cells planned.
+- **Loud-failure on transient NSE issue**: ✓ JSONDecodeError aborts; operator knows.
+- **Cache-friendliness**: ✓ `force=False`; reruns hit cache.
+
+**What I tried:**
+- Read [scripts/p6_sweep.py](scripts/p6_sweep.py) end-to-end.
+- Verified `_SKIPPABLE_ERRORS` doesn't include JSONDecodeError: `grep -n "_SKIPPABLE_ERRORS" src/engine/sweeper.py` → `_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)`.
+- Confirmed no new tests; pytest unchanged at 487/487 (script is operator-tooling, not a tested module).
+
+**Sequencing observation:** **The decision to commit-the-script-anyway is correct.** Without it, the §3.2 grid lives only in DESIGN_SPEC; with it, the operator has runnable artifact + the crash failure mode is documented + the Phase-7 hardening items are concrete. **"Loud failure with documented context"** is exactly the project's discipline. The alternative (silently fix-and-retry until success) would have hidden the JSONDecodeError surface from the catalogue.
+
+**Next-commit suggestion:** **`chore(p6.5.verify)`** — screenshot every tab against the Q1-2024 verify-set. Should:
+1. Boot `streamlit run app.py --server.headless` and confirm HTTP 200.
+2. Screenshot each tab AT DEFAULT min_n=5 — operator sees the load-bearing empty-state messages (heatmap all-masked, trends single-year).
+3. Re-screenshot with min_n=1 — operator sees actual values for the empty-state branches.
+4. Cross-check against `DESIGN/leaderboard.png` / `per_stock.png` / `heatmap.png` / `trends.png` — note any intentional divergences in the commit body.
+5. **Verify the corrected SURVIVORSHIP_CAVEAT date renders as "2024-07-01"** (the 79d50d8 fix should propagate to the rendered caveats card).
+
+Then `chore(p6.5.tag)` — `git tag v0.6-ui`. Phase 6 ships.
+
+**Outstanding `chore(p6.5.docs)` opportunity** (the ~9 remaining catalogued items) — could land between p6.5.verify and p6.5.tag, OR after the tag as a quick polish pass. None are blocking.
+
+---
+
 ## Review of 3d9cb13 — chore(p6.5.cleanup): batch-close 7 high-leverage Phase-6 reviewer non-blockers
 
 **Verdict:** ✅ accept
