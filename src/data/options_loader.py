@@ -263,12 +263,32 @@ def _normalize(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df["option_type"] = df["option_type"].astype("string")
     df["expiry"] = pd.to_datetime(df["expiry"]).astype("datetime64[us]")
     df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+    # Float columns are forgiving — pd.to_numeric coerces dirty values
+    # (whitespace, strings) to NaN rather than crashing. NSE
+    # occasionally returns settlement-only rows with empty trade-price
+    # fields; tolerating NaN here keeps the contract usable.
     for col in ("strike", "open", "high", "low", "close", "ltp", "settle_price"):
-        df[col] = df[col].astype("float64")
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    # Essential-row filter: rows missing lot_size or volume can't be
+    # priced (no contract size = no P&L). NSE rarely emits such rows
+    # — typically the last row of an expiry's lifetime when no actual
+    # trading occurred — but the direct-fetch path surfaces them
+    # (jugaad's old path silently swallowed via apply(np_int)).
+    pre_n = len(df)
+    df["lot_size"] = pd.to_numeric(df["lot_size"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    df = df.dropna(subset=["lot_size", "volume", "close"]).copy()
+    if len(df) < pre_n:
+        warnings.warn(
+            f"[options_loader] dropped {pre_n - len(df)} partial row(s) "
+            f"from {symbol} (missing lot_size / volume / close — "
+            f"typically NSE settlement-only rows with no trade data).",
+            stacklevel=2,
+        )
     df["lot_size"] = df["lot_size"].astype("int64")
     df["volume"] = df["volume"].astype("int64")
-    df["oi"] = df["oi"].astype("Int64")
-    df["oi_change"] = df["oi_change"].astype("Int64")
+    df["oi"] = pd.to_numeric(df["oi"], errors="coerce").astype("Int64")
+    df["oi_change"] = pd.to_numeric(df["oi_change"], errors="coerce").astype("Int64")
 
     # Verify every date is at midnight naive — derivatives_df should
     # return 00:00:00, unlike stock_df's 18:30 UTC. If a future jugaad
