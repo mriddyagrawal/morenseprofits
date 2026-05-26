@@ -9703,3 +9703,155 @@ If the BUILDER is iterating mockup-matching: yoy_sparkline is the natural next (
 **Suggest**: tag now, then yoy_sparkline, then live-run validation.
 
 ---
+
+## Review: d96e038 — feat(p7.drilldown.interpretations): auto-detect heavy-tail / outlier-carry / instability
+
+**Verdict: ✅ ACCEPT** — the "dashboard reads the data so the analyst doesn't have to" pattern is the right honesty primitive. Clean module, three well-chosen detectors, tunable thresholds. Two real grills: the SPECS §6b.3 reference in the heavy-tail callout conflates survivorship-bias with tail-shape (different phenomena), and the outlier-carry math can produce >100% share without a guard.
+
+### Why this commit matters
+
+The Median Hero card (c1522b8) + Bootstrap CI (aa19bac) tell the analyst "here's the headline number + uncertainty bound". This commit goes one layer deeper: **"and here's WHY the headline might be misleading"**. Three structural pathologies surfaced automatically:
+
+1. **Heavy-tail**: mean-median gap signals tail-risk hidden under a benign median.
+2. **Outlier-carry**: single trade dominates the cell's net P&L; pull it and the rule may collapse.
+3. **Instability**: dispersion wildly exceeds typical magnitude; per-trade outcomes are erratic.
+
+All three are things a careful analyst would check manually. Surfacing them automatically frees the operator's attention for things the dashboard CAN'T detect (regime context, fundamental data, etc.).
+
+### Module design — clean
+
+```python
+HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS = 20.0
+OUTLIER_CARRY_PNL_SHARE = 0.50
+INSTABILITY_STD_TO_MEDIAN_RATIO = 3.0
+
+def interpret_cell_stats(rows: pd.DataFrame) -> list[str]:
+    ...
+```
+
+- **Module-level constants**: future tuning lands in one place. ✓
+- **Pure function, no I/O**: trivially testable. ✓
+- **Returns empty list on degenerate inputs** (n<2, missing columns): caller can render via `for obs in ...` without conditionals. ✓
+- **Each detector has a guard** (n≥2 for stats, abs(total)>0 for outlier-carry, abs(median)>0.01 for instability): no div-by-zero, no false positives on edge cases. ✓
+- **Detectors are independent**: ordered by load-bearingness (tail-shape → outlier-carry → instability) but each fires on its own merits. ✓
+
+### Heavy-tail detector — direction-aware, well-worded
+
+```python
+if gap >= 20: "heavy upside tail — rare big winners pull the mean above..."
+elif gap <= -20: "heavy downside tail — rare big losers pull the mean below..."
+```
+
+**Correct interpretation for both strategy types**:
+- Short-vol (short_straddle, short_strangle, iron_condor): typical profile is "many small wins, rare big losses". Mean << median → "heavy downside tail" — the message a short-vol operator should hear.
+- Long-vol (long_straddle, long_strangle): typical profile is "many small losses, rare big wins". Mean >> median → "heavy upside tail" — the message a long-vol operator should hear.
+
+Both directions correctly mapped to operator-actionable phrasing. ✓
+
+### 🔬 Grill #1 (real): the SPECS §6b.3 citation in heavy-tail callouts is incorrect
+
+The callout strings include:
+
+> "rare big winners pull the mean above the typical outcome; **SPECS §6b.3 caveat applies**."
+
+[SPECS.md:638](SPECS.md#L638) is titled `### 6b.3 SURVIVORSHIP BIAS (load-bearing caveat)`. It's specifically about the v1 blue-chip universe being the 2024-07-01 Nifty 50 — i.e. stocks that survived to that date. Universe-selection bias.
+
+**Heavy-tail in observed returns is a DIFFERENT phenomenon**:
+- Survivorship bias: the dataset excludes names that died → median + mean both look better than reality.
+- Heavy tail: within the dataset you DO have, mean and median diverge because of return-distribution skew.
+
+Survivorship affects BOTH median and mean similarly (both inflated). It doesn't explain a mean-median GAP. **The citation conflates two different sources of bias.**
+
+The associative link (both → "trust the median less") is valid, but the citation should be either:
+- **Removed**: leave the callout as the structural observation without a SPECS cross-reference.
+- **Replaced**: with a SPECS section on tail-risk underestimation (doesn't currently exist; would need to be added).
+- **Reframed**: "heavy upside tail (rare big winners pull the mean above the typical outcome) — combined with survivorship bias (SPECS §6b.3), expected forward performance likely closer to the median than the mean." That accurately positions §6b.3 as ONE OF MULTIPLE reasons to trust the median over the mean.
+
+**Recommendation**: reframe the citation. Currently it conflates tail-shape with survivorship; an analyst reading the callout might think "§6b.3 explains my tail" when it actually doesn't.
+
+This isn't blocking — the callout still surfaces the structural observation correctly — but the citation is technically wrong and an analyst checking §6b.3 will find content that doesn't match what they expected.
+
+### 🔬 Grill #2 (real): outlier-carry can produce share > 100% without guard
+
+```python
+total = float(pnl.sum())          # SIGNED sum
+max_abs = float(pnl.abs().max())  # absolute max
+share = max_abs / abs(total)
+```
+
+Consider trades [+₹100k, -₹50k]:
+- `total = +50k`, `|total| = 50k`
+- `max_abs = 100k`
+- `share = 100k / 50k = 2.0` → fires with "one trade carries **200%** of the cell's |net P&L|"
+
+200% is mathematically correct (one trade is twice the magnitude of the net) but reads weirdly. An operator might assume a bug.
+
+**Two fixes** (both 1-line):
+- Cap the displayed share at 100%+ with appropriate wording: `if share > 1.0: "exceeds the cell's |net P&L| — net depends on offsetting movements"` vs `else: "carries N% of the cell's |net P&L|"`.
+- Use gross-P&L denominator: `share = max_abs / pnl.abs().sum()`. Caps share at ≤ 100% by construction. Different semantics — "one trade is N% of the cell's total dollar-flow" — but cleaner UX.
+
+The current behavior is more aggressive (fires more often, which catches the [+100k, -100k, +50k] scenario where the strategy is "luckily flat from cancellations"). Defensible — flag-on-doubt is the right side for honesty surfaces. **Recommend just the cap-at-100% display fix.**
+
+### 🔬 Grill #3 (soft): 20-pt heavy-tail threshold doesn't scale with ROI magnitude
+
+A 20-pt mean-median gap is:
+- Small relative to a 100% median ROI (20% relative gap).
+- Large relative to a 20% median ROI (100% relative gap).
+- Huge relative to a 5% median ROI (400% relative gap).
+
+The fixed-threshold approach means high-ROI strategies have to be "very tail-heavy" to trigger; low-ROI strategies trigger on minor gaps. **A relative threshold** (`|mean - median| / |median| >= 0.3`) would be more universally calibrated.
+
+But — module constants are tunable. Operator can adjust if the threshold misfires. **Not a blocker** — just a calibration note. The wide-sweep's median ROIs will tell whether 20 pts is the right knee.
+
+### Wiring into the drill-down
+
+```python
+from src.analytics.observations import interpret_cell_stats
+for obs in interpret_cell_stats(rows):
+    st.warning(obs)
+```
+
+- **Position**: after the 3-card top row, before the distribution chart. Natural reading order: headline → callouts → evidence. ✓
+- **st.warning** → yellow background, closest to the mockup's amber callout texture. ✓
+- **Inline import**: consistent with the file's existing pattern. Cosmetic.
+
+### Tests — comprehensive
+
+Per commit body, 14 tests covering:
+- Empty / degenerate inputs (returns []).
+- Each detector firing.
+- Threshold-edge cases (just-below threshold → silent; just-above → fires).
+- Defensive guards (zero-sum P&L, near-zero median).
+- All-three-coexist scenario.
+
+The threshold-edge tests are particularly valuable — they pin the EXACT boundary of when each detector fires. ✓
+
+### What I tried
+
+- Cross-referenced SPECS §6b.3 to verify the citation: confirmed it's about survivorship bias, not tail-shape. → Grill #1.
+- Worked through the outlier-carry math on `[+100k, -50k]` → confirmed share=2.0 → grill #2.
+- Computed relative thresholds for the heavy-tail detector across the 5 strategies' likely ROI ranges → grill #3.
+- Verified position in render_cell_drilldown via the diff — after 3-card top row, before chart. ✓
+
+### Carry-over open items
+
+- 🚦 **Click fix browser smoke-test verdict** — STILL OPEN.
+- ⚠ **`chore(p6.5.tag)`** at 37 commits pre-tag. Each commit increases the bisect-cost.
+- 🔬 **`feat(p7.drilldown.yoy_sparkline)`** — already landed as ace31eb (need to review next).
+- 🔬 **Live-run validation** for prefetch redesign — still open.
+
+### Next-commit suggestion
+
+ace31eb (yoy_sparkline) already landed. I should review it next.
+
+**After ace31eb**: STRONG recommendation `chore(p6.5.tag)`. The honesty stack is now substantially complete:
+- 3-card top row (deployment spec + headline + stability check).
+- Bootstrap CI under headline (uncertainty bound in eye-fixation).
+- Auto-detected structural callouts (heavy-tail / outlier-carry / instability).
+- Strike-rule disclosure.
+- Mode radio (Drill / Compare / Export stubs).
+- Click fix (pending smoke-test verdict).
+
+That's a coherent "drill-down honesty milestone". Tag it.
+
+---
