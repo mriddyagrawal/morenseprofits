@@ -479,6 +479,7 @@ def render_heatmaps(
 def render_cell_drilldown(
     df: pd.DataFrame,
     *,
+    skips_df: pd.DataFrame | None = None,
     strategy: str | None,
     symbol: str | None,
 ) -> None:
@@ -491,6 +492,13 @@ def render_cell_drilldown(
     worked), or one outlier carrying the average. Then drill into any
     specific trade's legs, costs, and margin to understand WHY.
 
+    Honesty contract — if any expiry was SKIPPED for this cell (e.g.
+    corporate-action lot-size change, missing NSE data, no liquid
+    strike), the skipped expiries are listed explicitly with their
+    reason. The analyst MUST be able to see "n=21 priced + 3 skipped"
+    rather than "n=21" — that's the difference between a model the
+    analyst can trust and one that quietly lies by omission.
+
     Selection lives in ``st.session_state['mp_heatmap_selected_cell']``
     (a 2-tuple of int (entry_offset_td, exit_offset_td) populated by
     the value-pane click handler). Per-row JSON columns
@@ -499,8 +507,10 @@ def render_cell_drilldown(
     """
     import json
 
-    if strategy is None or symbol is None or len(df) == 0:
+    if strategy is None or symbol is None:
         return
+    # df may be empty (zero-row filter) but skips may still exist for
+    # the selected cell — don't early-return on len(df)==0 alone.
 
     sel = st.session_state.get("mp_heatmap_selected_cell")
     st.markdown("---")
@@ -521,6 +531,17 @@ def render_cell_drilldown(
         & (df["exit_offset_td"] == exit_td)
     ].copy().sort_values("expiry").reset_index(drop=True)
 
+    # Skips matching the same cell — surface even if 0 priced trades.
+    if skips_df is not None and len(skips_df) > 0:
+        cell_skips = skips_df[
+            (skips_df["strategy"] == strategy)
+            & (skips_df["symbol"] == symbol)
+            & (skips_df["entry_offset_td"] == entry_td)
+            & (skips_df["exit_offset_td"] == exit_td)
+        ].copy().sort_values("expiry").reset_index(drop=True)
+    else:
+        cell_skips = pd.DataFrame()
+
     hdr_l, hdr_r = st.columns([5, 1])
     with hdr_l:
         st.markdown(
@@ -532,11 +553,27 @@ def render_cell_drilldown(
             st.session_state.pop("mp_heatmap_selected_cell", None)
             st.rerun()
 
-    if len(rows) == 0:
+    if len(rows) == 0 and len(cell_skips) == 0:
         st.info(
-            f"No trades for (T-{entry_td}, T-{exit_td}) on {strategy} × "
-            f"{symbol} after current filters. Pick another cell."
+            f"No trades or skips for (T-{entry_td}, T-{exit_td}) on "
+            f"{strategy} × {symbol} after current filters. Pick another cell."
         )
+        return
+
+    # Honesty banner: priced vs skipped count, always shown.
+    n_priced = len(rows)
+    n_skipped = len(cell_skips)
+    if n_skipped > 0:
+        st.warning(
+            f"**{n_priced} priced + {n_skipped} skipped** for this cell. "
+            f"Aggregate metrics below reflect ONLY the {n_priced} priced "
+            f"trades — see the skipped-expiries section for which were "
+            f"dropped and why."
+        )
+
+    if len(rows) == 0:
+        # All expiries skipped — show only the skipped section + bail.
+        _render_skipped_section(cell_skips)
         return
 
     # ---- Summary stats row -----------------------------------
@@ -693,3 +730,46 @@ def render_cell_drilldown(
                     )
                 except (ValueError, TypeError):
                     st.warning("margin_breakdown_json malformed.")
+
+    # ---- Skipped expiries section (always shown if any) ----
+    if len(cell_skips) > 0:
+        _render_skipped_section(cell_skips)
+
+
+def _render_skipped_section(cell_skips: pd.DataFrame) -> None:
+    """List the expiries for which this cell was unpriceable, with
+    skip_reason and skip_detail (the original exception message).
+
+    Surfacing these in the UI is the honesty contract — the analyst
+    must be able to see WHICH expiries dropped and WHY, never just
+    silently shrunken N counts.
+    """
+    st.markdown("---")
+    st.markdown(
+        f"#### Skipped expiries — {len(cell_skips)} cell-trial(s) "
+        f"dropped before pricing"
+    )
+    st.caption(
+        "_Each row is an (expiry × entry × exit) cell-trial the engine "
+        "refused to price. The aggregate metrics ABOVE exclude these — "
+        "they're surfaced here so you know exactly what's missing._"
+    )
+    has_detail = "skip_detail" in cell_skips.columns
+    skip_table = pd.DataFrame({
+        "Expiry": cell_skips["expiry"].dt.strftime("%Y-%m-%d"),
+        "Reason": cell_skips["skip_reason"],
+        "Detail": (
+            cell_skips["skip_detail"].fillna("(no detail recorded — pre-skip-detail parquet)")
+            if has_detail else
+            pd.Series(["(no detail recorded — pre-skip-detail parquet)"] * len(cell_skips))
+        ),
+    })
+    st.dataframe(skip_table, use_container_width=True, hide_index=True)
+
+    # Grouped count by reason — quick "is this all the same reason
+    # or mixed?" view.
+    by_reason = cell_skips.groupby("skip_reason").size().reset_index(
+        name="count"
+    ).sort_values("count", ascending=False)
+    st.markdown("**Skip-reason breakdown for this cell**")
+    st.dataframe(by_reason, use_container_width=True, hide_index=True)

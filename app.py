@@ -252,7 +252,7 @@ def _render_per_stock_tab(df_filtered: pd.DataFrame) -> None:
     render_strategy_dashboard(df_filtered, symbol=symbol, min_n=min_n)
 
 
-def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
+def _render_heatmap_tab(df_filtered: pd.DataFrame, skips_df: pd.DataFrame) -> None:
     render_caveats(tab_id="heatmap")
     st.markdown("## Heatmap")
     min_n = int(st.session_state["mp_min_n"])
@@ -265,7 +265,7 @@ def _render_heatmap_tab(df_filtered: pd.DataFrame) -> None:
         df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
     )
     render_heatmap_drilldown(
-        df_filtered, strategy=strategy, symbol=symbol,
+        df_filtered, skips_df=skips_df, strategy=strategy, symbol=symbol,
     )
 
 
@@ -318,7 +318,7 @@ def main() -> None:
     with tabs[1]:
         _render_per_stock_tab(df_filtered)
     with tabs[2]:
-        _render_heatmap_tab(df_filtered)
+        _render_heatmap_tab(df_filtered, skips_df=skips_df)
     with tabs[3]:
         _render_trends_tab(df_filtered)
 
