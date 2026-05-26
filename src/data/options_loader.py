@@ -511,5 +511,11 @@ def load_option(
     fresh = _fetch_contract_lifetime(
         symbol, expiry, strike, option_type, today_fn
     )
-    cache.write(path, fresh, overwrite=force_refresh)
+    # overwrite=True is required for multi-worker safety: two workers
+    # can BOTH see cache-miss, BOTH fetch, then race to write. Without
+    # overwrite, the slower writer hits WouldOverwriteError and the
+    # sweep dies. Same data either way (deterministic fetch), so last-
+    # writer-wins is correct; cache.write's PID-unique tmp ensures the
+    # rename itself is atomic and non-conflicting.
+    cache.write(path, fresh, overwrite=True)
     return _filter_window(fresh, from_date, to_date)

@@ -321,5 +321,7 @@ def load_bhavcopy_fo(
     raw, fmt = _fetch_raw(trade_date)
     parser = parse_legacy if fmt == "legacy" else parse_udiff
     df = parser(raw, trade_date)
-    cache.write(path, df, overwrite=force_refresh)
+    # overwrite=True for multi-worker race safety (see options_loader.py
+    # cache-miss block for the full reasoning).
+    cache.write(path, df, overwrite=True)
     return df

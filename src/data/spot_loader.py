@@ -146,7 +146,9 @@ def _load_year(
             f"requested (offline=True or MORENSE_OFFLINE=1)"
         )
     fresh = _fetch_year(symbol, year, today_fn)
-    cache.write(path, fresh, overwrite=force_refresh)
+    # overwrite=True for multi-worker race safety (see options_loader.py
+    # cache-miss block for the full reasoning).
+    cache.write(path, fresh, overwrite=True)
     return fresh
 
 
