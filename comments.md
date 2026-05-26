@@ -10777,3 +10777,96 @@ Per the commit body's planned arc:
 After that arc closes: dead-code cleanup of `_capture_cell_selection_from_click`, Compare-cells impl with REVIEWER CONSTRAINTS baked in as failing tests, then the actual live-run validation against the new 41-symbol universe.
 
 ---
+
+## Review: 73224c5 — feat(p7.expiry_roi): leaderboard + rank metric switch
+
+**Verdict: ✅ ACCEPT** — same display-only refactor pattern as b1b50ec, applied to leaderboard. Tests + docstrings updated coherently. One real new grill specific to the leaderboard's role (ranking semantics across hold periods).
+
+### Continuation of the b1b50ec arc
+
+Same pattern: display layer reads per-trade ROI now, parquet schema unchanged. `DEFAULT_RANK_METRIC: "median_roi_pct_annualized" → "median_roi_pct"`. Test renamed honestly (`test_default_rank_metric_is_annualized_median` → `test_default_rank_metric_is_per_trade_median`). 551/551 still passing.
+
+The escape hatch is preserved: operator can pass `by="median_roi_pct_annualized"` directly to `rank_strategies` for the annualized view.
+
+### 🔬 Grill #1 (real, NEW): the leaderboard's ranking semantic just shifted in a way the operator may not have considered
+
+In b1b50ec the per-trade-ROI shift was for DISPLAY in the heatmap — the operator sees the number, but the sort order within a single (strategy, symbol) hasn't fundamentally changed (all cells in one heatmap share comparisons within the same axes).
+
+**For the LEADERBOARD it's different.** Leaderboard ranks ACROSS (strategy, symbol, entry, exit) combinations — cells with DIFFERENT hold periods compete for top spots. With per-trade ROI as the default rank metric:
+
+- Cell A: (T-60, T-1) = 59-day hold, per-trade ROI = 8%. Annualized ≈ 50%.
+- Cell B: (T-3, T-1) = 2-day hold, per-trade ROI = 1%. Annualized ≈ 182%.
+
+Per-trade ranking puts A above B. **Annualized ranking puts B above A by 3.6×.** Which is "better"? Depends on framing:
+- Capital-turnover lens: B's capital recycles 30× faster → 30× the trade opportunities per year → much better realized returns if you can scale executions.
+- Per-deployment lens: A returns more per trade → simpler operationally, fewer trades to manage.
+
+**The default ranking just shifted from "capital efficiency" to "per-trade payoff". Different operators will prefer different metrics; the change wasn't framed as a trade-off in the commit body.**
+
+The operator's preference was per-trade ROI for the HEATMAP (where the unit annoyance was concrete). Applying that same preference to the LEADERBOARD's rank metric is a separate decision with different implications. **I'm not sure the operator considered this.**
+
+**Recommendation**:
+- Confirm with the operator that ranking by per-trade ROI (default) is the desired leaderboard behavior, not just inherited from the heatmap-display preference.
+- If yes: surface a caveat under the leaderboard. "_Ranked by per-trade ROI (not annualized). Cells with longer holds appear higher; for capital-efficiency comparison, switch to annualized rank._"
+- If no: keep DEFAULT_RANK_METRIC as `median_roi_pct_annualized` for leaderboard ONLY, while heatmap continues showing per-trade.
+
+This is a real design grill — not a bug, but a default-choice question worth surfacing before the leaderboard becomes operator-facing in real sessions.
+
+### 🔬 Grill #2 (carry-over): cross-tab inconsistency persists, now 2/4
+
+After this commit:
+- ✓ Heatmap: per-trade ROI
+- ✓ Leaderboard: per-trade ROI
+- ✗ Per_stock: annualized
+- ✗ Trends: annualized
+
+2 tabs flipped, 2 to go. Same cross-tab confusion as b1b50ec's grill #2. **The BUILDER chose to not bundle per my b1b50ec recommendation.** Defensible — each tab has its own test surface and reviewability scope — but it does mean operators have a window where heatmap+leaderboard speak one unit and per_stock+trends speak another.
+
+Per my b1b50ec recommendation: either bundle the remaining two as ONE atomic commit, OR add temp banners. Not pushing harder on this; the per_stock + trends commits should presumably follow shortly.
+
+### What's good
+
+- **Test rename `test_default_rank_metric_is_annualized_median` → `test_default_rank_metric_is_per_trade_median`** is the right honesty pattern: tests describe behavior, behavior changed, test name should change too. Some projects keep test names "stable" for grep history — this project's pattern (rename to match) is better for current-state readability.
+- **`_trade` fixture in test_rank.py keeps `roi_pct_annualized`** as an INPUT column even though the leaderboard doesn't read its aggregate. The commit body's "aggregate function still requires it as an INPUT column even though the leaderboard UI doesn't read its aggregates" — that's the right separation. Aggregates compute both columns; display picks one. ✓
+- **Docstring updated**: the comment on `DEFAULT_RANK_METRIC` no longer says "annualized so cells with different hold lengths are comparable per SPECS §4a caveat #2" — the SPECS reference was removed because it no longer applies. Honest cleanup. (But — see grill #1 — the SPECS §4a caveat #2 reasoning is STILL operationally relevant; just not enforced by the default anymore.)
+
+### What I'd actually like to see in the next commit
+
+The "right" recalibration to handle grill #1 isn't necessarily reverting; it's making the leaderboard surface BOTH columns side-by-side. A two-column "Per-trade / Annualized" view lets the operator compare at a glance without switching the rank metric.
+
+**Pattern**:
+```
+| Rank | Strategy   | Symbol   | Per-trade | Annualized | N  | ... |
+|  1   | s_straddle | RELIANCE |  4.5%     |   58%      | 23 |     |
+|  2   | s_strangle | INFY     |  3.2%     |   84%      | 24 |     |
+```
+
+The ROW ORDER is per-trade (default per operator preference) but the operator sees the annualized column right next to it — no mental annualization required. **Cosmetic but powerful**: dual-display preserves the operator's choice AND surfaces the trade-off.
+
+Could land as `feat(p7.leaderboard.dual_roi_columns)` after per_stock+trends switches.
+
+### What I tried
+
+- Worked through the (T-60, T-1) vs (T-3, T-1) scenario above to confirm the ranking flip is real and meaningful.
+- Verified `_trade` fixture in test_rank.py still provides `roi_pct_annualized` per the commit's note about aggregate-INPUT requirements.
+- Cross-referenced docstring update: SPECS §4a caveat #2 reference removed — the reasoning still holds operationally but no longer drives the default.
+
+### Carry-over open items
+
+- 🔬 **Per_stock + trends ROI switch** — 2 tabs remaining.
+- 🔬 **Observations heavy-tail threshold recalibration** — still pending.
+- 🔬 **Confirm operator preference applies to leaderboard ranking** (grill #1 above) — explicit confirmation worth getting.
+- 🔬 **Dead-code `_capture_cell_selection_from_click`** — still pending.
+
+### Next-commit suggestion
+
+Per the BUILDER's stated arc:
+1. Per_stock switch.
+2. Trends switch.
+3. Observations threshold recalibration.
+
+Then operator-confirmation on grill #1 (or land the dual-column leaderboard idea above) before declaring the per-trade-ROI arc complete.
+
+The 5-7 hour prefetch run is still consuming bandwidth, so small focused commits like this one are the right rhythm.
+
+---
