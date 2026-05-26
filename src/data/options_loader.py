@@ -33,8 +33,17 @@ from typing import Callable, Literal
 import pandas as pd
 import requests
 
+import functools
+
 from src.data import cache
 from src.data.errors import MissingDataError, OfflineCacheMiss, OptionsFormatError
+
+
+# Per-process LRU cache size for the full contract-lifetime read.
+# Wide sweep touches ~6,240 contracts (10 syms × 13 strikes × 2 types ×
+# ~24 expiries). maxsize=2048 keeps a working-set per worker without
+# exhausting memory: 8 workers × 2048 × ~50KB ≈ ~800 MB worst-case.
+_LRU_MAXSIZE_OPTIONS = 2048
 from src.data.offline import effective_offline
 from src.data.telemetry import warn_fetch
 
@@ -415,6 +424,94 @@ def _filter_window(df: pd.DataFrame, from_date: date, to_date: date) -> pd.DataF
     return df.loc[mask].reset_index(drop=True)
 
 
+@functools.lru_cache(maxsize=_LRU_MAXSIZE_OPTIONS)
+def _load_full_contract_cached(
+    symbol: str, expiry_iso: str, strike: float, option_type: str,
+    today_iso: str, offline: bool,
+) -> pd.DataFrame:
+    """Per-worker memoization of the full contract lifetime read
+    (post any open-expiry staleness refetch). ``load_option`` calls
+    this then applies the ``[from_date, to_date]`` window filter.
+
+    The 600-pair × 24-expiry × 3-strategy sweep redundantly re-reads
+    the same contract parquet ~600× per (sym, exp, strike, type) tuple
+    without this cache; with it, that drops to 1× per worker (cache
+    fill) + 599× memory hits.
+
+    Cache key includes ``today_iso`` so an open-expiry staleness
+    refresh on a later day's run doesn't return stale data; ``offline``
+    is keyed because it changes the branch behavior."""
+    today = date.fromisoformat(today_iso)
+    expiry = date.fromisoformat(expiry_iso)
+    today_fn = lambda: today
+    return _load_full_contract_impl(
+        symbol, expiry, strike, option_type, today_fn, offline,
+    )
+
+
+def _load_full_contract_impl(
+    symbol: str, expiry: date, strike: float, option_type: str,
+    today_fn: Callable[[], date], offline: bool,
+    *, force_refresh: bool = False,
+) -> pd.DataFrame:
+    """Underlying cache-then-fetch + open-expiry staleness logic. Kept
+    separate from the LRU wrapper so ``force_refresh=True`` and tests
+    can call it directly without polluting the cache."""
+    path = cache.option_path(symbol, expiry, strike, option_type)
+    today = today_fn()
+    is_closed = expiry < today
+    has_cache = cache.exists(path) and not force_refresh
+
+    if has_cache:
+        cached = cache.read(path)
+        if is_closed:
+            return cached
+        max_cached = (
+            cached["date"].max().date() if not cached.empty else None
+        )
+        deadline = min(today, expiry)
+        if max_cached is not None and max_cached >= deadline:
+            return cached
+        if offline:
+            return cached
+        try:
+            fresh = _fetch_contract_lifetime(
+                symbol, expiry, strike, option_type, today_fn
+            )
+        except MissingDataError:
+            return cached
+        cached_dates = set(cached["date"].tolist())
+        fresh_dates = set(fresh["date"].tolist())
+        if not cached_dates.issubset(fresh_dates):
+            missing = sorted(cached_dates - fresh_dates)
+            warnings.warn(
+                f"partial NSE response for {symbol.upper()} {expiry} "
+                f"{int(strike)}-{option_type}: fresh fetch missing "
+                f"{len(missing)} dates that exist in cache "
+                f"(first 3: {[str(d) for d in missing[:3]]}). Keeping cache.",
+                stacklevel=3,
+            )
+            return cached
+        cache.write(path, fresh, overwrite=True)
+        return fresh
+
+    # Cache miss
+    if offline:
+        raise OfflineCacheMiss(
+            f"option {symbol.upper()} {expiry} {int(strike)}-{option_type} "
+            f"not in cache and offline mode requested "
+            f"(offline=True or MORENSE_OFFLINE=1)"
+        )
+    fresh = _fetch_contract_lifetime(
+        symbol, expiry, strike, option_type, today_fn
+    )
+    # overwrite=True is required for multi-worker safety (see commit
+    # 8419a8c). cache.write's PID-unique tmp ensures atomic, race-safe
+    # rename even when two workers fetch the same missing contract.
+    cache.write(path, fresh, overwrite=True)
+    return fresh
+
+
 def load_option(
     symbol: str,
     expiry: date,
@@ -445,6 +542,11 @@ def load_option(
         TypeError: ``expiry`` is a ``datetime``.
         MissingDataError: contract has no data on NSE.
         cache.StrikeNotIntegerError: ``strike`` has a fractional part.
+
+    Hot-path memoization: under ``force_refresh=False`` (the default),
+    the full-contract read goes through ``_load_full_contract_cached``;
+    repeated calls within a worker for the same (sym, exp, strike, type)
+    skip disk entirely after the first.
     """
     if isinstance(expiry, datetime):
         raise TypeError(
@@ -457,65 +559,16 @@ def load_option(
     if option_type not in ("CE", "PE"):
         raise ValueError(f"option_type must be 'CE' or 'PE', got {option_type!r}")
 
-    offline = effective_offline(offline)
-    path = cache.option_path(symbol, expiry, strike, option_type)
-    today = today_fn()
-    is_closed = expiry < today
-    has_cache = cache.exists(path)
-
-    if has_cache and not force_refresh:
-        cached = cache.read(path)
-        if is_closed:
-            return _filter_window(cached, from_date, to_date)
-        # Open expiry: refetch only when cache is stale relative to today
-        max_cached = (
-            cached["date"].max().date() if not cached.empty else None
+    offline_eff = effective_offline(offline)
+    if force_refresh:
+        full = _load_full_contract_impl(
+            symbol, expiry, strike, option_type, today_fn, offline_eff,
+            force_refresh=True,
         )
-        deadline = min(today, expiry)
-        if max_cached is not None and max_cached >= deadline:
-            return _filter_window(cached, from_date, to_date)
-        # Want to refetch — but offline says no network. Return stale cache
-        # rather than raising; for an open expiry that just means "we're
-        # showing yesterday's prices, not today's", which is fine.
-        if offline:
-            return _filter_window(cached, from_date, to_date)
-        try:
-            fresh = _fetch_contract_lifetime(
-                symbol, expiry, strike, option_type, today_fn
-            )
-        except MissingDataError:
-            # Fresh fetch came back empty (contract de-listed?). Keep cache.
-            return _filter_window(cached, from_date, to_date)
-        cached_dates = set(cached["date"].tolist())
-        fresh_dates = set(fresh["date"].tolist())
-        if not cached_dates.issubset(fresh_dates):
-            missing = sorted(cached_dates - fresh_dates)
-            warnings.warn(
-                f"partial NSE response for {symbol.upper()} {expiry} "
-                f"{int(strike)}-{option_type}: fresh fetch missing "
-                f"{len(missing)} dates that exist in cache "
-                f"(first 3: {[str(d) for d in missing[:3]]}). Keeping cache.",
-                stacklevel=3,
-            )
-            return _filter_window(cached, from_date, to_date)
-        cache.write(path, fresh, overwrite=True)
-        return _filter_window(fresh, from_date, to_date)
-
-    # Cache miss OR force_refresh
-    if offline:
-        raise OfflineCacheMiss(
-            f"option {symbol.upper()} {expiry} {int(strike)}-{option_type} "
-            f"not in cache and offline mode requested "
-            f"(offline=True or MORENSE_OFFLINE=1)"
+    else:
+        today_iso = today_fn().isoformat()
+        full = _load_full_contract_cached(
+            symbol.upper(), expiry.isoformat(), float(strike), option_type,
+            today_iso, offline_eff,
         )
-    fresh = _fetch_contract_lifetime(
-        symbol, expiry, strike, option_type, today_fn
-    )
-    # overwrite=True is required for multi-worker safety: two workers
-    # can BOTH see cache-miss, BOTH fetch, then race to write. Without
-    # overwrite, the slower writer hits WouldOverwriteError and the
-    # sweep dies. Same data either way (deterministic fetch), so last-
-    # writer-wins is correct; cache.write's PID-unique tmp ensures the
-    # rename itself is atomic and non-conflicting.
-    cache.write(path, fresh, overwrite=True)
-    return _filter_window(fresh, from_date, to_date)
+    return _filter_window(full, from_date, to_date)

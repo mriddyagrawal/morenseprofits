@@ -21,6 +21,7 @@ Schema: SPECS §2.1.
 """
 from __future__ import annotations
 
+import functools
 import warnings
 from datetime import date
 from typing import Callable
@@ -33,6 +34,13 @@ from src.data import cache
 from src.data.errors import OfflineCacheMiss
 from src.data.offline import effective_offline
 from src.data.telemetry import warn_fetch
+
+
+# Per-process LRU cache size for the year-keyed parquet read.
+# 10 universe symbols × 3 years = 30 entries; 32 leaves headroom.
+# Each entry is ~250 rows × 10 cols ≈ ~25KB — 8 workers × 32 × 25KB ≈ 6 MB
+# worst-case across the pool. Negligible.
+_LRU_MAXSIZE_YEAR = 32
 
 
 # jugaad column -> SPECS §2.1 column
@@ -152,6 +160,26 @@ def _load_year(
     return fresh
 
 
+@functools.lru_cache(maxsize=_LRU_MAXSIZE_YEAR)
+def _load_year_cached(
+    symbol: str, year: int, today_iso: str, offline: bool,
+) -> pd.DataFrame:
+    """Per-worker memoization of ``_load_year`` for the (overwhelmingly
+    common) ``force_refresh=False`` path. Key includes ``today_iso`` so
+    a date roll mid-sweep invalidates the cache for open-year entries.
+
+    Returns the SAME DataFrame object on cache hit — ``load_spot``
+    callers do ``.loc[mask].reset_index(drop=True)`` which creates a
+    new frame, so the cached value is read-only in practice."""
+    today = date.fromisoformat(today_iso)
+    return _load_year(
+        symbol, year,
+        force_refresh=False,
+        today_fn=lambda: today,
+        offline=offline,
+    )
+
+
 def load_spot(
     symbol: str,
     from_date: date,
@@ -166,15 +194,30 @@ def load_spot(
 
     `offline=True` (or env MORENSE_OFFLINE=1): cache miss raises
     OfflineCacheMiss; never touches network. Takes precedence over
-    force_refresh."""
+    force_refresh.
+
+    Hot-path memoization: ``force_refresh=False`` (the default) goes
+    through ``_load_year_cached`` so repeated calls within the same
+    process for the same (symbol, year) skip disk entirely after the
+    first load. Sweeps that touch the same year hundreds of thousands
+    of times see ~3-4 orders of magnitude fewer parquet reads.
+    ``force_refresh=True`` always bypasses the cache.
+    """
     if from_date > to_date:
         raise ValueError(f"from_date {from_date} > to_date {to_date}")
     offline = effective_offline(offline)
     years = range(from_date.year, to_date.year + 1)
-    parts = [
-        _load_year(symbol, y, force_refresh=force_refresh, today_fn=today_fn, offline=offline)
-        for y in years
-    ]
+    if force_refresh:
+        parts = [
+            _load_year(symbol, y, force_refresh=True, today_fn=today_fn, offline=offline)
+            for y in years
+        ]
+    else:
+        today_iso = today_fn().isoformat()
+        parts = [
+            _load_year_cached(symbol, y, today_iso, offline)
+            for y in years
+        ]
     full = pd.concat(parts, ignore_index=True)
     mask = (full["date"] >= pd.Timestamp(from_date)) & (
         full["date"] <= pd.Timestamp(to_date)

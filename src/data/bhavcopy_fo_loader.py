@@ -23,6 +23,7 @@ day, or jugaad's date arithmetic drifts).
 """
 from __future__ import annotations
 
+import functools
 import io
 import warnings
 import zipfile
@@ -38,6 +39,14 @@ from src.data import cache
 from src.data.errors import BhavcopyFormatError, MissingDataError, OfflineCacheMiss
 from src.data.offline import effective_offline
 from src.data.telemetry import warn_fetch
+
+
+# Per-process LRU cache size for the per-date bhavcopy parquet read.
+# Wide sweeps touch ~500 trading dates × 8 workers = 4k cache fills max;
+# maxsize=512 holds a few months of recent dates per worker.
+# Each entry is ~1-2 MB → ~512 × 1.5 MB ≈ ~0.75 GB per worker worst-case.
+# Across 8 workers that's ~6 GB — fits comfortably on a 32+ GB host.
+_LRU_MAXSIZE_BHAVCOPY = 512
 
 
 # Match the discovered post-Jul-8 archive URL pattern (verified live on 4
@@ -292,6 +301,36 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
 # Public entry point
 # ============================================================
 
+@functools.lru_cache(maxsize=_LRU_MAXSIZE_BHAVCOPY)
+def _load_bhavcopy_fo_cached(trade_date_iso: str, offline: bool) -> pd.DataFrame:
+    """Per-worker memoization of ``load_bhavcopy_fo`` for the
+    ``force_refresh=False`` path. Bhavcopies are immutable historical
+    data so no today_iso key is needed — cache lifetime = worker
+    lifetime is correct."""
+    trade_date = date.fromisoformat(trade_date_iso)
+    return _load_bhavcopy_fo_impl(trade_date, offline=offline)
+
+
+def _load_bhavcopy_fo_impl(trade_date: date, *, offline: bool) -> pd.DataFrame:
+    """Underlying cache-then-fetch logic; kept separate from the LRU
+    wrapper so force_refresh can call it directly."""
+    path = cache.bhavcopy_fo_path(trade_date)
+    if cache.exists(path):
+        return cache.read(path)
+    if offline:
+        raise OfflineCacheMiss(
+            f"bhavcopy_fo for {trade_date} not in cache and offline mode "
+            f"requested (offline=True or MORENSE_OFFLINE=1)"
+        )
+    raw, fmt = _fetch_raw(trade_date)
+    parser = parse_legacy if fmt == "legacy" else parse_udiff
+    df = parser(raw, trade_date)
+    # overwrite=True for multi-worker race safety (see options_loader.py
+    # cache-miss block for the full reasoning).
+    cache.write(path, df, overwrite=True)
+    return df
+
+
 def load_bhavcopy_fo(
     trade_date: date,
     *,
@@ -308,20 +347,22 @@ def load_bhavcopy_fo(
     force_refresh.
 
     Mirrors ``spot_loader.load_spot``'s ``force_refresh`` semantics.
+    Hot-path memoization (``_load_bhavcopy_fo_cached``) skips disk for
+    repeat dates within the same worker — wide sweeps that touch each
+    bhavcopy ~30× drop to 1× post-warm.
     """
     offline = effective_offline(offline)
-    path = cache.bhavcopy_fo_path(trade_date)
-    if cache.exists(path) and not force_refresh:
-        return cache.read(path)
-    if offline:
-        raise OfflineCacheMiss(
-            f"bhavcopy_fo for {trade_date} not in cache and offline mode "
-            f"requested (offline=True or MORENSE_OFFLINE=1)"
-        )
-    raw, fmt = _fetch_raw(trade_date)
-    parser = parse_legacy if fmt == "legacy" else parse_udiff
-    df = parser(raw, trade_date)
-    # overwrite=True for multi-worker race safety (see options_loader.py
-    # cache-miss block for the full reasoning).
-    cache.write(path, df, overwrite=True)
-    return df
+    if force_refresh:
+        # Bypass LRU; fetch+write unconditionally.
+        path = cache.bhavcopy_fo_path(trade_date)
+        if offline:
+            raise OfflineCacheMiss(
+                f"bhavcopy_fo for {trade_date} not in cache and offline mode "
+                f"requested (offline=True or MORENSE_OFFLINE=1)"
+            )
+        raw, fmt = _fetch_raw(trade_date)
+        parser = parse_legacy if fmt == "legacy" else parse_udiff
+        df = parser(raw, trade_date)
+        cache.write(path, df, overwrite=True)
+        return df
+    return _load_bhavcopy_fo_cached(trade_date.isoformat(), offline)
