@@ -8175,3 +8175,122 @@ The user's "the sweep is too slow" diagnosis was understated by a factor of 100.
 The other reviewer was right that I overreached on 7ce07f9. **But the underlying concern — "does cache_only actually work?" — was real, just expressed wrong.** The right framing was "this needs a regression test pinning that offline propagates through the price_trade chain" (their valid grill #4). I framed it as "abandonment of defensive layer" which obscured the actual gap. **Calibration lesson: when grilling, lead with the SPECIFIC verifiable claim ("does X actually reach Y?") not the abstract architectural concern ("are we accepting silent skips?").**
 
 ---
+
+## Review: 9a8cd7a — docs: PLAN change-log + SPECS §6a cache_only carve-out, prefetch redesign plan
+
+**Verdict: ✅ ACCEPT** — closes my SPECS §6a doc-drift grill from the 7ce07f9 review (#2 there). Three grills on the prefetch-redesign change-log entries that should be settled BEFORE the next 3 atomic commits land.
+
+### What this commit changes
+
+Docs only. Two files:
+- [SPECS.md](SPECS.md) §6a gains one paragraph: the "Exception — `sweep_grid(cache_only=True)`" clause naming `_SKIPPABLE_ERRORS_CACHE_ONLY`, noting the default loud-fail contract is preserved, and pointing operators at `skip_reason` + `skip_detail` in the skip-log parquet.
+- [PLAN.md](PLAN.md) adds three 2026-05-26 change-log entries: (1) the cache_only carve-out itself + the e560ee7 plumb-through fix, (2) the prefetch daily-union strike-window redesign plan, (3) the prefetch parallelism plan.
+
+### Where the diagnosis numbers check out
+
+User's wide-sweep ran 333,165 priced / 116,835 skipped = 26.0% skip. Skip breakdown: 107,622 OfflineCacheMiss + 9,213 MissingDataError. **107,622 / 116,835 = 92.12%** of skips are OfflineCacheMiss. PLAN says "~92% of skips = `OfflineCacheMiss`". ✓ Matches.
+
+The "~1000 cells/sec" post-plumb-through claim matches the user's 1007 cells/sec observation. ✓
+
+### SPECS §6a wording — actually good
+
+The new paragraph is more precise than my own draft would have been:
+- Names the constant (`_SKIPPABLE_ERRORS_CACHE_ONLY`) so a grep from the test side finds the contract.
+- Operational justification ("a 450k-cell sweep would otherwise abort the moment any one strike is absent") that makes the trade-off concrete.
+- Closes the asymmetry by explicitly saying the default `_SKIPPABLE_ERRORS` preserves loud-fail for direct `load_option` callers — i.e. the exception is scoped to one entry point.
+- Points the analyst at the skip-log surfacing as the honest accountability mechanism.
+
+If anything, the wording is slightly stronger than what I had asked for. **Doc drift grill closed.**
+
+### Grills on the prefetch-redesign change-log entries
+
+These don't block the docs commit — but they're claims about the NEXT three commits, and ambiguity here propagates into implementation drift.
+
+#### 🔬 Grill #1 (real): `max(N strikes per side, X% range)` — X is literally written "X"
+
+The change-log says:
+
+> Strike-window helper uses `max(N strikes per side, X% range)` so the rule self-adapts to symbols with wider spacing (indices) without manual per-symbol tuning.
+
+**X is undefined.** That's not a typo — it's a "TBD" written as a literal. The next commit will need a number. What value, and based on what?
+
+Two interpretations, with very different implications:
+- **Reading A**: X is a FLOOR for narrow-spacing symbols (e.g. RELIANCE at ₹3000 with ₹50 strikes — ±6 strikes = ±10% range, which seems fine; but BAJFINANCE at ₹7500 with ₹100 strikes — ±6 = ±8% range). If X=5%, this barely binds. If X=15%, you'd cache 12+ extra strikes on most symbols.
+- **Reading B**: X is the OPERATIVE rule and N is the floor (the opposite). For indices like BANKNIFTY where strikes might be ₹100 apart on a ₹50,000 underlying, ±6 strikes = ±1.2% — likely too tight even without spot drift. X=5% would force ±25 strikes.
+
+The diagnosis says spot drift of 10%+ across the entry window is the culprit. So X needs to be ≥10% to handle drift even without the daily-union scan. **With the daily-union scan, drift is handled directly by the per-day picker, so X mostly matters at the edges.** But the change-log doesn't say which interpretation governs.
+
+**Recommendation**: write the X value into the change-log entry now (e.g. "X=10% based on observed entry-window spot drift; revisit after one wide-sweep validates skip rate <5%"). Otherwise the next commit will improvise it and the rationale won't be recorded.
+
+#### 🔬 Grill #2 (real): single-threaded ~18-20 hr estimate is ~2× too pessimistic
+
+The change-log says:
+
+> Single-threaded prefetch was ~3 hr for the 6,240-contract universe; with the daily-union design pushing contract count to ~20k, single-thread is ~18-20 hr.
+
+Linear scaling: 3 hr × (20k / 6.24k) = **~9.6 hr**, not 18-20 hr. Where does the extra 2× come from?
+
+Possibilities:
+- Per-contract cost is higher in the daily-union design (more bhavcopy lookups for strike-picker? But bhavcopy is cached.)
+- Contract count is actually ~40k, not 20k.
+- The ~3 hr number was for a partial run, not the full universe.
+- They built in a 2× safety margin to motivate parallelism.
+
+**Recommendation**: state the basis explicitly in the change-log. "X hr per contract × Y contracts" beats "~18-20 hr" because the latter compounds future hand-wave estimates. If the safety margin is intentional, say so.
+
+This isn't a blocker — the conclusion (need parallelism) is right regardless — but it's the kind of estimate that gets cited later as if it were measured.
+
+#### 🔬 Grill #3 (real): "2 workers first, then escalate" — escalation criterion undefined
+
+The change-log says:
+
+> Tested at 2 workers first (since 8 workers tripped NSE WAF during the sweep) before promoting to higher counts.
+
+**What's the promotion criterion?** Three implicit options:
+- (a) "If 2 workers complete N contracts without HTTP 4xx/5xx, try 4."
+- (b) "2 workers is the permanent ceiling for prefetch; only sweep_grid gets 8."
+- (c) "Manually escalate based on operator vibes."
+
+The 8-worker WAF trip during the sweep was via `load_option` calls (read history of one contract). Prefetch is the SAME endpoint, so the WAF behavior should be identical. Worker count is just `n_workers × (1/sleep_s) = aggregate req/sec`. **At 2 workers × 0.5s sleep = 4 req/sec. At 4 workers × 0.5s = 8 req/sec. At 8 workers × 0.5s = 16 req/sec.**
+
+The sweep tripped at 16 req/sec. So:
+- 4 workers (8 req/sec) is the next safe step.
+- 8 workers (16 req/sec) is the known-bad ceiling.
+- 6 workers (12 req/sec) is probably the sweet spot.
+
+**Recommendation**: pin the escalation ladder in the change-log: 2 → 4 → 6, stop at first sign of WAF block. And: log HTTP status codes from `_direct_derivatives_df` so the "WAF block" signal is detectable, not inferred from elapsed wall-clock.
+
+#### Nit: the "X strikes-per-side = 1, 150 contracts" test command
+
+Test command:
+
+> `--symbols RELIANCE --strikes-per-side 1 --no-bulk-bhavcopies --workers 2` for a 150-contract subset.
+
+1 strike per side = 3 strikes × 2 option-types × 25 expiries × 1 symbol = **150 contracts**. ✓ Math checks.
+
+But: `--strikes-per-side 1` is a degenerate case that **bypasses the X% rule entirely** — N=1 strike is so tight no symbol would hit the X% floor. The test command verifies the parallelism plumbing but **does not exercise the X% strike-window helper**. If the X% rule has a bug (off-by-one, wrong sign, wrong reference price), this test won't catch it. Want a second test command at `--strikes-per-side 6` against a wider-spaced symbol (BAJFINANCE or RELIANCE) to actually exercise the helper.
+
+### Carry-over open items (unchanged by this commit)
+
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now 23 commits pre-tag. This commit was the obvious place to bundle it (docs touch only, atomic).
+- 🔬 **`test_sweep_grid_cache_only_mode`** regression test still owed from my 7ce07f9 grill #4. The other reviewer correctly identified this as a real gap (vs my "abandonment of defensive layer" framing). Now that SPECS §6a is amended, the test can pin both: (a) `OfflineCacheMiss` becomes a skip in cache_only mode, (b) `OfflineCacheMiss` remains a raise in default mode. **The test should land BEFORE the prefetch redesign**, because the redesign will likely depend on cache_only semantics holding.
+
+### What I tried
+
+- Confirmed numbers (92% OCM, 26% skip rate, 1007 cells/sec) match the user's wide-sweep run.
+- Checked SPECS §6a wording for asymmetry: "default `_SKIPPABLE_ERRORS` (used by direct `load_option` callers and `cache_only=False` sweeps) preserves the loud-fail contract" — clean.
+- Math-checked the 150-contract test command (3 × 2 × 25 × 1 = 150 ✓).
+- Math-checked the 18-20 hr estimate against linear scaling — diverges by ~2×.
+
+### Next-commit suggestion
+
+The commit body says "the next 3 atomic commits" will follow this docs commit. From the change-log entries, those are:
+1. Strike-window helper (`max(N, X%)`) + per-day strike-picker integration.
+2. Daily-union scan over `[expiry−45 TD, expiry−1 TD]`.
+3. Prefetch parallelism (`--workers N`).
+
+**My suggestion**: insert `test_sweep_grid_cache_only_mode` as commit (0) before this trio, OR bundle it into commit (1). The test is small, the contract is now documented, and any future change to cache_only semantics needs a pin to detect drift. Also: **resolve grill #1 (X value) in commit (1)'s body** so the rationale is captured at landing, not improvised later.
+
+Alternative: **bundle this docs commit's prefetch entries with `chore(p6.5.tag)`** — the tag is overdue and the docs are a natural pause point.
+
+---
