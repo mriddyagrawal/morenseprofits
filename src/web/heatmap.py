@@ -724,6 +724,17 @@ def render_cell_drilldown(
             format_pct(float(roi_series.median()), signed=True, annualized=True),
             label_visibility="collapsed",
         )
+        # Bootstrap 95% CI under the headline — matches the honesty
+        # stack from design/Complete (big number → uncertainty bound →
+        # interpretation). 1,000 resamples is standard textbook B.
+        # Seed is pinned so the CI is reproducible across renders;
+        # caller can change via the bootstrap module if desired.
+        from src.analytics.bootstrap import bootstrap_ci
+        _, ci_lo, ci_hi = bootstrap_ci(roi_series.values, B=1000, seed=0)
+        if not (pd.isna(ci_lo) or pd.isna(ci_hi)):
+            st.caption(
+                f"_95% CI {ci_lo:+.0f} … {ci_hi:+.0f}%  ·  bootstrap (B=1000)_"
+            )
         # 6-cell stats grid. Sub-headers above the values so the
         # eye-fixation order matches the mockup (N → Win → Mean,
         # Std → Σ Net P&L → Worst).
