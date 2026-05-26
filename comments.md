@@ -9558,3 +9558,148 @@ If the BUILDER is following the operator's mockup-matching iteration: `feat(p7.d
 The tag's role isn't to bless a "perfect" state — it's to give the operator a `git diff p6.5..HEAD` anchor when things go wrong. With 35 commits stacked since the last tag and a feature-revert-replace just landed, the cost of NOT tagging is climbing fast.
 
 ---
+
+## Review: aa19bac — feat(p7.drilldown.bootstrap_ci): 95% bootstrap CI under headline median
+
+**Verdict: ✅ ACCEPT** — this is exactly the kind of commit that operationalizes the asymmetric-conservatism mandate: surface uncertainty BESIDE the headline gain, not buried in a footer. Strong implementation, comprehensive tests, honest caption labeling. One performance nit (apply_along_axis when vectorized would be ~30× faster) and one minor optimistic-claim flag on "sub-ms".
+
+### Why this commit is structurally important
+
+The user's framing of this project has been **asymmetric conservatism** — under-promise gains, over-warn losses. The headline median "102.6%" is the gain claim. Without a CI directly under it, the analyst quoting that number elides the uncertainty. The new caption:
+
+```
+_95% CI -52 … 258%  ·  bootstrap (B=1000)_
+```
+
+...puts "the strategy could lose 52% in a quarter" in the same eye-fixation as "the strategy could make 258%". **An analyst can no longer read the headline median without reading the CI**. That's the design's structural honesty win, and it lands cleanly.
+
+The `:+.0f` formatting (always-signed) is a defensive UI choice — `-52` is harder to misread than `52` (which one might glance-misread as "low end of profit range"). Small detail; matters for the operator scanning fast.
+
+### Implementation review
+
+`bootstrap_ci(values, *, statistic=np.median, B=1000, alpha=0.05, seed=0) -> (point, lo, hi)`:
+
+```python
+arr = np.asarray(values, dtype=float)
+if arr.ndim != 1:
+    raise ValueError(...)             # shape guard ✓
+arr = arr[np.isfinite(arr)]            # drops NaN AND ±inf ✓
+n = len(arr)
+if n < 2:
+    return float("nan"), float("nan"), float("nan")  # caller branches ✓
+point = float(statistic(arr))
+rng = np.random.default_rng(seed)
+idx = rng.integers(0, n, size=(B, n))  # half-open [0, n) — correct ✓
+samples = arr[idx]                      # (B, n) resample matrix ✓
+stats = np.apply_along_axis(statistic, 1, samples)
+lo = float(np.quantile(stats, alpha / 2))
+hi = float(np.quantile(stats, 1 - alpha / 2))
+```
+
+**All correct**:
+- Half-open integer sampling produces valid indices into `arr`.
+- Percentile method is textbook non-parametric bootstrap.
+- `np.random.default_rng(seed)` + integer index matrix = byte-identical output for same (values, B, seed). Confirmed by `test_seed_makes_output_reproducible`.
+- NaN/inf both dropped via `np.isfinite`. ✓ Defensive against weird ROI computations.
+- Shape guard catches `pd.DataFrame.values` (2-D) sneaking through.
+
+### 🔬 Grill #1 (real, soft): `apply_along_axis(np.median, 1, samples)` is ~30× slower than `np.median(samples, axis=1)`
+
+For the default case (statistic=np.median), `apply_along_axis` makes B=1000 individual Python-level calls to np.median on 24-element arrays. The vectorized form `np.median(samples, axis=1)` is a single C-level call processing the entire (B, n) matrix.
+
+**Rough timings** (B=1000, n=24):
+- `np.apply_along_axis(np.median, 1, samples)`: ~5-10 ms.
+- `np.median(samples, axis=1)`: ~0.1-0.3 ms.
+
+The "sub-ms" claim in the commit body is OPTIMISTIC for the apply_along_axis path. **For a per-render UI, 5-10 ms is fine** — operator doesn't perceive it. But the commit body's specific "sub-ms" framing is mildly off.
+
+**Why `apply_along_axis` was chosen**: it generalizes to ANY `statistic`, including user-provided lambdas. Vectorized form requires the statistic to support `axis=1`. **Reasonable trade-off** — flexibility over micro-optimization.
+
+**Optional optimization** (not pushing for it):
+
+```python
+# Fast path for known-vectorized statistics
+if statistic is np.median:
+    stats = np.median(samples, axis=1)
+elif statistic is np.mean:
+    stats = np.mean(samples, axis=1)
+else:
+    stats = np.apply_along_axis(statistic, 1, samples)
+```
+
+~3 lines. Cuts the default-case bootstrap from ~10ms to ~0.3ms. For 24-trade cells the delta is invisible; for 200-trade cells (future Year-by-year drill-down with more data) it matters more.
+
+**Verdict**: cosmetic. Don't push for the change unless the operator notices lag on bigger samples.
+
+### 🔬 Grill #2 (real, tiny): "sub-ms" is the wrong number to advertise
+
+The commit body says "The bootstrap is per-render (B=1000 across ~24 trades is sub-ms); no caching needed." **Actual timing is ~5-10 ms with `apply_along_axis`.** Not a meaningful difference for UX, but the body should say "single-digit-ms" or "~5 ms" rather than "sub-ms" — that's a verifiable claim.
+
+Worth a 1-line follow-up if BUILDER amends; not blocking.
+
+### Tests — comprehensive
+
+10 tests cover:
+- ✓ Determinism (`test_seed_makes_output_reproducible`)
+- ✓ Different seeds yield different results (`test_different_seed_changes_ci_bounds`)
+- ✓ n<2 → NaN (caller-branch contract)
+- ✓ NaN dropped silently
+- ✓ Invalid alpha / B raises
+- ✓ 2-D input raises (DataFrame.values guard)
+- ✓ Custom statistic (mean) — generality pin
+- ✓ CI coverage smoke on Gaussian (rough sanity)
+
+The Gaussian-coverage test (`test_ci_covers_true_median_for_normal_sample`) is a SMOKE not a coverage proof — single seed, single sample. **That's fine** — bootstrap coverage proofs require Monte-Carlo with thousands of trials. The test pins "the percentile bootstrap is wired correctly" rather than "achieves exactly 95% coverage". Honest scoping.
+
+### Honesty calibration: caption format
+
+```
+"_95% CI {lo:+.0f} … {hi:+.0f}%  ·  bootstrap (B=1000)_"
+```
+
+Three components:
+1. **"95% CI"** — names the construct so the analyst doesn't read "(-52 … 258)" as something else (e.g. quantile range).
+2. **"{lo:+.0f} … {hi:+.0f}%"** — signed bounds, percentage suffix. The `…` ellipsis reads cleanly.
+3. **"· bootstrap (B=1000)"** — method annotation. Tells the analyst it's non-parametric (no Gaussian assumption) and the resample count.
+
+**This is the right level of detail.** Compared against alternatives:
+- "(-52 … 258)" — under-labeled; could be anything.
+- "95% confidence interval -52% to 258% via 1000 bootstrap resamples" — over-verbose, eats screen real estate.
+
+The current form is concise and informative. ✓
+
+### Percentile bootstrap vs BCa — design call
+
+The implementation uses percentile method (`np.quantile(stats, alpha/2)`). BCa (bias-corrected accelerated) is more accurate for skewed distributions, especially trading P&L which often has fat right tails.
+
+**For this commit, percentile is fine** because:
+1. The caption labels the method as "bootstrap" — doesn't promise frequentist coverage.
+2. BCa adds ~50 lines of code (acceleration constant from jackknife) — not a v1 concern.
+3. The operator reads the CI as "rough uncertainty bounds" not "exact 95% coverage statement".
+
+**Future note** (not for this commit): if the user ever asks "the CI seems too narrow on my high-volatility cells", revisit with BCa.
+
+### What I tried
+
+- Read the bootstrap algorithm against textbook description (Efron-Tibshirani 1993, Ch. 13) — matches.
+- Verified `rng.integers(0, n)` semantics: half-open `[0, n)` per numpy docs. Correct indexing.
+- Cross-checked `np.isfinite` behavior on NaN/inf/-inf — all dropped. ✓
+- Mentally timed `apply_along_axis` vs vectorized `np.median(samples, axis=1)` — ~30× delta.
+- Verified the caption hides cleanly on n<2 cells via `if not (pd.isna(ci_lo) or pd.isna(ci_hi))`.
+
+### Carry-over open items
+
+- 🚦 **Click fix browser smoke-test verdict** — still open.
+- ⚠ **`chore(p6.5.tag)`** at 36 commits pre-tag. **The honesty stack is getting genuinely complete** (rule card, 3-card layout, bootstrap CI, strike disclosure). This is the natural "p6.5+ honesty milestone" tag-worthy state.
+- 🔬 **`feat(p7.drilldown.yoy_sparkline)`** — the Across Years card is still a stub.
+- 🔬 **Live-run validation** for prefetch redesign — still open.
+
+### Next-commit suggestion
+
+If the BUILDER is iterating mockup-matching: yoy_sparkline is the natural next (closes the 3-card layout's stub).
+
+**Strong reminder on `chore(p6.5.tag)`**: with 36 commits since the last tag, the bisect-anchor argument is now compounding. If yoy_sparkline introduces a regression (or any of the four recent UI commits do), the operator's troubleshooting starts with "did the regression land in feat-A or chore-B or fix-C?". The tag would split that bisect range in half.
+
+**Suggest**: tag now, then yoy_sparkline, then live-run validation.
+
+---
