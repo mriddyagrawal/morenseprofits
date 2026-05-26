@@ -9211,3 +9211,107 @@ The Compare commit is the BIGGEST remaining design surface. **Strong recommendat
 For now: stay paused for the operator's browser smoke-test. The mode radio adds a new affordance the operator can test alongside the click fix.
 
 ---
+
+## Review: e51d566 — fix(p7.drilldown.sort): waterfall sort by ROI desc, not expiry
+
+**Verdict: ✅ ACCEPT** — minimal change (one `sort_values` call + title rewrite), real UX shift, defensible trade-off. The one grill: no test pins the new sort order.
+
+### The semantic change
+
+```python
+# Before:
+rows = df[...].copy().sort_values("expiry").reset_index(drop=True)
+
+# After:
+rows = df[...].copy().sort_values("roi_pct_annualized", ascending=False).reset_index(drop=True)
+```
+
+Reads the chart entirely differently:
+- **Old (chronological)**: "how did this rule perform over time" — noisy unless there's an obvious regime break.
+- **New (sorted desc)**: "what's the distribution shape" — left-heavy green = wins concentrated, right-tail red = losers, symmetry = noise.
+
+Commit body's framing is honest:
+
+> Trends tab elsewhere will give the operator chronological order; here in the drill-down, sorting by P&L is right per the design analysis: the drill-down's question is "what does this rule look like" not "how did it change over time".
+
+Two tabs, two questions. Trends owns "over time"; drill-down owns "distribution shape". ✓ Clean separation of concerns.
+
+### The defensive labeling catches the obvious misread
+
+The x-axis title now says **"Expiry (sorted by ROI/yr, not chronological)"**. Without this, an operator scanning the chart would naturally assume the x-axis is a time series (it's labeled "Expiry"). The parenthetical disclosure prevents that misread. ✓
+
+The chart title also got more informative:
+
+```
+Per-expiry ROI · 24 trades · sorted descending · 0% baseline · color = sign
+```
+
+Trade count + sort direction + baseline reference + color encoding — every disambiguation an operator might need, packed into one line. The `·` separators are unusual but legible. Slightly cluttered for some tastes; informative for others. ✓ Acceptable.
+
+### 🔬 Grill (real, single): no test pins the new sort order
+
+`grep -n "render_cell_drilldown" tests/` → zero hits. The drill-down function has **no tests at all**. The `521/521 pass` claim only means the sort change didn't break anything else.
+
+If a future refactor changes the sort key (e.g. to `total_pl_inr` instead of `roi_pct_annualized`, or accidentally back to `expiry`), nothing fails. The visual change would only be caught in a manual UI inspection.
+
+**Suggested minimal test** (~15 lines):
+
+```python
+def test_drilldown_sorts_rows_by_roi_desc(monkeypatch, captured_charts):
+    """The waterfall + per-trade table must be sorted by
+    roi_pct_annualized descending — distribution-shape framing per
+    e51d566. Reverts to chronological order would silently regress UX."""
+    rows = [
+        _row(entry=15, exit_=1, roi_pct_annualized=10, expiry="2024-06-27"),  # mid
+        _row(entry=15, exit_=1, roi_pct_annualized=50, expiry="2024-05-30"),  # best
+        _row(entry=15, exit_=1, roi_pct_annualized=-20, expiry="2024-07-25"), # worst
+    ]
+    # ... call render_cell_drilldown with selection (entry=15, exit=1) ...
+    # Look at the dist_fig.data[0].y values — should be [50, 10, -20].
+```
+
+The shape's already there in existing fixtures (`captured_charts`). One ~15-line test would close this gap. **Not blocking** for the commit (change is small, sort behavior is verifiable manually) but worth filing.
+
+### Information-loss trade-off — explicitly accepted
+
+The old chronological view surfaced regime drift visually. The new sorted view buries it. Commit body addresses this: Trends tab fills the gap. **I'm comfortable with that scoping** because:
+
+- Drill-down has limited screen real estate; can't be everything.
+- Trends tab is the canonical place for "over time" questions.
+- The per-trade table BELOW the chart still has dates, so the operator who wants chronological context can re-sort the table by date.
+
+The only operator-facing risk: someone unfamiliar with the app sees the sorted chart and reads it as time-series (since x-axis label is "Expiry"). The parenthetical disclosure mitigates that. **Net: acceptable trade.**
+
+### Edge cases — checked and clean
+
+- **Ties on `roi_pct_annualized`** (e.g. two trades with identical ROI/yr): `pd.sort_values` is stable since pandas 1.0 → ties preserve original (chronological-by-expiry) insertion order. ✓
+- **NaN ROI**: `sort_values(ascending=False)` puts NaN at the end by default → bad/missing data sinks to the bottom of the waterfall. ✓ Reasonable.
+- **Single-trade cell**: sorted list of 1 element is identity. ✓
+- **Zero-trade cell**: rows is empty; chart isn't rendered (earlier check). ✓
+
+### What I tried
+
+- Grep'd for existing tests on `render_cell_drilldown` and the dist_fig — none exist.
+- Verified `sort_values` stability semantics for pandas (stable by default).
+- Confirmed the trade-table inherits the same `rows` ordering — no separate sort applied later.
+- Re-read the x-axis title to verify the disclaimer is in place (it is).
+
+### Carry-over open items — getting smaller
+
+- 🚦 **Click fix browser smoke-test** STILL gating. Now covers 4 surfaces (click drill, strike caption, mode radio, new sort order).
+- ⚠ **`chore(p6.5.tag)`** at 33 commits pre-tag.
+- 🔬 **Live-run validation** for prefetch redesign — still open.
+- 🔬 **Drill-down test coverage** — this commit's small grill; could bundle with the Compare-cells commit's tests.
+
+### Next-commit suggestion
+
+The order I'd recommend (unchanged from prior reviews):
+1. **PAUSE for operator browser smoke-test** of the heatmap surface (click drill + strike caption + mode radio + new sort).
+2. If smoke-test passes: `chore(p6.5.tag)`.
+3. Then: live-run validation OR `feat(p7.heatmap.compare)` (operator's call which to do first).
+
+The drill-down sort fix is a polish/feedback commit that suggests the operator HAS been smoke-testing — they noticed the chronological waterfall wasn't matching the design mockup. **This is a good signal**. If the smoke-test surfaced this issue, the click fix and other surfaces are probably also being looked at; their verdicts should land in commits or operator feedback soon.
+
+If more polish commits land before the smoke-test verdict is in, that's fine — they're cheap. But the long-pole step (`chore(p6.5.tag)` then live-run) remains gated on the click fix verdict.
+
+---
