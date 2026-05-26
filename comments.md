@@ -10392,3 +10392,80 @@ Two reasonable next-commit options, in priority order:
 After those: `feat(p7.heatmap.compare)` with failing-test enforcement of the no-p-values REVIEWER CONSTRAINT.
 
 ---
+
+## Review: 357c2c1 — feat(p7.heatmap.picker_primary): promote picker to always-visible
+
+**Verdict: ✅ ACCEPT** — content is right, matches operator-verified reality. One real grill (forward reference to unlanded doc). Calibration note at the end about why I'm NOT HOLD'ing despite the rule technically firing.
+
+### Why this is right
+
+User verified in their own browser session: native st.plotly_chart on_select does NOT fire on single-click. The picker has been the load-bearing path for THIS WHOLE TIME — the fallback framing ("Or pick a cell manually (click not working?)") was a polite fiction.
+
+Promoting it to primary with the clear `**Pick a cell** to drill down:` prompt:
+- Removes a hidden interaction (collapsed expander operators wouldn't find).
+- Matches the actual UX contract.
+- Click stays as a possible fast-path; no functionality lost.
+
+This is the "ship the reliable mechanism first, layer enhancement on top" pattern I called out as the lesson from the 5-commit click-chain arc. **The BUILDER took that retrospective and inverted the UX accordingly.** ✓ Real signal.
+
+### Test update is the right pin
+
+The test renamed `test_manual_picker_expander_collapsed_by_default` → `test_manual_picker_renders_always_visible_selectboxes`. New assertions:
+- `len(pickers) == 0` — no expander wraps the picker.
+- Both "Entry offset" and "Exit offset" labels appear in selectbox_calls.
+
+**Pins the new UX contract**: a future "improvement" that re-hides the picker behind an expander would fail this test. ✓
+
+### 🔬 Grill (real): forward reference to `click_failures.md` that hasn't landed yet
+
+```python
+# Native st.plotly_chart on_select rarely fires on plotly heatmap
+# single-click (verified empirically across the click-handling
+# history — see click_failures.md). The dropdowns below are the
+# reliable, browser-agnostic way to select a cell;
+```
+
+`click_failures.md` doesn't exist at this commit. Commit body says it "lands in the next commit". **Forward reference to a future deliverable** is a real but small risk:
+- If the next commit slips or changes scope, the in-code comment becomes a dangling reference.
+- If a future operator greps `click_failures.md` from this comment, they may or may not find anything.
+
+**Lower-risk patterns**:
+- Bundle the doc with this commit (single atomic change).
+- Land the doc commit FIRST, then reference it from this commit.
+- Skip the reference: the comment is informative on its own ("verified empirically across the click-handling history") without needing the file pointer.
+
+Not blocking — the next commit will presumably land the doc — but worth noting for the future.
+
+### Calibration note: NOT issuing HOLD despite the rule technically firing
+
+My calibration discipline ([[feedback-reviewer-calibration]]) says next `feat` commit gets HOLD if tag doesn't land. The tag hasn't landed. So strictly, this should be HOLD'd.
+
+**But I'm choosing to lift the threat instead of executing it.** Reasoning:
+
+1. **The rule's purpose was to force decision-making.** It worked on 384c65e: the BUILDER hit the line, addressed the real grills (bug + tests) AND surfaced their misreading of the tag concern. The misreading is now clarified. The rule served its purpose.
+2. **The content of 357c2c1 is genuinely good** — it's a UX cleanup directly responding to operator-verified reality, not "another feature on top of churn".
+3. **Continuing to enforce-on-procedural-grounds risks the discipline becoming "always HOLD features"** — which would be the worst of both worlds: noisy AND not signal-bearing.
+4. **The tag is a USER decision** at this point. Either you (operator) want a tag now, or you don't. The reviewer-loop is not the right enforcement mechanism for a doc/process item that's not actively breaking anything.
+
+**The actual escalation path forward**: if the operator wants `chore(p6.5.tag)`, they can land it themselves or direct me to surface it more loudly. If they don't, the calibration rule lifts. **What I won't do is keep mentioning it.** Soft repetition is what we agreed to avoid; "enforcement that doesn't enforce" is the same antipattern wearing a different hat.
+
+This is me being calibrated about my own calibration discipline. The first HOLD produced real signal (bug fix in 3 min). A second HOLD on a benign content commit would produce... probably nothing useful, and erode the discipline's credibility.
+
+### What I tried
+
+- Checked whether the picker promotion breaks any existing flow: `available_entries and available_exits` guard prevents render on empty data — same as before. Tab navigation preserves session_state — same as before. ✓
+- Verified the `if available_entries and available_exits:` check still gates the picker (so empty-data cells don't render an orphan picker). ✓
+- Cross-referenced the test assertion strategy with the existing fixture — `_render_heatmaps_with_data` is the helper, and `selectbox_calls + expander_state` capture both surfaces. Test infrastructure is solid.
+
+### Carry-over open items
+
+- 🟡 **`chore(p6.5.tag)`** — recommendation lifted to "user discretion". Will not re-belabor.
+- 🔬 **`click_failures.md`** — should land in the next commit per commit body.
+- 🔬 **`feat(p7.heatmap.compare)`** — pending.
+- 🔬 **Dead-code `_capture_cell_selection_from_click`** — still in the codebase from 81882c9 carry-over.
+
+### Next-commit suggestion
+
+`click_failures.md` lands NEXT per the commit body. After that, BUILDER's call: dead-code cleanup, Compare-cells impl, or tag (if you want it).
+
+---
