@@ -3306,6 +3306,58 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 0be7c72 — perf: smaller Pool chunksize → smoother tqdm bar
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal:** Empirical perf tweak — BUILDER ran the wide sweep (presumably during the 8.5-hour silence) and observed tqdm jumping in 20-second bursts because workers were processing 1,757-cell chunks privately before yielding any results. Smaller chunks = more frequent yields = smoother progress bar.
+
+**The math (verified)**:
+- **Before**: `chunksize = len(tasks) // (n_workers × 32)` → 450,000 / (8 × 32) = **1,757 cells/chunk**.
+- **After**: `chunksize = len(tasks) // (n_workers × 256)` → 450,000 / (8 × 256) = **~220 cells/chunk**.
+- Workers now yield every ~3 sec instead of every ~20 sec → tqdm reads smoothly.
+
+**What works:**
+
+- **Single-line tweak** — divisor `32 → 256`. Surgical.
+- **Comment updated with concrete numbers** ([src/engine/sweeper.py:307-310](src/engine/sweeper.py#L307-L310)): "Tuned to ~220 cells/chunk on the 450k wide-sweep — workers yield results every ~3 seconds for a smooth bar with negligible IPC overhead." Future contributor knows WHY 256 and on what dataset it was tuned.
+- **Determinism unchanged** — chunksize only affects scheduling, not output ordering. Sort-after-collection (rows + skips) preserves byte-identicality. ✓ SPECS §6c.3 still holds.
+- **IPC overhead analysis correct**: 8x more dispatch calls; at ~10-100 microseconds per IPC, that's tens of milliseconds total across 450k tasks. **Negligible vs the ~3-second yield improvement on operator-facing UX.**
+- **489/489 full suite passes**.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **`256` is a magic constant tuned for the 450k wide sweep**. For smaller sweeps (e.g., the §3.2 5,400-cell grid), `chunksize = 5400 / (8 × 256) = max(1, 2)` — still 2 cells per chunk, which is fine. For VERY large sweeps (e.g., 10M cells), 10,000,000 / (8 × 256) ≈ 4,883 cells/chunk → back to ~20-sec bursts. **Doesn't scale**. Cosmetic; only matters if future sweeps grow another 10x. Could be a per-sweep CLI knob `--chunksize-divisor 256`.
+
+2. **The 8.5-hour gap before this commit** is consistent with BUILDER running the wide sweep, observing the burstiness, and tweaking. **Implication**: the wide sweep likely RAN successfully (otherwise the commit would be a different shape — a fix, not a perf tweak). **The §3.2-equivalent live dataset may already exist**; the sweep parquet should now be visible in `data/results/`.
+
+**Carry-over open flags:**
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now **~11 commits pre-tag**. The Phase 6/7 boundary in git history is now structurally meaningless without a tag.
+- 🔬 **No regression test for parallel-skips determinism** (b41e047 follow-up flag) — still not added.
+
+**Domain / correctness checks:**
+
+- **Determinism**: ✓ unchanged.
+- **Backward-compat**: ✓ single-threaded path unaffected.
+- **IPC overhead**: ✓ trivial at typical sweep scales.
+
+**What I tried:**
+- `pytest tests/` → 489/489.
+- Math check: 450k / (8 × 256) = 219.7 → ~220 cells/chunk ✓.
+
+**Sequencing observation:** Empirical perf tuning lands AFTER the wide sweep was actually exercised. **This is the right shape** — measure, then tune. The original `32` divisor was an educated guess; `256` is calibrated to observed behavior. Comment now anchors the number to the empirical dataset so future contributors don't randomly retune it.
+
+**Next-commit suggestion:** **`chore(p6.5.tag)` is now genuinely overdue**. The wide sweep has presumably run (8.5-hour silence consistent with overnight execution). The wide sweep parquet should be on disk. Operator can:
+1. `streamlit run app.py` against the wide-sweep parquet.
+2. Screenshot every tab → `chore(p6.5.verify)`.
+3. `chore(p6.5.tag)` at the appropriate Phase-6 commit boundary.
+
+Then proceed with whatever Phase-7 work follows (p7.2 diagnostics, p7.3 export, p7.4 regime drill-down per fd72b85 PLAN).
+
+---
+
 ## Review of 5f28f1b + 78e20d5 — chore: suppress options_loader partial-row noise in workers + main
 
 **Verdict:** ✅ accept (both commits, paired)
