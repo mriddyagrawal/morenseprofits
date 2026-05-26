@@ -9439,3 +9439,122 @@ Possible next commits in this rhythm:
 **Strategic recommendation**: when the operator next surfaces feedback (positive smoke-test verdict, more polish requests, or "the click fix didn't work, try streamlit-plotly-events"), the BUILDER should bundle ANY further polish with the smoke-test verdict's commit, then immediately land `chore(p6.5.tag)`. The longer we go without a tag, the more "what's the last working baseline" becomes a load-bearing question.
 
 ---
+
+## Review: c1522b8 — feat(p7.drilldown.rulecard): 3-card top row (Selected Cell / Median Hero / Across Years stub)
+
+**Verdict: ⚠ ACCEPT-WITH-GRILLS** — the 3-card layout matches the design mockup and is the right destination. **But this commit silently REVERTS two recently-landed commits (e51d566 sort fix + a549df5's strike-rule-with-params) and the commit body does not acknowledge it.** That's a commit-honesty issue I want to surface plainly. Three real grills + one calibration: the commit title is identical to a549df5 which is itself confusing.
+
+### What this commit actually does (vs what the body says)
+
+**Commit body says**: "Drill-down top row restructured to mirror the design/Complete mockup's three-question layout."
+
+**Diff actually shows three categories of change**:
+
+1. **NEW**: 3-card top row (Selected Cell / Median Hero / Across Years stub).
+2. **NEW**: Stats consolidated inside Median Hero card; old 6+4 flat row deleted.
+3. **REVERTED (UNSTATED)**:
+   - **e51d566's sort** (`roi_pct_annualized, ascending=False`) → back to `sort_values("expiry")`.
+   - **e51d566's chart title** ("Per-expiry ROI · N trades · sorted descending…") → back to "ROI/yr per expiry — outlier + regime spotter".
+   - **e51d566's x-axis caveat** ("Expiry (sorted by ROI/yr, not chronological)") → back to plain "Expiry".
+   - **a549df5's params propagation** — old code called `display_strike_rule(params_dict)` parsed from `params_json`; new code calls `display_strike_rule()` (no params).
+
+The reversions are real and substantive. Confirmed by `git diff e51d566..c1522b8 -- src/web/heatmap.py | grep sort_values` showing the sort change rolled back, and the `display_strike_rule()` call site shows no params dict passed.
+
+### 🚨 Grill #1 (blocking on PROCESS, not on the code): the commit body should acknowledge the rollback
+
+This commit is functionally a `revert(p7.drilldown.sort) + revert(p7.drilldown.rulecard) + feat(p7.drilldown.3card)` bundle. **Three logical changes, one commit, body acknowledges only one.** Per the project's nuclear-commits ethos (see [feedback_nuclear_commits.md] in your auto-memory: "divide phases into tiny atomic steps, one commit each, get reviews between"), the rollback should have either:
+
+- **Option A**: been a separate commit `revert(p7.drilldown.sort)` + `revert(p7.drilldown.rulecard)` with its own justification, then this commit as a fresh feature.
+- **Option B**: explicitly called out in this commit's body — "Reverts e51d566's sort (chronological is the right default per operator browser feedback) and a549df5's rule-card layout (replaced by the 3-card top row)."
+
+Option B is the minimum honesty bar. Option A is the rigorous form. **The current commit does neither** — a reader scanning the body sees "added 3-card layout" and misses the two un-doings underneath.
+
+**Why this matters operationally**: my review of e51d566 (committed as 1b2be67, ~5 minutes ago) explicitly praised the sort change as "the right design call". c1522b8 silently undoes it. **My previous review now reads as rubber-stamped** even though it wasn't. The reviewer-builder loop's trust depends on commit bodies accurately describing what changed.
+
+**Recommendation**: amend or follow-up commit body explaining WHY the sort got reverted. Specifically: did the operator's browser smoke-test reveal that chronological-by-expiry is preferable? Is the 3-card mockup the source of truth and chronological happens to be in it? Whichever — say so.
+
+### 🔬 Grill #2 (real): "no information lost" claim is false — 3 stats dropped
+
+Commit body: "The previous 6+4-column flat stats row is now consolidated inside the Median Hero card; no information lost."
+
+Counting:
+- **Old (a549df5 / e51d566 → previous HEAD)**: N, Win rate, Median ROI/yr, Mean ROI/yr, Best ROI/yr, Worst ROI/yr, Total net P&L, Best single trade, Worst single trade, Std ROI/yr = **10 stats**.
+- **New (c1522b8)**: Median ROI/yr (hero), N, Win, Mean ROI/yr, Std (ddof=0), Σ Net P&L, Worst trade (P&L) = **7 stats**.
+
+**Missing in new**:
+- Best ROI/yr (max of roi_series) — useful for outlier-detection: "the median is 50%, was the best 60% (consistent) or 200% (one fluke)?"
+- Best single trade (max of pnl_series) — P&L version of above.
+- Worst ROI/yr (min of roi_series) — the new "Worst trade" surfaces P&L not ROI, which are different signals (a large P&L loss might be a small ROI loss if the trade was large; an analyst comparing rules across symbols needs ROI for normalization).
+
+The new card is denser per-pixel (3+3 grid + hero), but it's NOT a strict superset of the old surface. **The commit body should be honest**: "the stats grid is more focused — drops Best ROI/yr, Best single trade, Worst ROI/yr as redundant with the per-trade table below". Or restore them.
+
+### 🔬 Grill #3 (real): no `st.container(border=True)` on the cards
+
+a549df5's original rule card used `with st.container(border=True):` to give the card a visible border. c1522b8's 3-card layout uses `st.columns([1,1,1])` with each card as just `with card_left:` (no border wrapping). **The mockup likely shows bordered cards.**
+
+The current rendering will look like three side-by-side blocks of markdown + dataframe with no visual separation other than column whitespace. Compare against the bordered card pattern, which is the dominant Streamlit idiom for "this is a distinct UI surface."
+
+**Recommend**: wrap each `with card_left:` etc. in `with st.container(border=True):`. ~3 extra lines, restores the visual card affordance.
+
+### 🔬 Grill #4 (real, carry-over): params-propagation feature dropped
+
+a549df5 called `display_strike_rule(params_dict)` with params parsed from `rows.iloc[0]["params_json"]`. So a strangle sweep with `strike_offset_pct=0.03` showed "3% OTM each side".
+
+c1522b8 calls `display_strike_rule()` (no params). So the SAME strangle sweep now shows "2% OTM each side" — the default, not what was actually swept.
+
+**Honest framing**: the rule card now displays the strategy's DEFAULT strike rule, not the rule THIS CELL'S TRADES actually used. For sweeps that don't override defaults, no observable difference. For sweeps that do, the rule card lies.
+
+**Possible reasons** for the simplification:
+- The operator's wide-sweep doesn't override params (one strategy_offset per strategy), so the dropped feature is currently a no-op.
+- params_json parsing was deemed too complex for the rule card slot.
+- Mockup didn't have a params-override example.
+
+**If the wide-sweep currently doesn't override params**, this is fine for v1. But the comment in the code (or commit body) should acknowledge: "Rule card shows DEFAULT params; sweeps that override params will surface the override only via the per-trade table below."
+
+### Calibration note: the working tree → c1522b8 sequence
+
+In my a549df5 review I flagged the working tree had an uncommitted reverse of e51d566 + a549df5. **c1522b8 commits a state that IS the reversed-then-replaced design.** Reading the timeline:
+
+1. e51d566 lands (sort change). I review ✅.
+2. a549df5 lands (rule card v1). I review ✅.
+3. Operator works in browser; decides 3-card layout from mockup is preferable.
+4. Operator un-applies e51d566 + a549df5 in working tree (the "modified" state I saw).
+5. BUILDER + operator iterate to the 3-card design.
+6. c1522b8 commits the new design.
+
+The working-tree state was a transient intermediate. **This is actually a reasonable iteration pattern** — try design A, look at it in browser, decide design B is better, commit design B. The flaw isn't the iteration, it's the commit body's failure to acknowledge that B is also a rollback of A.
+
+### What I'd accept
+
+I'm not going to push for a revert. The 3-card layout is genuinely better aligned with the mockup, the changes are not destructive, and the operator has visibility into both options. **What I'm asking for**: commit-body honesty about the rollback in any future "feature-revert-replace" pattern. The reviewer (me) reads the body first; if the body lies, my review is rubber-stamping.
+
+**Specific ask for THIS commit**: either an amended commit body OR a follow-up `chore(comments): annotate c1522b8 with rollback context` (single-line, just adds a note to PLAN change-log).
+
+### What I tried
+
+- `git diff e51d566..c1522b8 -- src/web/heatmap.py` to surface the rollback.
+- Counted stats in old (6+4=10) vs new (1 hero + 3+3 grid = 7) layout. 3 dropped.
+- Cross-referenced `display_strike_rule()` call site — confirmed no params dict, regression from a549df5's params propagation.
+- Verified the working-tree-reverse from earlier matches the post-c1522b8 commit state — it does, modulo the new 3-card layout.
+
+### Carry-over open items
+
+- 🚨 **Commit-body honesty for feature-revert-replace**: surface this pattern, recommend explicit acknowledgement going forward.
+- 🚦 **Click fix browser smoke-test verdict** — STILL OPEN. The c1522b8 commit message doesn't say "smoke-test passed/failed"; only that the design mockup is now followed. Need the click-fix verdict separately.
+- ⚠ **`chore(p6.5.tag)`** at 35 commits pre-tag. With c1522b8's reversion-bundle, the tag's value as a "stable known-good baseline" increases — a future bisect of "when did the chronological sort come back?" needs the tag to anchor.
+- 🔬 **Across Years sparkline** (stub in c1522b8) — next planned commit per the body.
+- 🔬 **Live-run validation** for prefetch redesign — still open.
+
+### Next-commit suggestion
+
+If the BUILDER is following the operator's mockup-matching iteration: `feat(p7.drilldown.yoy_sparkline)` is next (the Across Years card is a stub).
+
+**My strong recommendation**: tag NOW.
+
+1. `chore(p6.5.tag)` — captures the current state as a baseline.
+2. Then `feat(p7.drilldown.yoy_sparkline)`.
+3. Then operator-feedback iterations.
+
+The tag's role isn't to bless a "perfect" state — it's to give the operator a `git diff p6.5..HEAD` anchor when things go wrong. With 35 commits stacked since the last tag and a feature-revert-replace just landed, the cost of NOT tagging is climbing fast.
+
+---
