@@ -11227,3 +11227,151 @@ Per the consultation response priorities:
 Cleanup (1) first gives a clean tree before the bigger features. Compare/Export then land with enforceable honesty constraints from day one.
 
 ---
+
+## Review: 6176374 — feat(p7.heatmap.compare): full impl + pinned no-p-values test
+
+**Verdict: ✅ ACCEPT** — this is the most important commit of the session in terms of process discipline. The REVIEWER CONSTRAINT from e6bb251's stub docstring is now a REAL CI GATE, not docstring-only guidance. The positive-control test prevents trivial-pass. Four small grills, all non-blocking.
+
+### Why this commit matters structurally
+
+For ~5 hours of project time, the no-p-values constraint lived only in the stub's docstring. My e6bb251 review flagged this as the strategic gap: "docstring REVIEWER CONSTRAINTS need test-level enforcement when the follow-ups land." My consultation response (b7586a6) made the case for landing e2e scaffold FIRST so this enforcement became practical.
+
+**The BUILDER delivered exactly that sequence**: e2e scaffold (2140b1f) → Compare impl WITH failing-test in same commit (this). The constraint is now load-bearing in CI, not in prose.
+
+This validates the reviewer-builder loop: when a real strategic concern was surfaced (docstring-only constraints rot), a real strategic response landed (build the infrastructure to enforce them).
+
+### The pinning test is the right shape
+
+```python
+_BANNED_STAT_PATTERNS = [
+    r"\bp[-_ ]?values?\b",
+    r"\bstatistical(?:ly)? significan(?:t|ce)\b",
+    r"\bp\s*[<>=]\s*0?\.\d+\b",
+    r"\bt[-_ ]?test\b",
+    r"\bchi[-_ ]?square\b",
+    r"\bmann[-_ ]?whitney\b",
+    r"\bkolmogorov\b",
+    r"\bwilcoxon\b",
+]
+```
+
+8 patterns covering the common ways a future contributor (or AI session) might accidentally introduce statistical-significance machinery. `_collect_visible_text` sweeps EVERY user-visible AppTest surface (markdown, caption, info, warning, error, success, button labels, selectbox labels, dataframe columns + cell text). Case-insensitive.
+
+**Critical design move**: the **positive-control test** (`test_compare_cells_renders_side_by_side_stats_and_diff`) asserts the comparison ACTUALLY rendered (Side-by-side header + Raw differences header + caveat caption). Without it, the no-p-values test could pass by silently rendering NOTHING. This is the test-design pattern I'd want for EVERY constraint-pin: anti-pattern check + positive control.
+
+### Subtle observation: caveat phrasing dodges the regex deliberately
+
+The caveat says **"No statistical-significance claims; sample sizes are too small for that machinery to be honest."** Note the **HYPHEN** in "statistical-significance".
+
+The regex pattern is `\bstatistical(?:ly)? significan(?:t|ce)\b` — a LITERAL SPACE between `statistical(ly)?` and `significan(t|ce)`. "statistical-significance" (hyphen) doesn't match because of that space; "statistically significant" (space) DOES match.
+
+**This is almost clever, almost fragile.** The phrasing was deliberately constructed so the caveat (which legitimately MENTIONS statistical-significance in order to deny it) doesn't trip its own pattern.
+
+**If a future contributor edits the caveat to "no statistical significance claims" (space, not hyphen), the test fires** — even though the intent is the same. That's a phrasing trap.
+
+**Recommendation**: relax the pattern to `\bstatistical(?:ly)?[-_ ]significan(?:t|ce)\b` (accept hyphen). The current phrasing still passes, AND a future "no statistical significance" rewording also passes. Negation detection isn't needed if the regex matches the affirmative claim pattern; the caveat's "No ..." prefix doesn't introduce a confused affirmation.
+
+Actually — wait. With the relaxed regex, the current caveat WOULD match (because hyphen is now in the character class). So negation-aware exclusion becomes necessary. **Easier fix**: drop "statistical-significance" entirely from the caveat. Replace with:
+
+> "No significance-test machinery; sample sizes are too small for that to be honest."
+
+That avoids the trigger phrase while preserving the operator-facing point. ~5 word change.
+
+Not blocking — the current state works — but the trap is real for future edits.
+
+### 🔬 Grill #1 (real, small): banned-patterns list misses some common stats vocab
+
+Coverage gap:
+- `ANOVA` / `F-test`
+- `z-score` / `z-test`
+- `hypothesis test` / `null hypothesis`
+- `effect size` / `Cohen's d`
+- `Bonferroni` (multiple-comparisons correction — debatable; arguably HONESTY surface, not significance-claim)
+- `Bayes factor`
+
+Most of these are unlikely in a user-friendly UI. The current set covers the most likely cases. **Worth adding to a follow-up `chore(p7.test.compare): expand banned-stats-vocab list` if you want full belt-and-suspenders.**
+
+### 🔬 Grill #2 (real, small): disabled-button conditions not tested
+
+The "Add to comparison" button has 4 disabled-when conditions:
+- `len(selected_cells) >= 4`
+- `new_entry <= new_exit`
+- `(new_entry, new_exit) in selected_cells` (duplicate)
+- `(new_entry, new_exit) not in pair_combos`
+
+None of these have unit tests. A future refactor that breaks the disabled-when logic (e.g. allows `entry ≤ exit`) would silently degrade the UX. ~4 unit tests on the button disabled state would close this.
+
+Same test discipline pattern as 5b0c722's manual-picker fix: pin EACH guard condition with a specific test.
+
+### 🔬 Grill #3 (real, small): interaction flows (Add / Remove / Clear) not tested
+
+The positive control covers "did the comparison render?". It doesn't cover:
+- "Add to comparison" actually appends to `mp_heatmap_compare_cells`
+- "Remove" button on cell N removes cell N (not N-1 or N+1)
+- "Clear all" empties the list
+
+For a stateful UI where state is in session_state, these interaction tests would be ~5-10 lines each via AppTest's `button.click()` + assert session_state change.
+
+Not blocking — the visible-render tests are the primary anti-regression — but the interaction surface is where UI bugs typically live (e.g. off-by-one in Remove indexing, button-click-doesn't-fire-rerun edge cases).
+
+### 🔬 Grill #4 (small): `except Exception: pass` in dataframe collection
+
+```python
+for el in at.dataframe:
+    try:
+        df = el.value
+        if df is not None:
+            parts.append(" ".join(str(c) for c in df.columns))
+            parts.append(df.to_string(index=False))
+    except Exception:
+        pass
+```
+
+Wide catch silently swallows any error in dataframe text extraction. If a future Streamlit upgrade changes `at.dataframe[i].value`'s shape, the test silently drops that dataframe from the haystack — a banned phrase in a dataframe would escape detection.
+
+**Suggested narrower catch**: `except (AttributeError, TypeError):` — catches the specific failure modes (no `.value`, non-iterable columns, non-stringable cells). Other exceptions should propagate so the test author sees them.
+
+Cosmetic but worth tightening if you touch this file again.
+
+### What's good about the impl beyond the test discipline
+
+- **`if entry_pick <= exit_pick`** check in the disabled-when (sweep doesn't allow impossible cells). ✓ Sweep semantics honored.
+- **`(new_entry, new_exit) not in pair_combos`** — only allows ADDITION of cells that actually exist in the data. Prevents the operator from clicking around invalid combos. ✓
+- **Chip/Remove pattern** uses indexed keys (`mp_heatmap_compare_remove_{i}`). When the operator removes a cell mid-list, the indices reset on next render. ✓ Streamlit-native pattern.
+- **`palette = ["#5dd39e", "#9aa3b2", "#f0c674", "#ff7676"]`** with explicit transparent overlay (`opacity=0.65`). Mockup-derived colors; visual distinguishability with overlap. ✓
+- **`max(len(...), 1)` guards** on win-rate division. ✓ Defensive against empty cells.
+
+### What I tried
+
+- Mentally traced the regex `\bstatistical(?:ly)? significan(?:t|ce)\b` against "statistical-significance" (current caveat) and confirmed NO match (literal space, not space-or-hyphen). Subtle phrasing trap.
+- Verified the 558 = 557 (post-e2e-scaffold) + 2 (new compare tests) - 1 (deleted stub test) math.
+- Cross-referenced the consultation response priorities: scaffold first, then Compare WITH failing-test in same commit. BUILDER executed exactly this sequence.
+- Counted banned patterns vs typical stats vocabulary; identified ANOVA / F-test / z-test as the likely-near-future gaps.
+
+### Carry-over open items
+
+- 🔬 **Banned-patterns expansion** (grill #1) — cosmetic follow-up.
+- 🔬 **Disabled-button condition tests** (grill #2) — small follow-up.
+- 🔬 **Interaction flow tests** (grill #3) — small follow-up.
+- 🔬 **Caveat phrasing trap** (subtle observation) — single-line caption rewrite or regex relaxation.
+- 🔬 **`feat(p7.heatmap.export)`** — same pattern (failing-test in same commit), with MULTIPLE_COMPARISONS_CAVEAT verbatim enforcement.
+- 🚦 **Live-run validation** against 41-symbol universe — gated on prefetch completion.
+
+### Next-commit suggestion
+
+Per the consultation response priorities:
+
+1. **`feat(p7.heatmap.export)`** — same pattern as this commit (failing-test in same commit), but with the MULTIPLE_COMPARISONS_CAVEAT verbatim enforcement test:
+   ```python
+   from src.analytics.rank import MULTIPLE_COMPARISONS_CAVEAT
+   assert MULTIPLE_COMPARISONS_CAVEAT in exported_md
+   ```
+   That's the verbatim re-export the e6bb251 docstring asks for.
+
+2. **`chore(p7.cleanup)`** — delete `_capture_cell_selection_from_click` + stale tests. Small, post-arc tidying.
+
+3. Then the follow-up test commits for the 4 grills above (banned-patterns expansion, disabled-button tests, interaction flow tests, caveat phrasing).
+
+The reviewer-builder loop is in a really good rhythm right now. Constraint pinned in stub → enforced in test → real CI gate. That pattern should be the template for every future "honesty constraint" surface.
+
+---

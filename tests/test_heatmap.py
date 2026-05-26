@@ -9,7 +9,8 @@ Load-bearing concerns:
     falsely imply zero P&L. counts → 0 (the accurate "no trades").
   - Filter contract: strategy/symbol both optional; either narrows
     the slice; both None aggregates across.
-  - Default value column is the now-exact roi_pct_annualized.
+  - Default value column is roi_pct (per-trade ROI; flipped from
+    roi_pct_annualized in p7.expiry_roi).
 """
 from __future__ import annotations
 

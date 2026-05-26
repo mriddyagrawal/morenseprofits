@@ -92,7 +92,8 @@ def test_populated_3x2_cells_pinpoints_best_worst_median(captured_metrics):
     every cell clears min_n=5. Hand-derive expected best / worst /
     median from a known matrix."""
     rows = []
-    # (entry, exit) → roi_pct_annualized values:
+    # (entry, exit) → roi_pct values (per-trade ROI; the metric the
+    # headline reads after p7.expiry_roi):
     #   (15, 1) → 100.0  ← best
     #   (15, 3) → 50.0
     #   (10, 1) → 75.0
@@ -445,50 +446,6 @@ def test_value_pane_uses_native_plotly_chart_with_on_select(captured_charts):
     assert value_kwargs.get("on_select") == "rerun"
     assert value_kwargs.get("selection_mode") == ("points",)
     assert value_kwargs.get("use_container_width") is True
-
-
-def test_capture_cell_selection_from_click_writes_session_state(monkeypatch):
-    """Direct unit test on the helper: a click payload like
-    ``[{"x": "T-3", "y": "T-15", "curveNumber": 0, "pointNumber": [0,5]}]``
-    must set ``mp_heatmap_selected_cell`` to (15, 3) in session_state."""
-    import src.web.heatmap as hm
-    state: dict = {}
-    monkeypatch.setattr(hm.st, "session_state", state)
-    hm._capture_cell_selection_from_click(
-        [{"x": "T-3", "y": "T-15", "curveNumber": 0, "pointNumber": [0, 5]}]
-    )
-    assert state["mp_heatmap_selected_cell"] == (15, 3)
-
-
-def test_capture_cell_selection_from_click_empty_is_no_op(monkeypatch):
-    """No fresh click this rerun → empty list. The prior session_state
-    selection must survive untouched (this is the persistence story
-    that lets drill-down stay open across non-click reruns)."""
-    import src.web.heatmap as hm
-    state = {"mp_heatmap_selected_cell": (7, 2)}
-    monkeypatch.setattr(hm.st, "session_state", state)
-    hm._capture_cell_selection_from_click([])
-    assert state["mp_heatmap_selected_cell"] == (7, 2)
-    hm._capture_cell_selection_from_click(None)
-    assert state["mp_heatmap_selected_cell"] == (7, 2)
-
-
-def test_capture_cell_selection_from_click_ignores_malformed(monkeypatch):
-    """Robustness: if plotly_events returns something we can't parse
-    (missing keys, non-string x/y, garbage), don't crash — leave
-    session_state alone."""
-    import src.web.heatmap as hm
-    state = {"mp_heatmap_selected_cell": (10, 3)}
-    monkeypatch.setattr(hm.st, "session_state", state)
-    # No x/y keys
-    hm._capture_cell_selection_from_click([{"curveNumber": 0}])
-    assert state["mp_heatmap_selected_cell"] == (10, 3)
-    # Non-string x/y
-    hm._capture_cell_selection_from_click([{"x": 3, "y": 15}])
-    assert state["mp_heatmap_selected_cell"] == (10, 3)
-    # Tick label that doesn't parse
-    hm._capture_cell_selection_from_click([{"x": "T-bad", "y": "T-7"}])
-    assert state["mp_heatmap_selected_cell"] == (10, 3)
 
 
 # ============================================================

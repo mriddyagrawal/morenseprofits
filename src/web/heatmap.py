@@ -209,36 +209,6 @@ def _capture_cell_selection(selected) -> None:
     st.session_state["mp_heatmap_selected_cell"] = (entry_td, exit_td)
 
 
-def _capture_cell_selection_from_click(clicked: list[dict] | None) -> None:
-    """Translate a ``streamlit_plotly_events.plotly_events`` click
-    payload into ``st.session_state['mp_heatmap_selected_cell']``.
-
-    plotly_events returns a list of clicked points (typically length 0
-    or 1 for click_event mode). Each point is a dict with ``x``, ``y``,
-    ``curveNumber``, ``pointNumber``. For our heatmap, ``x`` and ``y``
-    are tick labels like "T-3" / "T-15"; parse the integer back.
-
-    Empty list (no fresh click this rerun) is a no-op — the prior
-    selection in session_state persists. Same click twice is a no-op.
-
-    The plotly_events bridge listens to plotly_click, which Plotly
-    heatmaps DO emit reliably (unlike plotly_selected, which is why
-    Streamlit's native on_select doesn't catch heatmap clicks)."""
-    if not clicked:
-        return
-    pt = clicked[0]
-    x_label = pt.get("x") if isinstance(pt, dict) else None
-    y_label = pt.get("y") if isinstance(pt, dict) else None
-    if not isinstance(x_label, str) or not isinstance(y_label, str):
-        return
-    try:
-        exit_td = int(x_label.lstrip("T-"))
-        entry_td = int(y_label.lstrip("T-"))
-    except (ValueError, AttributeError):
-        return
-    st.session_state["mp_heatmap_selected_cell"] = (entry_td, exit_td)
-
-
 # ============================================================
 # Dual heatmaps — Phase 6.3 commit 16 (feat(p6.3.pivot))
 # ============================================================
