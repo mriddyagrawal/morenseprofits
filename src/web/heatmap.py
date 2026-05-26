@@ -505,6 +505,78 @@ def render_heatmaps(
             f"thin cells."
         )
 
+    # ---- Mode radio (Phase 7) ----------------------------------
+    # Three operator-selectable below-heatmap actions. Render the
+    # radio HERE so visually it sits right under the heatmaps. The
+    # ACT (Drill-down vs Compare vs Export) happens back in app.py
+    # via cell_action_mode() which reads the session_state key set
+    # below.
+    st.markdown("---")
+    st.radio(
+        "Cell action",
+        options=["Drill-down", "Compare cells", "Export rule"],
+        horizontal=True,
+        key="mp_heatmap_mode",
+    )
+
+
+def cell_action_mode() -> str:
+    """Read the current mode from session_state. ``app.py`` calls this
+    after ``render_heatmaps`` to decide which below-heatmap render to
+    invoke. Default is "Drill-down" — matches v0.6-ui behavior so
+    existing flows are unchanged."""
+    return st.session_state.get("mp_heatmap_mode", "Drill-down")
+
+
+def render_compare_cells(
+    df: pd.DataFrame,
+    *,
+    strategy: str | None,
+    symbol: str | None,
+    min_n: int,
+) -> None:
+    """Compare-cells mode (STUB). Implementation lands in
+    feat(p7.heatmap.compare).
+
+    REVIEWER CONSTRAINT (do not relax in the follow-up commit):
+    no p-values, no "statistically significant" copy. With N≈24 trades
+    per cell, ~5% of identical-distribution cell-pairs return p<0.05 by
+    chance. With 720 cells × 5 (strategy, symbol) pairs an operator
+    inspects, dozens of false-positive "significant differences" will
+    surface as noise-disguised-as-signal. Honest framing: visual overlay
+    + side-by-side stats + raw difference column ONLY. No p-value, no
+    statistical-test machinery.
+    """
+    st.info(
+        "**Compare cells** — shift-click 2-4 cells to overlay their "
+        "ROI distributions and view side-by-side stats. "
+        "_(Implementation pending — see feat(p7.heatmap.compare).)_"
+    )
+
+
+def render_export_rule(
+    df: pd.DataFrame,
+    *,
+    strategy: str | None,
+    symbol: str | None,
+) -> None:
+    """Export-rule mode (STUB). Implementation lands in
+    feat(p7.heatmap.export).
+
+    REVIEWER CONSTRAINT (do not relax in the follow-up commit):
+    the exported .md MUST include MULTIPLE_COMPARISONS_CAVEAT from
+    src.analytics.rank as a top-level "## Selection bias warning"
+    section. Operator selecting one cell from ~3,600 candidate
+    (strategy × symbol × entry × exit) rules has introduced selection
+    bias the per-rule backtest doesn't capture. Re-export the constant;
+    don't paraphrase or duplicate. No download path without it.
+    """
+    st.info(
+        "**Export rule** — pick a single cell to download a "
+        "deployment-ready trading rule (.md). "
+        "_(Implementation pending — see feat(p7.heatmap.export).)_"
+    )
+
 
 # ============================================================
 # Cell drill-down — Phase 7 (analyst exploration tool)

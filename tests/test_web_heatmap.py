@@ -469,6 +469,89 @@ def test_selector_renders_strike_rule_caption(monkeypatch):
     assert "ATM" in strike_caps[0]  # short_straddle's rule mentions ATM
 
 
+# ============================================================
+# feat(p7.heatmap.modes): radio + Compare / Export stubs
+# ============================================================
+
+def test_mode_radio_renders_with_three_options(monkeypatch, captured_charts):
+    """Radio under the heatmaps must offer exactly Drill-down /
+    Compare cells / Export rule, in that order. Pins the operator
+    contract — adding a 4th mode = explicit decision, not drift."""
+    import src.web.heatmap as hm
+    radio_calls: list[dict] = []
+
+    def fake_radio(label, *, options, horizontal=False, key=None, **_):
+        radio_calls.append({
+            "label": label, "options": list(options),
+            "horizontal": horizontal, "key": key,
+        })
+        return options[0]
+    monkeypatch.setattr(hm.st, "radio", fake_radio)
+    monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
+
+    rows = []
+    for e in (15, 10, 5):
+        for x in (3, 1):
+            for _ in range(6):
+                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+
+    mode_radios = [r for r in radio_calls if r["label"] == "Cell action"]
+    assert len(mode_radios) == 1
+    assert mode_radios[0]["options"] == [
+        "Drill-down", "Compare cells", "Export rule",
+    ]
+    assert mode_radios[0]["horizontal"] is True
+    assert mode_radios[0]["key"] == "mp_heatmap_mode"
+
+
+def test_cell_action_mode_default_is_drill_down(monkeypatch):
+    """No prior selection in session_state → default "Drill-down".
+    Preserves the v0.6-ui behavior so existing flows are unchanged."""
+    import src.web.heatmap as hm
+    monkeypatch.setattr(hm.st, "session_state", {})
+    assert hm.cell_action_mode() == "Drill-down"
+
+
+def test_cell_action_mode_returns_session_state_value(monkeypatch):
+    """When the radio sets the key, cell_action_mode reads it back."""
+    import src.web.heatmap as hm
+    monkeypatch.setattr(hm.st, "session_state", {"mp_heatmap_mode": "Compare cells"})
+    assert hm.cell_action_mode() == "Compare cells"
+    monkeypatch.setattr(hm.st, "session_state", {"mp_heatmap_mode": "Export rule"})
+    assert hm.cell_action_mode() == "Export rule"
+
+
+def test_compare_cells_stub_renders_info_with_implementation_pending(monkeypatch):
+    """Stub renders an info-box so the radio is operable; full
+    behavior lands in feat(p7.heatmap.compare). LOAD-BEARING wording:
+    "Implementation pending" tells reviewers + future BUILDER this
+    isn't done."""
+    import src.web.heatmap as hm
+    infos: list[str] = []
+    monkeypatch.setattr(hm.st, "info", lambda msg, **_: infos.append(msg))
+
+    hm.render_compare_cells(pd.DataFrame(), strategy="S", symbol="X", min_n=5)
+    assert len(infos) == 1
+    assert "Compare cells" in infos[0]
+    assert "Implementation pending" in infos[0]
+
+
+def test_export_rule_stub_renders_info_with_implementation_pending(monkeypatch):
+    """Same shape as compare-cells stub; full behavior lands in
+    feat(p7.heatmap.export). The future commit MUST surface the
+    MULTIPLE_COMPARISONS_CAVEAT per the constraint in the stub
+    docstring — not yet enforceable here since there's no download path."""
+    import src.web.heatmap as hm
+    infos: list[str] = []
+    monkeypatch.setattr(hm.st, "info", lambda msg, **_: infos.append(msg))
+
+    hm.render_export_rule(pd.DataFrame(), strategy="S", symbol="X")
+    assert len(infos) == 1
+    assert "Export rule" in infos[0]
+    assert "Implementation pending" in infos[0]
+
+
 def test_value_pane_config_exposes_select_tools(captured_charts):
     """Modebar surface: box-select + lasso buttons added, Plotly logo
     suppressed. Gives the operator a visible affordance for explicit

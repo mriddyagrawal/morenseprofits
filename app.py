@@ -38,7 +38,10 @@ from src.web.caveats import render_caveats  # noqa: E402
 from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E402
 from src.web.heatmap import (  # noqa: E402
     _selector as render_heatmap_selector,
+    cell_action_mode,
     render_cell_drilldown as render_heatmap_drilldown,
+    render_compare_cells,
+    render_export_rule,
     render_headline as render_heatmap_headline,
     render_heatmaps,
 )
@@ -264,9 +267,21 @@ def _render_heatmap_tab(df_filtered: pd.DataFrame, skips_df: pd.DataFrame) -> No
     render_heatmaps(
         df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
     )
-    render_heatmap_drilldown(
-        df_filtered, skips_df=skips_df, strategy=strategy, symbol=symbol,
-    )
+    # Route to the below-heatmap action based on the mode-radio set by
+    # render_heatmaps. Drill-down is the default and matches the v0.6-ui
+    # behavior. Compare / Export are stubs landed in
+    # feat(p7.heatmap.modes); full implementations come later.
+    mode = cell_action_mode()
+    if mode == "Compare cells":
+        render_compare_cells(
+            df_filtered, strategy=strategy, symbol=symbol, min_n=min_n,
+        )
+    elif mode == "Export rule":
+        render_export_rule(df_filtered, strategy=strategy, symbol=symbol)
+    else:  # "Drill-down" (default)
+        render_heatmap_drilldown(
+            df_filtered, skips_df=skips_df, strategy=strategy, symbol=symbol,
+        )
 
 
 def _render_trends_tab(df_filtered: pd.DataFrame) -> None:
