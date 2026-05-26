@@ -305,8 +305,11 @@ def sweep_grid(
         today_date = today_fn()
         worker_args = [(s, sym, exp, eo, xo, offline) for (s, sym, exp, eo, xo) in tasks]
         # chunksize keeps Pool scheduling efficient for 100k+-task sweeps;
-        # too small → IPC overhead, too large → poor work-stealing at tail
-        chunksize = max(1, len(worker_args) // (n_workers * 32))
+        # too small → IPC overhead, too large → bursty tqdm + poor tail
+        # work-stealing. Tuned to ~220 cells/chunk on the 450k wide-sweep
+        # — workers yield results every ~3 seconds for a smooth bar with
+        # negligible IPC overhead.
+        chunksize = max(1, len(worker_args) // (n_workers * 256))
         with mp.Pool(
             processes=n_workers,
             initializer=_worker_init,
