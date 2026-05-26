@@ -20,6 +20,8 @@ import warnings
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
@@ -34,7 +36,7 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from src.data import expiry_calendar  # noqa: E402
+from src.data import bhavcopy_fo_loader, expiry_calendar, options_loader, spot_loader  # noqa: E402
 from src.engine.sweeper import _compute_run_id, sweep_grid  # noqa: E402
 
 
@@ -87,6 +89,56 @@ def main() -> int:
         STRATEGIES, SYMBOLS, expiries, ENTRY_OFFSETS_TD, EXIT_OFFSETS_TD,
     )
     print(f"  run_id (sha-trunc): {run_id}")
+
+    # ============================================================
+    # Pre-warm open-expiry data before spawning Pool workers.
+    # ============================================================
+    # Workers spawned via mp.Pool are fresh processes and don't share
+    # the parent's in-memory LRU. If we let 8 workers concurrently hit
+    # NSE for the same open-expiry contracts, NSE rate-limits them and
+    # the sweep crawls. Pre-warming serially in the main process
+    # populates the *on-disk* cache; workers then read from a fresh
+    # cache and never call NSE.
+    today = TODAY_FN()
+    open_expiries = [e for e in expiries if e >= today]
+    if open_expiries:
+        _h(f"Pre-warming open-expiry data ({len(open_expiries)} expiry/expiries)")
+        for sym in SYMBOLS:
+            # Spot for current year — gets refetched once here, serialized
+            # so workers later hit a fresh cache deterministically.
+            try:
+                spot_loader.load_spot(
+                    sym, date(today.year, 1, 1), today,
+                    today_fn=TODAY_FN,
+                )
+            except Exception as e:
+                print(f"  ⚠ spot pre-warm {sym} {today.year} failed ({type(e).__name__})")
+        for exp in open_expiries:
+            try:
+                bhav = bhavcopy_fo_loader.load_bhavcopy_fo(today)
+                live_strikes = sorted({
+                    int(s) for s in bhav[
+                        (bhav["symbol"].isin([s.upper() for s in SYMBOLS]))
+                        & (bhav["instrument"] == "OPTSTK")
+                        & (bhav["expiry"] == pd.Timestamp(exp))
+                    ]["strike"].dropna().tolist()
+                })
+            except Exception as e:
+                print(f"  ⚠ bhavcopy pre-warm {exp} failed ({type(e).__name__})")
+                continue
+            for sym in SYMBOLS:
+                for strike in live_strikes:
+                    for ot in ("CE", "PE"):
+                        try:
+                            options_loader.load_option(
+                                sym, exp, strike, ot, exp, exp,
+                                today_fn=TODAY_FN,
+                            )
+                        except Exception:
+                            pass  # cells with this strike will skip in the parallel pass
+            print(f"  pre-warmed {exp}: {len(live_strikes)} strikes × {len(SYMBOLS)} syms × 2 types")
+    else:
+        _h("Pre-warm — no open expiries in the grid; skipping")
 
     _h(f"Running sweep (n_workers={N_WORKERS}; force=False; cache-hit short-circuits)")
     t0 = time.perf_counter()
