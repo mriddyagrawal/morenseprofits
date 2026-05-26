@@ -3306,6 +3306,72 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of b31ef0f — fix: p7_wide_sweep pre-warm UnboundLocalError on `s` shadowing
+
+**Verdict:** ✅ accept
+
+**Phase / commit goal:** Small bug fix surfaced by user-reported `⚠ bhavcopy pre-warm 2026-05-26 failed (UnboundLocalError)` after c43f48e landed. Cause: variable-shadowing in a nested comprehension where both the outer set comp's iterator AND the inner list comp's iterator were named `s`.
+
+**The bug**:
+
+```python
+{
+    int(s) for s in bhav[
+        (bhav["symbol"].isin([s.upper() for s in SYMBOLS]))  # ← inner uses 's'
+        & (bhav["instrument"] == "OPTSTK")
+        ...
+    ]["strike"].dropna().tolist()
+}
+```
+
+The interaction of CPython's comprehension scoping with the nested `[s.upper() for s in SYMBOLS]` inside the OUTER comprehension's subject expression triggered `UnboundLocalError`. **The bug existed since 6f52e65** but was masked by the outer `try/except Exception`, which printed a warning and moved on.
+
+**The fix** ([scripts/p7_wide_sweep.py:154-164](scripts/p7_wide_sweep.py#L154-L164)):
+1. **Hoist `upper_symbols = [sym.upper() for sym in SYMBOLS]`** out of the mask — eliminates the inner list comp inside the outer comp's subject expression.
+2. **Rename the outer set comp's iterator** from `s` to `k` — no possible collision.
+3. **Extract `mask` to a separate variable** — also makes the boolean expression more readable.
+
+**Honest commit framing**: "Harmless before this fix because the today_fn anchor (c43f48e's main contribution) already lets workers read fresh-enough cache without the pre-warm — the error was cosmetic. But fixing it cleans the log for future runs and removes a real lurking bug from the path people will copy from when adding pre-warm logic elsewhere."
+
+**This is a genuine insight**: c43f48e's anchor rebind made the pre-warm itself optional in the success-path sense. Even when pre-warm failed silently (this UnboundLocalError), workers' staleness check still passed because:
+1. The PREFETCH cache (from `prefetch_universe.py` overnight) had populated the open-expiry contracts.
+2. `today_fn` was anchored to a date when that prefetch cache was fresh.
+3. `max_cached >= today_fn()` → cache-hit fast path → workers don't hit NSE.
+
+So **pre-warm is belt-and-suspenders**, not the load-bearing layer. The today_fn anchor IS the load-bearing fix. Good architectural distinction surfaced.
+
+**What works:**
+- **Surgical 1-variable rename** + hoist. Minimum-change fix.
+- **`bhav.loc[mask, "strike"]`** is the idiomatic pandas selector — cleaner than the prior `bhav[mask]["strike"]` chained indexer (which can trigger SettingWithCopyWarning in some pandas versions).
+- **Commit body is candid**: "harmless before this fix" — doesn't overclaim impact.
+- **489/489 still passes**.
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **The UnboundLocalError originated from CPython's comprehension scoping**: subject expression of the outer comp is evaluated in the enclosing scope, but the comp's iteration variable IS introduced in the comp's scope. Mixing same-named iterators in nested comps creates corner cases that the bytecode compiler handles inconsistently across CPython versions. **Lesson for future contributors**: never reuse iterator variable names in nested comprehensions; the readability cost of distinct names is trivial vs the cost of debugging this class of bug.
+
+2. **Set comprehension iterating a list** ([scripts/p7_wide_sweep.py:163](scripts/p7_wide_sweep.py#L163)): `sorted({int(k) for k in bhav.loc[mask, "strike"].dropna().tolist()})`. **Could be more idiomatic** as `sorted({int(k) for k in bhav.loc[mask, "strike"].dropna()})` — iterating directly over the Series (no intermediate `.tolist()`). Marginal perf; cosmetic.
+
+3. **`Exception as e`** ([scripts/p7_wide_sweep.py:166](scripts/p7_wide_sweep.py#L166)) still bare. Operator tooling; consistent with rest of script.
+
+4. **Test coverage gap**: pre-warm code has no unit tests (operator tooling). A future bug of similar shape (variable shadowing, mask construction error) would re-fail at script-run time, not at test-time. **Acceptable for v1**; the cost of mocking `bhavcopy_fo_loader.load_bhavcopy_fo` for a pre-warm test would be high relative to the benefit.
+
+**Carry-over open flags:**
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now ~19 commits pre-tag.
+
+**What I tried:**
+- Read the diff (~10 line change).
+- Confirmed the fix: `upper_symbols` hoisted; `k` replaces `s` in the outer comp.
+- 489/489 still passes.
+
+**Sequencing observation:** The bug existed silently from 6f52e65 (15+ commits ago). User caught it via the warning printout. **The script's `try/except Exception` swallow + log-only-warning pattern means similar bugs could lurk elsewhere.** BUILDER's framing ("removes a real lurking bug from the path people will copy from") is the right meta-discipline.
+
+**Next-commit suggestion:** Same as before — **live-run validation** of the wide sweep with both perf optimizations + walk-back anchor + this fix all applied. Then `chore(p6.5.tag)`.
+
+---
+
 ## Review of c43f48e — fix: p7_wide_sweep walks back to last NSE-published day for TODAY_FN anchor
 
 **Verdict:** ✅ accept — **closes the failure the user surfaced 6 minutes after my 6f52e65 review.**
