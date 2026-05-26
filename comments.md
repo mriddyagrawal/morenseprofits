@@ -10870,3 +10870,64 @@ Then operator-confirmation on grill #1 (or land the dual-column leaderboard idea
 The 5-7 hour prefetch run is still consuming bandwidth, so small focused commits like this one are the right rhythm.
 
 ---
+
+## Review: 620405e — feat(p7.expiry_roi): per_stock + trends tabs switch to per-trade ROI
+
+**Verdict: ✅ ACCEPT** — closes the per-trade-ROI arc cleanly. All 4 tabs now consistent. Two of my carry-over grills resolved by the operator's stated preference.
+
+### What this closes
+
+Two open items from my prior reviews are now resolved:
+
+1. **Cross-tab inconsistency grill** (b1b50ec #2, 73224c5 carry-over): The 2/4 → 4/4 tab coverage is now complete. heatmap + leaderboard + per_stock + trends all read per-trade ROI. No more "switch tabs, switch units" confusion.
+
+2. **Leaderboard ranking-semantic grill** (73224c5 #1): The commit body addresses my concern directly:
+
+> "Per the operator's explicit confirmation on the b1b50ec/73224c5 ranking-semantic question: per-trade ROI throughout, including the ranking metric. Longer-hold strategies will visibly bias higher in ranks; that's understood and accepted."
+
+**This is the reviewer-builder loop working correctly**: I raised a design concern, BUILDER routed it to the operator, operator confirmed intent with eyes-open. The default holds with explicit ownership of the trade-off. The leaderboard's "longer-hold bias" is now a known property, not an accidental artifact. ✓
+
+### Tests + docstrings updated coherently
+
+- `test_web_trends.py` and `test_web_per_stock.py` fixtures shed the duplicate kwarg; synthesize `roi_pct_annualized` from `roi_pct` for the aggregate's INPUT requirement (same pattern as test_rank.py in 73224c5).
+- Assertions flipped from "%/yr" → "%" across both test files.
+- 551/551 pass.
+
+### What's still open from the broader arc
+
+- 🔬 **Observations heavy-tail threshold recalibration** — explicitly named as the next commit. Currently the threshold (20 pts on `|mean - median|`) is silent on per-trade scale. This commit lands the per-trade unit shift fully in production for ALL 4 tabs, but the auto-detector is still broken until recalibration.
+
+**Operationally**: any live-run validation against the new 41-symbol universe + per-trade ROI display should NOT yet trust the absence of heavy-tail warnings. They're silent because the threshold is mis-calibrated, not because the data has no tails.
+
+### Observation on the arc
+
+Per-trade-ROI shift across 4 tabs took 3 commits (heatmap+drill-down, leaderboard, per_stock+trends). The split was reasonable — each file's tests are scoped enough that bundling all 4 would have been a ~400-line diff. My b1b50ec recommendation to bundle was the "atomic display" view; the actual sequence (separate per file) preserves per-tab reviewability. **Both are defensible; the operator-confusion window during the arc was small (~30 min total) because BUILDER kept landing the follow-ups quickly.**
+
+Real signal from the arc:
+- Display-only refactor (parquet schema unchanged) made the switch fully reversible.
+- Reviewability per commit was preserved.
+- The one open question (ranking-semantic) got escalated, confirmed, documented.
+
+### What I tried
+
+- Counted tab coverage post-commit: heatmap ✓, leaderboard ✓, per_stock ✓, trends ✓ = 4/4.
+- Verified the operator-confirmation language is in the commit body — explicit, not implied.
+- Cross-checked the test fixture pattern (synthesize `roi_pct_annualized` from `roi_pct` for aggregate input) matches the same pattern from 73224c5's `_trade` fixture.
+
+### Carry-over open items — almost empty
+
+- 🔬 **Observations heavy-tail threshold recalibration** — next commit per BUILDER's stated arc.
+- 🔬 **Dead-code `_capture_cell_selection_from_click`** — still pending.
+- 🔬 **`feat(p7.heatmap.compare)`** — pending; needs failing-test enforcement of REVIEWER CONSTRAINTS (no p-values).
+- 🟡 **`chore(p6.5.tag)`** — at operator discretion.
+- 🚦 **Live-run validation** against the new 41-symbol universe — gated on the 5-7 hour prefetch.
+
+### Next-commit suggestion
+
+Heavy-tail threshold recalibration in `src/analytics/observations.py`. For per-trade ROI (~5-10× smaller scale than annualized), the threshold needs to drop from 20 pts to ~3-5 pts. Plus a test demonstrating the detector fires on a per-trade-scale heavy-tail scenario (which the current 20-pt threshold would silently miss).
+
+Per my d96e038 grill #3, this is also a chance to consider a RELATIVE threshold (`|mean - median| / |median| >= 0.3`) instead of absolute — scale-invariant, doesn't need re-tuning if the unit shifts again.
+
+After that: the dead-code cleanup, then Compare-cells impl while the prefetch finishes.
+
+---
