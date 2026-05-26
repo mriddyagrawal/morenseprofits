@@ -128,13 +128,20 @@ def _price_one_leg(
     exit_px, exit_lot, exit_vol, exit_oi = _pick_close_on(
         df, trade.exit_date, context=f"{context} exit",
     )
-    # Lot size at ENTRY is what's used for the P&L calc (NSE rarely
-    # changes lot size mid-contract; if it ever does, exit_lot would
-    # differ and we'd want to know — assert).
+    # Lot size at ENTRY differing from EXIT means the contract straddled
+    # a corporate-action ex-date (split / bonus / merger) — NSE adjusts
+    # F&O contracts so the same contract has DIFFERENT lot sizes on
+    # either side of the action. We can't price across the action
+    # without adjustment math (strike + qty also need ratio'ing), so
+    # skip via MissingDataError → sweeper records the cell + reason in
+    # the skip log and the sweep continues. NOT a LookaheadError: the
+    # data isn't bad, it's just unpriceable under our v1 model.
     if entry_lot != exit_lot:
-        raise LookaheadError(  # not really lookahead, but loud-failure class
+        raise MissingDataError(
             f"{context}: lot_size changed mid-contract "
-            f"({entry_lot} -> {exit_lot}); refusing to price silently"
+            f"({entry_lot} -> {exit_lot}); likely a corporate action "
+            f"(split / bonus / merger). Skipping — pricing across the "
+            f"adjustment requires strike+qty ratio'ing we don't model yet."
         )
     # Apply slippage to raw closes (SPECS §4b): the engine transacts at
     # entry_px_realized / exit_px_realized, not at the raw close.

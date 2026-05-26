@@ -205,11 +205,14 @@ def test_missing_data_at_exit_raises():
         price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
 
 
-def test_lot_size_change_mid_contract_rejected():
-    """If lot_size on entry-date row differs from exit-date row,
-    refuse to silently pick one. NSE changes lot sizes between
-    contracts but never mid-contract; if we see drift, it's data
-    corruption."""
+def test_lot_size_change_mid_contract_skipped_as_missing_data():
+    """If lot_size on entry-date row differs from exit-date row, the
+    contract straddled a corporate-action ex-date (split / bonus / merger)
+    — NSE adjusts F&O contracts so the same contract sees different lot
+    sizes on either side. We can't price across the action without
+    strike+qty ratio'ing, so skip via MissingDataError (sweeper logs
+    the cell and continues). NOT a LookaheadError: data isn't bad, it's
+    just unpriceable under our v1 model."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame([(entry, 100.0, 250), (exit_, 10.0, 500)])
@@ -221,7 +224,7 @@ def test_lot_size_change_mid_contract_rejected():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    with pytest.raises(LookaheadError, match="lot_size changed"):
+    with pytest.raises(MissingDataError, match="lot_size changed"):
         price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
 
 
