@@ -587,6 +587,8 @@ Every public loader (`load_spot`, `load_bhavcopy_fo`, `load_option`, `monthly_ex
 
 `offline=True` AND `force_refresh=True` are contradictory; **offline takes precedence**. For an open-expiry contract whose cache is stale relative to today, offline returns the stale cache rather than raising (still valid data, just not up-to-the-minute).
 
+**Exception — `sweep_grid(cache_only=True)`.** Wide sweeps can opt into a mode that treats `OfflineCacheMiss` as a per-cell skip (joining `MissingDataError` and `NoLiquidStrikeError` in `_SKIPPABLE_ERRORS_CACHE_ONLY`) rather than a fatal crash. Rationale: a 450k-cell sweep would otherwise abort the moment any one strike is absent from the cache, even if every other cell is healthy. The carve-out is **opt-in via `cache_only=True`**; the default `_SKIPPABLE_ERRORS` (used by direct `load_option` callers and `cache_only=False` sweeps) preserves the loud-fail contract. Skipped cells surface in the skip-log parquet with `skip_reason=OfflineCacheMiss` + the verbatim cache-path in `skip_detail`, so the analyst still sees exactly what's missing.
+
 ## 6b. Universe selection (Phase 2)
 
 ### 6b.1 Blue-chip (v1)
