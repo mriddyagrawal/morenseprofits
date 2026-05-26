@@ -10931,3 +10931,79 @@ Per my d96e038 grill #3, this is also a chance to consider a RELATIVE threshold 
 After that: the dead-code cleanup, then Compare-cells impl while the prefetch finishes.
 
 ---
+
+## Review: 33f19ae — fix(observations): recalibrate heavy-tail threshold for per-trade ROI
+
+**Verdict: ✅ ACCEPT** — closes the p7.expiry_roi arc cleanly. BUILDER considered my "use a relative threshold" suggestion and rejected it with a stated reason; the chosen absolute-rescale is defensible. One observation about future-proofing.
+
+### What this closes
+
+The p7.expiry_roi arc is now complete:
+- b1b50ec — heatmap + drill-down → per-trade
+- 73224c5 — leaderboard + rank → per-trade
+- 620405e — per_stock + trends → per-trade
+- **33f19ae (this) — observations threshold recalibration**
+
+All 4 tabs + the auto-detector now operate on the same per-trade ROI unit. The "heavy-tail detector silent on per-trade scale" gap I flagged in b1b50ec/620405e is closed.
+
+### My suggestion vs the BUILDER's choice
+
+My d96e038 grill #3 + 620405e next-commit suggestion: use a RELATIVE threshold (`|mean - median| / |median| >= 0.3`) — scale-invariant, no re-calibration on future unit shifts.
+
+The BUILDER's choice: keep absolute, lower 20.0 → 3.0. The docstring's rationale:
+
+> "The threshold is in ROI-pct points, not a ratio, because the absolute gap is the operator's intuition: 'the average expected value is N pts higher than the typical outcome — that gap is the tail.'"
+
+**This is defensible.** The same operator-intuition argument that drove the per-trade-ROI display shift ("annualization is confusing; operators reason in raw per-trade pts") also drives the threshold choice. Relative ratios are more mathematically honest but less operator-readable. **My suggestion was not wrong, but it was not the only valid answer. The BUILDER picked the one that matches the operator's mental model consistently.** ✓
+
+### Calibration of 3.0 pts — is it right?
+
+Pure linear scaling: 20.0 / 12 (annualized→monthly per-trade ratio) ≈ 1.67 pts. **The chosen 3.0 is slightly more conservative** — fires less often than strict scaling would. Trade-off:
+
+| Per-trade median | Per-trade mean | Gap | Old (20.0) | New (3.0) | Strict (1.67) |
+|---|---|---|---|---|---|
+| 3% | 6% | 3.0 | silent | **fires** | fires |
+| 8% | 11% | 3.0 | silent | **fires** | fires |
+| 10% | 12.5% | 2.5 | silent | silent | fires |
+| 4% | 5% | 1.0 | silent | silent | silent |
+
+**3.0 pts catches the operator-actionable cases (median 3-8% with 3+ pt gap)** while leaving the borderline cases (gap 2-3 pts) silent. Reasonable for "we want callouts to be meaningful, not noisy" preference.
+
+For HIGH-volatility strategies (per-trade median 15-20%), even a 3-pt gap is small in relative terms (15-20% relative skew). The detector would fire on these but the operator might not perceive them as "heavy tail." **Minor over-fire risk at the high-magnitude end.** Real-world data will tell.
+
+### What's good
+
+- **Scale-invariance call-outs in inline comments**: `OUTLIER_CARRY_PNL_SHARE = 0.50  # scale-invariant (ratio of |P&L|)` and same for INSTABILITY ratio. Documents WHICH thresholds DON'T need re-calibration. ✓ Good for future readers.
+- **Tests reference the constant**, not hardcoded values: 14/14 still pass without test edits. Tests verify BEHAVIOR (detector fires when gap exceeds threshold) rather than threshold value — robust to future tuning.
+- **Module-level threshold block comment** explicitly calls out the per-trade-ROI calibration context. Future maintainer reading this code understands WHY 3.0 (not 20.0).
+
+### Observation: future-proofing remains an open option
+
+If the operator (or a future operator) ever wants to flip back to annualized OR switch to a different unit (e.g. raw P&L in ₹), the absolute-threshold approach requires another recalibration. The relative-threshold approach would auto-adjust.
+
+**Not a current grill** — the project hasn't given signal it'll change units again. But worth noting for the change-log: "heavy-tail threshold is per-trade-ROI-calibrated; revisit if display unit ever changes."
+
+### What I tried
+
+- Worked the calibration math: 20.0 / 12 = 1.67 (strict linear scaling) vs chosen 3.0 (conservative). Verified the chosen value catches operator-actionable cases.
+- Tabulated detector behavior across typical per-trade ROI scenarios (3-20% median).
+- Cross-referenced the inline comments on each constant for scale-invariance documentation.
+
+### Carry-over open items
+
+- 🔬 **Dead-code `_capture_cell_selection_from_click`** — still pending.
+- 🔬 **`feat(p7.heatmap.compare)`** — needs failing-test enforcement of REVIEWER CONSTRAINTS.
+- 🟡 **`chore(p6.5.tag)`** — at operator discretion.
+- 🚦 **Live-run validation** against 41-symbol universe — gated on prefetch.
+
+### Next-commit suggestion
+
+The p7.expiry_roi arc is closed. Two equally-reasonable next moves:
+1. **Dead-code cleanup** — `chore(p7.cleanup): remove unused _capture_cell_selection_from_click helper + 3 tests`. 5-min change.
+2. **Compare-cells impl** — bigger; needs failing-test enforcement of the no-p-values REVIEWER CONSTRAINT.
+
+Personal preference: (1) first. Closes a backlog item before opening a bigger surface.
+
+The 5-7 hour prefetch is still in flight. After it completes, the wide-sweep run against the new universe is the actual signal-producing step — that result is what determines whether the per-trade-ROI shift LOOKS right in production data.
+
+---
