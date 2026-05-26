@@ -161,7 +161,14 @@ def test_negative_roi_signs_render_correctly(captured_metrics):
 
 @pytest.fixture
 def captured_charts(monkeypatch):
-    """Recorder for st.plotly_chart, st.info, st.caption, st.columns."""
+    """Recorder for st.plotly_chart, plotly_events (the value-pane
+    click bridge), st.info, st.caption, st.columns.
+
+    The value pane was switched from st.plotly_chart(on_select=...) to
+    streamlit_plotly_events.plotly_events(...) so click events fire
+    reliably across browsers. Both rendering paths are captured here
+    as ``kind="plotly_chart"`` so existing chart-count assertions
+    don't need to know which pane uses which API."""
     events: list[dict] = []
 
     class _NullCtx:
@@ -175,6 +182,13 @@ def captured_charts(monkeypatch):
     def fake_plotly_chart(fig, **kw):
         events.append({"kind": "plotly_chart", "fig": fig, "kwargs": kw})
 
+    def fake_plotly_events(fig, **kw):
+        # Mirror the plotly_chart shape so consumers don't need to
+        # care which pane uses which API. Returns [] (no clicks this
+        # render) to match plotly_events' real behavior.
+        events.append({"kind": "plotly_chart", "fig": fig, "kwargs": kw})
+        return []
+
     def fake_info(msg, **_):
         events.append({"kind": "info", "msg": msg})
 
@@ -186,6 +200,10 @@ def captured_charts(monkeypatch):
     monkeypatch.setattr(hm.st, "plotly_chart", fake_plotly_chart)
     monkeypatch.setattr(hm.st, "info", fake_info)
     monkeypatch.setattr(hm.st, "caption", fake_caption)
+    # streamlit_plotly_events is imported INSIDE render_heatmaps; patch
+    # at its source so the import inside the function picks it up.
+    import streamlit_plotly_events
+    monkeypatch.setattr(streamlit_plotly_events, "plotly_events", fake_plotly_events)
     # render_empty calls st.info via empty_state
     import src.web.empty_state as es
     monkeypatch.setattr(es.st, "info", fake_info)
@@ -392,16 +410,19 @@ def test_naming_rule_values_have_percent_suffix(captured_metrics):
 
 
 # ============================================================
-# fix(p7.heatmap.click): value pane must enter select-mode so clicks
-# register as 1-cell box-selects and fire on_select="rerun" — the
-# drill-down depended on this.
+# fix(p7.heatmap.plotly_events): value pane must use plotly_events
+# (the streamlit-plotly-events bridge) to listen to plotly_click —
+# Streamlit's native on_select listens to plotly_selected, which
+# heatmap traces don't emit reliably on single click.
 # ============================================================
 
-def test_value_pane_layout_is_select_mode(captured_charts):
-    """Pinned at render time: dragmode=select + clickmode=event+select
-    on the value pane's layout. Without these, a single click on a
-    heatmap cell emits plotly_click but not plotly_selected — and
-    streamlit's on_select listens for the latter."""
+def test_value_pane_uses_plotly_events_for_click(captured_charts):
+    """The value pane must invoke streamlit_plotly_events.plotly_events
+    with click_event=True (NOT st.plotly_chart with on_select). This
+    is the only reliable way to catch heatmap clicks across browsers
+    on Streamlit 1.57 / Plotly 6.7. Verified empirically via headless-
+    browser walkthrough — synthetic clicks don't propagate through
+    Streamlit's plotly_selected listener for heatmap traces."""
     rows = []
     for e in (15, 10, 5):
         for x in (3, 1):
@@ -409,10 +430,61 @@ def test_value_pane_layout_is_select_mode(captured_charts):
                 rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
 
+    # plotly_events is recorded with kind="plotly_chart" + the kwargs
+    # it was called with; the value-pane chart is the FIRST plotly
+    # render in the captured stream.
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
-    value_fig = charts[0]["fig"]
-    assert value_fig.layout.dragmode == "select"
-    assert value_fig.layout.clickmode == "event+select"
+    value_kwargs = charts[0]["kwargs"]
+    # plotly_events-specific kwarg: click_event=True. st.plotly_chart
+    # doesn't accept this kwarg, so its presence proves the value pane
+    # routed through plotly_events.
+    assert value_kwargs.get("click_event") is True
+    assert value_kwargs.get("select_event") is False
+    assert value_kwargs.get("hover_event") is False
+
+
+def test_capture_cell_selection_from_click_writes_session_state(monkeypatch):
+    """Direct unit test on the helper: a click payload like
+    ``[{"x": "T-3", "y": "T-15", "curveNumber": 0, "pointNumber": [0,5]}]``
+    must set ``mp_heatmap_selected_cell`` to (15, 3) in session_state."""
+    import src.web.heatmap as hm
+    state: dict = {}
+    monkeypatch.setattr(hm.st, "session_state", state)
+    hm._capture_cell_selection_from_click(
+        [{"x": "T-3", "y": "T-15", "curveNumber": 0, "pointNumber": [0, 5]}]
+    )
+    assert state["mp_heatmap_selected_cell"] == (15, 3)
+
+
+def test_capture_cell_selection_from_click_empty_is_no_op(monkeypatch):
+    """No fresh click this rerun → empty list. The prior session_state
+    selection must survive untouched (this is the persistence story
+    that lets drill-down stay open across non-click reruns)."""
+    import src.web.heatmap as hm
+    state = {"mp_heatmap_selected_cell": (7, 2)}
+    monkeypatch.setattr(hm.st, "session_state", state)
+    hm._capture_cell_selection_from_click([])
+    assert state["mp_heatmap_selected_cell"] == (7, 2)
+    hm._capture_cell_selection_from_click(None)
+    assert state["mp_heatmap_selected_cell"] == (7, 2)
+
+
+def test_capture_cell_selection_from_click_ignores_malformed(monkeypatch):
+    """Robustness: if plotly_events returns something we can't parse
+    (missing keys, non-string x/y, garbage), don't crash — leave
+    session_state alone."""
+    import src.web.heatmap as hm
+    state = {"mp_heatmap_selected_cell": (10, 3)}
+    monkeypatch.setattr(hm.st, "session_state", state)
+    # No x/y keys
+    hm._capture_cell_selection_from_click([{"curveNumber": 0}])
+    assert state["mp_heatmap_selected_cell"] == (10, 3)
+    # Non-string x/y
+    hm._capture_cell_selection_from_click([{"x": 3, "y": 15}])
+    assert state["mp_heatmap_selected_cell"] == (10, 3)
+    # Tick label that doesn't parse
+    hm._capture_cell_selection_from_click([{"x": "T-bad", "y": "T-7"}])
+    assert state["mp_heatmap_selected_cell"] == (10, 3)
 
 
 # ============================================================
@@ -552,21 +624,9 @@ def test_export_rule_stub_renders_info_with_implementation_pending(monkeypatch):
     assert "Implementation pending" in infos[0]
 
 
-def test_value_pane_config_exposes_select_tools(captured_charts):
-    """Modebar surface: box-select + lasso buttons added, Plotly logo
-    suppressed. Gives the operator a visible affordance for explicit
-    drag-selection if click-to-select isn't intuitive."""
-    rows = []
-    for e in (15, 10, 5):
-        for x in (3, 1):
-            for _ in range(6):
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
-    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
-
-    charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
-    value_kwargs = charts[0]["kwargs"]
-    assert "config" in value_kwargs
-    cfg = value_kwargs["config"]
-    assert "select2d" in cfg["modeBarButtonsToAdd"]
-    assert "lasso2d" in cfg["modeBarButtonsToAdd"]
-    assert cfg["displaylogo"] is False
+# test_value_pane_config_exposes_select_tools deleted:
+# the box-select / lasso modebar buttons were a fallback for the
+# on_select="rerun" approach. With plotly_events listening to
+# plotly_click directly, that fallback isn't needed — a plain single
+# click is the primary interaction. Modebar config is not part of
+# plotly_events' API surface.

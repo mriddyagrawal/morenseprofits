@@ -208,6 +208,36 @@ def _capture_cell_selection(selected) -> None:
     st.session_state["mp_heatmap_selected_cell"] = (entry_td, exit_td)
 
 
+def _capture_cell_selection_from_click(clicked: list[dict] | None) -> None:
+    """Translate a ``streamlit_plotly_events.plotly_events`` click
+    payload into ``st.session_state['mp_heatmap_selected_cell']``.
+
+    plotly_events returns a list of clicked points (typically length 0
+    or 1 for click_event mode). Each point is a dict with ``x``, ``y``,
+    ``curveNumber``, ``pointNumber``. For our heatmap, ``x`` and ``y``
+    are tick labels like "T-3" / "T-15"; parse the integer back.
+
+    Empty list (no fresh click this rerun) is a no-op — the prior
+    selection in session_state persists. Same click twice is a no-op.
+
+    The plotly_events bridge listens to plotly_click, which Plotly
+    heatmaps DO emit reliably (unlike plotly_selected, which is why
+    Streamlit's native on_select doesn't catch heatmap clicks)."""
+    if not clicked:
+        return
+    pt = clicked[0]
+    x_label = pt.get("x") if isinstance(pt, dict) else None
+    y_label = pt.get("y") if isinstance(pt, dict) else None
+    if not isinstance(x_label, str) or not isinstance(y_label, str):
+        return
+    try:
+        exit_td = int(x_label.lstrip("T-"))
+        entry_td = int(y_label.lstrip("T-"))
+    except (ValueError, AttributeError):
+        return
+    st.session_state["mp_heatmap_selected_cell"] = (entry_td, exit_td)
+
+
 # ============================================================
 # Dual heatmaps — Phase 6.3 commit 16 (feat(p6.3.pivot))
 # ============================================================
@@ -457,26 +487,26 @@ def render_heatmaps(
     )
 
     # Side-by-side render. Each chart claims its column.
-    # Value pane has on_select so clicking a cell drives the drilldown
-    # below (render_cell_drilldown reads mp_heatmap_selected_cell).
+    # Value pane uses streamlit-plotly-events to listen to plotly_click
+    # directly. Streamlit's native ``on_select="rerun"`` listens for
+    # plotly_selected, which Plotly heatmap traces don't reliably emit
+    # on single click (verified against streamlit 1.57 / plotly 6.7 in
+    # a real browser session — synthetic click events don't propagate
+    # selection through the websocket boundary). plotly_events binds
+    # to plotly_click on the JS side and round-trips the clicked
+    # point's x/y as a Python list.
     cols = st.columns(2)
     with cols[0]:
-        selected = st.plotly_chart(
+        from streamlit_plotly_events import plotly_events
+        clicked = plotly_events(
             value_fig,
-            use_container_width=True,
-            key="mp_heatmap_value_chart",
-            on_select="rerun",
-            selection_mode="points",
-            # Surface the box / lasso select buttons in the modebar so
-            # operators who prefer explicit drag-selection over click
-            # have the tools visible. ``displaylogo=False`` drops the
-            # Plotly-logo button (just clutter for an internal tool).
-            config={
-                "modeBarButtonsToAdd": ["select2d", "lasso2d"],
-                "displaylogo": False,
-            },
+            click_event=True,
+            select_event=False,
+            hover_event=False,
+            override_height=400,
+            key="mp_heatmap_value_click",
         )
-        _capture_cell_selection(selected)
+        _capture_cell_selection_from_click(clicked)
     with cols[1]:
         st.plotly_chart(
             density_fig,

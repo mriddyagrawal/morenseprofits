@@ -12,6 +12,10 @@ streamlit>=1.34.0   # on_select="rerun" on st.plotly_chart (heatmap cell
                     # drill-down click handler) requires ≥1.34.0; 1.32
                     # silently ignored the kwarg → clicks did nothing.
 plotly>=5.20.0    # heatmaps + trend charts; hover-tooltip composition
+streamlit-plotly-events>=0.0.6  # heatmap click → drill-down; bridges to
+                                # plotly_click (Streamlit's native on_select
+                                # listens to plotly_selected, which heatmap
+                                # traces don't emit reliably on single click).
                   # via customdata is the killer feature for the research
                   # UI (per DESIGN_SPEC §2.1). Replaces altair, which was
                   # never actually imported in src/ or tests/.
