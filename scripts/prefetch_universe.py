@@ -42,12 +42,20 @@ from src.data.errors import MissingDataError  # noqa: E402
 # ============================================================
 # Defaults
 # ============================================================
-DEFAULT_SYMBOLS = [
-    # Top-10 NSE F&O blue chips by historical liquidity. Operator
-    # can override with --symbols flag.
-    "RELIANCE",   "HDFCBANK",   "ICICIBANK",  "INFY",       "TCS",
-    "SBIN",       "AXISBANK",   "KOTAKBANK",  "BHARTIARTL", "LT",
-]
+def _build_default_symbols() -> list[str]:
+    """40 NSE blue chips (sourced from src.universe.blue_chip — the
+    canonical universe list) + PNB. PNB isn't in the blue-chip 40 but
+    the operator explicitly asked for it.
+
+    Computed at import time so the universe stays in lockstep with
+    src/universe/blue_chip.py — no drift if the blue-chip list ever
+    updates. Operator can still override the full list with --symbols."""
+    from datetime import date as _date
+    from src.universe.blue_chip import blue_chip
+    return blue_chip(_date.today()) + ["PNB"]
+
+
+DEFAULT_SYMBOLS = _build_default_symbols()
 
 DEFAULT_STRIKES_PER_SIDE = 6      # min strikes each side of ATM (per-day rule)
 DEFAULT_STRIKES_PCT = 0.05        # min %-of-spot window around ATM (per-day rule)

@@ -40,10 +40,17 @@ from src.data import bhavcopy_fo_loader, expiry_calendar, options_loader, spot_l
 from src.engine.sweeper import _compute_run_id, sweep_grid  # noqa: E402
 
 
-SYMBOLS = [
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
-    "SBIN", "AXISBANK", "KOTAKBANK", "BHARTIARTL", "LT",
-]   # matches scripts/prefetch_universe.py — 10 blue chips with cache
+def _build_symbols() -> list[str]:
+    """40 NSE blue chips (sourced from src.universe.blue_chip) + PNB.
+    Mirrors scripts/prefetch_universe.py's DEFAULT_SYMBOLS so the sweep
+    universe and the prefetch universe stay in lockstep — sweep
+    against a stock that wasn't prefetched would just produce
+    OfflineCacheMiss skips for every cell."""
+    from src.universe.blue_chip import blue_chip
+    return blue_chip(date.today()) + ["PNB"]
+
+
+SYMBOLS = _build_symbols()   # 41 symbols (40 blue chips + PNB)
 STRATEGIES = ["short_straddle", "short_strangle", "iron_condor"]
 ENTRY_OFFSETS_TD = list(range(1, 46))   # T-45 ... T-1
 EXIT_OFFSETS_TD = list(range(0, 16))    # T-0  ... T-15
