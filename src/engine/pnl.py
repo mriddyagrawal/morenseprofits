@@ -98,6 +98,7 @@ def _price_one_leg(
     load_option_fn: LoadOptionFn,
     today_fn: Callable[[], date],
     slippage_model: SlippageModelV1 = SLIPPAGE_MODEL_V1,
+    offline: bool = False,
 ) -> dict:
     """Price a single leg of ``trade``. Returns a dict that the trade-
     level pricer aggregates into the results-schema row."""
@@ -109,6 +110,7 @@ def _price_one_leg(
         trade.entry_date,
         trade.exit_date,
         today_fn=today_fn,
+        offline=offline,
     )
     context = (
         f"{trade.symbol} {trade.expiry} {int(leg.strike)}-{leg.option_type}"
@@ -204,6 +206,7 @@ def price_trade(
     spot_at_entry: float | None = None,
     hold_trading_days: int | None = None,
     today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
 ) -> dict:
     """Price every leg of ``trade``; return one row in the
     results-schema (SPECS §2.5) shape with the full financial picture:
@@ -248,6 +251,7 @@ def price_trade(
             load_option_fn=load_option_fn,
             today_fn=today_fn,
             slippage_model=slippage_model,
+            offline=offline,
         )
         for leg in trade.legs
     ]

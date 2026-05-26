@@ -215,6 +215,7 @@ def sweep_one(
             # is the true hold (no 252/365 round-trip approximation).
             hold_trading_days=int(entry_offset_td) - int(exit_offset_td),
             today_fn=today_fn,
+            offline=offline,
         )
     except skip_classes as e:
         # Return BOTH the exception class name (for groupby/counts) AND

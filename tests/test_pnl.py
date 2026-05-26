@@ -36,7 +36,7 @@ def _option_frame(dates_closes_lots: list[tuple[date, float, int]]) -> pd.DataFr
 
 def _stub_load_option(per_leg: dict[tuple[float, str], pd.DataFrame]):
     """Build a load_option_fn whose return depends on (strike, option_type)."""
-    def fake(symbol, expiry, strike, option_type, from_date, to_date, *, today_fn=date.today):
+    def fake(symbol, expiry, strike, option_type, from_date, to_date, *, today_fn=date.today, offline=False):
         key = (float(strike), option_type)
         if key not in per_leg:
             raise MissingDataError(f"no fixture for {key}")
@@ -156,7 +156,7 @@ def test_lookahead_rejected():
         (entry, 100.0, 250), (exit_, 10.0, 250), (past_exit, 5.0, 250),
     ])
 
-    def leaky_load(symbol, expiry, strike, option_type, from_date, to_date, *, today_fn=date.today):
+    def leaky_load(symbol, expiry, strike, option_type, from_date, to_date, *, today_fn=date.today, offline=False):
         return leaky_frame  # NO filter — returns the leaky row
 
     trade = Trade(
@@ -561,3 +561,41 @@ def test_qty_lots_scales_linearly():
     o1 = price_trade(t1, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     o3 = price_trade(t3, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
     assert o3["gross_pnl"] == 3 * o1["gross_pnl"]
+
+
+# ============================================================
+# LOAD-BEARING: offline propagation through price_trade → load_option
+# ============================================================
+def test_offline_flag_propagates_to_load_option():
+    """Regression for the cache_only bug: sweep_one was passing
+    ``offline=True`` to spot/trading_calendar but ``price_trade`` did
+    NOT forward it to ``load_option``. Workers in cache_only mode still
+    hit NSE for option contracts → throttled wide sweeps. Pin the
+    propagation here so a future refactor can't silently drop it.
+
+    The stub asserts it received ``offline=True``; if price_trade omits
+    it the assertion fails loud at test time, not at run time."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 25)
+    captured = {}
+
+    def watching_load(symbol, expiry, strike, option_type, from_date, to_date, *, today_fn, offline=False):
+        captured["offline"] = offline
+        return _option_frame([(entry, 100.0, 250), (exit_, 10.0, 250)])
+
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    price_trade(
+        trade, load_option_fn=watching_load,
+        today_fn=lambda: date(2026, 5, 24),
+        slippage_model=_NO_SLIPPAGE,
+        offline=True,
+    )
+    assert captured["offline"] is True, (
+        "price_trade must propagate offline=True to load_option_fn — "
+        "without this, cache_only=True sweeps still let workers hit NSE"
+    )
