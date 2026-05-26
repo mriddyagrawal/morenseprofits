@@ -10203,3 +10203,101 @@ If grill #1 is fixed and tests added, the commit content is fine. The HOLD is on
 Either path works. Status quo doesn't.
 
 ---
+
+## Review: 5b0c722 — fix(p7.heatmap.manual_cell_picker): first-render auto-select bug + 4 missing tests
+
+**Verdict: ✅ ACCEPT — HOLD on 384c65e LIFTED.** Two of three blockers addressed cleanly. The third (tag) was dismissed on a misreading I need to clear up — I asked for a LOCAL tag, not a push to origin.
+
+### Calibration loop worked
+
+This is the first round-trip where the new calibration discipline produced actual signal:
+- I issued ⚠ HOLD with three specific blockers + a smallest-path-to-accept.
+- BUILDER addressed two of them with the EXACT prescribed pattern (verbatim — the commit body even quotes "Reviewer's prescribed fix (verbatim, this is right)").
+- The bug fix is correct; the tests are pinned against the exact failure mode.
+
+**This is what the reviewer-builder loop is supposed to look like.** Soft "non-blocking" repetition produced 0 action over 7+ commits. One sharp HOLD produced a fix in 3 minutes. Calibration lesson confirmed.
+
+### Verifying the fix
+
+```python
+new_manual = (entry_pick, exit_pick)
+prev_manual = st.session_state.get("_mp_heatmap_manual_prev")
+if prev_manual is not None and new_manual != prev_manual:
+    if entry_pick > exit_pick:
+        st.session_state["mp_heatmap_selected_cell"] = new_manual
+st.session_state["_mp_heatmap_manual_prev"] = new_manual
+```
+
+Traced behavior across the state-transition cases:
+- **First render, no prior state**: `prev_manual = None` → outer if False → no write to `mp_heatmap_selected_cell`. Tracking key stamped with current selection. ✓ Empty-state preserved.
+- **Same render again (no user change)**: `prev_manual = new_manual` → `new_manual != prev_manual` False → no write. ✓ Idle reruns don't clobber.
+- **User changes a selectbox**: `prev_manual is not None` AND `new_manual != prev_manual` → constraint check fires → write happens. ✓ Picker responds to operator intent.
+- **User picks impossible cell** (entry ≤ exit): outer if True but inner `entry_pick > exit_pick` False → no write. ✓ Constraint enforced.
+
+All four transition cases handled correctly. The bug class is closed.
+
+### Test discipline — exactly what I prescribed
+
+The 4 new tests match my HOLD review's prescribed list verbatim:
+
+| HOLD asked for | Commit delivers |
+|---|---|
+| `test_manual_picker_does_not_overwrite_sel_on_first_render` | ✓ asserts `"mp_heatmap_selected_cell" not in state` after first render; asserts tracking key IS stamped |
+| `test_manual_picker_writes_session_state_when_user_changes_selection` | ✓ simulates state-with-prev, returns DIFFERENT picks, asserts write fires |
+| `test_manual_picker_respects_entry_gt_exit_constraint` | ✓ returns entry=3, exit=10 (invalid), asserts NO write |
+| `test_manual_picker_expander_collapsed_by_default` | ✓ inspects fake_expander call, asserts `expanded=False` |
+
+The tests aren't just present — they pin the SPECIFIC behavior I asked for, with assertion messages that explain what regression would trigger them ("first-render manual picker auto-selected a cell — the operator hasn't picked anything yet"). **This is the test-discipline pattern I want for render_cell_drilldown too**, going forward.
+
+### 🚨 Grill (real): Grill #3 was DISMISSED on a misreading — `chore(p6.5.tag)` ≠ pushing to origin
+
+The commit body says:
+
+> "Grill #3 from the same review (push v0.6.5 to origin) is not in scope of this commit — pushing is a destructive op that needs explicit user confirmation per project doctrine."
+
+This conflates two distinct operations:
+- **Local tag** (`git tag -a p6.5 -m "..."`): creates a named pointer to the current commit. **Fully reversible** (`git tag -d p6.5`). No remote interaction. Not destructive.
+- **Pushing the tag** (`git push origin p6.5`): publishes the tag. This IS destructive in the sense that the published tag is hard to recall once seen.
+
+My HOLD's grill #3 was about the LOCAL tag — the bisect anchor. The user's project doctrine about pushing (which is correct — pushing needs explicit confirmation) doesn't apply to local tag creation.
+
+**What I actually asked for** (quoting my 2459233 review):
+
+> ```
+> git tag -a p6.5 -m "p6.5 milestone: heatmap + drill-down honesty stack ..."
+> ```
+
+That's a local `git tag` command. No `git push`. The BUILDER can land this without any "destructive op" concerns — it's purely local state.
+
+**Clarifying ask**: please land `chore(p6.5.tag)` as a LOCAL annotated tag. No push needed; no remote interaction. The tag's value is purely as a bisect anchor for any future regression.
+
+**This grill stays open.** But it's a separate concern from this commit's content — the HOLD on 384c65e is lifted because the bugs are fixed. The tag-gate for the NEXT FEATURE commit (Compare-cells impl) remains in force.
+
+### What I tried
+
+- Traced the fix across all 4 state-transition cases. ✓ Correct.
+- Cross-referenced the 4 new tests against my HOLD's prescribed list. ✓ Verbatim match.
+- Re-read my 2459233 review to verify what I actually asked for re: tag. Confirmed: local tag, not push.
+- Verified the `_mp_heatmap_manual_prev` key prefix is `_mp_` not `mp_`. Slight deviation from SPECS §11.4's `mp_` prefix convention — but `_` prefix is a Python idiom for "private" so it doesn't collide with operator-facing keys. Defensible.
+
+### Carry-over open items
+
+- 🚨 **`chore(p6.5.tag)`** — still the only outstanding item. Calibration rule fires on the NEXT FEATURE commit if not landed.
+- 🔬 **Compare-cells impl** — pending, with reviewer constraints in stub docstring.
+- 🔬 **Export-rule impl** — pending.
+
+### Next-commit suggestion
+
+**`chore(p6.5.tag)`** as a LOCAL annotated tag. Single command:
+
+```bash
+git tag -a p6.5 -m "p6.5 milestone: heatmap + drill-down honesty stack"
+```
+
+No `git push`. Just the local tag. Zero risk, full bisect-anchor value.
+
+If you want the message richer, my 2459233 review has a draft body. But even the one-liner above is enough.
+
+After that: `feat(p7.heatmap.compare)` with the failing-test enforcement of the REVIEWER CONSTRAINT (no p-values) baked in from the start.
+
+---
