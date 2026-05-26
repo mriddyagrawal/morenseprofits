@@ -8508,3 +8508,140 @@ The change-log entry attributes the planned skip-rate reduction (<5%) to BOTH th
 Additionally: the cache_only regression test should land BEFORE daily-union, because daily-union touches the same prefetch path that cache_only assumes is the only data source.
 
 ---
+
+## Review: bfe0d32 — feat: prefetch_universe daily spot scan → union strikes via hybrid helper
+
+**Verdict: ✅ ACCEPT** — this IS the commit that should reduce the 26% skip rate. The design is right: scan spot across the entry window, call `strikes_around_spot_hybrid` per day, union the picks. Strike grid source claim verified. Three real grills (test gap, calendar-vs-trading-day comment, strategy-offset edge case) are non-blocking.
+
+### What this commit gets right
+
+- **Strike grid source assumption verified**: comment says "Strikes only get added over time, so the near-expiry bhavcopy has the superset of strikes the strategy could possibly pick across the entry window." **True**: NSE adds strikes as spot moves; strikes don't typically disappear within a contract's life. So pulling the grid from T-1 (or earlier walk-back) gives the union of all listed strikes for that expiry. ✓
+- **Set-based union**: `picked: set[int] = set()` + `picked.update(...)` then `sorted(picked)`. Deterministic order. ✓
+- **`worker_args` hoisted before the if/else**: serial AND parallel paths use the same arg-list construction. Reduces drift between paths. Nice refactor side-effect. ✓
+- **Exit code threshold now uses `total_attempts`**: was `expected_contracts` which is no longer well-defined. `max(total_attempts, 1)` guards div-by-zero. ✓
+- **Honest banner**: "per-pair contract count varies (depends on spot drift across the entry window)" replaces the previously-misleading "expected contracts = total_pairs × n_strikes × 2". ✓
+- **Walk-back loop simplified**: previously assigned `ref_day` inside the loop (used later); now just finds `bc` and discards `ref_day`. Cleaner. ✓
+
+### 🔬 Grill #1 (real): "~45 trading days" comment is off — `entry_window_days=70` cal ≈ **50 TD**, not 45
+
+```python
+DEFAULT_ENTRY_WINDOW_DAYS = 70    # calendar days back from expiry to scan spot
+                                  # (~45 trading days; ...)
+```
+
+Math: 70 calendar days × (5 trading days / 7 calendar days) = **50 TD**, not 45. The sweep grid depth is T-45 (per PLAN entry). At 70 calendar days, prefetch over-covers the sweep by ~5 trading days.
+
+**Two ways to fix**:
+1. Drop default to **63 calendar days** (63 × 5/7 = 45 TD exactly).
+2. Update the comment: "70 calendar days ≈ 50 trading days; ≥ T-45 sweep depth with margin".
+
+Option 2 is safer — over-cover by 5 TD is benign cache cost; under-cover by 5 TD would re-introduce skip-rate. **Recommend option 2**. The current comment misrepresents the math; that's the only real issue.
+
+### 🔬 Grill #2 (real): zero test for the daily-union integration
+
+The strike_planner has 12 unit tests (e58b5ff). `_process_pair` has **none**. The new logic:
+
+```python
+picked: set[int] = set()
+for close in spot_df["close"].astype(float).tolist():
+    picked.update(
+        strikes_around_spot_hybrid(strike_grid, close, ...)
+    )
+picked_strikes = sorted(picked)
+```
+
+If `strikes_around_spot_hybrid` is called with the wrong arguments order, or if the loop accidentally short-circuits, or if the spot DataFrame is shaped wrong (no `close` column → KeyError caught by outer `except Exception`), there's no test that would fail.
+
+**Suggested minimal test** (~20 lines):
+
+```python
+def test_process_pair_unions_strikes_across_window(monkeypatch):
+    # Strike grid has 21 strikes ₹100..₹120 step ₹1.
+    grid = list(range(100, 121))
+    fake_bc = pd.DataFrame({
+        "symbol": ["XYZ"] * 21, "instrument": ["OPTSTK"] * 21,
+        "expiry": [pd.Timestamp("2024-06-27")] * 21,
+        "option_type": ["CE"] * 21, "strike": grid,
+    })
+    monkeypatch.setattr(bhavcopy_fo_loader, "load_bhavcopy_fo", lambda d: fake_bc)
+    # Spot drifts 110 → 115 across 5 days.
+    monkeypatch.setattr(spot_loader, "load_spot",
+        lambda *a, **kw: pd.DataFrame({"date": pd.date_range(...), "close": [110.0, 112.0, 114.0, 115.0, 115.0]}))
+    captured = []
+    monkeypatch.setattr(options_loader, "load_option",
+        lambda **kw: captured.append(kw["strike"]) or pd.DataFrame())
+
+    _process_pair(("XYZ", date(2024, 6, 27), 2, 0.0, 70, "2024-06-26"))
+
+    # With per_side=2 and pct=0, daily picks for spots {110, 112, 114, 115}:
+    #   spot=110 → strikes [108,109,110,111,112]
+    #   spot=112 → strikes [110,111,112,113,114]
+    #   spot=114 → strikes [112,113,114,115,116]
+    #   spot=115 → strikes [113,114,115,116,117]
+    # Union = {108..117}, × 2 option_types (CE+PE) = 20 fetches.
+    assert sorted(set(captured)) == list(range(108, 118))
+```
+
+Without this test:
+- If a future commit changes the worker signature (adds a primitive), there's no compile-time check.
+- If `spot_df.empty` short-circuits accidentally cover the union path, no test fails.
+- If `picked` is built but never iterated, no test fails.
+
+**Not blocking** — the live-run will catch gross failures — but the test is small and pins the contract.
+
+### 🔬 Grill #3 (real): strategy-offset edge case at pct=5% boundary
+
+`pct_window=0.05` covers ATM ± 5% per day. The IronCondor strategy picks strikes at SPECS §5's `strategy_offset_pct` offsets — and the existing IronCondor offset is 0.05 (5% OTM wings per [SPECS.md](SPECS.md)).
+
+**The concern**: a 5% OTM strike at spot=₹3000 = ₹3150. With ₹100 strike grid, the snap is to ₹3150 = exactly the pct=5% upper bound. **Boundary case**: if `strikes_around_spot_hybrid` uses strict `>=` and `<=` (it does: line 74 `k >= low_bound`, line 79 `k <= high_bound`), the boundary strike IS included. ✓
+
+But — what if the strategy's strike calculation includes rounding/snapping that pushes slightly past 5%? E.g., spot=₹3017 (a real intraday close), 5% OTM = ₹3168, snap to ₹3200 = +6.06%. At spot=₹3017, the prefetch pct=5% covers up to ₹3168 (idx of ₹3150). The strategy would pick ₹3200. **Strike OUTSIDE pct window.**
+
+For the v1 stock universe, per_side=6 covers ±~17-20% range, so this case is handled by per_side. **No remaining gap**. But if pct=5% were the binding rule (only true for hypothetical indices), the boundary snapping could leak ~1-2 strikes per day per leg, contributing to the <5% residual skip rate the PLAN predicts.
+
+**Recommend** for IronCondor wings: verify the strategy's actual strike snapping behavior. If it can land OUTSIDE the pct window after snapping, either:
+- Bump pct_window to 0.07 (covers up to 7% to account for snapping headroom).
+- Or have the strategy's strike-picker round AWAY from spot (more conservative), so any 5% target snaps to ≤ 5%.
+
+This is a corner case — likely contributes <0.5% of skips for v1. Worth noting in commit body when daily-union live-run completes, so the residual skip rate is correctly attributed.
+
+### Nit #1: "502 tests still pass" framing
+
+Was 490 before strike_planner (+12 = 502). New daily-union code in `_process_pair` has **no new tests**. "502 tests pass" → operator might think the new code is covered. It isn't. Worth being explicit: "previously-passing 502 tests still pass; no new test for `_process_pair` daily-union logic" (see grill #2).
+
+### Nit #2: delisted-strike edge case
+
+The strike grid comes from ONE near-expiry bhavcopy. If NSE delisted a strike between T-45 and T-1 (rare), it'd exist in T-45's bhavcopy but not T-1's. Strategy at T-45 could pick a strike that prefetch can't find. **Vanishingly rare for stocks**; mostly impossible because NSE doesn't delist option strikes mid-contract. **No fix needed**; a 1-line comment acknowledging the assumption would be paranoid-but-fine.
+
+### What I tried
+
+- Verified the "strikes only added, never removed" claim against NSE convention. ✓ Holds for stocks.
+- Recomputed `70 cal days × 5/7 = 50 TD` vs claimed "~45 TD". Mismatch.
+- Cross-checked that `_process_pair`'s new signature lines up with `worker_args` construction.
+- Confirmed `worker_args` hoisted refactor reduces serial-vs-parallel path drift.
+- Checked the exit-code threshold math.
+
+### Carry-over open items — now URGENT
+
+- 🚨 **`test_sweep_grid_cache_only_mode`** regression test — **block any live-run validation until this lands**. The next operator step is a fresh prefetch + wide-sweep with cache_only=True; if cache_only semantics regress (e.g. a future refactor drops the `offline=` plumb-through again), the sweep silently produces all-skip results. The test is the only durable pin.
+- ⚠ **`chore(p6.5.tag)`** at 27 commits pre-tag.
+
+### Next-commit suggestion
+
+**`test_sweep_grid_cache_only_mode`** — overdue and now the long pole. Suggested test outline:
+
+```python
+def test_sweep_grid_cache_only_skips_on_missing_option():
+    # 1. Build a tiny grid where ONE cell's option file doesn't exist.
+    # 2. Run sweep_grid(cache_only=True, ...).
+    # 3. Assert: priced count = N-1, skipped count = 1.
+    # 4. Assert: skip_log has skip_reason="OfflineCacheMiss" + skip_detail.
+    # 5. Run sweep_grid(cache_only=False, ...) on same grid.
+    # 6. Assert: raises OfflineCacheMiss (loud-fail).
+```
+
+This pins the asymmetry the SPECS §6a exception relies on. ~30-40 lines, fast (no NSE, just cache file presence).
+
+After that, the live-run validation: fresh `prefetch_universe.py --workers 2` → wide-sweep with cache_only → compare skip rate vs the 26% baseline. Expect <5% per PLAN.
+
+---
