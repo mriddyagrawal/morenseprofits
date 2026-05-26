@@ -8095,3 +8095,83 @@ Output is reproducible byte-identical to the commit-message preview.
 The verify script's exact CLI output (sections a + e + f) is roughly the data shape p6.1 needs to render. Streamlit `st.dataframe` + `st.info` blocks for the callouts. Hot-reload makes iteration fast.
 
 ---
+
+## Review of e560ee7 — fix: price_trade plumbs offline= through to load_option — cache_only really works now
+
+**Verdict:** ✅ accept — **and directly admit my 7ce07f9 review was wrong about "Workers truly NSE-free".**
+
+**The bug**: even with `cache_only=True` set in the run banner, the wide sweep stayed at 23-25 cells/sec with **FOUR ESTABLISHED NSE connections** (TCP :443 to 23.217.111.16). User caught it via system-level connection inspection. The flag was reaching `sweep_one` (which set `offline=True` on spot/trading_calendar) but NOT through to `load_option` inside `price_trade → _price_one_leg`. `load_option` defaulted to `offline=False` and the open-expiry staleness check fired NSE refetches.
+
+**Reviewer-miss admission**: my 7ce07f9 review claimed:
+> **Workers truly NSE-free**: ✓ offline=True propagated through all loaders.
+
+That was **wrong**. I read sweep_one's surface (which does pass `offline=` to spot_loader, trading_calendar, and `strategy.generate_trades`) and inferred propagation through. **I didn't trace the transitive call chain `price_trade → _price_one_leg → load_option_fn`** where the kwarg was being dropped. Code review of the offline-plumbing should have been: `grep -n "offline" src/engine/*.py src/data/*.py` and verifying every call along the data path forwards it. I didn't do that.
+
+This also reframes the architectural history: **pre-warm was masking this plumbing bug.** With pre-warm running, the open-expiry cache was fresh enough that the staleness check passed → load_option's `offline=False` default never fired NSE because cache-hit short-circuited. Drop pre-warm (7ce07f9) → staleness check fires → load_option ignores cache_only's intent → workers hammer NSE. So:
+
+- Pre-warm was NOT just a "band-aid"; it was unwittingly covering for a plumbing gap.
+- Dropping pre-warm wasn't just "removing edge cases"; it surfaced the latent bug.
+- The user's "data size > newness" trade-off endorsement is even more correct now — by accepting the trade-off, they forced the underlying bug to the surface where it could be fixed.
+
+**My 7ce07f9 "abandonment of defensive layer" critique was even less accurate** than the other reviewer's pushback indicated. The "defensive layer" wasn't even working — it was a hidden patch for the plumbing bug, not a self-healing layer.
+
+### What works in the fix
+
+- **`offline` threaded through `price_trade → _price_one_leg → load_option_fn`** ([src/engine/pnl.py:101, 113, 207, 254](src/engine/pnl.py)) — three-line wiring, kwarg default `False` preserves backward-compat.
+- **`sweep_one` updated to pass `offline=offline`** to `price_trade` ([src/engine/sweeper.py:218](src/engine/sweeper.py#L218)) — the missing link.
+- **`test_offline_flag_propagates_to_load_option`** regression test ([tests/test_pnl.py:580-601](tests/test_pnl.py#L580-L601)) — a watching-stub asserts `captured["offline"] is True`. **Pinning message explicitly names the use case**: "without this, cache_only=True sweeps still let workers hit NSE". Future contributor refactoring the call chain sees the test failure with the WHY embedded.
+- **Two existing test stubs** updated to accept `offline=` kwarg (callers ignore it). Compatibility-preserving change.
+- **`load_option_fn` callable contract now expects `offline=`** — future stubs without the kwarg will fail with TypeError. **Loud failure; contract enforced.** ✓
+- **19/19 test_pnl.py passes** (was 18 + 1 new); full suite presumably 490 (had 489).
+
+### Implications for prior reviews
+
+| Prior review claim | Reality post-e560ee7 | What I should have done |
+|---|---|---|
+| 7ce07f9: "Workers truly NSE-free ✓" | False — load_option fell back to NSE | Grep `offline` through the call chain before claiming propagation |
+| 7ce07f9 grill: "Abandonment of defensive layer" | Even more wrong — the layer was hiding a plumbing bug | Asked "what does pre-warm actually fix?" before defending it |
+| f69019f speedup estimate "~3-4 min" | Couldn't materialize until e560ee7 because workers were still hitting NSE | Should have verified cache_only actually reaches load_option |
+| 6f52e65 estimate "~4-5 min wall-clock" | Same; theoretical until plumbing was right | Same |
+
+**The chain of perf reviews (f69019f, 6f52e65, 7ce07f9) all assumed cache_only worked end-to-end. None of them grep'd the kwarg propagation.** Real reviewer-discipline failure.
+
+### Blocking issues: None.
+
+### Non-blocking observations
+
+1. **Test stub signature now requires `offline=`** — any third-party `load_option_fn` consumer outside the project would need to update. **For v1 single-codebase**: no third-party callers. Cosmetic.
+
+2. **The fix surfaces the question**: why does sweep_one separately pass `offline=` to spot_loader, trading_calendar, AND price_trade? Each loader has its own offline path. **DRY opportunity**: a `SweepContext` dataclass carrying `today_fn + offline + cache_only` would centralize the propagation. But the explicit-kwargs pattern is also defensible (more grep-able). Phase-7 polish at most.
+
+3. **The user's debugging approach** ("look at ESTABLISHED connections via netstat/lsof to verify cache_only really doesn't hit NSE") is a transferable operator-tooling pattern. Worth a one-line `README` note: "to verify a cache_only sweep is truly offline, check `lsof -iTCP:443 | grep python` while the sweep runs". Useful diagnostic primitive.
+
+### Recalibrated speedup expectation
+
+Now that the plumbing actually carries cache_only end-to-end, the predicted wall-clock from f69019f + 6f52e65 + LRU + cache_only should finally materialize:
+- Theoretical: ~2-5 min for 450k cells.
+- Pre-e560ee7 observed: ~23-25 cells/sec → 450k / 24 = ~5.2 hours. **Dramatically slower because of the plumbing gap.**
+- Post-e560ee7 expected: ~2,000-4,500 cells/sec → 100-225 seconds. **~100× speedup.**
+
+The user's "the sweep is too slow" diagnosis was understated by a factor of 100. The LRU+cache_only stack was only delivering ~5% of its potential before this fix.
+
+### Carry-over open flags
+
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now ~22 commits pre-tag.
+- 🔬 **SPECS §6a doc drift** + **cache_only test** still open from my (valid) 7ce07f9 grills #2 and #4.
+
+### What I tried
+
+- Read [src/engine/pnl.py:95-260](src/engine/pnl.py) diff and `_price_one_leg` signature changes.
+- Confirmed `test_offline_flag_propagates_to_load_option` passes with the explicit-`offline=True` assertion.
+- Cross-checked `sweep_one` now passes `offline=offline` to `price_trade`.
+- Ran `pytest tests/test_pnl.py -v` → 19/19.
+
+### Next-commit suggestion
+
+1. **Live-run the wide sweep NOW** and capture the actual wall-clock. Expected: <5 min, possibly <2 min. Settles the "~2-5 min" forecast.
+2. Bundle the two valid follow-ups from 7ce07f9 review: SPECS §6a amendment + `test_sweep_grid_cache_only_mode`. Small commit.
+3. **`chore(p6.5.tag)`** — overdue.
+
+The other reviewer was right that I overreached on 7ce07f9. **But the underlying concern — "does cache_only actually work?" — was real, just expressed wrong.** The right framing was "this needs a regression test pinning that offline propagates through the price_trade chain" (their valid grill #4). I framed it as "abandonment of defensive layer" which obscured the actual gap. **Calibration lesson: when grilling, lead with the SPECIFIC verifiable claim ("does X actually reach Y?") not the abstract architectural concern ("are we accepting silent skips?").**
+
+---
