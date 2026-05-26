@@ -3306,6 +3306,115 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 7ce07f9 — chore: p7_wide_sweep switches to cache_only=True, drops pre-warm
+
+**Verdict:** ⚠ accept-with-grills — the architectural shift IS cleaner in some dimensions, but the commit body's "simplification" framing is too generous. Two things actually happened: (1) pre-warm got DROPPED rather than fixed, and (2) `OfflineCacheMiss` got carved out of SPECS §6a's loud-fail contract without a SPECS amendment. Both deserve naming.
+
+**Phase / commit goal:** Drop the brittle pre-warm logic (which had edge cases: today's bhavcopy not published, weekends/holidays, phantom-strike artifacts) and switch sweep_grid to `cache_only=True` mode. Workers never touch NSE; missing cache entries surface as `OfflineCacheMiss` skips visible in the drill-down's Skipped Expiries section.
+
+**The architectural shift:**
+
+| Layer | Before (pre-warm era) | After (cache_only=True) |
+|---|---|---|
+| Responsibility | Pre-warm pulls open-expiry data into cache + sweep workers also have NSE-fallback | `prefetch_universe.py` owns ALL NSE fetches; sweep is strict-read-only |
+| Failure mode | Edge cases in pre-warm → workers fall back to NSE → race-throttle | Missing cache → cell skip with explicit reason |
+| When can workers hit NSE? | Anytime cache is stale or missing | Never |
+| Operator timing | Must run AFTER NSE publishes bhavcopy (~6 PM IST) | Anytime; cache_only doesn't care |
+
+**Single-responsibility win**: the operator's mental model becomes "run prefetch → run sweep". Prefetch is the ONLY thing that needs network. Sweep is pure CPU + cache I/O.
+
+**What works:**
+
+- **`_SKIPPABLE_ERRORS_CACHE_ONLY` tuple** ([src/engine/sweeper.py:57-59](src/engine/sweeper.py#L57-L59)): `(MissingDataError, NoLiquidStrikeError, OfflineCacheMiss)`. **Per-mode skip-class** — the default `_SKIPPABLE_ERRORS` keeps OfflineCacheMiss as a fatal crash (SPECS §6a "cold offline cache is operator error"), but cache_only mode explicitly opts into "missing cache = per-cell skip". **Right boundary**: a normal interactive `load_option` call still loudly fails on OfflineCacheMiss; only the explicit cache_only=True sweep relaxes it.
+- **`if cache_only: offline = True`** ([src/engine/sweeper.py:176-177](src/engine/sweeper.py#L176-L177)) — auto-implies. **Foolproof**: operator can't accidentally pass `cache_only=True, offline=False` and get NSE-touching behavior. The implication is one-way (cache_only → offline; offline alone doesn't imply cache_only).
+- **today_fn anchor KEPT** despite the cache_only addition — commit body explains why: trading_calendar's "cap at not-past-today" semantic still uses today_fn, AND the open-expiry `max_cached >= deadline` check still wants the anchored date so most contracts pass the freshness check (cache-hit fast path). **cache_only is the safety net for the tail cases that anchor doesn't cover.** Both layers complement.
+- **Pre-warm code DELETED, not commented-out** ([scripts/p7_wide_sweep.py](scripts/p7_wide_sweep.py)) — 52 lines removed, 7 added. Clean removal; nothing left to confuse a future reader.
+- **The skip log NOW catalogues missing-cache entries** — operator running the wide sweep gets actionable diagnostic: "OfflineCacheMiss for (RELIANCE, 2026-05-28, 2400, CE)" tells them exactly which contract their prefetch missed. Pair this with the drill-down's Skipped Expiries section (0b567af) → analyst sees both the AGGREGATE skip count AND per-cell detail.
+- **489/489 still passes.**
+
+**Strategic implication: the LRU stale-after-force-refresh bug we just discussed is now even MORE irrelevant for sweep_grid:**
+- Sweep uses `cache_only=True` → implies `offline=True`.
+- `offline=True` means "never call NSE".
+- Force-refresh paths can't execute under offline=True (they raise `OfflineCacheMiss` if cache missing).
+- So the LRU staleness bug genuinely cannot manifest in sweep_grid AT ALL — not even theoretically.
+
+This narrows the LRU bug's relevance from "Phase 7-8 corner cases" down to **only Phase 8 MCP / REPL with force_refresh on open data**. Even smaller surface than my prior triage.
+
+**Blocking issues:** None — but several should-fix items below.
+
+**Grills (sharpened):**
+
+1. **🔬 "Simplification" frames an abandonment as architectural progress.** Pre-warm was a real defensive layer: if prefetch_universe.py had any gap, sweep workers would still NSE-fetch and self-heal (slow, but correct). After 7ce07f9, **a prefetch gap becomes a permanent silent skip.** That's not strictly simpler — it's **one layer instead of two with no recovery.** The trade-off the commit body doesn't acknowledge:
+
+   | Old (pre-warm + NSE-fallback) | New (cache_only-strict) |
+   |---|---|
+   | 2 layers, slow recovery via NSE-fallback | 1 layer, no recovery; silent skips |
+   | Pre-warm had edge cases | No edge cases — but also no second chance |
+   | Operator can run anytime; sweep self-corrects | Operator MUST run prefetch successfully first |
+
+   Framing this as "simplification" obscures that the operator's mental model is now: **"trust the prefetch is complete, or your sweep silently misses cells."** That's a real shift in responsibility, not just a code-cleanup.
+
+2. **🔬 SPECS §6a contract is silently weakened.** §6a says: "OfflineCacheMiss is operator error, loud-fail" — explicitly NOT in `_SKIPPABLE_ERRORS`. This commit adds `_SKIPPABLE_ERRORS_CACHE_ONLY` that includes it. **The spec hasn't been updated.** Either:
+   - **Update SPECS §6a** with a "Exception: cache_only=True mode" carve-out, OR
+   - **Rename the new behavior** so it doesn't conflict (e.g., `accept_missing_cache=True`).
+   
+   Right now there's doc drift between the SPECS narrative and the code behavior. A future contributor reading SPECS §6a will be surprised by `_SKIPPABLE_ERRORS_CACHE_ONLY`.
+
+3. **🔬 No skip-reason histogram in the script output.** The wide-sweep prints `skip rate: 3.2%` — but doesn't say WHICH 3.2%. Was it 1 contract that's missing × N cells touching it, or 50 contracts × few cells each? Operator can't tell from the script alone — they have to load the parquet and `groupby("skip_reason").size()` themselves. **The commit body's framing "operator gets actionable diagnostic" overstates what the operator actually sees in the run output.**
+   
+   **Should add**: a `print(skips_df.groupby("skip_reason").size())` at the end of `main()`, OR pipe through to the existing skip-log inspection block. ~5 lines.
+
+4. **🔬 No tests for the cache_only mode.** `_SKIPPABLE_ERRORS_CACHE_ONLY` is a new code path; the per-mode skip-class is a new contract. **Without a test, a future refactor that removes the tuple silently makes OfflineCacheMiss fatal again in cache_only sweeps** — surprising the operator at run time, not test time. Same risk as the parallel-skips regression test I've been flagging. **Should-add**, not "cosmetic" as I had it.
+
+5. **🔬 Wall-clock estimate "~2-5 min" is unmeasured.** That's a 2.5× range. Variance from what — cache density? Worker count? OS scheduling? Mid-day NSE outage that doesn't matter because cache_only? **BUILDER hasn't live-run the post-7ce07f9 wide sweep yet** (or they have and didn't mention it). The estimate is theoretical. **Should validate before claiming**: run once, post the actual number in a follow-up commit body.
+
+6. **`if cache_only: offline = True` is silent override.** If an operator passes `cache_only=True, offline=False`, the offline=False is silently ignored. Defensible (cache_only implies offline by definition), but a `warnings.warn` on the conflict OR a `ValueError` would catch a confused caller. Cosmetic; minor.
+
+7. **`p6_sweep.py` doesn't use cache_only=True** — only the wide sweep does. **Two scripts now have different failure semantics for the same engine.** The §3.2 grid still uses online mode; if prefetch misses something for p6, the operator gets a crash (online + OfflineCacheMiss-not-in-skippable). Inconsistent. Either both scripts use cache_only, or neither does. Worth a deliberate decision documented somewhere.
+
+8. **Drill-down's `_render_skipped_section` will handle `OfflineCacheMiss` rows generically** ([src/web/heatmap.py:739-775](src/web/heatmap.py#L739-L775)) since it renders `Reason` + `Detail` columns without special-casing. ✓ No UI change needed. **But**: the analyst seeing 100 cells with `Reason=OfflineCacheMiss` doesn't immediately know the root cause is "prefetch_universe.py missed this contract" — they might assume NSE had no data. **A clarifying note in the drill-down** or the skip_detail message ("contract not in cache — re-run prefetch_universe.py to populate") would close the trust gap.
+
+9. **Pre-warm code DELETED, walk-back logic DELETED with it.** ✓ Clean — but if a future contributor wants to add a smaller-scope pre-warm (e.g., for a Phase-8 live-trading view that DOES need fresh open-expiry data), they have to re-implement the walk-back. **No comment in the script noting "if you need pre-warm back, see c43f48e + b31ef0f for the working version".** Cosmetic; minor.
+
+10. **The LRU stale-after-force-refresh bug we just discussed is now even more irrelevant for sweep_grid:**
+    - Sweep uses `cache_only=True` → implies `offline=True`.
+    - `offline=True` means "never call NSE".
+    - Force-refresh paths can't execute under offline=True (they raise `OfflineCacheMiss` if cache missing).
+    - So the LRU staleness bug genuinely cannot manifest in sweep_grid AT ALL — not even theoretically.
+    
+    This narrows the LRU bug's relevance to **only Phase 8 MCP / REPL with force_refresh on open data**. Even smaller surface than my prior triage; reinforces my earlier "defer to Phase 8" position.
+
+**Domain / correctness checks:**
+
+- **SPECS §6a contract**: ⚠ default sweep still loud-fails; cache_only=True quietly relaxes it WITHOUT updating §6a doc. Doc drift to fix.
+- **Determinism**: ✓ cache_only doesn't change result content; just changes failure-mode.
+- **Workers truly NSE-free**: ✓ offline=True propagated.
+- **today_fn anchor still load-bearing**: ✓ open-expiry max_cached check benefits.
+
+**Architectural shift assessment (revised):**
+
+What the commit IS: cleaner separation-of-concerns. `prefetch_universe.py` owns NSE; sweep is strict-read-only.
+
+What the commit body says it is: "simplification."
+
+What it ACTUALLY also is: **abandonment of a defensive layer.** Pre-warm had real value as a self-healing fallback — if prefetch missed something, workers would NSE-fetch it during the sweep (slow but correct). Now: prefetch is the single point of failure. Operator runs prefetch → if it had any bug or NSE quirk → wide sweep silently has missing cells → analyst's heatmap reads thin without knowing the data simply wasn't there.
+
+This is a TRADE-OFF, not a clean win. The commit framing should acknowledge it: "We're accepting that prefetch is now a hard gate, in exchange for guaranteed-zero-NSE during parallel sweeps."
+
+**Carry-over open flags:**
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now ~21 commits pre-tag.
+
+**Should-fix items from this commit:**
+1. Update SPECS §6a or rename the cache_only contract carve-out (grill #2).
+2. Add per-skip-reason histogram to the wide-sweep script output (grill #3).
+3. Add `test_sweep_grid_cache_only_mode` regression test pinning the new behavior (grill #4).
+4. Live-validate the "~2-5 min" wall-clock claim before treating it as a published number (grill #5).
+5. Decide whether p6_sweep.py should ALSO use cache_only=True for consistency (grill #7).
+
+**Next-commit suggestion:** Land items 1-3 as a small bundled `chore(p7+): cache_only mode follow-ups — SPECS amendment + skip histogram + regression test`. Then live-validate the wall-clock. Then **`chore(p6.5.tag)`** — long overdue.
+
+---
+
 ## Review of b31ef0f — fix: p7_wide_sweep pre-warm UnboundLocalError on `s` shadowing
 
 **Verdict:** ✅ accept
