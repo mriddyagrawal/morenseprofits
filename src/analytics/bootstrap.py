@@ -61,10 +61,21 @@ def bootstrap_ci(
     point = float(statistic(arr))
     rng = np.random.default_rng(seed)
     # Vectorized resample: (B, n) integer indices into arr → (B, n)
-    # sample matrix → apply statistic along axis=1.
+    # sample matrix.
     idx = rng.integers(0, n, size=(B, n))
     samples = arr[idx]
-    stats = np.apply_along_axis(statistic, 1, samples)
+    # Fast-path: when statistic IS np.median, call it with axis=1 in C
+    # (~10× faster than np.apply_along_axis at B=1000). Mean / max /
+    # min also support axis natively. Generic callables fall back to
+    # apply_along_axis since we can't introspect their axis-awareness.
+    if statistic is np.median:
+        stats = np.median(samples, axis=1)
+    elif statistic is np.mean:
+        stats = np.mean(samples, axis=1)
+    elif statistic in (np.max, np.amax, np.min, np.amin):
+        stats = statistic(samples, axis=1)
+    else:
+        stats = np.apply_along_axis(statistic, 1, samples)
     lo = float(np.quantile(stats, alpha / 2))
     hi = float(np.quantile(stats, 1 - alpha / 2))
     return point, lo, hi
