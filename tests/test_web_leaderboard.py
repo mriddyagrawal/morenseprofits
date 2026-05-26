@@ -52,12 +52,22 @@ def captured_metrics(monkeypatch):
     return metrics
 
 
-def _row(strategy="S", symbol="X", net_pnl=100.0,
-         roi_pct=1.0, roi_pct_annualized=12.0):
+def _row(strategy="S", symbol="X", net_pnl=100.0, roi_pct=1.0):
+    """Build a minimal results-row dict for the leaderboard UI tests.
+
+    Per-trade ROI throughout per p7.expiry_roi — the UI reads
+    ``median_roi_pct`` / ``mean_roi_pct`` / ``std_roi_pct``. The
+    aggregate function still REQUIRES ``roi_pct_annualized`` as an
+    input column (it computes both sets of aggregates from the
+    results parquet, and the real parquet always has both). Tests
+    set roi_pct_annualized to a benign synthetic value since the
+    UI no longer reads its aggregates."""
     return {
         "strategy": strategy, "symbol": symbol,
         "net_pnl": net_pnl, "roi_pct": roi_pct,
-        "roi_pct_annualized": roi_pct_annualized,
+        # Synthetic annualized value — aggregate computes *_annualized
+        # outputs from this, but the UI no longer reads them.
+        "roi_pct_annualized": roi_pct * 12.0,
     }
 
 
@@ -88,8 +98,8 @@ def test_empty_frame_renders_four_dashes(captured_metrics):
 # ============================================================
 
 def test_populated_frame_emits_four_cards_in_canonical_order(captured_metrics):
-    """6 trades on one (strategy, symbol) pair, all winning at 20%/yr."""
-    rows = [_row(net_pnl=100.0, roi_pct=1.0, roi_pct_annualized=20.0)] * 6
+    """6 trades on one (strategy, symbol) pair, all winning at 20%."""
+    rows = [_row(net_pnl=100.0, roi_pct=20.0)] * 6
     render_headline(pd.DataFrame(rows), min_n=5)
     assert [m["label"] for m in captured_metrics] == [
         "Top pair", "Overall win rate", "Total net P&L", "Ranked pairs",
@@ -98,12 +108,12 @@ def test_populated_frame_emits_four_cards_in_canonical_order(captured_metrics):
 
 def test_top_pair_value_is_strategy_x_symbol(captured_metrics):
     rows = [_row(strategy="iron_condor", symbol="HDFCBANK",
-                 net_pnl=500.0, roi_pct=2.0, roi_pct_annualized=24.0)] * 6
+                 net_pnl=500.0, roi_pct=24.0)] * 6
     render_headline(pd.DataFrame(rows), min_n=5)
     top_card = captured_metrics[0]
     assert top_card["value"] == "iron_condor × HDFCBANK"
     # Subtitle includes the median ann ROI with sign + /yr suffix
-    assert "+24.0%/yr" in top_card["delta"] or "+24.0 %/yr" in top_card["delta"]
+    assert "+24.0%" in top_card["delta"] or "+24.0 %" in top_card["delta"]
 
 
 def test_win_rate_card_format_is_percentage(captured_metrics):
@@ -161,7 +171,7 @@ def test_top_pair_dash_when_no_pair_passes_min_n(captured_metrics):
     sample to rank=1."""
     # Single (S, X) pair with n=2, well below min_n=5
     rows = [_row(strategy="S", symbol="X", net_pnl=100.0,
-                 roi_pct_annualized=999.0)] * 2
+                 roi_pct=999.0)] * 2
     render_headline(pd.DataFrame(rows), min_n=5)
     top_card = captured_metrics[0]
     assert top_card["value"] == "—"
@@ -247,7 +257,7 @@ def test_rank_table_all_below_min_n_shows_correct_empty_state(captured_table):
 def test_rank_table_populated_renders_dataframe_with_canonical_columns(captured_table):
     """≥1 pair passes min_n → real st.dataframe with the 9 columns
     pinned in DESIGN_SPEC §4 commit 12."""
-    rows = [_row(strategy="A", symbol="X", roi_pct_annualized=20.0)] * 6
+    rows = [_row(strategy="A", symbol="X", roi_pct=20.0)] * 6
     render_rank_table(pd.DataFrame(rows), min_n=5)
     df_event = next((e for e in captured_table if e["kind"] == "dataframe"), None)
     assert df_event is not None
@@ -257,9 +267,9 @@ def test_rank_table_populated_renders_dataframe_with_canonical_columns(captured_
     expected_cols = [
         "rank", "n_trades", "strategy", "symbol",
         "win_rate_pct",
-        "median_roi_pct_annualized",
-        "mean_roi_pct_annualized",
-        "std_roi_pct_annualized",
+        "median_roi_pct",
+        "mean_roi_pct",
+        "std_roi_pct",
         "total_net_pnl",
     ]
     assert list(df.columns) == expected_cols
@@ -343,9 +353,9 @@ def test_thin_samples_sorted_by_n_desc_then_roi_desc(captured_table):
     worth lowering min_n for. Sort: n_trades DESC, then ann ROI DESC.
     Pinned so future refactor doesn't silently reorder."""
     rows = (
-        [_row(strategy="A", symbol="X", roi_pct_annualized=10.0)] * 4 +
-        [_row(strategy="B", symbol="X", roi_pct_annualized=50.0)] * 4 +
-        [_row(strategy="A", symbol="Y", roi_pct_annualized=99.0)] * 2  # smaller N
+        [_row(strategy="A", symbol="X", roi_pct=10.0)] * 4 +
+        [_row(strategy="B", symbol="X", roi_pct=50.0)] * 4 +
+        [_row(strategy="A", symbol="Y", roi_pct=99.0)] * 2  # smaller N
     )
     render_thin_samples(pd.DataFrame(rows), min_n=5)
     df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
@@ -389,11 +399,11 @@ def test_within_stock_resets_rank_at_each_symbol(captured_table):
     rows, with #=1 appearing twice (one per symbol)."""
     rows = (
         # RELIANCE: A and B, A has higher median ann ROI
-        [_row(strategy="A", symbol="RELIANCE", roi_pct_annualized=30.0)] * 6 +
-        [_row(strategy="B", symbol="RELIANCE", roi_pct_annualized=10.0)] * 6 +
+        [_row(strategy="A", symbol="RELIANCE", roi_pct=30.0)] * 6 +
+        [_row(strategy="B", symbol="RELIANCE", roi_pct=10.0)] * 6 +
         # INFY: B and C, C wins
-        [_row(strategy="B", symbol="INFY", roi_pct_annualized=20.0)] * 6 +
-        [_row(strategy="C", symbol="INFY", roi_pct_annualized=40.0)] * 6
+        [_row(strategy="B", symbol="INFY", roi_pct=20.0)] * 6 +
+        [_row(strategy="C", symbol="INFY", roi_pct=40.0)] * 6
     )
     render_within_stock_rank(pd.DataFrame(rows), min_n=5)
     df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
@@ -414,9 +424,9 @@ def test_within_stock_sorted_symbol_then_rank(captured_table):
     Operator reads row-by-row and sees each symbol's full ladder
     contiguously."""
     rows = (
-        [_row(strategy="Z", symbol="ZEEL", roi_pct_annualized=10.0)] * 6 +
-        [_row(strategy="A", symbol="ACC",  roi_pct_annualized=20.0)] * 6 +
-        [_row(strategy="B", symbol="ACC",  roi_pct_annualized=5.0)] * 6
+        [_row(strategy="Z", symbol="ZEEL", roi_pct=10.0)] * 6 +
+        [_row(strategy="A", symbol="ACC",  roi_pct=20.0)] * 6 +
+        [_row(strategy="B", symbol="ACC",  roi_pct=5.0)] * 6
     )
     render_within_stock_rank(pd.DataFrame(rows), min_n=5)
     df = next(e for e in captured_table if e["kind"] == "dataframe")["df"]
@@ -472,8 +482,7 @@ def test_nan_safety_in_aggregates(captured_metrics):
     missing data slipped through), the headline strip should NOT
     render 'nan%' anywhere — format_pct + format_inr both return
     em-dash on NaN."""
-    rows = [_row(net_pnl=float("nan"), roi_pct=float("nan"),
-                 roi_pct_annualized=float("nan"))] * 6
+    rows = [_row(net_pnl=float("nan"), roi_pct=float("nan"))] * 6
     render_headline(pd.DataFrame(rows), min_n=5)
     # Render shouldn't crash; values may be —
     for m in captured_metrics:

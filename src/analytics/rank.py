@@ -23,10 +23,13 @@ import pandas as pd
 from src.analytics.aggregate import MIN_N_FOR_RANKING
 
 
-# Default ranking metric — median over mean for robustness to outliers,
-# annualized so cells with different hold lengths are comparable per
-# SPECS §4a caveat #2.
-DEFAULT_RANK_METRIC: str = "median_roi_pct_annualized"
+# Default ranking metric — median over mean for robustness to outliers.
+# Per-trade ROI (not annualized) per p7.expiry_roi; operator preference
+# is to compare strategies on their per-expiry return since every
+# expiry-based strategy maps to one trade per expiry. Operators who
+# need the annualized view can pass ``by="median_roi_pct_annualized"``
+# directly to rank_strategies.
+DEFAULT_RANK_METRIC: str = "median_roi_pct"
 
 
 # v1 documentation-only mitigation for the selection-bias problem:

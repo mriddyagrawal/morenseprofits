@@ -9,7 +9,8 @@ the within/across toggle below it.
 
 Naming rule pinned in §2.5: if a card's value is RUPEES, the label
 contains "P&L" or "₹" — never "ROI". If a card's value is a
-PERCENTAGE, the label ends in "%" or "%/yr" — never a bare number.
+PERCENTAGE, the label ends in "%" — never a bare number. (Per-trade
+ROI throughout, no annualization per p7.expiry_roi.)
 This is the contract that prevents the mockup's "AVG ROI ₹25.76 L"
 bug (rupees mislabeled as percentage).
 """
@@ -51,7 +52,7 @@ def render_headline(df: pd.DataFrame, *, min_n: int) -> None:
 
     Cards (left → right):
       TOP PAIR          rank=1's strategy × symbol, subtitle =
-                        +X.X %/yr median ann. ROI
+                        +X.X% median ROI
       OVERALL WIN RATE  (net_pnl > 0).sum() / n_trades × 100
       TOTAL NET P&L     sum(net_pnl) formatted as ₹X.XX L or Cr
       RANKED PAIRS      n_above_min_n / n_pairs_total
@@ -87,7 +88,7 @@ def render_headline(df: pd.DataFrame, *, min_n: int) -> None:
             st.metric(
                 "Top pair",
                 f"{top['strategy']} × {top['symbol']}",
-                f"{format_pct(top['median_roi_pct_annualized'], signed=True, annualized=True)} median ann. ROI",
+                f"{format_pct(top['median_roi_pct'], signed=True)} median ROI",
                 delta_color="off",
             )
         else:
@@ -155,7 +156,7 @@ def render_rank_table(df: pd.DataFrame, *, min_n: int) -> None:
       - win_rate_pct       — ProgressColumn (0-100 range; visual bar)
       - rupee P&L          — NumberColumn with format="₹%,.0f"
       - percentages        — NumberColumn with format="%.1f%%"
-        (annualized %s get "%.1f%%/yr"-equivalent via subtitle)
+        (per-trade ROI throughout per p7.expiry_roi)
     """
     if len(df) == 0:
         render_empty("leaderboard_no_rows_after_filters")
@@ -181,9 +182,9 @@ def render_rank_table(df: pd.DataFrame, *, min_n: int) -> None:
     display_cols = [
         "rank", "n_trades", "strategy", "symbol",
         "win_rate_pct",
-        "median_roi_pct_annualized",
-        "mean_roi_pct_annualized",
-        "std_roi_pct_annualized",
+        "median_roi_pct",
+        "mean_roi_pct",
+        "std_roi_pct",
         "total_net_pnl",
     ]
     table = ranked[display_cols].copy()
@@ -214,19 +215,19 @@ def render_rank_table(df: pd.DataFrame, *, min_n: int) -> None:
                 "Win %", format="%.1f%%",
                 min_value=0.0, max_value=100.0, width="small",
             ),
-            "median_roi_pct_annualized": st.column_config.NumberColumn(
-                "Median ROI/yr", format="%+.1f%%",
+            "median_roi_pct": st.column_config.NumberColumn(
+                "Median ROI", format="%+.1f%%",
                 help=(
                     "Median holding-period ROI annualized to 252 trading days "
                     "(SPECS §4a caveat #2). Cross-window-comparable; robust "
                     "to single-trade outliers in small N samples."
                 ),
             ),
-            "mean_roi_pct_annualized": st.column_config.NumberColumn(
-                "Mean ROI/yr", format="%+.1f%%",
+            "mean_roi_pct": st.column_config.NumberColumn(
+                "Mean ROI", format="%+.1f%%",
             ),
-            "std_roi_pct_annualized": st.column_config.NumberColumn(
-                "Std ROI/yr", format="±%.1f%%",
+            "std_roi_pct": st.column_config.NumberColumn(
+                "Std ROI", format="±%.1f%%",
                 help=(
                     "Observed-sample dispersion (ddof=0). Treat as LOWER "
                     "BOUND on true population spread; small-N groups "
@@ -326,11 +327,11 @@ def render_within_stock_rank(df: pd.DataFrame, *, min_n: int) -> None:
         )
         return
 
-    # Per-symbol rank by median_roi_pct_annualized DESC.
+    # Per-symbol rank by median_roi_pct DESC.
     # Sort + cumulative rank within group; final sort is by (symbol,
     # rank_within_symbol) so the table reads naturally.
     eligible = eligible.sort_values(
-        ["symbol", "median_roi_pct_annualized"],
+        ["symbol", "median_roi_pct"],
         ascending=[True, False],
     )
     eligible["rank_within_symbol"] = (
@@ -345,9 +346,9 @@ def render_within_stock_rank(df: pd.DataFrame, *, min_n: int) -> None:
     display_cols = [
         "symbol", "rank_within_symbol", "n_trades", "strategy",
         "win_rate_pct",
-        "median_roi_pct_annualized",
-        "mean_roi_pct_annualized",
-        "std_roi_pct_annualized",
+        "median_roi_pct",
+        "mean_roi_pct",
+        "std_roi_pct",
         "total_net_pnl",
     ]
     table = eligible[display_cols]
@@ -374,14 +375,14 @@ def render_within_stock_rank(df: pd.DataFrame, *, min_n: int) -> None:
                 "Win %", format="%.1f%%",
                 min_value=0.0, max_value=100.0, width="small",
             ),
-            "median_roi_pct_annualized": st.column_config.NumberColumn(
-                "Median ROI/yr", format="%+.1f%%",
+            "median_roi_pct": st.column_config.NumberColumn(
+                "Median ROI", format="%+.1f%%",
             ),
-            "mean_roi_pct_annualized": st.column_config.NumberColumn(
-                "Mean ROI/yr", format="%+.1f%%",
+            "mean_roi_pct": st.column_config.NumberColumn(
+                "Mean ROI", format="%+.1f%%",
             ),
-            "std_roi_pct_annualized": st.column_config.NumberColumn(
-                "Std ROI/yr", format="±%.1f%%",
+            "std_roi_pct": st.column_config.NumberColumn(
+                "Std ROI", format="±%.1f%%",
             ),
             "total_net_pnl": st.column_config.NumberColumn(
                 "Net P&L (₹)", format="₹%,.0f",
@@ -433,15 +434,15 @@ def render_thin_samples(df: pd.DataFrame, *, min_n: int) -> None:
     # so the operator sees the "biggest, best" thin samples first
     # (the ones most worth investigating further by lowering min_n).
     thin = thin.sort_values(
-        ["n_trades", "median_roi_pct_annualized"],
+        ["n_trades", "median_roi_pct"],
         ascending=[False, False],
     ).reset_index(drop=True)
 
     display_cols = [
         "strategy", "symbol", "n_trades",
         "win_rate_pct",
-        "median_roi_pct_annualized",
-        "std_roi_pct_annualized",
+        "median_roi_pct",
+        "std_roi_pct",
         "total_net_pnl",
     ]
     table = thin[display_cols]
@@ -475,11 +476,11 @@ def render_thin_samples(df: pd.DataFrame, *, min_n: int) -> None:
                 "Win %", format="%.1f%%",
                 min_value=0.0, max_value=100.0, width="small",
             ),
-            "median_roi_pct_annualized": st.column_config.NumberColumn(
-                "Median ROI/yr", format="%+.1f%%",
+            "median_roi_pct": st.column_config.NumberColumn(
+                "Median ROI", format="%+.1f%%",
             ),
-            "std_roi_pct_annualized": st.column_config.NumberColumn(
-                "Std ROI/yr", format="±%.1f%%",
+            "std_roi_pct": st.column_config.NumberColumn(
+                "Std ROI", format="±%.1f%%",
             ),
             "total_net_pnl": st.column_config.NumberColumn(
                 "Net P&L (₹)", format="₹%,.0f",

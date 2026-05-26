@@ -28,11 +28,20 @@ from src.analytics.rank import (
 )
 
 
-def _trade(strategy, symbol, net_pnl=100.0, roi_pct=1.0, roi_pct_annualized=12.0):
+def _trade(strategy, symbol, net_pnl=100.0, roi_pct=1.0):
+    """Build a minimal trade-row for rank tests.
+
+    Per-trade ROI throughout per p7.expiry_roi: the default rank
+    metric is now ``median_roi_pct`` (not ``..._annualized``). Tests
+    pass per-trade values via ``roi_pct=``. The aggregate function
+    requires ``roi_pct_annualized`` as an input column (it computes
+    both sets of aggregates), so we synthesize one from roi_pct ×12."""
     return {
         "strategy": strategy, "symbol": symbol,
         "net_pnl": net_pnl, "roi_pct": roi_pct,
-        "roi_pct_annualized": roi_pct_annualized,
+        # Synthetic annualized — required by aggregate but no longer
+        # the rank metric. Tests don't read it.
+        "roi_pct_annualized": roi_pct * 12.0,
     }
 
 
@@ -52,21 +61,21 @@ def test_rank_column_is_1_indexed_dense():
     for strat, annualized in [("A", 30.0), ("B", 10.0), ("C", 20.0)]:
         for _ in range(6):
             rows.append(_trade(strat, "X",
-                               roi_pct_annualized=annualized))
+                               roi_pct=annualized))
     out = rank_strategies(_summary_from(rows))
     assert "rank" in out.columns
     assert list(out["rank"]) == [1, 2, 3]
 
 
 def test_descending_by_default_higher_is_better():
-    """Highest median_roi_pct_annualized → rank 1."""
+    """Highest median_roi_pct → rank 1."""
     rows = [
-        _trade("A", "X", roi_pct_annualized=10.0),
-        _trade("B", "X", roi_pct_annualized=50.0),
-        _trade("C", "X", roi_pct_annualized=30.0),
+        _trade("A", "X", roi_pct=10.0),
+        _trade("B", "X", roi_pct=50.0),
+        _trade("C", "X", roi_pct=30.0),
     ] * 6  # min_n satisfaction
     out = rank_strategies(_summary_from(rows), min_n=0)
-    # Note: descending by median_roi_pct_annualized
+    # Note: descending by median_roi_pct
     # B (50) → rank 1, C (30) → rank 2, A (10) → rank 3
     assert out.iloc[0]["strategy"] == "B"
     assert out.iloc[1]["strategy"] == "C"
@@ -76,9 +85,9 @@ def test_descending_by_default_higher_is_better():
 def test_ascending_flips_to_worst_first():
     """For 'what should I AVOID' use case."""
     rows = [
-        _trade("A", "X", roi_pct_annualized=10.0),
-        _trade("B", "X", roi_pct_annualized=50.0),
-        _trade("C", "X", roi_pct_annualized=30.0),
+        _trade("A", "X", roi_pct=10.0),
+        _trade("B", "X", roi_pct=50.0),
+        _trade("C", "X", roi_pct=30.0),
     ] * 6
     out = rank_strategies(_summary_from(rows), ascending=True, min_n=0)
     # Ascending → A (10) first
@@ -87,15 +96,15 @@ def test_ascending_flips_to_worst_first():
 
 
 def test_by_kwarg_selects_metric():
-    """Default = median_roi_pct_annualized. Specifying ``by`` picks
+    """Default = median_roi_pct. Specifying ``by`` picks
     a different metric (e.g., win_rate_pct, or total_net_pnl)."""
     rows = []
     # Strategy A: 6 trades, all small wins
     for _ in range(6):
-        rows.append(_trade("A", "X", net_pnl=10.0, roi_pct=0.1, roi_pct_annualized=1.2))
+        rows.append(_trade("A", "X", net_pnl=10.0, roi_pct=1.2))
     # Strategy B: 6 trades, all huge but barely profitable
     for _ in range(6):
-        rows.append(_trade("B", "X", net_pnl=10_000.0, roi_pct=0.05, roi_pct_annualized=0.6))
+        rows.append(_trade("B", "X", net_pnl=10_000.0, roi_pct=0.6))
     # By default (annualized ROI): A wins (1.2 > 0.6)
     by_roi = rank_strategies(_summary_from(rows))
     assert by_roi.iloc[0]["strategy"] == "A"
@@ -114,9 +123,9 @@ def test_min_n_suppresses_thin_samples_from_output():
     is the consumer-side filter."""
     rows = (
         # A: 6 trades (passes min_n=5)
-        [_trade("A", "X", roi_pct_annualized=10.0)] * 6
+        [_trade("A", "X", roi_pct=10.0)] * 6
         # B: 2 trades (FAILS min_n=5)
-        + [_trade("B", "X", roi_pct_annualized=100.0)] * 2
+        + [_trade("B", "X", roi_pct=100.0)] * 2
     )
     out = rank_strategies(_summary_from(rows))
     # B has the higher metric but is suppressed
@@ -126,7 +135,7 @@ def test_min_n_suppresses_thin_samples_from_output():
 
 def test_min_n_zero_disables_suppression():
     """``min_n=0`` includes every row regardless of n_trades."""
-    rows = [_trade("S", "X", roi_pct_annualized=10.0)]  # n=1
+    rows = [_trade("S", "X", roi_pct=10.0)]  # n=1
     out = rank_strategies(_summary_from(rows), min_n=0)
     assert len(out) == 1
 
@@ -156,7 +165,7 @@ def test_tiebreaker_by_strategy_then_symbol():
     # Two pairs with identical annualized ROI (= 10)
     for strat, sym in [("Z", "X"), ("A", "Y"), ("A", "X")]:
         for _ in range(6):
-            rows.append(_trade(strat, sym, roi_pct_annualized=10.0))
+            rows.append(_trade(strat, sym, roi_pct=10.0))
     out = rank_strategies(_summary_from(rows))
     # All have same median; lex tiebreaker by (strategy, symbol)
     # (A, X), (A, Y), (Z, X)
@@ -173,7 +182,7 @@ def test_top_n_truncates_after_ranking():
     rows = []
     for strat, roi in [("A", 30.0), ("B", 10.0), ("C", 20.0), ("D", 40.0)]:
         for _ in range(6):
-            rows.append(_trade(strat, "X", roi_pct_annualized=roi))
+            rows.append(_trade(strat, "X", roi_pct=roi))
     out = rank_strategies(_summary_from(rows), top_n=2)
     assert len(out) == 2
     # Top 2 by annualized ROI: D (40), A (30)
@@ -229,7 +238,7 @@ def test_empty_input_returns_empty_with_rank_column():
         "strategy": pd.Series(dtype="string"),
         "symbol": pd.Series(dtype="string"),
         "n_trades": pd.Series(dtype="int64"),
-        "median_roi_pct_annualized": pd.Series(dtype="float64"),
+        "median_roi_pct": pd.Series(dtype="float64"),
     })
     out = rank_strategies(empty)
     assert "rank" in out.columns
@@ -259,7 +268,7 @@ def test_empty_input_no_warning():
         "strategy": pd.Series(dtype="string"),
         "symbol": pd.Series(dtype="string"),
         "n_trades": pd.Series(dtype="int64"),
-        "median_roi_pct_annualized": pd.Series(dtype="float64"),
+        "median_roi_pct": pd.Series(dtype="float64"),
     })
     with _w.catch_warnings():
         _w.simplefilter("error")  # Promote any warning to an exception
@@ -275,8 +284,8 @@ def test_multiple_comparisons_caveat_is_real_string():
     assert "selection bias" in MULTIPLE_COMPARISONS_CAVEAT.lower()
 
 
-def test_default_rank_metric_is_annualized_median():
+def test_default_rank_metric_is_per_trade_median():
     """Phase-6 default ranking surface uses this. Pin the choice so a
     change to a different default (e.g. mean) is intentional and
     visible as a test diff."""
-    assert DEFAULT_RANK_METRIC == "median_roi_pct_annualized"
+    assert DEFAULT_RANK_METRIC == "median_roi_pct"
