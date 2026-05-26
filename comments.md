@@ -8861,3 +8861,189 @@ After the smoke-test:
 - **Click fix doesn't work** → streamlit-plotly-events fallback (small) → repeat smoke-test → `chore(p6.5.tag)`.
 
 ---
+
+## Review: 861b307 — feat(p7.heatmap.strike_disclosure): every strategy advertises its strike rule
+
+**Verdict: ✅ ACCEPT** — pure honesty-surface commit. Zero behavior change. Pinning tests freeze the exact wording so a "let me improve the copy" refactor would have to update tests in lockstep. Defensive Protocol approach + try/except integration keeps the heatmap alive if a future strategy lacks the method. Lands BEFORE Compare-cells, which was my sequencing recommendation pre-context-compaction — order matches.
+
+### Why this lands NOW and not after Compare-cells
+
+Commit body's reasoning:
+
+> Once analysts can compare cells, they need to know whether two cells share the same strike rule or differ. The caption gives them that signal at a glance.
+
+This is the right sequencing. If Compare-cells landed first, the analyst could compare cells without knowing how strikes were picked — implicitly trusting that two cells with the same strategy use the same strike rule. **They do** (today), but the comparison's mental model would silently depend on that assumption. Landing strike_disclosure first makes the assumption explicit and visible. ✓ Sequencing matches what I recommended pre-compaction.
+
+### Pinned strings — what each test catches
+
+The strategy-level tests are explicit:
+
+```python
+def test_short_straddle_default():
+    assert ShortStraddle().display_strike_rule() == "ATM — nearest listed strike to entry-day spot close"
+
+def test_iron_condor_default():
+    assert IronCondor().display_strike_rule() == "Inner SELL at ±2% OTM ; Outer BUY at ±5% OTM (all nearest listed)"
+
+def test_iron_condor_both_overrides_propagate():
+    s = IronCondor().display_strike_rule({"inner_offset_pct": 0.025, "outer_offset_pct": 0.06})
+    assert s == "Inner SELL at ±2.5% OTM ; Outer BUY at ±6% OTM (all nearest listed)"
+```
+
+**These will go red on**:
+- Any wording change (em-dash → hyphen, "OTM" → "out of the money", etc.).
+- Float-formatting drift (e.g. someone switches `:g` to `:.1f`, which renders `2.5` as `2.5` but renders `2` as `2.0`).
+- A param key rename (`inner_offset_pct` → `inner_offset`) that breaks the override path.
+- Default offset value changes (e.g. dropping `DEFAULT_OUTER_OFFSET_PCT` from 0.05 → 0.04).
+
+This is the right pin. The string is operator-facing UX — silent drift is the failure mode you actually want to catch. ✓
+
+### `:g` formatter — verified safe across reasonable offsets
+
+`f"{x:g}"` uses default 6-significant-digit precision and strips trailing zeros:
+- `2.0` → `"2"` ✓
+- `2.5` → `"2.5"` ✓
+- `0.025 * 100 = 2.5000000000000004` (float64 imprecision) → `"2.5"` ✓
+- `0.07 * 100 = 7.000000000000001` → `"7"` ✓
+- `0.001 * 100 = 0.1` → `"0.1"` ✓
+- Negative numbers: not possible — offsets are non-negative.
+
+`:g` is the right choice. Default `f"{x}"` would render `2.0` as `"2.0"`; `:.2f` would render `2` as `"2.00"`. Neither matches the pinned string. Worth a 1-line comment near one of the format strings noting that `:g` strips trailing zeros — but cosmetic.
+
+### Defensive try/except — and the trade-off
+
+```python
+try:
+    from src.strategies.registry import get_strategy
+    strat_obj = get_strategy(strategy)
+    st.caption(f"ℹ Strike rule: {strat_obj.display_strike_rule()}")
+except Exception:
+    pass
+```
+
+**Reads silent failure as the right call here**: the caption is non-critical UX; if it fails, the rest of the tab should still render. Per the commit body: "If the registry / display_strike_rule isn't available for this strategy (3rd-party plug-in, future strategy that hasn't implemented the protocol yet), silently skip the caption rather than crash the whole tab."
+
+### Grills
+
+#### 🔬 Grill #1 (real but soft): `except Exception` could mask bugs in `display_strike_rule` itself
+
+The catch is INTENTIONALLY wide. Three failure modes:
+1. **Strategy not in registry** (`KeyError` from `get_strategy(unknown_name)`) — defensible silent skip.
+2. **Strategy missing the method** (`AttributeError`) — defensible silent skip (matches the Protocol's "future strategy" carve-out).
+3. **Bug INSIDE `display_strike_rule`** (e.g. `KeyError` on a typo'd param key, `TypeError` on a missing default) — **swallowed silently**, no log, no signal to anyone.
+
+Case (3) is the one that bothers me. A bug in the method would silently remove the caption from the UI without anyone knowing. The operator wouldn't immediately notice because the caption is just an info string, not a primary surface.
+
+**Recommendation**: narrow the catch OR log on swallow. Either:
+
+```python
+except (AttributeError, KeyError, ImportError):
+    pass  # known degrade paths
+
+# OR
+except Exception as e:
+    import logging
+    logging.warning(f"Failed to render strike rule caption for {strategy}: {e}")
+```
+
+The second is operationally safer — log once, keep the tab alive. **Not blocking** because the impact of a missing caption is low; just worth noting.
+
+#### 🔬 Grill #2 (real, low-stakes): "OTM each side" prefix is redundant with the spot× notation
+
+```
+"2% OTM each side — nearest listed to spot×1.02 (CE), spot×0.98 (PE)"
+```
+
+The "2%" prefix duplicates info that "spot×1.02 (CE), spot×0.98 (PE)" already conveys (someone reading the latter can compute "2% OTM"). Could shorten to:
+
+```
+"CE at spot×1.02, PE at spot×0.98 (2% OTM each side)"
+```
+
+Or invert to lead with the example math:
+
+```
+"Spot×1.02 (CE) + spot×0.98 (PE) — 2% OTM symmetric"
+```
+
+This is **pure UX taste** — the current is fine. Just noting. The IronCondor string has the same property: "Inner SELL at ±2% OTM" is the rule, and "all nearest listed" is the snap-method. Could split as `Rule: ±2% inner / ±5% outer | Snap: nearest listed`. Cosmetic.
+
+#### 🔬 Grill #3 (real, code duplication): short_straddle and long_straddle have identical strings
+
+```python
+# short_straddle.py:
+def display_strike_rule(self, params=None) -> str:
+    return "ATM — nearest listed strike to entry-day spot close"
+
+# long_straddle.py:
+def display_strike_rule(self, params=None) -> str:
+    return "ATM — nearest listed strike to entry-day spot close"
+```
+
+Verbatim duplication. Same for short_strangle / long_strangle — same string for both, both with the same `:g` formatting.
+
+**Options**:
+- Leave it (defensible — each tested independently, no risk of one drifting from the other silently).
+- Extract a helper: `from src.strategies._strikes import atm_display, otm_symmetric_display`.
+- Put a default impl on the Protocol (Python Protocols can have default impls).
+
+The current is fine. The risk is low because tests pin each string independently — if one drifts, its own test fails. **Just noting for posterity**: if a 6th strategy is added that's a variant of straddle, an obvious extractable surface emerges.
+
+### Web test — solid but the multi-call structure is unusual
+
+```python
+df = pd.DataFrame([_row(entry=15, exit_=1, roi_pct_annualized=42.0)])
+strategy, symbol = hm._selector(df)
+assert strategy == "S"
+assert symbol == "X"
+# (no caption assertion here — "S" is unregistered, try/except silently degrades)
+
+df_real = pd.DataFrame([_row(..., strategy="short_straddle", symbol="RELIANCE")])
+captions.clear()
+hm._selector(df_real)
+strike_caps = [c for c in captions if "Strike rule:" in c]
+assert len(strike_caps) == 1
+assert "ATM" in strike_caps[0]
+```
+
+This test does two things in one function:
+1. Pin that synthetic-strategy-name graceful-degrade works (no caption, no crash).
+2. Pin that real-strategy-name renders the caption with "ATM" in it.
+
+**Both worth testing**, but combining them into one test makes the failure message ambiguous if either half breaks. Suggested split into two: `test_selector_caption_silently_degrades_on_unregistered_strategy` and `test_selector_renders_caption_for_registered_strategy`. Cosmetic; the current works.
+
+### What I tried
+
+- Traced `:g` format spec edge cases against the pinned strings (2%, 5%, 2.5%, 6%) — all clean.
+- Verified the Protocol method declaration in `base.py` is a proper `...` body (not `pass`, not `raise NotImplementedError`). Both work; `...` is more idiomatic for Protocols. ✓
+- Checked that the try/except in `_selector` correctly catches both AttributeError (unimplemented method) and KeyError (unregistered name).
+- Re-read the test name `test_selector_renders_strike_rule_caption` and its assertions — pins prefix ("Strike rule:") + content ("ATM"). Good substring match.
+- Cross-referenced the float arithmetic for 0.025 * 100 to verify `:g` handles the 2.5000000000000004 case. ✓
+
+### Carry-over open items
+
+- 🚦 **Click fix browser smoke-test** still gating. This commit adds new UX (caption) under the strategy selector — operator should verify the caption appears correctly AS PART OF the click-fix smoke-test, not separately. Two-birds-one-stone.
+- ⚠ **`chore(p6.5.tag)`** at 31 commits pre-tag. The case for tagging is getting stronger; each non-tag commit widens the bisect surface.
+- 🔬 **Live-run validation** for prefetch redesign — still open.
+
+### Next-commit suggestion
+
+The original 3-commit sequence I recommended pre-compaction was:
+1. `fix(p7.heatmap.click)` ✓ landed
+2. `feat(p7.heatmap.strike_disclosure)` ✓ landed (this commit)
+3. `feat(p7.heatmap.modes)` — Drill / Compare / Export modes
+
+Stay the course. **Compare-cells is next**, with the caveats I flagged pre-compaction:
+- **Skip p-values entirely** (multiple-comparisons hazard at N=24 cell-pairs).
+- **Export-rule must pipe in MULTIPLE_COMPARISONS_CAVEAT** to the markdown export.
+
+If those caveats hold, that commit is straightforward.
+
+**But before Compare-cells**: operator should verify the click fix in browser. Order:
+1. **PAUSE → operator smoke-test of click fix + new caption**.
+2. If both work: `chore(p6.5.tag)` → live-run validation → `feat(p7.heatmap.modes)`.
+3. If click fix doesn't work: streamlit-plotly-events fallback → repeat smoke-test.
+
+The operator's verdict on the click fix is the load-bearing input for what BUILDER does next.
+
+---
