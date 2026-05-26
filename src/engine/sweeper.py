@@ -198,9 +198,11 @@ def sweep_one(
             today_fn=today_fn,
         )
     except _SKIPPABLE_ERRORS as e:
-        # Return the exception class name as a string so sweep_grid can
-        # log the reason. None would lose the diagnostic info.
-        return f"skip:{type(e).__name__}"
+        # Return BOTH the exception class name (for groupby/counts) AND
+        # the message (for analyst-facing drill-down "why was this cell
+        # skipped" tooltips). Format: "skip:ClassName|message". Class
+        # names never contain '|'; messages may, but we split max-once.
+        return f"skip:{type(e).__name__}|{e}"
 
     # Sweep-specific decorations
     result["entry_offset_td"] = int(entry_offset_td)
@@ -286,6 +288,13 @@ def sweep_grid(
     def _handle(task_args: tuple, result) -> None:
         s, sym, exp, eo, xo = task_args
         if isinstance(result, str) and result.startswith("skip:"):
+            # Format: "skip:ClassName|message" — split max-once so a
+            # message containing '|' survives intact.
+            payload = result[len("skip:"):]
+            if "|" in payload:
+                reason, detail = payload.split("|", 1)
+            else:  # legacy single-token payload (defensive)
+                reason, detail = payload, ""
             skipped.append({
                 "run_id": run_id,
                 "strategy": s,
@@ -293,7 +302,8 @@ def sweep_grid(
                 "expiry": pd.Timestamp(exp),
                 "entry_offset_td": int(eo),
                 "exit_offset_td": int(xo),
-                "skip_reason": result[len("skip:"):],
+                "skip_reason": reason,
+                "skip_detail": detail,
             })
             return
         if result is None:
@@ -350,10 +360,13 @@ def sweep_grid(
     # Sort skips by the same canonical key tuple so the skips parquet
     # is byte-identical across n_workers — Pool.imap_unordered yields
     # results in worker-completion order, not task-enumeration order.
+    # Tie-break on (reason, detail) for total determinism if any one
+    # cell-key somehow produced multiple skip entries.
     skipped.sort(
         key=lambda r: (
             r["strategy"], r["symbol"], r["expiry"],
             int(r["entry_offset_td"]), int(r["exit_offset_td"]),
+            r.get("skip_reason", ""), r.get("skip_detail", ""),
         )
     )
 

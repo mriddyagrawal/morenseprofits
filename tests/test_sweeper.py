@@ -228,8 +228,10 @@ def test_sweep_one_rejects_inverted_window():
 
 
 def test_sweep_one_skips_on_missing_data_returns_skip_marker(monkeypatch, tmp_path):
-    """MissingDataError → `skip:MissingDataError` (sweep_grid records
-    the reason in the skip log)."""
+    """MissingDataError → `skip:MissingDataError|<message>` (sweep_grid
+    records both the reason class name AND the message in the skip log
+    so the analyst-facing drill-down can show WHY each cell was
+    dropped, not just THAT it was dropped)."""
     _wire_mocks(monkeypatch)
     cache.CACHE_DIR = tmp_path
 
@@ -243,7 +245,7 @@ def test_sweep_one_skips_on_missing_data_returns_skip_marker(monkeypatch, tmp_pa
         entry_offset_td=15, exit_offset_td=1,
         today_fn=lambda: date(2026, 5, 24),
     )
-    assert out == "skip:MissingDataError"
+    assert out == "skip:MissingDataError|simulated illiquid contract"
 
 
 # ============================================================

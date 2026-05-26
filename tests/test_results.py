@@ -157,6 +157,7 @@ def test_write_then_read_skips():
             "entry_offset_td": 15,
             "exit_offset_td": 1,
             "skip_reason": "MissingDataError",
+            "skip_detail": "no derivatives data for RELIANCE 2024-01-25 2600-CE",
         }
     ]
     path = r.write_skips(rows, run_id="abc123")
@@ -164,6 +165,7 @@ def test_write_then_read_skips():
     back = r.read_skips("abc123")
     assert len(back) == 1
     assert back.iloc[0]["skip_reason"] == "MissingDataError"
+    assert back.iloc[0]["skip_detail"].startswith("no derivatives data")
 
 
 def test_read_skips_empty_when_no_companion_file():

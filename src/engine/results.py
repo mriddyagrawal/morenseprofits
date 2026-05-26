@@ -58,6 +58,11 @@ RESULTS_COLUMNS: tuple[str, ...] = (
 
 # Skip-log columns — the parallel file recording cells that were tried
 # but produced no result row (MissingData / NoLiquidStrike).
+#
+# skip_reason: the exception class name — for groupby/counts.
+# skip_detail: the exception message — for analyst drill-down ("WHY was
+#   this cell skipped"). Pre-skip-detail parquets won't have this column;
+#   readers must tolerate its absence and fall back to skip_reason only.
 SKIPS_COLUMNS: tuple[str, ...] = (
     "run_id",
     "strategy",
@@ -66,6 +71,7 @@ SKIPS_COLUMNS: tuple[str, ...] = (
     "entry_offset_td",
     "exit_offset_td",
     "skip_reason",
+    "skip_detail",
 )
 
 

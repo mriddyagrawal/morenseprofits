@@ -88,4 +88,10 @@ def read_sweep_with_skips(
     skips_companion = skips_path(run_id, name="sweep")
     if not skips_companion.exists():
         return results_df, empty_skips_frame()
-    return results_df, pd.read_parquet(skips_companion)
+    skips_df = pd.read_parquet(skips_companion)
+    # Back-compat: pre-skip-detail parquets lack the column. Add it as
+    # empty so downstream code (drill-down rendering) doesn't KeyError.
+    if "skip_detail" not in skips_df.columns:
+        skips_df = skips_df.copy()
+        skips_df["skip_detail"] = ""
+    return results_df, skips_df
