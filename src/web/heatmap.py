@@ -630,12 +630,19 @@ def render_cell_drilldown(
         return
 
     entry_td, exit_td = sel
+    # Sort by ROI descending so the waterfall reads as a distribution
+    # SHAPE (left-heavy = wins concentrated, right-tail = losers) rather
+    # than as a noisy time series. Per-trade table inherits the same
+    # order so "best trades" are top-of-table — operator asking "is
+    # this rule reliable?" gets the answer at a glance.
     rows = df[
         (df["strategy"] == strategy)
         & (df["symbol"] == symbol)
         & (df["entry_offset_td"] == entry_td)
         & (df["exit_offset_td"] == exit_td)
-    ].copy().sort_values("expiry").reset_index(drop=True)
+    ].copy().sort_values(
+        "roi_pct_annualized", ascending=False,
+    ).reset_index(drop=True)
 
     # Skips matching the same cell — surface even if 0 priced trades.
     if skips_df is not None and len(skips_df) > 0:
@@ -752,8 +759,11 @@ def render_cell_drilldown(
         annotation_position="top right",
     )
     dist_fig.update_layout(
-        title="ROI/yr per expiry — outlier + regime spotter",
-        xaxis_title="Expiry",
+        title=(
+            f"Per-expiry ROI · {len(rows)} trades · sorted descending "
+            f"· 0% baseline · color = sign"
+        ),
+        xaxis_title="Expiry (sorted by ROI/yr, not chronological)",
         yaxis_title="ROI/yr (%)",
         height=280,
         margin=dict(l=60, r=40, t=50, b=40),
