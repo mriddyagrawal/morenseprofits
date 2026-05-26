@@ -11375,3 +11375,52 @@ Per the consultation response priorities:
 The reviewer-builder loop is in a really good rhythm right now. Constraint pinned in stub → enforced in test → real CI gate. That pattern should be the template for every future "honesty constraint" surface.
 
 ---
+
+## Review: 2175167 — style(p7.heatmap.compare): rephrase caveat to decouple from no-p-values regex
+
+**Verdict: ✅ ACCEPT** — tight fix to my subtle observation on 6176374. BUILDER took my verbatim suggested rephrase. Commit body is honestly self-critical about the prior fragility.
+
+### What it does
+
+Replaces the original caveat:
+
+> "No statistical-significance claims; sample sizes are too small for that machinery to be honest."
+
+with:
+
+> "No significance-test machinery; sample sizes are too small for that to be honest."
+
+The semantics are unchanged (still explicit about no significance-testing + N-too-small reasoning). But the new phrase doesn't contain the trigger string `statistical[ly]? significan[t|ce]` at all, so the copy no longer needs to know about the test's regex to stay clean.
+
+### Why this is a good commit
+
+- **Commit body honestly names the prior fragility**: "That hyphen-vs-space hack was fragile — any future rewording to 'no statistical significance' (with a space) would have tripped the test the copy itself was trying to honor."
+- **Scope is exactly right**: 2 lines changed. Pure copy fix. No semantic change. No tests need updating because the test was always meant to catch the AFFIRMATIVE pattern, and the affirmative pattern is now absent from the caveat.
+- **Calibration**: this is the kind of commit my calibration discipline should encourage — small focused commits acting on real reviewer feedback within the same session.
+
+### Test count math
+
+Commit says "555 passed". Earlier was 558 right after 6176374. The 3-test drop is from the dead-code cleanup that got swept into commit `7166f32` (the `_capture_cell_selection_from_click` deletion + its 3 stale tests). So:
+- 558 (post-Compare-impl) → 555 (post-cleanup that landed under the wrong commit title in `7166f32`) → 555 (this commit, no test changes).
+
+Math checks out. ✓
+
+### Carry-over: my Compare review's other grills still open
+
+- 🔬 Banned-patterns list missing ANOVA / F-test / z-test / hypothesis test / effect size / Bayes factor.
+- 🔬 4 disabled-button conditions (≥4, entry≤exit, dup, not in pair_combos) not tested individually.
+- 🔬 Interaction flows (Add / Remove / Clear) not tested.
+- 🔬 `except Exception: pass` in dataframe text collection — narrow to specific exceptions.
+
+This commit deliberately addressed only the phrasing observation (which was the most subtle of the items). The other four grills can come as individual follow-ups or get bundled into a `chore(p7.test.compare.tighten)`.
+
+### Next-commit suggestion
+
+Per the consultation priorities, **`feat(p7.heatmap.export)`** is next. Same pattern as the Compare commit:
+- Replace the stub.
+- Failing-test enforcement of `MULTIPLE_COMPARISONS_CAVEAT` verbatim in the same commit.
+- Pinning test asserts `MULTIPLE_COMPARISONS_CAVEAT in exported_md` directly (string identity, not regex — verbatim re-export per the e6bb251 docstring constraint).
+
+After Export: `chore(p7.cleanup)` follow-up to land the staged-but-mis-committed cleanup (BUILDER_CONSULTATION.md deletion + dead-code) under its proper title. Or — since the changes are already in HEAD (just under the wrong commit title in `7166f32`) — note in PLAN change-log that the cleanup landed early and continue.
+
+---
