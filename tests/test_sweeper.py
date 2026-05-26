@@ -19,7 +19,7 @@ from src.config import RESULTS_DIR
 from src.data import (
     bhavcopy_fo_loader, cache, spot_loader, trading_calendar,
 )
-from src.data.errors import MissingDataError
+from src.data.errors import MissingDataError, OfflineCacheMiss
 from src.engine import sweeper as sweeper_mod
 from src.engine.sweeper import _compute_run_id, sweep_grid, sweep_one
 
@@ -310,6 +310,62 @@ def test_sweep_grid_force_rebuilds(monkeypatch, tmp_path):
     a = sweep_grid(**kwargs)
     b = sweep_grid(force=True, **kwargs)
     pd.testing.assert_frame_equal(a, b)
+
+
+def test_sweep_grid_cache_only_treats_offline_miss_as_skip(monkeypatch, tmp_path):
+    """LOAD-BEARING: cache_only=True must convert OfflineCacheMiss from
+    a fatal crash into a per-cell skip (the SPECS §6a carve-out). Without
+    this, a 450k-cell wide sweep aborts the first time any one strike is
+    absent from cache. The mode is the analyst's "use whatever's cached,
+    note what isn't" knob.
+
+    Default cache_only=False keeps the loud-fail behavior — verified by
+    the second half of this test."""
+    _wire_mocks(monkeypatch)
+    _redirect_results(monkeypatch, tmp_path)
+    cache.CACHE_DIR = tmp_path
+
+    # Override load_option to raise OfflineCacheMiss on the PE leg, so
+    # the short_straddle trade (CE + PE) hits a cache miss mid-pricing.
+    from src.data import options_loader
+    def half_missing(symbol, expiry, strike, option_type, fd, td, *,
+                     force_refresh=False, today_fn=date.today, offline=False):
+        if option_type == "PE":
+            raise OfflineCacheMiss(
+                f"option {symbol} {expiry} {int(strike)}-PE not in cache"
+            )
+        return _option_frame(fd, td, 60.0, 95.0)
+    monkeypatch.setattr(options_loader, "load_option", half_missing)
+
+    kwargs = dict(
+        strategies=["short_straddle"],
+        symbols=["RELIANCE"],
+        expiries=[date(2024, 1, 25)],
+        entry_offsets_td=[15],
+        exit_offsets_td=[1],
+        today_fn=lambda: date(2026, 5, 24),
+    )
+
+    # cache_only=True → cell skipped, sweep completes, skip log has the
+    # OfflineCacheMiss row with the verbatim message in skip_detail.
+    df = sweep_grid(cache_only=True, **kwargs)
+    assert len(df) == 0, "the only cell should have been skipped"
+    run_id = _compute_run_id(
+        kwargs["strategies"], kwargs["symbols"], kwargs["expiries"],
+        kwargs["entry_offsets_td"], kwargs["exit_offsets_td"],
+    )
+    skips_path = tmp_path / f"sweep_{run_id}_skipped.parquet"
+    assert skips_path.exists(), "skip log parquet must be written"
+    skips = pd.read_parquet(skips_path)
+    assert len(skips) == 1
+    assert skips.iloc[0]["skip_reason"] == "OfflineCacheMiss"
+    assert "not in cache" in skips.iloc[0]["skip_detail"]
+
+    # cache_only=False (default) → OfflineCacheMiss bubbles out (loud
+    # fail per SPECS §6a). Force=True so the cache-hit short-circuit
+    # doesn't return the parquet we just wrote.
+    with pytest.raises(OfflineCacheMiss, match="not in cache"):
+        sweep_grid(force=True, **kwargs)
 
 
 def test_sweep_grid_skips_missing_data_without_dying(monkeypatch, tmp_path):
