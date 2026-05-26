@@ -8392,3 +8392,119 @@ Based on the 9a8cd7a change-log, the daily-union scan is up next. **No blocking 
 A new commit landed while I was writing this review: **e58b5ff "feat: src/data/strike_planner — hybrid max(N per side, X% range) helper"** — looks like that's exactly the helper from (1). Will review next.
 
 ---
+
+## Review: e58b5ff — feat: src/data/strike_planner hybrid `max(N per side, X% range)` helper
+
+**Verdict: ✅ ACCEPT** — pure function, no I/O, 12 unit tests, defensive sort, SPECS §5 tie-break correctly threaded. Resolves my 9a8cd7a grill #1 (X is now `pct_window=0.05` by default). Two real grills on the tests and one calibration observation on rule dominance.
+
+### Closes my 9a8cd7a grill #1
+
+The literal "X" in the change-log entry is now a concrete value: **`pct_window: float = 0.05`** (5%). And the module docstring documents the regime where each rule binds:
+
+> Tight-spaced symbols (e.g. SBIN @ ₹10 spacing): "N per side" tends to win because 5% covers only ~4 strikes.
+> Wide-spaced indices (e.g. BANKNIFTY @ ₹100 spacing): "X% range" wins because N=6 covers only ~0.7% of spot.
+
+Both regimes covered with concrete examples. ✓
+
+### What the function does correctly
+
+- **Union, not intersection**: `lo = min(lo_via_count, lo_via_pct)`, `hi = max(hi_via_count, hi_via_pct)`. "Whichever rule is wider on each side wins." This is the right semantics — you want the MORE inclusive of the two, not the less. ✓
+- **Defensive `sorted(grid)`** (line 55) — handles unsorted input. Don't have to trust the caller. ✓
+- **SPECS §5 tie-break threaded correctly**: `key=lambda i: (abs(sorted_grid[i] - spot), sorted_grid[i])` → tuple sort: primary distance, secondary strike value. Min finds lowest-distance, then lowest-strike on tie. Verified with `test_atm_tiebreak_picks_lower_strike`. ✓
+- **Edge-clamping**: spot below the grid → ATM clamps to lowest strike; spot above → ATM clamps to highest. ✓
+- **Pct-rule fallback to atm_idx**: when no strike satisfies the pct bound (spot far outside grid), defaults to atm_idx so the per-side rule alone governs. Reasonable, but worth noting — see grill below.
+
+### 🔬 Grill #1 (real): `test_tight_spaced_grid_per_side_dominates` doesn't actually demonstrate dominance
+
+The test:
+
+```python
+grid = list(range(780, 861, 10))  # 780..860 step 10
+out = strikes_around_spot_hybrid(grid, 820.0, per_side=6, pct_window=0.05)
+```
+
+Math:
+- 820 × 0.95 = 779 → leftmost ≥ 779 is 780 (idx 0)
+- 820 × 1.05 = 861 → rightmost ≤ 861 is 860 (idx 8)
+- per_side=6 from ATM idx 4: max(0, 4-6)=0, min(8, 4+6)=8 → idx 0..8
+
+**Both rules give idx 0..8 — they tie.** The test asserts `min(out) <= 780 and max(out) >= 860` which holds for either rule. There's no scenario in this test where per_side STRICTLY BEATS pct. The test name claims dominance; the test does not.
+
+The inline comment even admits it: "per_side=6 from ATM (820, idx 4) → [780..860] (idx 0..8)? actually idx 4 - 6 = -2 clamped to 0; idx 4 + 6 = 10 clamped to 8. **Both rules cover the same here.**" — and then waves it off with "Verify exact symmetry isn't required". But the test NAME claims one rule dominated.
+
+**Recommendation**: either rename to `test_tight_spaced_grid_both_rules_agree` (truthful) OR strengthen with a scenario where per_side strictly beats pct. E.g.:
+
+```python
+def test_tight_spaced_grid_per_side_strictly_dominates():
+    grid = list(range(700, 901, 10))  # 700..900 step 10, 21 strikes
+    out = strikes_around_spot_hybrid(grid, 800.0, per_side=6, pct_window=0.02)
+    # 2% of 800 = ±16 → pct covers 784..816 (idx 9..11 plus one each side)
+    # per_side=6 from ATM idx 10 → idx 4..16 (700+40=740 to 700+160=860)
+    # per_side STRICTLY wider than pct. Result is per_side's range exactly.
+    assert out == list(range(740, 871, 10))
+    assert len(out) == 2 * 6 + 1
+```
+
+The companion `test_wide_spaced_grid_pct_dominates` is genuine (asserts `len(out) > 13`); this one is the asymmetric weak side.
+
+### 🔬 Grill #2 (real): pct=5% likely never binds for the v1 blue-chip universe
+
+The DEFAULT_SYMBOLS in [scripts/prefetch_universe.py:44-49](scripts/prefetch_universe.py#L44-L49): RELIANCE, HDFCBANK, ICICIBANK, INFY, TCS, SBIN, AXISBANK, KOTAKBANK, BHARTIARTL, LT. Let me sanity-check whether pct=5% provides ANY coverage beyond per_side=6 for these symbols:
+
+| Symbol | ~Spot | Strike spacing | per_side=6 range | 5% of spot | Wider rule |
+|---|---|---|---|---|---|
+| RELIANCE | ₹3000 | ₹100 | ±₹600 (±20%) | ±₹150 (±5%) | per_side |
+| HDFCBANK | ₹1700 | ₹50 | ±₹300 (±17.6%) | ±₹85 (±5%) | per_side |
+| INFY | ₹1500 | ₹50 | ±₹300 (±20%) | ±₹75 (±5%) | per_side |
+| SBIN | ₹820 | ₹10 | ±₹60 (±7.3%) | ±₹41 (±5%) | per_side |
+| LT | ₹3700 | ₹100 | ±₹600 (±16.2%) | ±₹185 (±5%) | per_side |
+| BHARTIARTL | ₹1600 | ₹20 | ±₹120 (±7.5%) | ±₹80 (±5%) | per_side |
+
+For every v1 symbol, per_side=6 covers a wider %-range than pct=5%. **So pct_window adds zero strikes for the v1 universe — it's pure future-proofing.**
+
+This isn't a bug — the hybrid helper is the right design — but it's worth documenting:
+1. The 26% skip-rate reduction from this commit chain will come ENTIRELY from the daily-union scan (next commit), not from pct_window expansion.
+2. If someone adds indices to the universe (BANKNIFTY, NIFTY), pct=5% will kick in automatically.
+
+**Recommendation**: add a 1-line comment in [scripts/prefetch_universe.py](scripts/prefetch_universe.py) when wiring up: `# pct=5% is a no-op for current v1 stock universe; it kicks in if indices are added.`
+
+This calibrates the expected skip-rate impact accurately. Without this note, an operator might assume strike_planner alone delivers the <5% skip rate.
+
+### Calibration observation: the daily-union scan does the real work
+
+The change-log entry attributes the planned skip-rate reduction (<5%) to BOTH the daily-union scan AND the strike-window helper. From the table above, for v1 symbols the helper alone adds nothing. **The 21-percentage-point reduction (26% → <5%) hinges entirely on the daily-union scan.** Worth pinning that expectation in the daily-union commit's body so the live-run result is graded against the right baseline.
+
+### Tests — what's good
+
+- `test_atm_tiebreak_picks_lower_strike` traces SPECS §5 explicitly. Critical pin. ✓
+- `test_spot_below_grid_clamps_to_first_strike` / `test_spot_above_grid_clamps_to_last_strike` — boundary cases that would otherwise be silent off-by-ones. ✓
+- `test_output_is_sorted_ascending` with unsorted input grid — pins the defensive sort. ✓
+- `test_negative_per_side_raises` / `test_negative_pct_window_raises` — argument validation. ✓
+
+### Nit: no upper bound on `pct_window`
+
+`pct_window=1.5` → `low_bound = spot × (1 - 1.5) = -0.5 × spot` (negative). Doesn't crash; the `next(...)` for `lo_via_pct` still works because every strike satisfies `k >= negative_number`. So `lo_via_pct = 0`, `hi_via_pct = n-1` → full grid returned. Practically: `pct_window >= 1.0` degenerates to "return all strikes". **Not buggy, just semantically weird** — operator passing 1.5 probably meant 0.15. A `pct_window > 1.0` ValueError or `pct_window > 0.5` warning would prevent typos. Cosmetic.
+
+### What I tried
+
+- Traced the `next((i for i, k ...), atm_idx)` fallback for spot-outside-grid case — verified it does not produce a wider window than the per-side rule already covers.
+- Recomputed all 6 v1 symbol per_side-vs-pct comparisons.
+- Read `test_tight_spaced_grid_per_side_dominates` carefully — confirmed it does not exercise dominance.
+
+### Carry-over open items
+
+- ⚠ **`chore(p6.5.tag)`** at 26 commits pre-tag.
+- 🔬 **`test_sweep_grid_cache_only_mode`** regression test still owed.
+
+### Next-commit suggestion
+
+**Daily-union scan** is the right next commit — and the one that actually moves the skip-rate needle. When it lands, the commit body should:
+
+1. Cite the expected baseline (current 26% skip rate, of which ~92% is OfflineCacheMiss).
+2. Quantify the contribution from strike_planner alone (= 0 for v1 universe — see grill #2).
+3. State the target post-rewrite skip rate (<5% per change-log).
+4. Plan the live-run validation: run the wide-sweep with cache_only=True after prefetch, compare skip rate.
+
+Additionally: the cache_only regression test should land BEFORE daily-union, because daily-union touches the same prefetch path that cache_only assumes is the only data source.
+
+---
