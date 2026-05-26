@@ -3306,6 +3306,106 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of c43f48e — fix: p7_wide_sweep walks back to last NSE-published day for TODAY_FN anchor
+
+**Verdict:** ✅ accept — **closes the failure the user surfaced 6 minutes after my 6f52e65 review.**
+
+**Phase / commit goal:** Direct fix to the pre-warm failure surfaced by the user's actual run output: `⚠ bhavcopy pre-warm 2026-05-26 failed (MissingDataError)`. NSE publishes the F&O bhavcopy ~6 PM IST; pre-market-close runs always fail `load_bhavcopy_fo(today)`. The original `try/except` swallowed the failure but left workers re-introducing the NSE-throttle problem on the open expiry.
+
+**🔬 The fix is cleverer than I described**:
+
+I proposed a walk-back to the most recent trading day for the bhavcopy lookup. BUILDER's commit does that AND **rebinds `TODAY_FN`** to the resolved anchor:
+
+```python
+TODAY_FN = lambda: anchor  # noqa: E731 — local override for the rest of main
+```
+
+**Why that's the load-bearing insight**:
+
+`load_option`'s open-expiry staleness check is:
+```python
+deadline = min(today, expiry)
+if max_cached >= deadline:
+    return _filter_window(cached, ...)
+```
+
+If `today_fn()` returns wall-clock today but the cache's `max_cached` is from yesterday (because today's NSE data isn't published yet), `max_cached < today` → staleness fires → refetch → workers hammer NSE.
+
+By anchoring `TODAY_FN` to the SAME date pre-warm used (most-recent NSE-published day), `max_cached == today_fn()` → staleness check PASSES → workers hit the cache-hit fast path → zero NSE calls. **Both the pre-warm AND the staleness check now reference the same "what NSE knows" timestamp.**
+
+My earlier review only flagged the bhavcopy-availability half; BUILDER's commit addresses both halves with one anchor.
+
+### What works
+
+- **`_resolve_anchor_date(start, max_back=7)`** ([scripts/p7_wide_sweep.py:55-79](scripts/p7_wide_sweep.py#L55-L79)) — walks back up to 7 days, returns the first usable date. Raises `RuntimeError` if no bhavcopy in 7 days (NSE outage; defensive).
+- **`WALL_TODAY` preserved** as the "actual calendar today" — documentation anchor + walk-back seed. **Original semantic kept** for diagnostic output: `"anchor today = 2026-05-25 (wall today 2026-05-26; walked back 1 day(s) for usable bhavcopy)"`.
+- **`TODAY_FN` local rebind** ([scripts/p7_wide_sweep.py:101](scripts/p7_wide_sweep.py#L101)) — scoped to `main()` so the script's downstream calls (spot_loader, options_loader, sweep_grid, trading_calendar) all use the anchor consistently. **No global mutation**; clean function-scoped override with `# noqa: E731` annotation explaining the lambda choice.
+- **Commit body explicitly cites the staleness-check semantic** — future contributor reading this understands WHY the anchor matters beyond "fix the pre-warm".
+- **Same walk-back pattern as `prefetch_universe.py:_pick_reference_day`** — convergent design across scripts.
+- **489/489 still passes.**
+
+### Blocking issues: None.
+
+### Non-blocking observations
+
+1. **Walk-back helper duplicated across 3 sites**:
+   - `scripts/prefetch_universe.py:_pick_reference_day` (slightly different — also takes a bhavcopy-dates list).
+   - `scripts/p7_wide_sweep.py:_resolve_anchor_date` (this commit).
+   - **No use in `scripts/p6_sweep.py`** — but p6_sweep doesn't have pre-warm either.
+   
+   **DRY opportunity** (carry-over from 6f52e65 review): extract a `_calendar_helpers.py` or `src/data/anchor.py` helper. Phase-7 polish; doesn't block.
+
+2. **`_resolve_anchor_date` uses default `today_fn=date.today`** inside `load_bhavcopy_fo` — but bhavcopy for past dates is immutable, so today_fn doesn't affect the result. ✓ Correct.
+
+3. **Bare `except Exception`** ([scripts/p7_wide_sweep.py:74](scripts/p7_wide_sweep.py#L74)) — same pattern as the rest of the script. Operator tooling; absorbs MissingDataError + any other transient.
+
+4. **`max_back=7`** — defensible. NSE has never had a 7-day market closure (longest in modern history was the 2008 Mumbai attack ~3 days). If 7 days exhausts, the RuntimeError is the right failure mode (the operator can't reasonably backtest against 7-day-stale data).
+
+5. **The anchor date now flows through to `_compute_run_id`** via `today_fn` — but `_compute_run_id` already excludes operational kwargs from the run_id hash (per the explicit "Operational kwargs ... are explicitly EXCLUDED" docstring). **Determinism preserved**: same logical sweep → same run_id regardless of whether anchor walks back or not.
+
+6. **`TODAY_FN` local rebind only affects `main()`** — if a future contributor imports `TODAY_FN` from the script module, they'd get the ORIGINAL module-level lambda (`date(2026, 5, 26)`), not the anchored one. **No current importer**; cosmetic.
+
+### Domain / correctness checks
+
+- **Pre-warm now succeeds**: ✓ walk-back finds yesterday's (or earlier) bhavcopy.
+- **Workers' staleness check passes**: ✓ today_fn anchored to cache freshness; max_cached >= today_fn().
+- **Zero NSE during parallel sweep**: ✓ confirmed by the chain of logic in commit body.
+- **Determinism**: ✓ run_id unchanged (today_fn excluded from hash).
+- **Backward-compat**: ✓ no API changes; only `main()` behavior tweak.
+
+### Strategic value
+
+**Loop integrity**:
+1. User surfaced the real failure (`⚠ bhavcopy pre-warm 2026-05-26 failed`).
+2. I acknowledged my "non-blocker" labeling was wrong and re-classified it.
+3. BUILDER landed the fix within 6 minutes — addressing BOTH the bhavcopy-availability half (which I flagged) AND the staleness-check half (which I missed).
+
+The staleness-check insight is the genuinely subtle part. **I missed that even after fixing pre-warm, the workers' `load_option` would still re-trigger the staleness refetch because `today_fn()` returned wall-clock today.** BUILDER caught it via the staleness math.
+
+### Recalibrated speedup estimate (post-fix)
+
+With c43f48e applied, both perf optimizations should now work as predicted:
+- Pre-warm succeeds against the anchored date.
+- Workers see cache-hit fast path.
+- Wall-clock for 450k cells: **~4-5 min** (back to my original prediction).
+
+### Carry-over open flags
+
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now ~18 commits pre-tag.
+- 🔬 **Walk-back helper DRY** — 3 sites with similar logic; extract to shared module.
+
+### What I tried
+
+- Read [scripts/p7_wide_sweep.py:55-110](scripts/p7_wide_sweep.py#L55-L110).
+- Cross-checked the staleness-check logic in `load_option` — confirmed BUILDER's insight is correct.
+- 489/489 unchanged.
+
+### Next-commit suggestion
+
+Same as before: **live-run validation** (does the wide sweep complete in the predicted ~4-5 min now?). Then **`chore(p6.5.tag)`**.
+
+---
+
 ## Review of 6f52e65 — perf: p7_wide_sweep pre-warms open-expiry data before spawning Pool
 
 **Verdict:** ✅ accept — **smart follow-up to f69019f closes the multi-worker first-call cold-fetch concern.**
