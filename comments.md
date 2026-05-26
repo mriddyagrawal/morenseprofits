@@ -9047,3 +9047,167 @@ If those caveats hold, that commit is straightforward.
 The operator's verdict on the click fix is the load-bearing input for what BUILDER does next.
 
 ---
+
+## Review: e6bb251 — feat(p7.heatmap.modes): 3-mode radio (Drill-down / Compare / Export) + stubs
+
+**Verdict: ✅ ACCEPT** — the BUILDER pinned MY pre-context-compaction grills as REVIEWER CONSTRAINTS at the top of each stub's docstring. That's the durable mechanism I wanted. Architecture split (radio in render_heatmaps, routing in app.py) is reasonable. Two real grills on thin-data interaction; one strategic flag that the docstring-constraints need test-level enforcement when the follow-ups land.
+
+### The single best thing about this commit
+
+The two stubs encode the constraints I gave pre-context-compaction VERBATIM in their docstrings:
+
+```python
+def render_compare_cells(...):
+    """Compare-cells mode (STUB)...
+
+    REVIEWER CONSTRAINT (do not relax in the follow-up commit):
+    no p-values, no "statistically significant" copy. With N≈24 trades
+    per cell, ~5% of identical-distribution cell-pairs return p<0.05 by
+    chance. With 720 cells × 5 (strategy, symbol) pairs an operator
+    inspects, dozens of false-positive "significant differences" will
+    surface as noise-disguised-as-signal. Honest framing: visual overlay
+    + side-by-side stats + raw difference column ONLY. No p-value, no
+    statistical-test machinery.
+    """
+
+def render_export_rule(...):
+    """Export-rule mode (STUB)...
+
+    REVIEWER CONSTRAINT (do not relax in the follow-up commit):
+    the exported .md MUST include MULTIPLE_COMPARISONS_CAVEAT from
+    src.analytics.rank as a top-level "## Selection bias warning"
+    section. ... Re-export the constant; don't paraphrase or duplicate.
+    No download path without it.
+    """
+```
+
+**This is the right way to carry forward a reviewer's grill across multiple commits.** Without it, the constraint would live only in my comments.md review of THIS commit — easy to miss when BUILDER lands `feat(p7.heatmap.compare)` next. With it, anyone editing the function sees the constraint immediately. ✓
+
+### Architecture: radio in render_heatmaps, routing in app.py
+
+```python
+# render_heatmaps:
+st.radio("Cell action", options=["Drill-down", "Compare cells", "Export rule"],
+         horizontal=True, key="mp_heatmap_mode")
+
+# app.py:
+mode = cell_action_mode()  # reads session_state["mp_heatmap_mode"]
+if mode == "Compare cells":   render_compare_cells(...)
+elif mode == "Export rule":   render_export_rule(...)
+else:                          render_heatmap_drilldown(...)  # default
+```
+
+Justification per commit body: "render_heatmaps already promises 'render the two heatmaps + their immediate decoration'; mixing in 'and now invoke one of three downstream renders' would bloat its responsibilities. app.py is already the orchestration layer."
+
+**I'd accept this.** The alternative — all-in-render_heatmaps — would make that function the orchestrator instead of app.py. The split keeps responsibilities clean. The only cost is the slightly-distant coupling: changing the mode set requires editing TWO files (the radio options in render_heatmaps + the dispatch in app.py). Reasonable trade-off.
+
+### 🔬 Grill #1 (real): thin-data state desynchronizes radio + routing
+
+The radio is rendered at line 514 of [src/web/heatmap.py](src/web/heatmap.py), AFTER FIVE early-return paths ([src/web/heatmap.py:333-364](src/web/heatmap.py#L333)):
+1. `len(df) == 0` → return (no radio)
+2. `strategy is None or symbol is None` → return (no radio)
+3. `values.empty` → return (no radio)
+4. `n_entry < 2 or n_exit < 2` → return (no radio)
+5. `masked.notna().sum().sum() == 0` → return (no radio)
+
+So when the heatmap is thin/empty, no radio renders. But app.py STILL calls `cell_action_mode()` and STILL dispatches to one of the three renderers. **Result**: if the user previously selected "Compare cells" and then filtered down to zero rows, they see:
+- An "empty state" message from the heatmap area.
+- The "Compare cells — pick 2-4 cells to overlay..." stub info box below it.
+
+Two contradictory messages: "no data" + "pick cells". The operator has no visible radio to switch back to "Drill-down" because the radio isn't rendered.
+
+**Fix options**:
+1. **Always render the radio** (move it BEFORE the early returns) — simplest; preserves operator's ability to switch modes regardless of data state.
+2. **Force-default to Drill-down in cell_action_mode when data is thin** — keep `cell_action_mode()` reading session_state, but add a `df_has_renderable_cells: bool` arg that overrides when False.
+3. **Skip routing entirely when render_heatmaps returned early** — app.py needs a signal back from render_heatmaps. Requires a return value or shared flag.
+
+**Recommend option 1**. The radio's existence is independent of whether THIS data has cells; it should always be operable. The thin-data state should fall through to a normal Drill-down empty state, not "Compare cells stub on top of an empty heatmap".
+
+This is non-blocking — the bug is cosmetic and triggers only when the user filters into zero rows. But it's real.
+
+### 🔬 Grill #2 (real): stubs ignore thin-data state
+
+The stub renderers `render_compare_cells` and `render_export_rule` both unconditionally render their info-box:
+
+```python
+def render_compare_cells(...):
+    st.info("**Compare cells** — shift-click 2-4 cells to overlay...")
+
+def render_export_rule(...):
+    st.info("**Export rule** — pick a single cell to download...")
+```
+
+Neither checks `len(df) == 0` or any of the same conditions that gate the heatmap rendering. Consequence: the info-box appears even when there's no data. This is the symptom of grill #1.
+
+**Each stub should mirror the heatmap's empty-state behavior**: if `len(df) == 0`, render `render_empty("no_rows")` instead of the stub info. **Easy fix when the full impls land**: just borrow the existing early-return pattern from `render_heatmaps`.
+
+### 🔬 Strategic flag: REVIEWER CONSTRAINTS need test-level enforcement when impls land
+
+The docstring constraints are advisory only. A future BUILDER (or AI session) implementing `feat(p7.heatmap.compare)` could:
+- Read the docstring.
+- Decide "no p-values" is too conservative; sneak a p-value column in.
+- Commit the change; the docstring becomes a lie.
+
+**Test-level enforcement** is the durable pattern. When `feat(p7.heatmap.compare)` lands, the test should grow:
+
+```python
+def test_compare_cells_does_not_surface_pvalues(captured_charts, monkeypatch):
+    # Render compare with 2 cells worth of data.
+    rendered = capture_all_text(...)
+    forbidden = ["p-value", "p <", "p<", "statistically significant", "significance"]
+    for f in forbidden:
+        assert f.lower() not in rendered.lower(), (
+            f"compare-cells must NOT surface '{f}' — N≈24 → noise dressed as signal. "
+            f"See REVIEWER CONSTRAINT in render_compare_cells docstring."
+        )
+
+def test_export_rule_md_contains_multiple_comparisons_caveat(...):
+    md_output = capture_download_payload(...)
+    from src.analytics.rank import MULTIPLE_COMPARISONS_CAVEAT
+    assert "## Selection bias warning" in md_output
+    # Verify the constant is re-exported VERBATIM, not paraphrased.
+    assert MULTIPLE_COMPARISONS_CAVEAT in md_output
+```
+
+The first turns "no p-values" into a red CI bar; the second pins the verbatim constant. **Without these tests, the docstring constraints don't survive the next refactor.**
+
+**Flag this to BUILDER in the feat(p7.heatmap.compare) commit body**: "Tests must enforce the REVIEWER CONSTRAINT from this stub's docstring — not just docstring-as-comment guidance."
+
+### Tests — solid for what they pin
+
+- `test_mode_radio_renders_with_three_options` pins **exact options + order** (not just presence). Adding a 4th option becomes an explicit decision (test fails until updated). ✓
+- `test_cell_action_mode_default_is_drill_down` pins the v0.6-ui-preserves-default contract. ✓
+- `test_cell_action_mode_returns_session_state_value` parametrized over Compare/Export. ✓
+- `test_compare_cells_stub_renders_info_with_implementation_pending` — pins **"Implementation pending"** as the marker for "not done yet". Searchable signal for reviewers + future BUILDER. ✓
+- Same for Export.
+
+**Gaps**:
+- No test for the thin-data interaction (grill #1).
+- No test enforcing the docstring constraints (strategic flag — defer until impls).
+
+### What I tried
+
+- Read all five early-return paths in `render_heatmaps` to verify the radio is gated on data-having-content.
+- Cross-checked `cell_action_mode()` against `st.session_state.get(..., "Drill-down")` — default behavior preserves v0.6.
+- Confirmed app.py's dispatch is post-render — so if render_heatmaps early-returns, no signal back to app.py to skip the downstream render.
+- Verified the test's `captured_charts` fixture wires monkeypatch to st.* — pattern is consistent with existing tests.
+
+### Carry-over open items
+
+- 🚦 **Click fix browser smoke-test** STILL gating. Operator now has THREE new UX surfaces to smoke-test together: click drill-down, strike-rule caption, mode radio. Single browser session covers all.
+- ⚠ **`chore(p6.5.tag)`** at 32 commits pre-tag.
+- 🔬 **Live-run validation** for prefetch redesign — still open.
+
+### Next-commit suggestion
+
+The next commit will be `feat(p7.heatmap.compare)`. **When it lands, my review should test for**:
+1. **NO p-values** in the rendered output (negative-assertion test enforcing the docstring constraint).
+2. Visual overlay + raw-difference column structure matches the docstring's "honest framing" line.
+3. Empty-state when no cells selected (thin-data UX).
+4. Multi-cell click capture from the heatmap (depends on the a1db694 click fix working).
+
+The Compare commit is the BIGGEST remaining design surface. **Strong recommendation**: BUILDER opens it with a stub-detail-design comment (1-2 paragraphs in the commit body) describing the layout BEFORE the code, so I can review the design before the implementation.
+
+For now: stay paused for the operator's browser smoke-test. The mode radio adds a new affordance the operator can test alongside the click fix.
+
+---
