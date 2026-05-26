@@ -8645,3 +8645,112 @@ This pins the asymmetry the SPECS §6a exception relies on. ~30-40 lines, fast (
 After that, the live-run validation: fresh `prefetch_universe.py --workers 2` → wide-sweep with cache_only → compare skip rate vs the 26% baseline. Expect <5% per PLAN.
 
 ---
+
+## Review: fdcedba — test: end-to-end regression for sweep_grid(cache_only=True)
+
+**Verdict: ✅ ACCEPT** — closes the test gap I've been pushing for since the 7ce07f9 review (and that the other reviewer correctly identified as the real grill #4 my "abandonment of defensive layer" framing was obscuring). The test is well-scoped, exercises both halves of the SPECS §6a asymmetry, and the mock plumbing is correct. Two real grills (multi-process path not pinned, source-of-OCM not parametrized) — neither blocking.
+
+### What the test pins — and why each assertion is load-bearing
+
+```python
+df = sweep_grid(cache_only=True, **kwargs)
+assert len(df) == 0                                  # cell skipped, not crashed
+assert skips_path.exists()                           # skip log persisted
+assert skips.iloc[0]["skip_reason"] == "OfflineCacheMiss"   # class-name classifier
+assert "not in cache" in skips.iloc[0]["skip_detail"]      # verbatim message preserved
+
+with pytest.raises(OfflineCacheMiss, match="not in cache"):
+    sweep_grid(force=True, **kwargs)                  # default: loud-fail
+```
+
+Every assertion guards a specific regression I (or someone else) could realistically introduce:
+
+| Assertion | What regresses if missing |
+|---|---|
+| `len(df) == 0` | A future refactor classifies OCM as a non-skip → cell crashes the whole sweep |
+| `skips_path.exists()` | `write_skips` is gated on something other than skips-non-empty → silent loss |
+| `skip_reason == "OfflineCacheMiss"` | skip log stores class name vs `repr(e)` — drift would confuse drill-down |
+| `skip_detail contains "not in cache"` | Stack trace munging strips the verbatim message → operators can't tell which cache key is missing |
+| `pytest.raises` half | The asymmetry between cache_only=True/False collapses (e.g. someone makes OCM always-skippable) |
+
+**The `force=True` on the second call is necessary**: `sweep_grid` short-circuits if a results parquet exists for the run_id ([src/engine/sweeper.py:297-298](src/engine/sweeper.py#L297)), AND the first call wrote an empty results parquet (verified via [src/engine/sweeper.py:402-410](src/engine/sweeper.py#L402)). Without `force=True`, the second call returns the empty cached frame and **does not actually exercise the loud-fail path**. The test comment captures this correctly.
+
+### Verified plumbing
+
+- **`monkeypatch.setattr(options_loader, "load_option", half_missing)` actually reaches the sweep**: `sweep_one` calls `price_trade(...)` without `load_option_fn=` → `_price_one_leg` lazily resolves `options_loader.load_option` at call time ([src/engine/pnl.py:243-247](src/engine/pnl.py#L243)) → monkeypatch is picked up. ✓
+- **Skip classification IS at sweep_one boundary** (not per-leg), so this single-strategy test pins the contract for ALL strategies (covered_call, iron_condor, etc.) without per-strategy variants. ✓ Strategy-agnostic.
+- **Mock signature matches real `load_option`**: 6 positional params + 3 keyword-only (`force_refresh`, `today_fn`, `offline`). ✓
+- **`half_missing` raises on PE leg only** → exercises mid-trade OCM (CE priced, PE fails). More realistic than blanket-fail and catches "did we accidentally swallow the exception inside leg processing instead of bubbling to sweep_one's catch" regressions.
+
+### 🔬 Grill #1 (real): multi-process Pool path is NOT pinned
+
+The test runs with default `n_workers=1`. Pool workers are fresh interpreters — monkeypatched `options_loader.load_option` doesn't propagate to spawned children. If a future refactor breaks cache_only specifically in the multi-process path (e.g. `_worker_init` forgets to thread `cache_only` through, or `_worker_run` swallows OCM without writing a skip-log entry), this test won't catch it.
+
+**Why this matters**: the operator's live runs use `n_workers=2-8` (per PLAN entries). The Pool-spawn path is the actually-used path. The test pins the single-process path that the analyst is unlikely to exercise.
+
+**How to fix without a heavy refactor**: a sibling test that builds a tmp-path cache with one strike absent on-disk (real file-system miss instead of mocked OCM), then runs `sweep_grid(cache_only=True, n_workers=2)`. Worker spawns reload the real `load_option`, which hits the real cache, which raises real `OfflineCacheMiss`. Slow (~1s vs ~5ms for the mocked version) but pins the path that matters in prod. Not blocking for this commit; could land as a follow-up.
+
+### 🔬 Grill #2 (real): only tests OCM from `load_option` — not `load_spot` or `offset_trading_days`
+
+`sweep_one` calls THREE distinct loaders inside the wrapped try/except ([src/engine/sweeper.py:182-201](src/engine/sweeper.py#L182)):
+
+1. `trading_calendar.offset_trading_days(...)` — can raise OCM if today's calendar isn't cached.
+2. `spot_loader.load_spot(...)` — can raise OCM if symbol's year file is missing.
+3. `price_trade(...) → ... → load_option(...)` — the path this test pins.
+
+A future refactor that SPLITS the try/except (e.g. catches only `price_trade` failures) would leave OCM from spot/calendar as fatal. The test would still pass — but the wide-sweep would crash on the first symbol whose 2024 spot file is absent.
+
+**Suggested parametrization** (one test, three cases):
+
+```python
+@pytest.mark.parametrize("ocm_source", ["load_option", "load_spot", "offset_trading_days"])
+def test_sweep_grid_cache_only_skips_on_ocm_from(monkeypatch, tmp_path, ocm_source):
+    # monkeypatch the named loader to raise OfflineCacheMiss; assert
+    # skip log captures it with the correct source's verbatim message.
+```
+
+~15 extra lines. Pins the entire try/except scope, not just one origin. Non-blocking — a refactor splitting the try/except is unlikely, and the explicit `_SKIPPABLE_ERRORS_CACHE_ONLY` tuple is the more proximate footgun. But low-cost insurance.
+
+### Nit: imports `_compute_run_id` from sweeper module
+
+The test imports a `_`-prefixed function (`_compute_run_id`) from `sweeper`. Underscores mean "private" by Python convention. Most projects don't enforce this; in this repo, the existing sweeper tests already do it (line 21: `from src.engine.sweeper import _compute_run_id, sweep_grid, sweep_one`). Consistency wins — keep as is. **Just noting** that there's an implicit "_compute_run_id is part of the test surface" contract that should not be broken by a refactor without updating tests.
+
+### What I tried
+
+- Traced `monkeypatch.setattr(options_loader, "load_option", half_missing)` through `price_trade`'s lazy resolve to confirm the mock is reached.
+- Verified `_SKIPPABLE_ERRORS_CACHE_ONLY` is checked at sweep_one boundary, not per-leg → strategy-agnostic coverage with one strategy.
+- Confirmed `force=True` on the second call is necessary (first call writes empty results parquet via `_results.write_results(df=empty_frame)` → short-circuit would otherwise return that on the second call).
+- Verified mock signature against `load_option`'s real signature in [src/data/options_loader.py:515-526](src/data/options_loader.py#L515).
+- Verified run_id excludes `cache_only` (logical-only payload per SPECS §6c.3) → both calls compute the same run_id → `force=True` on the second is correct.
+
+### Honesty note — this closes my long-standing grill
+
+I've been flagging "cache_only semantics will regress silently" since the 7ce07f9 review (where the other reviewer correctly identified my "abandonment of defensive layer" framing as overreach). The valid sub-grill — "this needs a regression test pinning that offline propagates through the price_trade chain and OCM is properly classified" — is what this commit closes. The test is **structurally exactly right**: minimum cells, two halves of the SPECS §6a contract, both assertions defensible. ✓
+
+The reviewer-loop arc here:
+1. 7ce07f9 review: I overreached with abstract concern, BUT identified the real gap.
+2. Another reviewer triaged my abstraction down to "needs a test".
+3. e560ee7: BUILDER fixed the underlying plumbing bug.
+4. af82e9c review: I admitted the reviewer-miss and acknowledged the test-pin framing.
+5. **fdcedba (this commit)**: test pin landed.
+
+**Lesson taken**: when grilling, lead with the SPECIFIC verifiable claim ("does X actually reach Y?" / "would a refactor breaking Z be caught?") not the abstract architectural concern ("are we accepting silent skips?"). The other reviewer's reframing was the right move.
+
+### Carry-over open items — much smaller now
+
+- ⚠ **`chore(p6.5.tag)`** at 28 commits pre-tag. **This commit is a natural pause point** — test trio is now coherent, prefetch redesign is done, no pending grills hold up a tag.
+- 🚦 **Live-run validation**: fresh prefetch (with `--workers 2`, daily-union) → wide-sweep with `cache_only=True`. Expected skip rate <5% per PLAN entry; the 26% → <5% reduction is the main claim of this whole sequence. Operator action.
+- 🔬 **Heatmap click bug** (pre-context-compaction): still open. The Plotly `dragmode="select"` + `clickmode="event+select"` fix has not landed yet — possibly deferred while the prefetch trio was prioritized. Worth surfacing back when the live-run completes.
+
+### Next-commit suggestion
+
+**`chore(p6.5.tag)`** is now the obvious next step. Reasons:
+1. The prefetch-redesign trio + test pin are coherent — a tag captures a verifiable state.
+2. Live-run validation (the OPERATOR step) is the right thing to do FROM a tagged baseline, so any regression can be bisected against the tag.
+3. The tag is 28 commits overdue. Each additional commit before it widens the bisect surface.
+
+If the operator wants to do the live-run before tagging, that's also fine — but the order should be one of: **tag → live-run → next-iteration commits**, or **tag → next-iteration commits → live-run later**. NOT "more commits, then maybe tag later" — the bisect cost compounds.
+
+After the tag: the heatmap click fix is the next-most-impactful item. The Plotly `dragmode="select"` 4-line patch was discussed pre-context-compaction; that's worth surfacing back as a single small commit.
+
+---
