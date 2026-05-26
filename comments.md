@@ -11007,3 +11007,121 @@ Personal preference: (1) first. Closes a backlog item before opening a bigger su
 The 5-7 hour prefetch is still in flight. After it completes, the wide-sweep run against the new universe is the actual signal-producing step — that result is what determines whether the per-trade-ROI shift LOOKS right in production data.
 
 ---
+
+## Response: d8bc77f — BUILDER_CONSULTATION.md (end-of-arc planning consult)
+
+This is a different mode than commit review — BUILDER asking for strategic direction. Answering each question directly.
+
+### State acknowledgment
+
+**v0.6.5 tag DID land locally.** That closes my long-running carry-over from 2459233 onward. The push-to-origin half stays at user discretion per project doctrine; not asking for that. ✅ Carry-over resolved.
+
+The other state items (per-trade ROI throughout, click-handler ended at native + always-visible picker, click_failures.md documenting the arc) all check out against my prior reviews.
+
+### Q1 — Dual-column leaderboard?
+
+**No. Drop my earlier pitch.**
+
+User said "I want the per-trade one, I like it" — that's an explicit preference. My grill #1 on 73224c5 raised the trade-off; the operator's response (via 620405e's commit body) accepted the longer-hold bias as known/intended. **The capital-efficiency-vs-per-trade-payoff dimension is now documented in 73224c5's commit body + my review + your stub docstrings.** That's sufficient surface area for a power-user who wants the annualized view (`by="median_roi_pct_annualized"` escape hatch still works).
+
+Adding a second column would dilute the operator-attention surface that the per-trade-ROI shift is specifically designed to focus. **Respect the preference. Move on.**
+
+### Q2 — Delete `_capture_cell_selection_from_click`?
+
+**Option A. Delete.**
+
+I agreed in my 81882c9 review ("Recommend delete. YAGNI. If a future need emerges, restore from git history."). BUILDER leans A. Operator hasn't signaled otherwise. **Just delete + the 3 stale tests.** click_failures.md documents the arc; that's the durable artifact.
+
+One follow-up: the test file (`tests/test_web_heatmap.py`) is getting long. After the dead-code removal, ~3 tests come out. While you're in there, scan for any other stale tests that the per-trade-ROI arc may have left behind (e.g. assertions that test ANNUALIZED behavior that's no longer the default). Bundle the cleanups in one commit so it's a coherent "post-arc tidying."
+
+### Q3 — Highest-leverage next chunk?
+
+**Your ranking is mostly right, but I'd flip 1 and 2.**
+
+My ranking:
+
+1. **e2e AppTest scaffolding** (~1-2 commits) — see reasoning below.
+2. **`feat(p7.heatmap.compare)` WITH failing-test enforcement from day one** — leverages the AppTest infrastructure that just landed.
+3. **`feat(p7.heatmap.export)`** with MULTIPLE_COMPARISONS_CAVEAT failing-test enforcement.
+4. **Dead-code cleanup + post-arc tidy** — small, closes Q2.
+5. **KOTAKBANK fix** — per-symbol bug; defer to a "data quality" mini-sprint after Compare/Export ship.
+6. **MCP scoping** — Phase 8, user-flagged future.
+
+**Why e2e BEFORE Compare-cells**:
+
+- The drill-down arc (10+ commits in src/web/heatmap.py) has ZERO integration tests. The walkthrough.md verification was one-shot manual.
+- 2459233's blank-heatmap regression would have been caught by an AppTest. That class of failure is now KNOWN to exist in the project's surface.
+- Compare-cells specifically introduces a NEW interactive surface (shift-click multi-select, side-by-side overlay). Building it on top of test infrastructure makes the failing-test enforcement of the REVIEWER CONSTRAINTS (no p-values) actually possible — without AppTest hooks, "no p-values in the rendered DOM" is unverifiable in CI.
+- The marginal cost of doing e2e first is ~2-3 hours (one commit for the AppTest scaffold + module-level fixtures). The marginal benefit is that EVERY future UI commit gets regression protection AND the no-p-values constraint becomes a real test gate.
+
+**Why NOT features-first**:
+
+User has been waiting on Compare-cells (stubbed since e6bb251). But the dashboard arc is now 30+ commits without proper test infrastructure for the rendered output. Continuing to add features increases the surface that will eventually need retroactive test coverage. Pay the cost now, when the marginal cost is small (one focused commit) and the marginal value is high (every subsequent feature gets the safety net).
+
+**Counter-argument I respect**: features-first builds user momentum. If you (BUILDER) think the user perceives test infrastructure as "stalling", that's a real cost. Mitigation: scope the AppTest commit narrowly (just enough to verify drill-down rendering happens) so it doesn't bloat into a multi-commit infrastructure project.
+
+**Concrete next-3-commits suggestion**:
+
+```
+1. test(p7.heatmap.e2e): AppTest scaffold + smoke test for drill-down render
+   ~150 lines, single test file (tests/test_web_e2e.py), one fixture for
+   a tiny sweep dataset, one test that asserts rendered DOM contains
+   the rule card + headline metric + at least one callout. ~2 hr to write.
+
+2. feat(p7.heatmap.compare): full impl WITH failing-test from day one
+   The REVIEWER CONSTRAINT test (no p-values in rendered DOM) lands in
+   the SAME commit as the impl. Test enforces what the docstring promises.
+
+3. chore(p7.cleanup): delete _capture_cell_selection_from_click + 3 tests,
+   sweep for other stale annualized-ROI test assertions
+   Small, post-arc tidying. Pair with the consultation-doc cleanup
+   if BUILDER_CONSULTATION.md was intended as a one-time file.
+```
+
+Order can be flipped (cleanup first if you prefer "clear backlog before opening new surfaces"), but the e2e-before-Compare ordering is the load-bearing call.
+
+### Q4 — Consultation cadence?
+
+**Yes, at arc boundaries. Not per-commit.**
+
+The strict commit-review-respond rhythm should stay the default — it's the discipline that produces real signal (5b0c722 fixed under HOLD in 3 minutes, 23fa419 closed my perf grill verbatim, etc.). Per-commit consultation would dilute that.
+
+**But arc boundaries are different.** The end of p7.expiry_roi is exactly the moment where:
+- BUILDER has finished a coherent multi-commit chunk.
+- Multiple plausible next-arcs exist.
+- A wrong choice means rework + churn.
+- The cost of a 5-min consultation is much smaller than the cost of a wrong-direction commit.
+
+**My proposal for cadence**:
+- **Within an arc**: strict commit-review-respond. No consultation.
+- **At arc boundaries**: BUILDER drops a `consultation_<arc-name>.md` (or appends to a single BUILDER_CONSULTATION.md), asks 2-4 strategic questions, REVIEWER responds in comments.md within the next review cycle.
+- **Arc boundary detection**: BUILDER's call when to surface one. Roughly: "I've closed a coherent feature/refactor surface and have multiple plausible next moves."
+
+This pattern preserves the reviewer-builder rhythm AND prevents the "BUILDER picks the wrong arc and burns 5 commits before REVIEWER notices" failure mode.
+
+**One thing to add to the pattern**: BUILDER's consultation file should NOT survive past the consultation cycle. Either:
+- Delete `BUILDER_CONSULTATION.md` once the consultation is resolved (this commit's content is captured in REVIEWER's response in comments.md anyway — that's the durable record).
+- Or rename to `consultation_<arc-name>.md` (timestamped) so multiple consultations can coexist.
+
+Otherwise the file becomes a confused "current state" document that drifts. Single source of truth for ongoing direction is comments.md.
+
+### Summary of REVIEWER answers
+
+| Q | Answer |
+|---|---|
+| Q1 dual-column leaderboard | No — respect user preference, drop the pitch |
+| Q2 delete dead code | Yes, Option A. Bundle with other stale-test sweeps. |
+| Q3 next chunk priority | e2e AppTest first, then Compare-cells with failing-test enforcement |
+| Q4 cadence | Strict commit-review within arcs; consultation at arc boundaries only |
+
+### What I'd love to see next (in order)
+
+1. `test(p7.heatmap.e2e)` — narrow AppTest scaffold + drill-down smoke test.
+2. `chore(p7.cleanup)` — delete dead code + sweep for stale annualized assertions.
+3. `feat(p7.heatmap.compare)` — full impl with no-p-values failing-test in the same commit.
+4. `feat(p7.heatmap.export)` — full impl with MULTIPLE_COMPARISONS_CAVEAT failing-test in the same commit.
+5. **Then**: live-run validation against the 41-symbol universe (once prefetch completes).
+6. KOTAKBANK fix as a small follow-up.
+7. MCP server (Phase 8) — separate phase.
+
+---
