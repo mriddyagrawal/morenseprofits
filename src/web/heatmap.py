@@ -18,9 +18,10 @@ sidebar's min_n threshold.
   WORST CELL   pivot_window.min().min()  (post-mask)  → "(entry T-?, exit T-?)"
   MEDIAN CELL  pivot_window.stack().median()           → "across N visible cells"
 
-Naming rule per §2.5: card values are percentages — labels end
-in % via format_pct(..., signed=True, annualized=True). Never a
-bare number.
+Naming rule per §2.5: card values are percentages — labels end in %.
+Per-trade ROI throughout (no annualization). Each cell's trades all
+share the same hold period, so per-trade ROI is exactly comparable
+within a cell.
 """
 from __future__ import annotations
 
@@ -152,7 +153,7 @@ def render_headline(
     with cols[0]:
         st.metric(
             "Best cell",
-            format_pct(best_val, signed=True, annualized=True),
+            format_pct(best_val, signed=True),
             _cell_label(best_idx),
             delta_color="off",
         )
@@ -161,7 +162,7 @@ def render_headline(
     with cols[1]:
         st.metric(
             "Worst cell",
-            format_pct(worst_val, signed=True, annualized=True),
+            format_pct(worst_val, signed=True),
             _cell_label(worst_idx),
             delta_color="off",
         )
@@ -170,7 +171,7 @@ def render_headline(
     with cols[2]:
         st.metric(
             "Median cell",
-            format_pct(median_val, signed=True, annualized=True),
+            format_pct(median_val, signed=True),
             f"across {n_visible_cells} visible cell(s)",
             delta_color="off",
         )
@@ -273,7 +274,7 @@ def _build_customdata(
         Plotly's %{customdata[N]:,.0f} can't replicate (would
         break §2.7 contract for cells in the L / Cr range).
       - Empty cells (no trades) render as "—" universally — fixes
-        the "Median ROI/yr: +0.0%" mislead for zero-count cells.
+        the "Median ROI: +0.0%" mislead for zero-count cells.
 
     Implementation: vectorized via a single groupby + reindex,
     replaces the prior O(H × W × N) nested-loop filter — important
@@ -295,9 +296,9 @@ def _build_customdata(
             "n_win": (pair["net_pnl"] > 0).groupby(
                 [pair["entry_offset_td"], pair["exit_offset_td"]]
             ).sum(),
-            "std": grouped["roi_pct_annualized"].std(ddof=0),
+            "std": grouped["roi_pct"].std(ddof=0),
             "total_pnl": grouped["net_pnl"].sum(),
-            "median_roi": grouped["roi_pct_annualized"].median(),
+            "median_roi": grouped["roi_pct"].median(),
         }).reset_index()
         stats["win_rate"] = 100.0 * stats["n_win"] / stats["n"]
         # Index lookup by (entry, exit) tuple
@@ -319,11 +320,11 @@ def _build_customdata(
                 )
                 out[i, j, 3] = format_inr(float(row["total_pnl"]))
                 out[i, j, 4] = format_pct(
-                    float(row["median_roi"]), signed=True, annualized=True,
+                    float(row["median_roi"]), signed=True,
                 )
             else:
                 # Zero-count cell — every field "—" so hover doesn't
-                # mislead with "Median ROI/yr: +0.0%" on no data.
+                # mislead with "Median ROI: +0.0%" on no data.
                 out[i, j, 0] = "0"
                 out[i, j, 1] = "—"
                 out[i, j, 2] = "—"
@@ -342,7 +343,7 @@ def render_heatmaps(
     """Dual Plotly heatmaps per DESIGN_SPEC §4 commit 16 + §2.3
     colormap mandate:
 
-      Left pane  — MEDIAN ROI/yr per (entry, exit) cell
+      Left pane  — MEDIAN ROI per (entry, exit) cell
                    Colormap: RdYlGn diverging with zmid=0 (red =
                    loss, white = breakeven, green = profit). Per
                    §2.3, NEVER sequential — a first-negative-cell
@@ -398,13 +399,13 @@ def render_heatmaps(
     exit_ticks = [_format_offset_label("T", v) for v in values.columns]
 
     # === Per-cell customdata for hover tooltips (p6.3.hover) ===
-    # Compose the full row's stats (win_rate_pct, std_roi_pct_annualized,
-    # total_net_pnl, mean_roi_pct_annualized) into a 3D customdata
+    # Compose the full row's stats (win_rate_pct, std_roi_pct,
+    # total_net_pnl, mean_roi_pct) into a 3D customdata
     # array aligned with the (entry, exit) grid. Hover renders the
     # full per-cell story per DESIGN_SPEC §2.5 + §2.2.
     custom = _build_customdata(df, strategy, symbol, values.index, values.columns)
 
-    # === Left pane — median ROI/yr (diverging colormap) ====
+    # === Left pane — median ROI (diverging colormap) ====
     value_z = masked.values  # NaN cells render as no-data
     value_fig = go.Figure(data=go.Heatmap(
         z=value_z,
@@ -413,30 +414,30 @@ def render_heatmaps(
         colorscale="RdYlGn",      # diverging — see §2.3
         zmid=0,                   # white at breakeven
         # Annotate each visible cell with its rounded value. Signed
-        # format (+248%/yr / -89%/yr) matches the MoY bar annotations
+        # format (+248% / -89%) matches the MoY bar annotations
         # for sign-format consistency across all annual-ROI surfaces.
         # NaN cells (masked) get blank annotations naturally.
         text=[[
-            f"{value_z[i][j]:+.0f}%/yr" if value_z[i][j] == value_z[i][j] else ""
+            f"{value_z[i][j]:+.0f}%" if value_z[i][j] == value_z[i][j] else ""
             for j in range(value_z.shape[1])
         ] for i in range(value_z.shape[0])],
         texttemplate="%{text}",
         textfont={"size": 12},
-        colorbar={"title": "%/yr", "x": 1.02},
+        colorbar={"title": "%", "x": 1.02},
         hoverongaps=False,
         customdata=custom,
         hovertemplate=(
             "<b>entry %{y}, exit %{x}</b><br>"
-            "Median ROI/yr: %{customdata[4]}<br>"
+            "Median ROI: %{customdata[4]}<br>"
             "N: %{customdata[0]}<br>"
             "Win rate: %{customdata[1]}<br>"
-            "Std ROI/yr: %{customdata[2]}<br>"
+            "Std ROI: %{customdata[2]}<br>"
             "Net P&L: %{customdata[3]}"
             "<extra></extra>"
         ),
     ))
     value_fig.update_layout(
-        title="Median ROI/yr",
+        title="Median ROI",
         xaxis_title="Exit offset",
         yaxis_title="Entry offset",
         height=400,
@@ -473,7 +474,7 @@ def render_heatmaps(
         hovertemplate=(
             "<b>entry %{y}, exit %{x}</b><br>"
             "N: %{z}<br>"
-            "Median ROI/yr: %{customdata[4]}<br>"
+            "Median ROI: %{customdata[4]}<br>"
             "Win rate: %{customdata[1]}"
             "<extra></extra>"
         ),
@@ -522,7 +523,7 @@ def render_heatmaps(
     # caption below the panes since Plotly hovertemplates can't carry
     # tooltips on a column name.
     st.caption(
-        "_Std ROI/yr in the hover is observed-sample dispersion "
+        "_Std ROI in the hover is observed-sample dispersion "
         "(ddof=0), not an unbiased population estimate. Bias vs "
         "ddof=1 sample-std: ~11% at n=5, ~5% at n=10, ~2.5% at n=20. "
         "Treat as a LOWER BOUND on true population spread._"
@@ -704,7 +705,7 @@ def render_cell_drilldown(
     if sel is None:
         st.markdown("### Cell drill-down")
         st.caption(
-            "_Click any cell on the **Median ROI/yr** heatmap above to "
+            "_Click any cell on the **Median ROI** heatmap above to "
             "see the underlying trades, distribution, and full per-leg "
             "/ per-cost breakdown._"
         )
@@ -770,7 +771,7 @@ def render_cell_drilldown(
     from src.web._format import format_inr
     n = len(rows)
     pnl_series = rows["net_pnl"]
-    roi_series = rows["roi_pct_annualized"]
+    roi_series = rows["roi_pct"]
     n_win = int((pnl_series > 0).sum())
 
     card_left, card_mid, card_right = st.columns([1, 1, 1])
@@ -801,8 +802,8 @@ def render_cell_drilldown(
     with card_mid:
         st.markdown("**MEDIAN ROI / ANNUALIZED**")
         st.metric(
-            "Median ROI/yr",
-            format_pct(float(roi_series.median()), signed=True, annualized=True),
+            "Median ROI",
+            format_pct(float(roi_series.median()), signed=True),
             label_visibility="collapsed",
         )
         # Bootstrap 95% CI under the headline — matches the honesty
@@ -827,7 +828,7 @@ def render_cell_drilldown(
         )
         g1[2].metric(
             "Mean",
-            format_pct(float(roi_series.mean()), signed=True, annualized=True),
+            format_pct(float(roi_series.mean()), signed=True),
         )
         g2 = st.columns(3)
         g2[0].metric(
@@ -846,7 +847,7 @@ def render_cell_drilldown(
         st.markdown("**ACROSS YEARS**")
         yoy = (
             rows.assign(year=rows["expiry"].dt.year)
-            .groupby("year")["roi_pct_annualized"]
+            .groupby("year")["roi_pct"]
             .mean()
             .reset_index()
             .sort_values("year")
@@ -855,13 +856,13 @@ def render_cell_drilldown(
             spark = go.Figure()
             spark.add_trace(go.Scatter(
                 x=yoy["year"].astype(str),
-                y=yoy["roi_pct_annualized"],
+                y=yoy["roi_pct"],
                 mode="lines+markers+text",
                 line={"color": "#d4ff3a", "width": 2},
                 marker={"size": 8, "color": "#d4ff3a"},
-                text=[f"{v:.0f}%" for v in yoy["roi_pct_annualized"]],
+                text=[f"{v:.0f}%" for v in yoy["roi_pct"]],
                 textposition="top center",
-                hovertemplate="<b>%{x}</b><br>mean ROI/yr: %{y:+.1f}%<extra></extra>",
+                hovertemplate="<b>%{x}</b><br>mean ROI: %{y:+.1f}%<extra></extra>",
             ))
             spark.update_layout(
                 height=120,
@@ -911,7 +912,7 @@ def render_cell_drilldown(
         textposition="outside",
         hovertemplate=(
             "<b>%{x}</b><br>"
-            "ROI/yr: %{y:+.1f}%<br>"
+            "ROI: %{y:+.1f}%<br>"
             "<extra></extra>"
         ),
     ))
@@ -919,13 +920,13 @@ def render_cell_drilldown(
         y=float(roi_series.median()),
         line_dash="dash",
         line_color="#666",
-        annotation_text=f"median {float(roi_series.median()):+.0f}%/yr",
+        annotation_text=f"median {float(roi_series.median()):+.0f}%",
         annotation_position="top right",
     )
     dist_fig.update_layout(
-        title="ROI/yr per expiry — outlier + regime spotter",
+        title="ROI per expiry — outlier + regime spotter",
         xaxis_title="Expiry",
-        yaxis_title="ROI/yr (%)",
+        yaxis_title="ROI (%)",
         height=280,
         margin=dict(l=60, r=40, t=50, b=40),
         showlegend=False,
@@ -951,7 +952,7 @@ def render_cell_drilldown(
         "Costs": rows["costs"].round(2),
         "Net P&L": rows["net_pnl"].round(2),
         "ROI (%)": rows["roi_pct"].round(2),
-        "ROI/yr (%)": rows["roi_pct_annualized"].round(1),
+        "ROI (%)": rows["roi_pct"].round(1),
         "Margin at entry": rows["margin_at_entry"].round(0),
     })
     st.markdown("**Per-expiry trades** (sortable — click column headers)")
@@ -980,7 +981,7 @@ def render_cell_drilldown(
     )
     for i, row in rows.iterrows():
         exp_label = row["expiry"].strftime("%Y-%m-%d")
-        roi_lbl = f"{row['roi_pct_annualized']:+.1f}%/yr"
+        roi_lbl = f"{row['roi_pct']:+.1f}%"
         pnl_lbl = format_inr(float(row["net_pnl"]))
         with st.expander(
             f"Expiry {exp_label} — Net P&L {pnl_lbl} ({roi_lbl})"

@@ -41,12 +41,16 @@ def captured_metrics(monkeypatch):
 
 
 def _row(strategy="S", symbol="X", entry=15, exit_=1,
-         net_pnl=0.0, roi_pct=0.0, roi_pct_annualized=0.0):
+         net_pnl=0.0, roi_pct=0.0):
+    """Build a minimal results-row dict for the heatmap UI tests.
+
+    Per-trade ROI throughout (no annualization): the UI reads from
+    ``roi_pct`` post commit p7.expiry_roi. Tests pass values via the
+    ``roi_pct=`` kwarg; the column is the same name."""
     return {
         "strategy": strategy, "symbol": symbol,
         "entry_offset_td": entry, "exit_offset_td": exit_,
         "net_pnl": net_pnl, "roi_pct": roi_pct,
-        "roi_pct_annualized": roi_pct_annualized,
     }
 
 
@@ -62,7 +66,6 @@ def test_empty_df_renders_three_dashes(captured_metrics):
         "exit_offset_td": pd.Series(dtype="int64"),
         "net_pnl": pd.Series(dtype="float64"),
         "roi_pct": pd.Series(dtype="float64"),
-        "roi_pct_annualized": pd.Series(dtype="float64"),
     }), strategy=None, symbol=None, min_n=5)
     assert [m["label"] for m in captured_metrics] == [
         "Best cell", "Worst cell", "Median cell",
@@ -106,7 +109,7 @@ def test_populated_3x2_cells_pinpoints_best_worst_median(captured_metrics):
     }
     for (e, x), roi in grid.items():
         for _ in range(6):  # n=6 per cell, above min_n=5
-            rows.append(_row(entry=e, exit_=x, roi_pct_annualized=roi))
+            rows.append(_row(entry=e, exit_=x, roi_pct=roi))
 
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     best = captured_metrics[0]
@@ -114,15 +117,15 @@ def test_populated_3x2_cells_pinpoints_best_worst_median(captured_metrics):
     median = captured_metrics[2]
 
     # BEST = 100% at (15, 1)
-    assert "+100.0%/yr" in best["value"]
+    assert "+100.0%" in best["value"]
     assert "(entry T-15, exit T-1)" in best["delta"]
 
     # WORST = 10% at (5, 1)
-    assert "+10.0%/yr" in worst["value"]
+    assert "+10.0%" in worst["value"]
     assert "(entry T-5, exit T-1)" in worst["delta"]
 
     # MEDIAN = median of [100, 50, 75, 25, 10, 40] = 45
-    assert "+45.0%/yr" in median["value"]
+    assert "+45.0%" in median["value"]
     assert "across 6 visible cell(s)" in median["delta"]
 
 
@@ -130,8 +133,8 @@ def test_all_cells_masked_at_high_min_n(captured_metrics):
     """LOAD-BEARING per DESIGN_SPEC §2.6: when every cell has fewer
     than min_n trades, headline cards say so explicitly rather than
     rendering a misleading max() over essentially-empty data."""
-    rows = [_row(entry=15, exit_=1, roi_pct_annualized=100.0)] * 3
-    rows += [_row(entry=10, exit_=1, roi_pct_annualized=50.0)] * 2
+    rows = [_row(entry=15, exit_=1, roi_pct=100.0)] * 3
+    rows += [_row(entry=10, exit_=1, roi_pct=50.0)] * 2
     # 3 + 2 = 5 trades total, 2 cells of N={3, 2}; min_n=10 masks both
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=10)
     for m in captured_metrics:
@@ -143,16 +146,16 @@ def test_negative_roi_signs_render_correctly(captured_metrics):
     """Best can be negative (every-cell losses); worst can be more
     negative. Sign discipline pinned."""
     rows = (
-        [_row(entry=15, exit_=1, roi_pct_annualized=-50.0)] * 6 +
-        [_row(entry=10, exit_=1, roi_pct_annualized=-100.0)] * 6
+        [_row(entry=15, exit_=1, roi_pct=-50.0)] * 6 +
+        [_row(entry=10, exit_=1, roi_pct=-100.0)] * 6
     )
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     best = captured_metrics[0]
     worst = captured_metrics[1]
     # Best = less-bad = -50
-    assert "-50.0%/yr" in best["value"]
+    assert "-50.0%" in best["value"]
     # Worst = -100
-    assert "-100.0%/yr" in worst["value"]
+    assert "-100.0%" in worst["value"]
 
 
 # ============================================================
@@ -216,7 +219,7 @@ def test_heatmaps_render_two_plotly_charts(captured_charts):
     for e in (15, 10, 5):
         for x in (3, 1):
             for _ in range(6):
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
+                rows.append(_row(entry=e, exit_=x, roi_pct=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
     assert len(charts) == 2  # value pane + density pane
@@ -241,7 +244,7 @@ def test_value_pane_uses_diverging_rdylgn_colormap(captured_charts):
     construction. Fingerprint check: 0.0 stop is red-ish, 1.0 stop is
     green-ish. Robust against future Plotly version changes that
     refine the exact rgb values."""
-    rows = [_row(entry=e, exit_=x, roi_pct_annualized=50.0)
+    rows = [_row(entry=e, exit_=x, roi_pct=50.0)
             for e in (15, 10) for x in (3, 1) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
@@ -259,7 +262,7 @@ def test_value_pane_uses_diverging_rdylgn_colormap(captured_charts):
 def test_density_pane_uses_sequential_blues(captured_charts):
     """LOAD-BEARING per DESIGN_SPEC §2.3: density pane uses sequential
     Blues; 0 = white, max = dark blue. Fingerprint on first/last rgb."""
-    rows = [_row(entry=e, exit_=x, roi_pct_annualized=50.0)
+    rows = [_row(entry=e, exit_=x, roi_pct=50.0)
             for e in (15, 10) for x in (3, 1) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     density_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][1]["fig"]
@@ -277,7 +280,7 @@ def test_single_axis_empty_state(captured_charts):
     → heatmap_single_axis message, NO plotly chart rendered (a
     one-row "heatmap" isn't a heatmap)."""
     # 3 entries × 1 exit
-    rows = [_row(entry=e, exit_=1, roi_pct_annualized=50.0)
+    rows = [_row(entry=e, exit_=1, roi_pct=50.0)
             for e in (15, 10, 5) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     kinds = [e["kind"] for e in captured_charts]
@@ -291,7 +294,7 @@ def test_all_cells_masked_empty_state(captured_charts):
     for e in (15, 10, 5):
         for x in (3, 1):
             for _ in range(2):  # N=2 per cell, below min_n=5
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
+                rows.append(_row(entry=e, exit_=x, roi_pct=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     kinds = [e["kind"] for e in captured_charts]
     assert "info" in kinds
@@ -316,7 +319,7 @@ def test_cells_have_customdata_for_hover_tooltips(captured_charts):
         for x in (3, 1):
             for _ in range(6):
                 rows.append(_row(entry=e, exit_=x, net_pnl=100.0 * (e + x),
-                                 roi_pct_annualized=10.0 * (e + x)))
+                                 roi_pct=10.0 * (e + x)))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
     trace = value_fig.data[0]
@@ -338,17 +341,17 @@ def test_hover_template_includes_all_load_bearing_fields(captured_charts):
     pre-formatted customdata strings, not from the template format
     specifiers. So the template no longer contains ₹/% literals —
     the formatted strings interpolated via %{customdata[N]} do."""
-    rows = [_row(entry=e, exit_=x, roi_pct_annualized=50.0)
+    rows = [_row(entry=e, exit_=x, roi_pct=50.0)
             for e in (15, 10) for x in (3, 1) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
     trace = value_fig.data[0]
     tmpl = trace.hovertemplate
     # Required field labels per §2.5
-    assert "Median ROI/yr" in tmpl
+    assert "Median ROI" in tmpl
     assert "N:" in tmpl
     assert "Win rate" in tmpl
-    assert "Std ROI/yr" in tmpl
+    assert "Std ROI" in tmpl
     assert "Net P&L" in tmpl
     # Currency / percent symbols now live inside the customdata
     # strings — check at least one cell's pre-formatted Net P&L
@@ -365,13 +368,13 @@ def test_density_pane_hover_references_value_via_customdata(captured_charts):
     """Density pane shows N as the main z; hover should ALSO surface
     the cell's median ROI so the operator doesn't need to switch
     panes."""
-    rows = [_row(entry=e, exit_=x, roi_pct_annualized=42.0)
+    rows = [_row(entry=e, exit_=x, roi_pct=42.0)
             for e in (15, 10) for x in (3, 1) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     density_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][1]["fig"]
     tmpl = density_fig.data[0].hovertemplate
     assert "N:" in tmpl
-    assert "Median ROI/yr" in tmpl  # via customdata[4]
+    assert "Median ROI" in tmpl  # via customdata[4]
     assert "Win rate" in tmpl       # via customdata[1]
 
 
@@ -383,9 +386,9 @@ def test_partial_mask_caption_surfaces_count(captured_charts):
     # have N=2 (masked from value pane).
     for x in (1, 3):
         for _ in range(6):
-            rows.append(_row(entry=15, exit_=x, roi_pct_annualized=50.0))
+            rows.append(_row(entry=15, exit_=x, roi_pct=50.0))
         for _ in range(2):
-            rows.append(_row(entry=10, exit_=x, roi_pct_annualized=50.0))
+            rows.append(_row(entry=10, exit_=x, roi_pct=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
     captions = [e for e in captured_charts if e["kind"] == "caption"]
@@ -399,8 +402,8 @@ def test_partial_mask_caption_surfaces_count(captured_charts):
 
 def test_naming_rule_values_have_percent_suffix(captured_metrics):
     """LOAD-BEARING §2.5 naming rule: card values for percentages
-    MUST end in % or %/yr. Anti-mockup-bug (rupees mislabeled etc.)."""
-    rows = [_row(entry=15, exit_=1, roi_pct_annualized=42.0)] * 6
+    MUST end in % or %. Anti-mockup-bug (rupees mislabeled etc.)."""
+    rows = [_row(entry=15, exit_=1, roi_pct=42.0)] * 6
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     for m in captured_metrics:
         if m["value"] != "—":
@@ -431,7 +434,7 @@ def test_value_pane_uses_native_plotly_chart_with_on_select(captured_charts):
     for e in (15, 10, 5):
         for x in (3, 1):
             for _ in range(6):
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
+                rows.append(_row(entry=e, exit_=x, roi_pct=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
 
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
@@ -543,7 +546,7 @@ def _render_heatmaps_with_data(monkeypatch):
     for e in (15, 10, 5):
         for x in (3, 1):
             for _ in range(6):
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=42.0))
+                rows.append(_row(entry=e, exit_=x, roi_pct=42.0))
     hm.render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     return selectbox_calls, expander_state
 
@@ -615,7 +618,7 @@ def test_manual_picker_writes_session_state_when_user_changes_selection(monkeypa
     for e in (15, 10, 5):
         for x in (3, 1):
             for _ in range(6):
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=42.0))
+                rows.append(_row(entry=e, exit_=x, roi_pct=42.0))
     hm.render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
 
     # Picker fired because new (10,3) != prev (15,1) AND 10 > 3.
@@ -667,7 +670,7 @@ def test_manual_picker_respects_entry_gt_exit_constraint(monkeypatch):
     for e in (15, 10, 3):
         for x in (10, 3, 1):
             for _ in range(6):
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=42.0))
+                rows.append(_row(entry=e, exit_=x, roi_pct=42.0))
     hm.render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
 
     # picker DID NOT write — constraint failed.
@@ -734,7 +737,7 @@ def test_selector_renders_strike_rule_caption(monkeypatch):
     monkeypatch.setattr(hm.st, "columns", fake_columns)
     monkeypatch.setattr(hm.st, "session_state", {})
 
-    df = pd.DataFrame([_row(entry=15, exit_=1, roi_pct_annualized=42.0)])
+    df = pd.DataFrame([_row(entry=15, exit_=1, roi_pct=42.0)])
     strategy, symbol = hm._selector(df)
     assert strategy == "S"
     assert symbol == "X"
@@ -743,7 +746,7 @@ def test_selector_renders_strike_rule_caption(monkeypatch):
     # guard inside _selector swallows that; nothing crashes. To test
     # the actual rendering path, use a real strategy name:
     df_real = pd.DataFrame([
-        _row(entry=15, exit_=1, roi_pct_annualized=42.0,
+        _row(entry=15, exit_=1, roi_pct=42.0,
              strategy="short_straddle", symbol="RELIANCE"),
     ])
     captions.clear()
@@ -777,7 +780,7 @@ def test_mode_radio_renders_with_three_options(monkeypatch, captured_charts):
     for e in (15, 10, 5):
         for x in (3, 1):
             for _ in range(6):
-                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
+                rows.append(_row(entry=e, exit_=x, roi_pct=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
 
     mode_radios = [r for r in radio_calls if r["label"] == "Cell action"]

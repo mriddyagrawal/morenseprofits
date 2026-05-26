@@ -24,12 +24,11 @@ def _fixture(rows):
 
 
 def _row(strategy="S", symbol="X", entry=15, exit_=1,
-         net_pnl=0.0, roi_pct=0.0, roi_pct_annualized=0.0):
+         net_pnl=0.0, roi_pct=0.0):
     return {
         "strategy": strategy, "symbol": symbol,
         "entry_offset_td": entry, "exit_offset_td": exit_,
         "net_pnl": net_pnl, "roi_pct": roi_pct,
-        "roi_pct_annualized": roi_pct_annualized,
     }
 
 
@@ -40,9 +39,9 @@ def _row(strategy="S", symbol="X", entry=15, exit_=1,
 def test_index_descending_entry_offset(monkeypatch):
     """T-15 entry must appear at the top of the pivot (index[0])."""
     df = pivot_window(_fixture([
-        _row(entry=5, exit_=1, roi_pct_annualized=10.0),
-        _row(entry=10, exit_=1, roi_pct_annualized=20.0),
-        _row(entry=15, exit_=1, roi_pct_annualized=30.0),
+        _row(entry=5, exit_=1, roi_pct=10.0),
+        _row(entry=10, exit_=1, roi_pct=20.0),
+        _row(entry=15, exit_=1, roi_pct=30.0),
     ]))
     # Index sorted descending → 15, 10, 5
     assert list(df.index) == [15, 10, 5]
@@ -51,9 +50,9 @@ def test_index_descending_entry_offset(monkeypatch):
 def test_columns_descending_exit_offset():
     """Larger exit_offset (e.g., T-3, "earlier exit") at left, T-1 at right."""
     df = pivot_window(_fixture([
-        _row(entry=15, exit_=1, roi_pct_annualized=10.0),
-        _row(entry=15, exit_=3, roi_pct_annualized=20.0),
-        _row(entry=15, exit_=5, roi_pct_annualized=30.0),
+        _row(entry=15, exit_=1, roi_pct=10.0),
+        _row(entry=15, exit_=3, roi_pct=20.0),
+        _row(entry=15, exit_=5, roi_pct=30.0),
     ]))
     # Columns sorted descending → 5, 3, 1
     assert list(df.columns) == [5, 3, 1]
@@ -66,9 +65,9 @@ def test_columns_descending_exit_offset():
 def test_cell_values_are_median_by_default():
     """Three trades at (15, 1) with ROIs [10, 20, 30] → median = 20."""
     df = pivot_window(_fixture([
-        _row(entry=15, exit_=1, roi_pct_annualized=10.0),
-        _row(entry=15, exit_=1, roi_pct_annualized=20.0),
-        _row(entry=15, exit_=1, roi_pct_annualized=30.0),
+        _row(entry=15, exit_=1, roi_pct=10.0),
+        _row(entry=15, exit_=1, roi_pct=20.0),
+        _row(entry=15, exit_=1, roi_pct=30.0),
     ]))
     assert df.loc[15, 1] == 20.0
 
@@ -78,7 +77,7 @@ def test_missing_cells_are_nan_not_zero():
     so Phase-6 heatmap doesn't paint "no data" cells the same color
     as "zero return" cells."""
     df = pivot_window(_fixture([
-        _row(entry=15, exit_=1, roi_pct_annualized=10.0),
+        _row(entry=15, exit_=1, roi_pct=10.0),
         # No (10, 1) cell — only (15, 1) populated
     ]))
     # The empty cell (10, 1) shouldn't even exist in this pivot since
@@ -87,8 +86,8 @@ def test_missing_cells_are_nan_not_zero():
 
     # Now WITH a missing combo in a grid that has both axes:
     df = pivot_window(_fixture([
-        _row(entry=15, exit_=1, roi_pct_annualized=10.0),
-        _row(entry=10, exit_=3, roi_pct_annualized=20.0),
+        _row(entry=15, exit_=1, roi_pct=10.0),
+        _row(entry=10, exit_=3, roi_pct=20.0),
     ]))
     # 2x2 grid: only diagonal populated, off-diagonals NaN
     assert pd.isna(df.loc[15, 3])
@@ -120,8 +119,8 @@ def test_invalid_value_col_raises():
 
 def test_strategy_filter_isolates_one_strategy():
     df = pivot_window(_fixture([
-        _row(strategy="short_straddle", entry=15, exit_=1, roi_pct_annualized=10.0),
-        _row(strategy="iron_condor",    entry=15, exit_=1, roi_pct_annualized=99.0),
+        _row(strategy="short_straddle", entry=15, exit_=1, roi_pct=10.0),
+        _row(strategy="iron_condor",    entry=15, exit_=1, roi_pct=99.0),
     ]), strategy="short_straddle")
     # Iron condor's 99 row should be filtered out
     assert df.loc[15, 1] == 10.0
@@ -129,8 +128,8 @@ def test_strategy_filter_isolates_one_strategy():
 
 def test_symbol_filter_isolates_one_symbol():
     df = pivot_window(_fixture([
-        _row(symbol="RELIANCE", entry=15, exit_=1, roi_pct_annualized=10.0),
-        _row(symbol="INFY",     entry=15, exit_=1, roi_pct_annualized=99.0),
+        _row(symbol="RELIANCE", entry=15, exit_=1, roi_pct=10.0),
+        _row(symbol="INFY",     entry=15, exit_=1, roi_pct=99.0),
     ]), symbol="RELIANCE")
     assert df.loc[15, 1] == 10.0
 
@@ -138,8 +137,8 @@ def test_symbol_filter_isolates_one_symbol():
 def test_no_filter_aggregates_across_both_axes():
     """Both strategy=None and symbol=None → median across everything."""
     df = pivot_window(_fixture([
-        _row(strategy="S1", symbol="X", entry=15, exit_=1, roi_pct_annualized=10.0),
-        _row(strategy="S2", symbol="Y", entry=15, exit_=1, roi_pct_annualized=20.0),
+        _row(strategy="S1", symbol="X", entry=15, exit_=1, roi_pct=10.0),
+        _row(strategy="S2", symbol="Y", entry=15, exit_=1, roi_pct=20.0),
     ]))
     # median of [10, 20] = 15
     assert df.loc[15, 1] == 15.0
@@ -197,9 +196,9 @@ def test_counts_and_values_pivots_have_same_shape():
     """LOAD-BEARING for the masking pattern:
        v.where(counts >= MIN_N_FOR_RANKING) — needs identical shape."""
     rows = [
-        _row(entry=15, exit_=1, roi_pct_annualized=10.0),
-        _row(entry=15, exit_=1, roi_pct_annualized=20.0),
-        _row(entry=10, exit_=3, roi_pct_annualized=30.0),
+        _row(entry=15, exit_=1, roi_pct=10.0),
+        _row(entry=15, exit_=1, roi_pct=20.0),
+        _row(entry=10, exit_=3, roi_pct=30.0),
     ]
     v = pivot_window(_fixture(rows))
     n = pivot_counts(_fixture(rows))
@@ -215,8 +214,8 @@ def test_min_n_masking_pattern_with_pivot_counts():
     from src.analytics.aggregate import MIN_N_FOR_RANKING
     rows = (
         # 6 trades at (15, 1) — exceeds MIN_N_FOR_RANKING
-        [_row(entry=15, exit_=1, roi_pct_annualized=10.0)] * 6
-        + [_row(entry=10, exit_=1, roi_pct_annualized=99.0)]  # 1 trade only
+        [_row(entry=15, exit_=1, roi_pct=10.0)] * 6
+        + [_row(entry=10, exit_=1, roi_pct=99.0)]  # 1 trade only
     )
     v = pivot_window(_fixture(rows))
     n = pivot_counts(_fixture(rows))

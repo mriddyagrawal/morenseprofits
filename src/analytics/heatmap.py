@@ -16,11 +16,19 @@ Consumers compose them with ``.where(counts >= MIN_N_FOR_RANKING)`` to
 mask thin-sample cells. Same statistical-honesty contract as the
 ``aggregate`` module — surface N, never silently drop.
 
-Reviewer's design constraints (per p5.1 review):
-  - Default value_col = ``roi_pct_annualized`` (cross-window-rankable)
+Reviewer's design constraints (per p5.1 review, amended for p7 expiry-ROI shift):
+  - Default value_col = ``roi_pct`` (per-trade ROI, no annualization)
   - Default aggfunc = ``median`` (robust to outliers in small samples)
   - Missing combinations → NaN (no false zero in the heatmap)
   - Indices sorted descending (T-15 at top of the heatmap)
+
+Operator-facing rationale for the per-trade default: every cell aggregates
+trades that all share the same (entry, exit) offsets, so all trades in a
+cell have the SAME hold period — per-trade ROI is exactly comparable
+within a cell. Cross-cell comparison is hold-period-aware (a longer-hold
+cell will naturally show a larger per-trade ROI for the same daily yield);
+that's the operator's choice to make, not the engine's to hide behind
+forced annualization.
 """
 from __future__ import annotations
 
@@ -58,7 +66,7 @@ def pivot_window(
     *,
     strategy: str | None = None,
     symbol: str | None = None,
-    value_col: str = "roi_pct_annualized",
+    value_col: str = "roi_pct",
     aggfunc: str = "median",
 ) -> pd.DataFrame:
     """Return a 2D pivot of ``value_col`` aggregated across the
@@ -69,9 +77,10 @@ def pivot_window(
     exit, leftmost; T-1 = rightmost = "held to expiry").
     Missing cells → NaN.
 
-    Default ``value_col = "roi_pct_annualized"`` so the heatmap is
-    cross-window-comparable per SPECS §4a caveat #2 (the now-exact
-    annualization from p4.verify.a).
+    Default ``value_col = "roi_pct"`` — per-trade ROI. Each cell's
+    trades all share the same (entry, exit) offsets, so per-trade ROI
+    is exactly comparable within a cell. Operators who need the
+    annualized view can pass ``value_col="roi_pct_annualized"``.
 
     Default ``aggfunc = "median"`` so a single outlier cell doesn't
     dominate the color scale. Mean is available via aggfunc="mean".
