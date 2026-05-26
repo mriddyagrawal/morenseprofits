@@ -766,6 +766,15 @@ def render_cell_drilldown(
             "_Stability check — sparkline lands in a follow-up commit._"
         )
 
+    # ---- Auto-detected structural callouts -------------------
+    # The dashboard reads the data so the analyst doesn't have to:
+    # heavy-tail signals, single-trade-carry, instability — all
+    # surfaced as inline observations before the chart. Empty list
+    # means "no structural surprises" — silent is honest.
+    from src.analytics.observations import interpret_cell_stats
+    for obs in interpret_cell_stats(rows):
+        st.warning(obs)
+
     # ---- ROI distribution mini-chart -------------------------
     # Lets the analyst see at a glance whether the cell's median is
     # representative or whether it's hiding fat tails / regime split.
