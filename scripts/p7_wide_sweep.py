@@ -17,7 +17,7 @@ from __future__ import annotations
 import sys
 import time
 import warnings
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -49,8 +49,35 @@ ENTRY_OFFSETS_TD = list(range(1, 46))   # T-45 ... T-1
 EXIT_OFFSETS_TD = list(range(0, 16))    # T-0  ... T-15
 EXPIRY_FROM = date(2024, 5, 1)
 EXPIRY_TO = date(2026, 5, 31)
-TODAY_FN = lambda: date(2026, 5, 26)
+WALL_TODAY = date(2026, 5, 26)   # actual calendar today (used for walk-back start)
 N_WORKERS = 8   # M1 Max has 8 perf cores; efficiency cores add little
+
+
+def _resolve_anchor_date(start: date, max_back: int = 7) -> date:
+    """Find the most recent date with a usable bhavcopy on NSE.
+
+    Why: NSE publishes today's F&O bhavcopy AFTER market close
+    (~6 PM IST). Pre-market-close runs, weekends, and holidays all
+    fail load_bhavcopy_fo(today). Walking back to the latest usable
+    day gives us a date where both:
+
+      (a) the bhavcopy strike-enumeration succeeds (pre-warm works),
+      (b) cached contract max_date most likely matches → workers'
+          open-expiry staleness check passes → no NSE during sweep.
+
+    Returns the anchor date; raises RuntimeError if no bhavcopy in
+    the past `max_back` days (e.g. NSE outage)."""
+    for offset in range(max_back + 1):
+        cand = start - timedelta(days=offset)
+        try:
+            bhavcopy_fo_loader.load_bhavcopy_fo(cand)
+            return cand
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"no usable F&O bhavcopy in last {max_back} days from {start}; "
+        f"NSE outage or pre-warm cannot proceed"
+    )
 
 
 def _h(s: str) -> None:
@@ -63,6 +90,17 @@ def main() -> int:
     print(f"  strategies  = {STRATEGIES}")
     print(f"  entry_td    = T-{min(ENTRY_OFFSETS_TD)} … T-{max(ENTRY_OFFSETS_TD)} ({len(ENTRY_OFFSETS_TD)} values)")
     print(f"  exit_td     = T-{min(EXIT_OFFSETS_TD)} … T-{max(EXIT_OFFSETS_TD)} ({len(EXIT_OFFSETS_TD)} values)")
+
+    # Resolve a "today" anchor — last NSE day with a published bhavcopy.
+    # Pre-market-close on a trading day, today's bhavcopy isn't out yet,
+    # so we walk back. Anchoring TODAY_FN here means the staleness checks
+    # downstream compare against THIS date, not the wall-clock today, so
+    # workers' open-expiry cache passes the check post pre-warm.
+    anchor = _resolve_anchor_date(WALL_TODAY)
+    print(f"  anchor today = {anchor.isoformat()}  "
+          f"(wall today {WALL_TODAY.isoformat()}; walked back "
+          f"{(WALL_TODAY - anchor).days} day(s) for usable bhavcopy)")
+    TODAY_FN = lambda: anchor  # noqa: E731 — local override for the rest of main
 
     _h(f"Building expiry list ({EXPIRY_FROM.isoformat()} → {EXPIRY_TO.isoformat()})")
     all_expiries: set = set()
