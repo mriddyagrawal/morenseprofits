@@ -781,8 +781,8 @@ def render_compare_cells(
         st.caption(
             "_Raw deltas only. With N ≈ 24 per cell, treat these as "
             "directional signals — not as definitive comparisons. "
-            "No statistical-significance claims; sample sizes are too "
-            "small for that machinery to be honest._"
+            "No significance-test machinery; sample sizes are too "
+            "small for that to be honest._"
         )
 
     # ---- Overlay distribution chart ---------------------------
