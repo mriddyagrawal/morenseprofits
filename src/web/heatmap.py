@@ -617,22 +617,235 @@ def render_compare_cells(
     symbol: str | None,
     min_n: int,
 ) -> None:
-    """Compare-cells mode (STUB). Implementation lands in
-    feat(p7.heatmap.compare).
+    """Compare-cells mode.
 
-    REVIEWER CONSTRAINT (do not relax in the follow-up commit):
-    no p-values, no "statistically significant" copy. With N≈24 trades
-    per cell, ~5% of identical-distribution cell-pairs return p<0.05 by
-    chance. With 720 cells × 5 (strategy, symbol) pairs an operator
-    inspects, dozens of false-positive "significant differences" will
-    surface as noise-disguised-as-signal. Honest framing: visual overlay
-    + side-by-side stats + raw difference column ONLY. No p-value, no
-    statistical-test machinery.
+    REVIEWER CONSTRAINT (load-bearing — failing-test enforced in
+    tests/test_web_e2e.py::test_compare_cells_renders_no_p_values):
+    NO p-values, NO "statistically significant" copy, NO statistical-
+    test machinery. With N≈24 trades per cell, ~5% of identical-
+    distribution cell-pairs would return p<0.05 by chance. Across 720
+    cells × 5 (strategy, symbol) pairs an operator might compare, dozens
+    of false-positive "significant differences" would surface as
+    noise-disguised-as-signal. Honest framing: visual overlay + side-by-
+    side stats + raw difference column ONLY.
+
+    UX (no browser-side multi-click — click reliability documented in
+    click_failures.md):
+      - Selection list lives in ``st.session_state["mp_heatmap_compare_cells"]``
+        as a list of ``(entry_td, exit_td)`` tuples (1-4 cells).
+      - Operator picks Entry / Exit dropdowns, clicks "Add to comparison".
+      - Each selected cell renders as a chip with a Remove button.
+      - Once ≥2 cells are added, the comparison renders: side-by-side
+        stats table + raw-difference column + overlay distribution chart.
     """
-    st.info(
-        "**Compare cells** — shift-click 2-4 cells to overlay their "
-        "ROI distributions and view side-by-side stats. "
-        "_(Implementation pending — see feat(p7.heatmap.compare).)_"
+    if strategy is None or symbol is None:
+        st.info(
+            "Pick a strategy + symbol above, then add cells to compare."
+        )
+        return
+
+    pair_df = filter_pair(df, strategy=strategy, symbol=symbol)
+    if pair_df.empty:
+        st.info(
+            f"No data for {strategy} × {symbol} after current filters."
+        )
+        return
+
+    # Available (entry, exit) combinations for this pair.
+    pair_combos = sorted(
+        pair_df[["entry_offset_td", "exit_offset_td"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    )
+    if not pair_combos:
+        st.info(
+            f"No (entry, exit) cells available for {strategy} × {symbol}."
+        )
+        return
+    available_entries = sorted({e for (e, _) in pair_combos}, reverse=True)
+    available_exits = sorted({x for (_, x) in pair_combos}, reverse=True)
+
+    # ---- Selection management ----------------------------------
+    if "mp_heatmap_compare_cells" not in st.session_state:
+        st.session_state["mp_heatmap_compare_cells"] = []
+    selected_cells: list[tuple[int, int]] = list(
+        st.session_state["mp_heatmap_compare_cells"]
+    )
+
+    add_cols = st.columns([2, 2, 1, 1])
+    with add_cols[0]:
+        new_entry = st.selectbox(
+            "Entry offset",
+            options=available_entries,
+            format_func=lambda v: f"T-{v}",
+            key="mp_heatmap_compare_new_entry",
+        )
+    with add_cols[1]:
+        new_exit = st.selectbox(
+            "Exit offset",
+            options=available_exits,
+            format_func=lambda v: f"T-{v}",
+            key="mp_heatmap_compare_new_exit",
+        )
+    with add_cols[2]:
+        st.markdown("&nbsp;")  # vertical spacer for button alignment
+        add_clicked = st.button(
+            "Add to comparison",
+            key="mp_heatmap_compare_add",
+            disabled=(
+                len(selected_cells) >= 4
+                or new_entry <= new_exit
+                or (new_entry, new_exit) in selected_cells
+                or (new_entry, new_exit) not in pair_combos
+            ),
+        )
+    with add_cols[3]:
+        st.markdown("&nbsp;")
+        clear_clicked = st.button(
+            "Clear all",
+            key="mp_heatmap_compare_clear",
+            disabled=(len(selected_cells) == 0),
+        )
+
+    if add_clicked:
+        selected_cells.append((new_entry, new_exit))
+        st.session_state["mp_heatmap_compare_cells"] = selected_cells
+        st.rerun()
+    if clear_clicked:
+        st.session_state["mp_heatmap_compare_cells"] = []
+        st.rerun()
+
+    # ---- Selected-cells chips with Remove buttons --------------
+    if selected_cells:
+        st.markdown("**Selected cells:**")
+        for i, (e, x) in enumerate(selected_cells):
+            chip_cols = st.columns([5, 1])
+            chip_cols[0].markdown(f"`{i+1}.` entry T-{e} → exit T-{x}")
+            if chip_cols[1].button(
+                "Remove", key=f"mp_heatmap_compare_remove_{i}",
+            ):
+                new_list = selected_cells[:i] + selected_cells[i+1:]
+                st.session_state["mp_heatmap_compare_cells"] = new_list
+                st.rerun()
+
+    if len(selected_cells) < 2:
+        st.caption(
+            "_Add at least 2 cells to see the side-by-side comparison._"
+        )
+        return
+
+    # ---- Side-by-side stats table -----------------------------
+    from src.web._format import format_inr
+    st.markdown("---")
+    st.markdown("### Side-by-side stats")
+    stats_rows = []
+    for (e, x) in selected_cells:
+        cell_df = pair_df[
+            (pair_df["entry_offset_td"] == e)
+            & (pair_df["exit_offset_td"] == x)
+        ]
+        n = len(cell_df)
+        if n == 0:
+            stats_rows.append({
+                "Cell": f"T-{e} → T-{x}",
+                "N": 0,
+                "Win %": "—",
+                "Median ROI": "—",
+                "Mean ROI": "—",
+                "Std ROI": "—",
+                "Σ Net P&L": "—",
+            })
+            continue
+        roi = cell_df["roi_pct"]
+        pnl = cell_df["net_pnl"]
+        n_win = int((pnl > 0).sum())
+        stats_rows.append({
+            "Cell": f"T-{e} → T-{x}",
+            "N": n,
+            "Win %": f"{100.0 * n_win / n:.1f}%",
+            "Median ROI": f"{roi.median():+.1f}%",
+            "Mean ROI": f"{roi.mean():+.1f}%",
+            "Std ROI": f"±{roi.std(ddof=0):.1f}%" if n > 1 else "—",
+            "Σ Net P&L": format_inr(float(pnl.sum())),
+        })
+    stats_table = pd.DataFrame(stats_rows)
+    st.dataframe(stats_table, hide_index=True, use_container_width=True)
+
+    # ---- Raw-difference column (cell N+1 minus cell 1) --------
+    # No p-values, no "significant". Just the raw delta the operator
+    # can interpret with their own intuition + N counts.
+    if len(selected_cells) >= 2:
+        st.markdown("**Raw differences (vs cell 1):**")
+        base_e, base_x = selected_cells[0]
+        base_df = pair_df[
+            (pair_df["entry_offset_td"] == base_e)
+            & (pair_df["exit_offset_td"] == base_x)
+        ]
+        diff_rows = []
+        for (e, x) in selected_cells[1:]:
+            other_df = pair_df[
+                (pair_df["entry_offset_td"] == e)
+                & (pair_df["exit_offset_td"] == x)
+            ]
+            if base_df.empty or other_df.empty:
+                continue
+            diff_rows.append({
+                "Cell": f"T-{e} → T-{x}",
+                "Δ Median ROI": (
+                    f"{other_df['roi_pct'].median() - base_df['roi_pct'].median():+.1f} pts"
+                ),
+                "Δ Mean ROI": (
+                    f"{other_df['roi_pct'].mean() - base_df['roi_pct'].mean():+.1f} pts"
+                ),
+                "Δ Win %": (
+                    f"{100.0 * ((other_df['net_pnl'] > 0).sum() / max(len(other_df), 1) - (base_df['net_pnl'] > 0).sum() / max(len(base_df), 1)):+.1f} pp"
+                ),
+                "Δ Σ Net P&L": format_inr(
+                    float(other_df["net_pnl"].sum() - base_df["net_pnl"].sum())
+                ),
+            })
+        if diff_rows:
+            st.dataframe(
+                pd.DataFrame(diff_rows), hide_index=True, use_container_width=True,
+            )
+        st.caption(
+            "_Raw deltas only. With N ≈ 24 per cell, treat these as "
+            "directional signals — not as definitive comparisons. "
+            "No statistical-significance claims; sample sizes are too "
+            "small for that machinery to be honest._"
+        )
+
+    # ---- Overlay distribution chart ---------------------------
+    st.markdown("---")
+    st.markdown("### ROI distribution overlay")
+    overlay_fig = go.Figure()
+    palette = ["#5dd39e", "#9aa3b2", "#f0c674", "#ff7676"]  # mockup tokens
+    for i, (e, x) in enumerate(selected_cells):
+        cell_df = pair_df[
+            (pair_df["entry_offset_td"] == e)
+            & (pair_df["exit_offset_td"] == x)
+        ].sort_values("expiry")
+        if cell_df.empty:
+            continue
+        overlay_fig.add_trace(go.Bar(
+            x=cell_df["expiry"].dt.strftime("%Y-%m"),
+            y=cell_df["roi_pct"],
+            name=f"T-{e} → T-{x}",
+            marker_color=palette[i % len(palette)],
+            opacity=0.65,
+        ))
+    overlay_fig.update_layout(
+        title="ROI per expiry — all selected cells",
+        xaxis_title="Expiry",
+        yaxis_title="ROI (%)",
+        barmode="group",
+        height=350,
+        margin=dict(l=60, r=40, t=50, b=40),
+    )
+    st.plotly_chart(
+        overlay_fig,
+        use_container_width=True,
+        key="mp_heatmap_compare_overlay",
     )
 
 

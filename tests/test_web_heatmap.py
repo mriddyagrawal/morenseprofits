@@ -809,21 +809,6 @@ def test_cell_action_mode_returns_session_state_value(monkeypatch):
     assert hm.cell_action_mode() == "Export rule"
 
 
-def test_compare_cells_stub_renders_info_with_implementation_pending(monkeypatch):
-    """Stub renders an info-box so the radio is operable; full
-    behavior lands in feat(p7.heatmap.compare). LOAD-BEARING wording:
-    "Implementation pending" tells reviewers + future BUILDER this
-    isn't done."""
-    import src.web.heatmap as hm
-    infos: list[str] = []
-    monkeypatch.setattr(hm.st, "info", lambda msg, **_: infos.append(msg))
-
-    hm.render_compare_cells(pd.DataFrame(), strategy="S", symbol="X", min_n=5)
-    assert len(infos) == 1
-    assert "Compare cells" in infos[0]
-    assert "Implementation pending" in infos[0]
-
-
 def test_export_rule_stub_renders_info_with_implementation_pending(monkeypatch):
     """Same shape as compare-cells stub; full behavior lands in
     feat(p7.heatmap.export). The future commit MUST surface the
