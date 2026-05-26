@@ -3306,6 +3306,78 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 54850d4 + ca55d4c + 8419a8c — three multi-worker sweep fixes I missed during the overnight watcher gap
+
+**Verdict:** ✅ accept (all three) — caught up after spotting "54850d4 race-fix" referenced in 8419a8c's commit body. The watcher missed two notifications during the overnight window.
+
+**Watcher coverage gap acknowledged**: my commit-watcher fired for 5f28f1b/78e20d5 (ecda612 review) then went silent for 8.5 hours until 0be7c72. Two commits (54850d4 + ca55d4c) landed inside that window without my noticing. Caught only because 8419a8c's commit body referenced 54850d4 by SHA. **Process note**: in future, periodically `git log --oneline | head -20` even during quiet stretches to catch this. The heartbeat watcher proves *I'm* alive, not that *every commit* fired a notification.
+
+### 54850d4 — fix: cache.write — PID-unique tmp filename to survive concurrent writers
+
+**Phase / commit goal:** Real crash from the live wide sweep — `FileNotFoundError: .../RELIANCE/2026.parquet.tmp -> 2026.parquet`. 8 workers all wrote the SAME `.tmp` file; one's `tmp.replace(path)` succeeded, the others crashed because their `.tmp` had been atomically renamed out from under them.
+
+**What works:**
+- **Fix is one-line**: `tmp = path.with_suffix(...)` → `tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}")`. Every concurrent writer gets a unique tmp filename. POSIX `replace` is atomic on a single filesystem so concurrent renames to the same target resolve as last-writer-wins — readers always see EITHER the old complete file OR the new complete file, never a torn write.
+- **Single-threaded callers unaffected** — the .tmp name uniqueness doesn't change behavior; it just avoids the collision in the multi-worker case.
+- **Docstring updated** ([src/data/cache.py:140-146](src/data/cache.py#L140-L146)) — explains the why and the atomicity guarantee.
+- **Stack trace included verbatim** in commit body — high-quality bug repro for future contributors.
+- **Acknowledges leftover inefficiency**: "Multi-writer redundant fetches still happen (each worker independently fetches the same data before writing) — that's wasteful but separate from this crash; would need a process-level lock or pre-loader to dedupe." **Phase-7 hardening item correctly deferred.**
+
+**Non-blocking observation:**
+- **`os.urandom(4).hex()`** = 8 hex chars = 32-bit randomness. **For 8 workers writing concurrently the birthday collision probability is ~10⁻⁹**. Combined with `os.getpid()` discriminator (unique per process), collision is essentially impossible. ✓
+
+### ca55d4c — fix: lot_size mid-contract change → MissingDataError (skip), not LookaheadError (crash)
+
+**Phase / commit goal:** Live wide-sweep surfaced HDFCBANK 2025-11-25 1000-CE with lot_size **1100 → 550** between entry and exit. That's a corporate-action ex-date adjustment (NSE adjusts F&O contracts on split / bonus / merger). The engine's old assumption "NSE never changes lot mid-contract" was WRONG; the assertion fired `LookaheadError` and aborted the entire sweep at the first such cell.
+
+**What works:**
+- **Semantic class correction**: `LookaheadError` → `MissingDataError`. LookaheadError was wrong: the data wasn't bad, it just wasn't priceable under v1. **MissingDataError is in `_SKIPPABLE_ERRORS`** so sweeper's skip-loop catches the cell and records it; sweep continues.
+- **Error message names the cause + the v1 limitation**: "likely a corporate action (split / bonus / merger). Skipping — pricing across the adjustment requires strike+qty ratio'ing we don't model yet." Operator reads the skip log, knows immediately why.
+- **Test renamed + updated** ([tests/test_pnl.py:208-227](tests/test_pnl.py#L208-L227)): `test_lot_size_change_mid_contract_rejected` → `test_lot_size_change_mid_contract_skipped_as_missing_data`. Assertion changed from `LookaheadError` to `MissingDataError`. **Test docstring rewritten** to explain the corporate-action context. Anti-regression intact.
+- **LookaheadError semantic preserved**: reserved for its actual meaning — "the loader returned rows past exit_date (genuine look-ahead bias)". **Different failure class for different bug**.
+
+**This is a real domain insight surfaced by the wide sweep**: the prior assumption was wrong, and only a >5,400-cell sweep would have surfaced an actual split-bonus-merger straddle (the verify set's Q1-2024 RELIANCE had no corporate actions in window). **Wide sweep paying off as a correctness check, not just a perf check.**
+
+### 8419a8c — fix: cache-miss writes use overwrite=True for multi-worker race safety
+
+**Phase / commit goal:** Second concurrency race after 54850d4. The .tmp-collision was the OS-level race; this is the application-level check-then-write race:
+1. Worker A: `cache.exists()=False`
+2. Worker B: `cache.exists()=False` (simultaneously)
+3. Worker A: fetches, writes (overwrite=False) → OK
+4. Worker B: fetches (same data, deterministic), writes (overwrite=False) → **`WouldOverwriteError`** because A's file now exists.
+
+**What works:**
+- **3-loader symmetric fix**: `options_loader`, `spot_loader`, `bhavcopy_fo_loader` all switch their cache-miss write to `overwrite=True`. Single behavioral change applied consistently.
+- **Comments cite the central explanation** ([src/data/options_loader.py:514-519](src/data/options_loader.py#L514-L519)): bhavcopy + spot loaders' comments reference "see options_loader.py cache-miss block for the full reasoning" — DRY documentation.
+- **Domain reasoning is sound**: deterministic fetch + last-writer-wins + atomic POSIX rename (from 54850d4) = correct under racy concurrent workers. The fetched data is the same regardless of which worker won.
+- **SPECS §7 "no silent clobber" contract preserved at the API boundary** — commit body explicitly notes this. The `cache.write` API still defaults to overwrite=False; callers must opt-in. **This commit is the loader internal acknowledging that its own check-then-write is non-atomic across workers and choosing the right semantics for that fact.**
+- **Builds on 54850d4**: 54850d4 fixed the OS-level rename; this commit fixes the application-level WouldOverwriteError race. Both required for multi-worker safety.
+
+**Non-blocking observation:**
+- **Force-refresh path (`overwrite=force_refresh`) was the prior behavior** — this commit changes cache-miss writes from `overwrite=force_refresh` to `overwrite=True`. **The cache-hit path is unchanged**: if `cache.exists()` is True AND `force_refresh=False`, the loader returns early without writing at all (no race). The race only happens when the cache-miss path runs concurrently across workers. ✓
+
+**Domain / correctness checks (all three):**
+- **Multi-worker safety**: ✓ tmp uniqueness (54850d4) + last-writer-wins (8419a8c) + atomic POSIX rename = readers always see consistent files.
+- **Skip semantics**: ✓ MissingDataError vs LookaheadError properly separated; corporate-action cells get logged, not crashed.
+- **Determinism**: ✓ all three changes preserve byte-identical sweep parquet output (same fetched data; deterministic order via post-collection sort).
+- **Backward-compat**: ✓ single-threaded callers see no behavior change in any of the three.
+
+**What I tried:**
+- `git show 54850d4 / ca55d4c / 8419a8c` — read all three diffs.
+- `pytest tests/` → 489/489.
+- Cross-checked `_SKIPPABLE_ERRORS` includes `MissingDataError` (sweeper.py:51) — confirms ca55d4c's skip semantics work.
+
+**Sequencing observation:** These three commits + 0be7c72 (chunksize tweak) all surfaced during the live wide-sweep overnight run. **The wide sweep is acting as a stress-test that surfaced 4 distinct issues** (one perf, three correctness/concurrency) before they hit production data. **This is exactly the validation discipline a v1 launch needs.**
+
+**Carry-over open flags:**
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now **~13 commits pre-tag** (including the 3 I just caught up on). Phase-6/Phase-7 boundary structurally vanishes from history.
+- 🔬 **No regression test for parallel-skips determinism** (b41e047 follow-up flag).
+- 🔬 **No regression test for the new race-safety in 54850d4 + 8419a8c** — these are hard to test deterministically (race conditions are non-deterministic by definition), but a `pytest-xdist`-based stress test could be added.
+
+**Next-commit suggestion:** Now genuinely overdue: **`chore(p6.5.tag)`** — pick a Phase-6 commit boundary OR adjust DESIGN_SPEC §4 to acknowledge p7.x is in v0.6-ui scope. Either way, lock the artifact.
+
+---
+
 ## Review of 0be7c72 — perf: smaller Pool chunksize → smoother tqdm bar
 
 **Verdict:** ✅ accept
