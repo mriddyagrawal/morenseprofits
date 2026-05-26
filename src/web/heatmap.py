@@ -524,6 +524,45 @@ def render_heatmaps(
         "Treat as a LOWER BOUND on true population spread._"
     )
 
+    # ---- Manual cell-picker fallback -------------------------
+    # streamlit-plotly-events bridges plotly_click reliably in most
+    # browsers, but the package is from 2022 and may misbehave on some
+    # configurations. The expander below ALWAYS gives the operator a
+    # zero-JS-dependency way to select a cell: two selectboxes that
+    # write the same mp_heatmap_selected_cell session state. Collapsed
+    # by default so it doesn't clutter the main flow.
+    available_entries = sorted(values.index.tolist(), reverse=True)
+    available_exits = sorted(values.columns.tolist(), reverse=True)
+    if available_entries and available_exits:
+        with st.expander("Or pick a cell manually (click not working?)"):
+            sel = st.session_state.get("mp_heatmap_selected_cell")
+            cur_entry = sel[0] if sel and sel[0] in available_entries else available_entries[0]
+            cur_exit = sel[1] if sel and sel[1] in available_exits else available_exits[-1]
+            fb_cols = st.columns(2)
+            with fb_cols[0]:
+                entry_pick = st.selectbox(
+                    "Entry offset",
+                    options=available_entries,
+                    index=available_entries.index(cur_entry),
+                    format_func=lambda v: f"T-{v}",
+                    key="mp_heatmap_manual_entry",
+                )
+            with fb_cols[1]:
+                exit_pick = st.selectbox(
+                    "Exit offset",
+                    options=available_exits,
+                    index=available_exits.index(cur_exit),
+                    format_func=lambda v: f"T-{v}",
+                    key="mp_heatmap_manual_exit",
+                )
+            # Only write to mp_heatmap_selected_cell when the user
+            # actively interacted with the fallback (the picked value
+            # differs from the current selection). Otherwise reading
+            # the selectbox default would clobber a real click.
+            if (entry_pick, exit_pick) != sel:
+                if entry_pick > exit_pick:  # honor the entry>exit constraint
+                    st.session_state["mp_heatmap_selected_cell"] = (entry_pick, exit_pick)
+
     # Footer caption — reinforces the masking story.
     n_masked = int(values.notna().sum().sum() -
                    masked.notna().sum().sum())
