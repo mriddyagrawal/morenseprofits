@@ -11125,3 +11125,105 @@ Otherwise the file becomes a confused "current state" document that drifts. Sing
 7. MCP server (Phase 8) — separate phase.
 
 ---
+
+## Review: 2140b1f — test(p7.heatmap.e2e): AppTest scaffold + drill-down smoke tests
+
+**Verdict: ✅ ACCEPT** — exactly the scaffold I asked for in the consultation response. Sharp test selection (the "two-assertion completes-not-crashes" pattern in drill-down test is a real design move), skip-on-no-data gating is the right call. Three real grills, all small.
+
+### This is the right scope and the right shape
+
+177 LOC, single file, 6 tests, ~6 sec runtime, gated on `data/results/*.parquet` presence. **Matches the "narrow scaffold" recommendation from my consultation response.** The commit body explicitly references that constraint ("Scaffold deliberately narrow (~150 LOC, single file) per REVIEWER's recommendation"). Acknowledgement appreciated.
+
+**Test selection covers the load-bearing surfaces**:
+1. App boots cleanly — catches 2459233-class import/runtime breaks.
+2. 4-tab contract pinned — anti-rename guard for v0.6 UX.
+3. Heatmap selectors render — operator entry point.
+4. Manual cell picker renders — primary selection mechanism per click_failures.md.
+5. Drill-down renders to COMPLETION — see below.
+6. Strike-rule caption renders — anti-regression on 861b307's honesty contract.
+
+### The drill-down test is the sharpest move
+
+```python
+captions = [c.value for c in at.caption]
+ci_captions = [c for c in captions if "95% CI" in c and "bootstrap" in c]
+assert len(ci_captions) >= 1, "bootstrap CI caption missing — drill-down's Median Hero card did not render"
+
+std_bias_captions = [c for c in captions if "observed-sample dispersion" in c]
+assert len(std_bias_captions) >= 1, "std-bias caveat footer missing — drill-down may have crashed mid-render"
+```
+
+Two assertions, picked deliberately:
+- **First** = the bootstrap CI caption renders → proves the Median Hero card fired (drill-down STARTED).
+- **Second** = the std-bias footer renders → proves the drill-down ran to the very end (drill-down COMPLETED).
+
+**Together they detect "drill-down crashed mid-render"** — a failure mode that would otherwise pass if only the first assertion ran. This is exactly the kind of test design that catches the 2459233-class "partial rendering" regressions. ✓ Sharp.
+
+The `at.session_state["mp_heatmap_selected_cell"] = (15, 3)` before `at.run()` is also the right move: bypass the unreliable click chain (per click_failures.md), seed state directly, test the rendering pipeline. AppTest's session_state injection makes this clean.
+
+### What the test infrastructure enables next
+
+The commit body says it explicitly:
+
+> "This scaffold makes the next commit's failing-test enforcement practical: feat(p7.heatmap.compare) can now land with an AppTest that asserts 'no p-values appear in the rendered DOM' as a real CI gate, not just a docstring promise."
+
+**This is exactly the value proposition I argued for in the consultation.** The REVIEWER CONSTRAINTS in e6bb251's stub docstrings can now have failing-test enforcement instead of docstring-only guidance. The Compare-cells commit (and Export-rule) can include `test_compare_cells_does_not_render_pvalues` as a peer to the impl, in the SAME commit. **The "tests must enforce the constraint" is no longer aspirational.**
+
+### 🔬 Grill #1 (small): SKIP_NO_SWEEP evaluated at module-import time
+
+```python
+SKIP_NO_SWEEP = pytest.mark.skipif(
+    not _has_sweep_parquet(),
+    reason="no sweep parquet in data/results/ — AppTest needs one to render",
+)
+```
+
+`_has_sweep_parquet()` is called once when `test_web_e2e.py` is imported. If a sweep parquet is generated AFTER pytest collection but BEFORE the test runs (race condition; e.g., a CI step that runs both `pytest scripts/p7_wide_sweep.py && pytest`), the skip is based on stale state.
+
+Trivial in practice — operators run the sweep BEFORE the tests, and CI typically generates fixtures in a `conftest.py` setup or before the pytest call. **Not blocking.** Worth a one-line comment: "evaluated at import time; if you generate a sweep mid-test-run, restart pytest". Cosmetic.
+
+### 🔬 Grill #2 (small, scope): other tabs (per_stock, leaderboard, trends) not yet covered
+
+Only Heatmap tab content is exercised. If a future refactor breaks `render_per_stock_tab` or `render_trends_tab`, only `test_app_renders_expected_tabs` fires (asserts tab EXISTENCE, not tab CONTENT). The drill-down had 10+ commits without integration tests; the other tabs are now in similar territory.
+
+**Explicitly out of scope per the commit body**: "Scaffold deliberately narrow (~150 LOC, single file)". I agree the scaffold should be narrow. **Recommendation**: follow-up commit `test(p7.web.e2e.tabs): per_stock + leaderboard + trends smoke tests` after Compare-cells lands. Same pattern (load app, seed state if needed, assert key elements render).
+
+This isn't a grill on THIS commit — it's a flag that the test coverage gap continues for the other tabs. The right time to close it is after the next 1-2 BUILDER commits have stabilized.
+
+### 🔬 Grill #3 (small): no test for the bootstrap CI's signed format (`:+.0f`)
+
+I praised the signed format in my aa19bac review ("`+.0f` formatting (always-signed) prevents glance-misread of negatives"). The new test checks "95% CI" + "bootstrap" appear in the caption, but doesn't verify the SIGN formatting on the bounds.
+
+A future refactor that changes `f"{ci_lo:+.0f}"` → `f"{ci_lo:.0f}"` would silently regress the formatting choice. **Not blocking** — anti-regression on a specific formatting detail isn't load-bearing, and the operator would notice "-52" becoming "52" eventually. Just noting for completeness.
+
+### What's good about the scope
+
+- **`SKIP_NO_SWEEP` gating** keeps fresh-clone CI clean. Operator (or future-AI session) doing `git clone && pytest` doesn't get spurious failures.
+- **Existing sweep parquet** used rather than synthetic fixtures. Fastest path to coverage; synthetic-fixture infrastructure can come later if the existing parquet becomes a bottleneck.
+- **Test names are anti-regression-focused** (`test_app_loads_without_crash`, `test_app_renders_expected_tabs`). The names tell future maintainers what failure mode each test catches.
+- **6-second total runtime** is acceptable for CI. If it grows to 30+ AppTest cases (~30 sec), still reasonable. Watch the trend.
+
+### What I tried
+
+- Cross-referenced the test selection against my consultation response priorities. The 6 tests cover exactly the load-bearing surfaces (app boots, tab contract, Heatmap entry point, manual picker, drill-down full pipeline, strike rule). ✓
+- Verified the two-assertion pattern in `test_drilldown_renders_when_cell_selected` catches mid-render crashes (not just "rendering started").
+- Confirmed `at.session_state["mp_heatmap_selected_cell"] = (15, 3)` is the same cell the Antigravity walkthrough verified manually — gives apples-to-apples regression baseline.
+
+### Carry-over open items
+
+- 🔬 **Other-tab e2e coverage** — `per_stock`, `leaderboard`, `trends` content tests, after Compare-cells stabilizes.
+- 🔬 **Dead-code cleanup** + stale-test sweep — Q2 from consultation, still pending.
+- 🔬 **`feat(p7.heatmap.compare)`** with failing-test enforcement — now PRACTICAL given this scaffold.
+- 🚦 **Live-run validation** against the 41-symbol universe — still gated on prefetch completion.
+
+### Next-commit suggestion
+
+Per the consultation response priorities:
+
+1. **`chore(p7.cleanup)`** — delete `_capture_cell_selection_from_click` + 3 tests + sweep for stale annualized assertions. Small, closes Q2.
+2. **`feat(p7.heatmap.compare)`** with `test_compare_cells_does_not_render_pvalues` in the SAME commit, using the AppTest infrastructure that just landed. The REVIEWER CONSTRAINT becomes a real CI gate.
+3. **`feat(p7.heatmap.export)`** with `test_export_rule_md_contains_multiple_comparisons_caveat` in the same commit.
+
+Cleanup (1) first gives a clean tree before the bigger features. Compare/Export then land with enforceable honesty constraints from day one.
+
+---
