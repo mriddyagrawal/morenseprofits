@@ -9315,3 +9315,127 @@ The drill-down sort fix is a polish/feedback commit that suggests the operator H
 If more polish commits land before the smoke-test verdict is in, that's fine — they're cheap. But the long-pole step (`chore(p6.5.tag)` then live-run) remains gated on the click fix verdict.
 
 ---
+
+## Review: a549df5 — feat(p7.drilldown.rulecard): Selected Cell rule card surfaces deployment spec
+
+**Verdict: ✅ ACCEPT** — small, focused, surfaces what was already known in one place. Three grills (none blocking): wide-catch try/except, rule-card invisible on fully-skipped cells, and zero test coverage for the drill-down (carry-over).
+
+### Working-tree note for the operator (not the BUILDER)
+
+`git status` shows **`src/web/heatmap.py` modified in the working tree as an uncommitted REVERSE of both e51d566 + a549df5**. The HEAD has both commits; the working tree has the pre-e51d566 file content. Also `DESIGN/Complete/` is untracked.
+
+This is fine — probably operator testing the previous version in browser, or comparing against the mockup screenshots. Just flagging so the operator is aware that running the local Streamlit will currently render the OLD drill-down (no rule card, expiry-sorted waterfall), not what HEAD describes. **NOT taking any action on the working tree** — that's not my role; my review is against the committed HEAD code.
+
+### What this commit adds (against HEAD)
+
+A bordered "SELECTED CELL" container at the top of the drill-down panel:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ SELECTED CELL                                                │
+│ short_strangle × RELIANCE                                    │
+│ Entry offset    Exit offset   Strike rule                    │
+│ T-15            T-1           3% OTM each side — nearest...  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+3-column layout `[1, 1, 2]` (25/25/50% widths). Strike rule pulls `params_json` from the first row of the cell and calls `get_strategy(name).display_strike_rule(params_dict)` — so a strangle whose sweep used `strike_offset_pct=0.03` shows "3% OTM each side", not the default "2%". ✓ Matches the design intent (deployment spec = screenshot-shareable rule definition).
+
+### Compositional honesty — three pieces wire together
+
+This commit only works because of two prior commits:
+1. **861b307** added `display_strike_rule(params)` to all strategies. → enables the strike-rule field.
+2. **a549df5** (this commit) consumes `display_strike_rule` from the drill-down.
+
+If 861b307 hadn't pinned the override-propagation behavior, this card would show DEFAULT params instead of the actual-sweep params. The composition is correct: 861b307's grill #1 (`display_strike_rule(params={"strike_offset_pct": 0.03})` flow) is the load-bearing dependency this commit relies on.
+
+### 🔬 Grill #1 (real, soft): rule card is invisible on fully-skipped cells
+
+The card is at line ~689 of HEAD's heatmap.py, AFTER the early-return `_render_skipped_section(cell_skips); return` block:
+
+```python
+if len(rows) == 0:
+    # All expiries skipped — show only the skipped section + bail.
+    _render_skipped_section(cell_skips)
+    return
+
+# ---- Selected Cell rule card -----------------------------
+with st.container(border=True):
+    st.caption("SELECTED CELL")
+    ...
+```
+
+So a cell with 0 priced + N skipped trades shows ONLY the skipped section, not the rule card. **Possibly intentional** ("rule failed → no deployment spec needed") but **possibly an oversight** (the operator might want to see WHAT was attempted to understand why all expiries failed).
+
+**Trade-off**:
+- Show card always → operator sees the rule even on full-fail cells (good for understanding the attempt + debugging the prefetch coverage gap).
+- Hide card on full-fail → less visual clutter when there's nothing to deploy.
+
+**Recommend**: show the card always. The rule definition is the question the operator is asking ("what was I trying to backtest?"). When the answer is "everything failed", surfacing the question helps debugging. **Easy fix**: move the rule card BEFORE the early-return.
+
+This isn't blocking — operators rarely encounter fully-skipped cells (the prefetch redesign should drive skips to <5% per PLAN) — but it's a small honesty gain.
+
+### 🔬 Grill #2 (real, soft): defensive try/except is the same pattern as 861b307 — same grill applies
+
+```python
+try:
+    from src.strategies.registry import get_strategy
+    sample_params = rows.iloc[0].get("params_json", "{}") if len(rows) else "{}"
+    import json
+    try:
+        params_dict = json.loads(sample_params) if isinstance(sample_params, str) else {}
+    except (ValueError, TypeError):
+        params_dict = {}
+    strike_rule = get_strategy(strategy).display_strike_rule(params_dict)
+except Exception:
+    strike_rule = "—"
+```
+
+Two layers of defense:
+- Inner: `try/except (ValueError, TypeError)` for json.loads — narrow and correct.
+- Outer: `except Exception` swallowing EVERYTHING from registry lookup + display_strike_rule call.
+
+**Same grill from 861b307 review**: the outer catch is intentionally wide, but a bug INSIDE `display_strike_rule` (e.g. a TypeError on a missing param) would silently render "—" with no log. Recommend logging on swallow.
+
+The "—" fallback is reasonable UX — a dash beats a stack trace. But it should also write to logs so a recurring bug doesn't go undetected for a week.
+
+### 🔬 Grill #3 (carry-over): zero tests for render_cell_drilldown
+
+Same gap I flagged in the e51d566 review. The rule card has no test pin. A future refactor that:
+- Reorders the columns
+- Drops the strike rule
+- Changes the caption from "SELECTED CELL" to "RULE CARD"
+
+...would silently regress UX with green CI. **One small test** asserting the container is rendered + has the expected three columns + "Strike rule" appears would close this. Bundle with the drill-down sort test from e51d566 — same fixture, same render call, two assertions. ~25 lines total.
+
+### Nit: `import json` inside the try block
+
+`import json` is at function-call-time, inside the inner block. Cosmetic — could hoist to module-level. The file already has many top-level imports. **No grill** — current placement keeps the import close to its use, which has its own readability merit.
+
+### What I tried
+
+- Diffed the rule-card block against the existing caption from 861b307 — confirmed the strike-rule string is derived consistently (same `get_strategy(name).display_strike_rule(params)` call pattern).
+- Verified `rows.iloc[0].get("params_json", "{}")` is safe when `len(rows) == 0` (guarded by the `if len(rows)` check at the same line).
+- Verified the rule card position — AFTER the all-skipped early-return. Source of grill #1.
+- Cross-checked the inner json.loads try/except against the outer broad catch — composition is correct (inner narrows the json failure; outer catches everything else).
+- Noted the working-tree state (uncommitted reverse of two recent commits + untracked DESIGN/Complete/) and flagged to operator.
+
+### Carry-over open items
+
+- 🚦 **Click fix browser smoke-test** STILL gating. The working-tree reverse suggests the operator IS smoke-testing — they may be running the older version to compare against HEAD. Verdict on the click fix would unblock `chore(p6.5.tag)`.
+- ⚠ **`chore(p6.5.tag)`** at 34 commits pre-tag.
+- 🔬 **Drill-down test coverage** — sort + rule card both untested. Bundle them.
+- 🔬 **Live-run validation** — still open.
+
+### Next-commit suggestion
+
+The pattern of recent commits (e51d566 sort + a549df5 rule card) suggests **BUILDER is iterating on the drill-down UI based on operator feedback** — small focused polish, design-mockup-matching. **This is the right rhythm** while waiting for the click-fix smoke-test verdict.
+
+Possible next commits in this rhythm:
+- Drill-down test coverage (closing the e51d566 + a549df5 test gaps).
+- Move rule card BEFORE the all-skipped early-return (if grill #1 lands).
+- Other Complete-mockup-matching tweaks the operator surfaces during browser inspection.
+
+**Strategic recommendation**: when the operator next surfaces feedback (positive smoke-test verdict, more polish requests, or "the click fix didn't work, try streamlit-plotly-events"), the BUILDER should bundle ANY further polish with the smoke-test verdict's commit, then immediately land `chore(p6.5.tag)`. The longer we go without a tag, the more "what's the last working baseline" becomes a load-bearing question.
+
+---
