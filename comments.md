@@ -10664,3 +10664,116 @@ The wall-clock cost of the universe expansion ($~5-7 hours prefetch + ~30 min sw
 **For the BUILDER's next commit**: probably the dead-code cleanup or Compare-cells impl, while the prefetch runs in the background. The 5-7 hour prefetch is an opportunity to land 2-3 small commits without churn pressure.
 
 ---
+
+## Review: b1b50ec — feat(p7.expiry_roi): heatmap + drill-down switch to per-trade ROI
+
+**Verdict: ✅ ACCEPT** — display-only refactor, fully reversible (parquet still has both columns), tests updated coherently, commit body is honest about the multi-commit arc. Three real grills: cross-tab unit inconsistency during the arc, auto-detector thresholds now out of calibration, operator mental-model shift needs caveat surfacing.
+
+### Why per-trade ROI is the right unit (calibration check on the design call)
+
+The operator's framing in the commit body:
+
+> "Every expiry-based strategy maps 1:1 to one trade per expiry, so per-trade ROI (no annualization) is the natural unit. Annualization was confusing for monthly-expiry strategies — '%/yr' on a strategy that produces ~12 trades a year is misleading without context."
+
+**Defensible — possibly correct.** The argument:
+- Annualization scales returns by `365 / hold_days`. For a 7-day strategy with 5% per-trade ROI, annualized = `5% × 365/7 = 261%/yr`. The 261% is mathematically right but operationally meaningless — you can't actually compound 5%-per-week trades indefinitely.
+- Per-trade ROI is what the operator actually sees: "I put up X capital, I got back X × 1.05".
+
+**Counter-consideration** (not raised by the commit, worth noting):
+- Cross-strategy comparison gets harder. A 5% per-trade ROI on a 7-day hold is different RISK than 5% on a 60-day hold. The annualization factor was a (rough) risk normalizer.
+- Cross-cell comparison within the heatmap is fine — same hold period for all trades in one (entry, exit) cell.
+- Cross-cell comparison between cells with DIFFERENT (entry, exit) offsets is harder — different hold periods mean different risk profiles.
+
+The commit's analytics docstring says: "per-trade ROI is exact-comparable within a cell (same hold period for all trades) and that cross-cell comparison is hold-period-aware by design". **That's the honest framing.** It acknowledges the cross-cell limitation rather than pretending the unit is universally comparable. ✓
+
+### 🔬 Grill #1 (real): the auto-detector thresholds are now out of calibration
+
+[src/analytics/observations.py](src/analytics/observations.py) thresholds were tuned for annualized ROI:
+- `HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS = 20.0`
+- `INSTABILITY_STD_TO_MEDIAN_RATIO = 3.0`
+- `OUTLIER_CARRY_PNL_SHARE = 0.50` (PnL-based, not ROI-based — still fine)
+
+For per-trade ROI (5-10× smaller scale than annualized):
+- **Heavy-tail** at 20 pts is now ~10× too sensitive (heavy-tail) or ~10× too insensitive depending on framing. Median per-trade ROI for short-vol is typically 3-8%; mean-median gap of 20 pts would require mean = 23-28%, which is rare. **Detector effectively silent for the new scale.**
+- **Instability** detector (`std > 3 × |median|`) — with smaller medians, the ratio is more sensitive. A cell with median 3% and std 12% (ratio 4×) now fires; the equivalent annualized cell had median 50% and std 200% (ratio 4×) — same ratio, same fire. **No change in fire rate.** Threshold is scale-invariant; my initial worry was wrong here.
+- **Outlier-carry** is PnL-based so unaffected by the ROI-unit switch. ✓
+
+**Net effect**: heavy-tail detector is now under-tuned. Per the commit body, recalibration is planned in a follow-up commit. **But this commit lands the unit shift WITHOUT the recalibration**, so the heavy-tail callouts will be silent in production for the operator's wide-sweep runs against the new universe.
+
+**Recommendation**: bundle the recalibration in the SAME commit (or land it as the immediately-next commit). The half-state where heavy-tail is silent + UI shows per-trade ROI is worse than either fully-old or fully-new — operator sees "no tail-shape warnings" and trusts cells that may actually have hidden tails.
+
+### 🔬 Grill #2 (real): cross-tab unit inconsistency until follow-ups land
+
+Heatmap + drill-down now show per-trade ROI. Per the commit body: "Next commits handle leaderboard, per_stock, trends".
+
+Until those land, the operator switching tabs sees:
+- **Heatmap**: per-trade ROI ("Median ROI: 3.5%")
+- **Per-stock**: annualized ROI ("Median ROI/yr: 50%")
+- **Leaderboard**: annualized ROI
+- **Trends**: annualized ROI
+
+Same cell, two unit conventions. **Operator confusion is real.** The "3.5% on heatmap vs 50% on per-stock for the same rule" is a believable interpretation gap — both numbers are correct for the same underlying trades but in different units.
+
+**Recommendation**: either land the cross-tab switch as ONE bundle (similar to the prefetch+sweep atomic bundle in 39d1ba1), OR add a temporary banner in the unswitched tabs saying "Showing annualized ROI/yr; heatmap shows per-trade ROI. Unit unification in progress." Worse UX than full bundle, but at least it surfaces the inconsistency.
+
+### 🔬 Grill #3 (real): operator mental-model shift needs caveat surfacing
+
+The unit switch changes the operator's interpretation of EVERY number on the heatmap. Numbers that previously looked "modest" (50% annualized) now look "small" (5% per-trade). Numbers that previously looked "great" (200% annualized) now look "less obviously great" (15% per-trade for a 30-day hold).
+
+**Without a caveat, an operator who used the old UI might**:
+- Misread the new heatmap colors (RdYlGn) as showing modest returns.
+- Fail to mentally re-anchor "what's a good number" for this strategy.
+
+**Recommendation**: add a one-line caveat under the heatmap when showing per-trade ROI:
+
+```
+_Showing per-trade ROI. To annualize, multiply by 365 / hold_days_calendar.
+For T-15 → T-1 (14-day hold): per-trade ROI × 26._
+```
+
+Or a more general formula. The numbers are operator-facing; the unit is a new convention. **Surface it explicitly during the transition window.**
+
+### What's preserved (and why that matters)
+
+- **Parquet schema unchanged**: both `roi_pct` and `roi_pct_annualized` still in results. Reversible UI choice. ✓
+- **Test discipline maintained**: `_row` fixture updated, hovertemplate assertions flipped, format checks adjusted. ✓
+- **Default `value_col` in `pivot_window` is a parameter**: operators (or future tabs) wanting annualized can still pass `value_col="roi_pct_annualized"`. ✓
+
+The reversibility is the key safety — if the operator finds per-trade ROI worse, flipping the default back is a 5-minute change.
+
+### Compositional honesty — Bootstrap CI
+
+The Bootstrap CI now brackets per-trade ROI. **Width of the CI in absolute terms shrinks** (e.g. ±15% becomes ±2%), but the RELATIVE uncertainty (CI width / median) stays the same. **Numbers look more precise; they're not.** Operator reading "+1 … +5%  ·  bootstrap (B=1000)" might think the rule is well-determined, but a 4-point CI on a 3% median is ±66% uncertainty.
+
+Same statistical content, different visual presentation. **The bootstrap CI caption pattern stays correct** ("95% CI lo … hi%  ·  bootstrap (B=1000)") — no change needed. Just an honesty note for the operator-transition.
+
+### What I tried
+
+- Worked through the unit-shift implications for each auto-detector threshold:
+  - Heavy-tail (`|mean - median| ≥ 20 pts`): scale-dependent, now over-restrictive. ✓ Grill stands.
+  - Instability (`std > 3× |median|`): scale-invariant ratio. **My initial worry was wrong.** ✓ Caught in the review.
+  - Outlier-carry (PnL share): scale-invariant. ✓ Unaffected.
+- Verified parquet schema is unchanged — both columns still present per the analytics module docstring.
+- Cross-checked the test updates: `_row` fixture changes, hovertemplate string assertions, all consistent.
+- Computed annualization factor for a typical sweep window: 365 / 14 days ≈ 26×. For a per-trade ROI of 2%, annualized ≈ 52%. Sanity-checks the operator's "per-trade is smaller" intuition.
+
+### Carry-over open items
+
+- 🔬 **Recalibrate heavy-tail threshold** in observations.py for per-trade scale. Per commit body, in next commits.
+- 🔬 **Land cross-tab unit switch** as atomic bundle (or with temp banner during transition).
+- 🔬 **Surface per-trade-ROI caveat** in the heatmap area (annualization formula).
+- 🔬 **Live-run validation** post-prefetch — once the 41-symbol prefetch completes, the wide-sweep with cache_only will produce per-trade ROI numbers across the new universe. Operator interpretation should be tested against the new unit.
+
+### Next-commit suggestion
+
+Per the commit body's planned arc:
+1. Leaderboard switch to per-trade ROI.
+2. Per-stock switch.
+3. Trends switch.
+4. Recalibrate observations thresholds.
+
+**My counter-recommendation**: bundle (1)-(3) as ONE commit (similar to 39d1ba1's prefetch+sweep atomic). The cross-tab inconsistency is worse than any single tab's churn. Then land (4) separately because it's a different file (observations.py) with its own test surface.
+
+After that arc closes: dead-code cleanup of `_capture_cell_selection_from_click`, Compare-cells impl with REVIEWER CONSTRAINTS baked in as failing tests, then the actual live-run validation against the new 41-symbol universe.
+
+---
