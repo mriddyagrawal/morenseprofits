@@ -488,6 +488,209 @@ def test_capture_cell_selection_from_click_ignores_malformed(monkeypatch):
 
 
 # ============================================================
+# feat(p7.heatmap.manual_cell_picker): selectbox fallback tests
+# ============================================================
+#
+# Reviewer caught a real bug in the original 384c65e: the "only write
+# when user interacted" guard compared against ``sel`` (the click-driven
+# selection), which is the WRONG reference frame. On first render with
+# sel=None, the selectbox defaults always pass `!= None` and the picker
+# fires without operator intent. Tests below pin the corrected pattern
+# (separate ``_mp_heatmap_manual_prev`` tracking key) plus the other
+# invariants the reviewer asked for.
+
+def _render_heatmaps_with_data(monkeypatch):
+    """Helper: render the heatmap tab over a minimal dataset with
+    enough cells (3 entry × 2 exit) to surface the manual picker.
+    Returns the captured radio + selectbox calls so tests can inspect
+    behavior without a live Streamlit runtime."""
+    import src.web.heatmap as hm
+
+    selectbox_calls: list[dict] = []
+    expander_state: list[dict] = []
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n):
+        return [_NullCtx() for _ in range(n if isinstance(n, int) else len(n))]
+
+    def fake_selectbox(label, *, options, index=0, key=None,
+                       format_func=None, help=None):
+        selectbox_calls.append({
+            "label": label, "options": list(options), "index": index, "key": key,
+        })
+        return options[index]
+
+    def fake_expander(label, expanded=False):
+        expander_state.append({"label": label, "expanded": expanded})
+        return _NullCtx()
+
+    monkeypatch.setattr(hm.st, "columns", fake_columns)
+    monkeypatch.setattr(hm.st, "selectbox", fake_selectbox)
+    monkeypatch.setattr(hm.st, "expander", fake_expander)
+    monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "radio", lambda *a, **k: "Drill-down")
+    monkeypatch.setattr(hm.st, "caption", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "plotly_chart", lambda *a, **k: None)
+    import streamlit_plotly_events
+    monkeypatch.setattr(streamlit_plotly_events, "plotly_events",
+                        lambda fig, **kw: [])
+
+    rows = []
+    for e in (15, 10, 5):
+        for x in (3, 1):
+            for _ in range(6):
+                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=42.0))
+    hm.render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    return selectbox_calls, expander_state
+
+
+def test_manual_picker_does_not_overwrite_sel_on_first_render(monkeypatch):
+    """LOAD-BEARING — first render with no prior selection MUST NOT
+    auto-write ``mp_heatmap_selected_cell``. The picker's job is to
+    respond to operator picks, not to make picks itself."""
+    import src.web.heatmap as hm
+    state: dict = {}  # empty session — no prior click, no prior manual
+    monkeypatch.setattr(hm.st, "session_state", state)
+    _render_heatmaps_with_data(monkeypatch)
+    # mp_heatmap_selected_cell MUST stay absent (or None) — the
+    # manual picker has not been actively used yet.
+    assert "mp_heatmap_selected_cell" not in state, (
+        "first-render manual picker auto-selected a cell — "
+        "the operator hasn't picked anything yet"
+    )
+    # The tracking key IS stamped (so the next interaction can detect
+    # a transition).
+    assert "_mp_heatmap_manual_prev" in state
+
+
+def test_manual_picker_writes_session_state_when_user_changes_selection(monkeypatch):
+    """Happy path: simulate an operator picking different values on a
+    second render — the picker must write mp_heatmap_selected_cell."""
+    import src.web.heatmap as hm
+    # Simulate state AFTER a first render (prev stamped, sel absent).
+    state: dict = {"_mp_heatmap_manual_prev": (15, 1)}
+    monkeypatch.setattr(hm.st, "session_state", state)
+
+    # Override selectbox to return a DIFFERENT (entry, exit) than prev.
+    selectbox_calls: list = []
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n):
+        return [_NullCtx() for _ in range(n if isinstance(n, int) else len(n))]
+
+    def fake_expander(label, expanded=False):
+        return _NullCtx()
+
+    def fake_selectbox(label, *, options, index=0, key=None,
+                       format_func=None, help=None):
+        # Picker wants: entry=10, exit=3. options for entry are sorted
+        # desc [15,10,5]; entry pick = 10 → index 1. exits sorted desc
+        # [3,1]; exit pick = 3 → index 0.
+        selectbox_calls.append(label)
+        if label == "Entry offset":
+            return 10
+        if label == "Exit offset":
+            return 3
+        return options[index]
+
+    monkeypatch.setattr(hm.st, "columns", fake_columns)
+    monkeypatch.setattr(hm.st, "selectbox", fake_selectbox)
+    monkeypatch.setattr(hm.st, "expander", fake_expander)
+    monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "radio", lambda *a, **k: "Drill-down")
+    monkeypatch.setattr(hm.st, "caption", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "plotly_chart", lambda *a, **k: None)
+    import streamlit_plotly_events
+    monkeypatch.setattr(streamlit_plotly_events, "plotly_events",
+                        lambda fig, **kw: [])
+
+    rows = []
+    for e in (15, 10, 5):
+        for x in (3, 1):
+            for _ in range(6):
+                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=42.0))
+    hm.render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+
+    # Picker fired because new (10,3) != prev (15,1) AND 10 > 3.
+    assert state.get("mp_heatmap_selected_cell") == (10, 3)
+    assert state["_mp_heatmap_manual_prev"] == (10, 3)
+
+
+def test_manual_picker_respects_entry_gt_exit_constraint(monkeypatch):
+    """If the user picks an impossible cell (entry ≤ exit), the
+    picker MUST NOT write to mp_heatmap_selected_cell. Same constraint
+    the sweep itself enforces."""
+    import src.web.heatmap as hm
+    state: dict = {"_mp_heatmap_manual_prev": (15, 1)}
+    monkeypatch.setattr(hm.st, "session_state", state)
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n):
+        return [_NullCtx() for _ in range(n if isinstance(n, int) else len(n))]
+
+    def fake_expander(label, expanded=False):
+        return _NullCtx()
+
+    # User picks entry=3, exit=10 → entry < exit. INVALID.
+    def fake_selectbox(label, *, options, index=0, key=None,
+                       format_func=None, help=None):
+        if label == "Entry offset":
+            return 3
+        if label == "Exit offset":
+            return 10
+        return options[index]
+
+    monkeypatch.setattr(hm.st, "columns", fake_columns)
+    monkeypatch.setattr(hm.st, "selectbox", fake_selectbox)
+    monkeypatch.setattr(hm.st, "expander", fake_expander)
+    monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "radio", lambda *a, **k: "Drill-down")
+    monkeypatch.setattr(hm.st, "caption", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "plotly_chart", lambda *a, **k: None)
+    import streamlit_plotly_events
+    monkeypatch.setattr(streamlit_plotly_events, "plotly_events",
+                        lambda fig, **kw: [])
+
+    # Need cells with entry=3 AND exit=10 in the dataframe so the pivot
+    # surfaces both as available options.
+    rows = []
+    for e in (15, 10, 3):
+        for x in (10, 3, 1):
+            for _ in range(6):
+                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=42.0))
+    hm.render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+
+    # picker DID NOT write — constraint failed.
+    assert "mp_heatmap_selected_cell" not in state, (
+        "manual picker wrote an impossible (entry ≤ exit) cell — "
+        "the entry > exit guard must reject this"
+    )
+
+
+def test_manual_picker_expander_collapsed_by_default(monkeypatch):
+    """UX promise: the expander is collapsed by default so the main
+    flow stays clean. Only visible when an operator needs it."""
+    import src.web.heatmap as hm
+    monkeypatch.setattr(hm.st, "session_state", {})
+    _, expander_state = _render_heatmaps_with_data(monkeypatch)
+    pickers = [
+        e for e in expander_state
+        if "pick a cell manually" in (e["label"] or "")
+    ]
+    assert len(pickers) == 1
+    assert pickers[0]["expanded"] is False
+
+
+# ============================================================
 # feat(p7.heatmap.strike_disclosure): caption under selectors
 # ============================================================
 

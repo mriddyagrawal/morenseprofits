@@ -555,13 +555,23 @@ def render_heatmaps(
                     format_func=lambda v: f"T-{v}",
                     key="mp_heatmap_manual_exit",
                 )
-            # Only write to mp_heatmap_selected_cell when the user
-            # actively interacted with the fallback (the picked value
-            # differs from the current selection). Otherwise reading
-            # the selectbox default would clobber a real click.
-            if (entry_pick, exit_pick) != sel:
-                if entry_pick > exit_pick:  # honor the entry>exit constraint
-                    st.session_state["mp_heatmap_selected_cell"] = (entry_pick, exit_pick)
+            # Bug-fix for the original (buggy) guard: comparing against
+            # ``sel`` (the click-driven selection) is the wrong reference
+            # frame — on first render with sel=None, the selectbox
+            # defaults always pass the != check and the manual picker
+            # auto-fires without the operator touching anything.
+            #
+            # Correct pattern: stash a SEPARATE "previous manual picks"
+            # key. Only write to mp_heatmap_selected_cell when the
+            # current picks differ from the LAST OBSERVED manual picks
+            # (i.e. the user changed a selectbox). First render is a
+            # no-op write because prev is None.
+            new_manual = (entry_pick, exit_pick)
+            prev_manual = st.session_state.get("_mp_heatmap_manual_prev")
+            if prev_manual is not None and new_manual != prev_manual:
+                if entry_pick > exit_pick:  # honor entry>exit constraint
+                    st.session_state["mp_heatmap_selected_cell"] = new_manual
+            st.session_state["_mp_heatmap_manual_prev"] = new_manual
 
     # Footer caption — reinforces the masking story.
     n_masked = int(values.notna().sum().sum() -
