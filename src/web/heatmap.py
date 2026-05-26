@@ -855,7 +855,10 @@ def render_cell_drilldown(
         key="mp_heatmap_drilldown_roi_dist",
     )
 
-    # ---- Per-trade table -------------------------------------
+    # ---- Per-trade table — All / Winners / Losers tabs -------
+    # Matches the design/Complete mockup's per-trade-table filter row.
+    # Tab-based so the operator can switch context without losing the
+    # ordering / column choice.
     table = pd.DataFrame({
         "Expiry": rows["expiry"].dt.strftime("%Y-%m-%d"),
         "Entry date": rows["entry_date"].dt.strftime("%Y-%m-%d"),
@@ -871,11 +874,23 @@ def render_cell_drilldown(
         "Margin at entry": rows["margin_at_entry"].round(0),
     })
     st.markdown("**Per-expiry trades** (sortable — click column headers)")
-    st.dataframe(
-        table,
-        use_container_width=True,
-        hide_index=True,
-    )
+    tab_all, tab_wins, tab_losses = st.tabs([
+        f"All ({len(rows)})",
+        f"Winners ({int((rows['net_pnl'] > 0).sum())})",
+        f"Losers ({int((rows['net_pnl'] <= 0).sum())})",
+    ])
+    with tab_all:
+        st.dataframe(table, use_container_width=True, hide_index=True)
+    with tab_wins:
+        st.dataframe(
+            table[rows["net_pnl"].values > 0],
+            use_container_width=True, hide_index=True,
+        )
+    with tab_losses:
+        st.dataframe(
+            table[rows["net_pnl"].values <= 0],
+            use_container_width=True, hide_index=True,
+        )
 
     # ---- Expandable per-trade legs + cost/margin breakdowns --
     st.markdown(
@@ -927,9 +942,27 @@ def render_cell_drilldown(
                 except (ValueError, TypeError):
                     st.warning("margin_breakdown_json malformed.")
 
-    # ---- Skipped expiries section (always shown if any) ----
+    # ---- Skipped expiries section ----------------------------
+    # Always shown — if zero skips, surfaces the literary positive
+    # statement; if any, lists each (expiry, reason, detail).
     if len(cell_skips) > 0:
         _render_skipped_section(cell_skips)
+    else:
+        st.markdown(
+            f"_**No skipped expiries** — all {len(rows)} priced cleanly._"
+        )
+
+    # ---- std-bias caveat footer ------------------------------
+    # Matches the mockup's footer disclosure exactly. ddof=0 sample
+    # std is a LOWER BOUND on population dispersion; small-N groups
+    # understate spread by ~20% at n=5, ~2.5% at n=20. Surface so the
+    # analyst doesn't quote std as if it were the population spread.
+    st.caption(
+        "_**std (ddof=0)** is observed-sample dispersion, not a "
+        "population estimate. Treat as a lower bound on true population "
+        "variance — small-N groups understate spread by ~20% at n=5, "
+        "~2.5% at n=20._"
+    )
 
 
 def _render_skipped_section(cell_skips: pd.DataFrame) -> None:
