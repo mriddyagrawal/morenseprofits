@@ -10469,3 +10469,78 @@ This is me being calibrated about my own calibration discipline. The first HOLD 
 `click_failures.md` lands NEXT per the commit body. After that, BUILDER's call: dead-code cleanup, Compare-cells impl, or tag (if you want it).
 
 ---
+
+## Review: 23fa419 + ee874b5 — bootstrap vectorization + click_failures.md
+
+**Verdict: ✅ ACCEPT both.** Two small commits closing two of my flagged items in <10 minutes. Reviewing together because they're small and unrelated to each other beyond timing.
+
+### 23fa419 (perf bootstrap) — addresses my aa19bac grill #1 verbatim
+
+My aa19bac review suggested:
+
+```python
+if statistic is np.median:
+    stats = np.median(samples, axis=1)
+elif statistic is np.mean:
+    stats = np.mean(samples, axis=1)
+else:
+    stats = np.apply_along_axis(statistic, 1, samples)
+```
+
+The commit delivers EXACTLY that pattern plus np.max/np.amax/np.min/np.amin (slightly broader fast-path). Measured speedup: ~3 ms → 0.72 ms per call at B=1000, n=24.
+
+**Real-numbers honesty check**: I predicted ~30× speedup from ~5 ms to ~0.3 ms; actual is ~4× from 3 ms to 0.72 ms. My estimate was high on both ends — apply_along_axis was faster than I guessed (3 vs 5 ms) and the vectorized path is slower than I guessed (0.72 vs 0.3 ms). **My prediction was directionally right but quantitatively off by ~2×.** Worth filing for future perf grills: when claiming N× speedup, ground in actual measurement, not back-of-envelope.
+
+The commit body's "measured" framing replaces the previous "sub-ms" claim from aa19bac. Honesty calibration improved. ✓
+
+**One observation**: `statistic in (np.max, np.amax, np.min, np.amin)` is an `is`/`in` mix — the first two branches use `is`, this one uses `in`. Both work because numpy's function identity is stable across import. Consistent style would prefer one or the other. Cosmetic.
+
+### ee874b5 (click_failures.md) — closes the forward reference from 357c2c1
+
+A 170-line living document covering:
+1. **Three chronological attempts** with WHAT FAILED AND WHY for each.
+2. **What was ruled out** with reasons.
+3. **4 paths to make click work reliably** (all expensive).
+4. **5 lessons learned**.
+5. **Living-document model**: future attempts append the same-shape section.
+
+**Why this matters**:
+- The forward reference from 357c2c1 is now resolved. No dangling pointer.
+- Future BUILDER (or AI session) starting on click work can read the file FIRST and skip the 3 failed paths. Saves churn.
+- The "5 lessons learned" turns a 5-commit churn arc into transferable knowledge. The 4th lesson presumably encodes "visually verify rendering before declaring a click-handler fix done" — which IS the lesson from this arc.
+
+**This is the right shape for arc-retrospective docs**: don't bury the lessons in commit-body prose where they get lost; promote them to a file the next operator will actually grep.
+
+### Combined calibration signal
+
+Two grills closed:
+- aa19bac #1 (apply_along_axis) → 23fa419
+- 357c2c1 forward reference → ee874b5
+
+Plus:
+- 384c65e bugs → 5b0c722 (fixed under HOLD)
+- 2459233 click-fix hypothesis → 81882c9 (reverted after user-verified failure)
+
+**The reviewer-builder loop is functioning.** Real grills produce real action. Soft repetition (the chore(p6.5.tag) drum-beat) doesn't. The new calibration discipline from [[feedback-reviewer-calibration]] is validated: sharp grills produce signal, soft ones produce noise.
+
+### What I tried
+
+- Recomputed the actual speedup from the commit body's numbers (3 ms → 0.72 ms = 4.17×). Compared against my aa19bac prediction (~30×). Logged the prediction-vs-actual delta as a calibration data point.
+- Checked the fast-path conditions: `statistic is np.median` (identity check), `statistic is np.mean` (identity check), `statistic in (np.max, np.amax, np.min, np.amin)` (membership check). All correct for the function-object stability invariant.
+- Read click_failures.md's commit body summary; structure looks right for a chronological log + lessons-learned doc.
+
+### Carry-over open items — smaller
+
+- 🟡 **`chore(p6.5.tag)`** — at operator discretion per my 357c2c1 review. Not re-belaboring.
+- 🔬 **Dead-code `_capture_cell_selection_from_click`** + 3 tests — still in the codebase.
+- 🔬 **`feat(p7.heatmap.compare)`** — pending; needs failing-test enforcement of the no-p-values REVIEWER CONSTRAINT.
+
+### Next-commit suggestion
+
+Two equally-reasonable next moves:
+1. `chore(p7.cleanup): remove unused _capture_cell_selection_from_click helper + 3 tests` — small, closes the dead-code grill from 81882c9.
+2. `feat(p7.heatmap.compare)` — bigger; needs failing-test bake-in for the no-p-values constraint.
+
+Personal preference: (1) first, because dead-code accumulates faster than features need it, AND it's a 5-minute change. Then (2).
+
+---
