@@ -759,12 +759,53 @@ def render_cell_drilldown(
     # --- Right card: Across Years (sparkline placeholder) -----
     # YoY mini-chart lands in feat(p7.drilldown.yoy_sparkline). This
     # commit just reserves the card slot so the layout is final and
-    # the chart commit is a small additive change.
+    # YoY mean-ROI mini-chart — answers "does this cell's result hold
+    # up across years, or is one good year carrying the average?".
     with card_right:
         st.markdown("**ACROSS YEARS**")
-        st.caption(
-            "_Stability check — sparkline lands in a follow-up commit._"
+        yoy = (
+            rows.assign(year=rows["expiry"].dt.year)
+            .groupby("year")["roi_pct_annualized"]
+            .mean()
+            .reset_index()
+            .sort_values("year")
         )
+        if len(yoy) >= 2:
+            spark = go.Figure()
+            spark.add_trace(go.Scatter(
+                x=yoy["year"].astype(str),
+                y=yoy["roi_pct_annualized"],
+                mode="lines+markers+text",
+                line={"color": "#d4ff3a", "width": 2},
+                marker={"size": 8, "color": "#d4ff3a"},
+                text=[f"{v:.0f}%" for v in yoy["roi_pct_annualized"]],
+                textposition="top center",
+                hovertemplate="<b>%{x}</b><br>mean ROI/yr: %{y:+.1f}%<extra></extra>",
+            ))
+            spark.update_layout(
+                height=120,
+                margin=dict(l=20, r=20, t=20, b=30),
+                showlegend=False,
+                xaxis={"showgrid": False, "title": None},
+                yaxis={"showgrid": False, "title": None, "showticklabels": False},
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(
+                spark,
+                use_container_width=True,
+                key="mp_drilldown_yoy_sparkline",
+            )
+            st.caption(
+                f"_Stability check · {len(yoy)} year(s) observed in sweep._"
+            )
+        else:
+            # Single-year cell can't show stability — be honest about
+            # what's not measurable rather than draw a misleading line.
+            st.caption(
+                f"_Stability check unavailable — cell spans only "
+                f"{len(yoy)} year. Need ≥ 2 to plot._"
+            )
 
     # ---- Auto-detected structural callouts -------------------
     # The dashboard reads the data so the analyst doesn't have to:
