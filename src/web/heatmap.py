@@ -528,54 +528,52 @@ def render_heatmaps(
         "Treat as a LOWER BOUND on true population spread._"
     )
 
-    # ---- Manual cell-picker fallback -------------------------
-    # streamlit-plotly-events bridges plotly_click reliably in most
-    # browsers, but the package is from 2022 and may misbehave on some
-    # configurations. The expander below ALWAYS gives the operator a
-    # zero-JS-dependency way to select a cell: two selectboxes that
-    # write the same mp_heatmap_selected_cell session state. Collapsed
-    # by default so it doesn't clutter the main flow.
+    # ---- Cell picker (primary selection mechanism) -----------
+    # Native st.plotly_chart on_select rarely fires on plotly heatmap
+    # single-click (verified empirically across the click-handling
+    # history — see click_failures.md). The dropdowns below are the
+    # reliable, browser-agnostic way to select a cell; the click event
+    # is kept as a possible fast-path but it's not load-bearing.
     available_entries = sorted(values.index.tolist(), reverse=True)
     available_exits = sorted(values.columns.tolist(), reverse=True)
     if available_entries and available_exits:
-        with st.expander("Or pick a cell manually (click not working?)"):
-            sel = st.session_state.get("mp_heatmap_selected_cell")
-            cur_entry = sel[0] if sel and sel[0] in available_entries else available_entries[0]
-            cur_exit = sel[1] if sel and sel[1] in available_exits else available_exits[-1]
-            fb_cols = st.columns(2)
-            with fb_cols[0]:
-                entry_pick = st.selectbox(
-                    "Entry offset",
-                    options=available_entries,
-                    index=available_entries.index(cur_entry),
-                    format_func=lambda v: f"T-{v}",
-                    key="mp_heatmap_manual_entry",
-                )
-            with fb_cols[1]:
-                exit_pick = st.selectbox(
-                    "Exit offset",
-                    options=available_exits,
-                    index=available_exits.index(cur_exit),
-                    format_func=lambda v: f"T-{v}",
-                    key="mp_heatmap_manual_exit",
-                )
-            # Bug-fix for the original (buggy) guard: comparing against
-            # ``sel`` (the click-driven selection) is the wrong reference
-            # frame — on first render with sel=None, the selectbox
-            # defaults always pass the != check and the manual picker
-            # auto-fires without the operator touching anything.
-            #
-            # Correct pattern: stash a SEPARATE "previous manual picks"
-            # key. Only write to mp_heatmap_selected_cell when the
-            # current picks differ from the LAST OBSERVED manual picks
-            # (i.e. the user changed a selectbox). First render is a
-            # no-op write because prev is None.
-            new_manual = (entry_pick, exit_pick)
-            prev_manual = st.session_state.get("_mp_heatmap_manual_prev")
-            if prev_manual is not None and new_manual != prev_manual:
-                if entry_pick > exit_pick:  # honor entry>exit constraint
-                    st.session_state["mp_heatmap_selected_cell"] = new_manual
-            st.session_state["_mp_heatmap_manual_prev"] = new_manual
+        st.markdown("**Pick a cell** to drill down:")
+        sel = st.session_state.get("mp_heatmap_selected_cell")
+        cur_entry = sel[0] if sel and sel[0] in available_entries else available_entries[0]
+        cur_exit = sel[1] if sel and sel[1] in available_exits else available_exits[-1]
+        fb_cols = st.columns(2)
+        with fb_cols[0]:
+            entry_pick = st.selectbox(
+                "Entry offset",
+                options=available_entries,
+                index=available_entries.index(cur_entry),
+                format_func=lambda v: f"T-{v}",
+                key="mp_heatmap_manual_entry",
+            )
+        with fb_cols[1]:
+            exit_pick = st.selectbox(
+                "Exit offset",
+                options=available_exits,
+                index=available_exits.index(cur_exit),
+                format_func=lambda v: f"T-{v}",
+                key="mp_heatmap_manual_exit",
+            )
+        # Bug-fix for the original (buggy) guard: comparing against
+        # ``sel`` (the click-driven selection) is the wrong reference
+        # frame — on first render with sel=None, the selectbox defaults
+        # always pass the != check and the picker auto-fires without
+        # the operator touching anything.
+        #
+        # Correct pattern: stash a SEPARATE "previous picks" key. Only
+        # write to mp_heatmap_selected_cell when the current picks
+        # differ from the LAST OBSERVED picks (i.e. the user changed a
+        # selectbox). First render is a no-op write because prev is None.
+        new_manual = (entry_pick, exit_pick)
+        prev_manual = st.session_state.get("_mp_heatmap_manual_prev")
+        if prev_manual is not None and new_manual != prev_manual:
+            if entry_pick > exit_pick:  # honor entry>exit constraint
+                st.session_state["mp_heatmap_selected_cell"] = new_manual
+        st.session_state["_mp_heatmap_manual_prev"] = new_manual
 
     # Footer caption — reinforces the masking story.
     n_masked = int(values.notna().sum().sum() -

@@ -677,18 +677,26 @@ def test_manual_picker_respects_entry_gt_exit_constraint(monkeypatch):
     )
 
 
-def test_manual_picker_expander_collapsed_by_default(monkeypatch):
-    """UX promise: the expander is collapsed by default so the main
-    flow stays clean. Only visible when an operator needs it."""
+def test_manual_picker_renders_always_visible_selectboxes(monkeypatch):
+    """UX promise revised: the picker is no longer hidden behind an
+    expander. After verifying empirically that the native click handler
+    fails for the user, the picker became the PRIMARY (not fallback)
+    selection mechanism — always visible, no "click not working?"
+    framing. Tests pin that we render two selectboxes (Entry offset,
+    Exit offset) directly, not nested in an expander."""
     import src.web.heatmap as hm
     monkeypatch.setattr(hm.st, "session_state", {})
-    _, expander_state = _render_heatmaps_with_data(monkeypatch)
+    selectbox_calls, expander_state = _render_heatmaps_with_data(monkeypatch)
+    # No expander surrounds the picker — selectboxes are top-level.
     pickers = [
         e for e in expander_state
-        if "pick a cell manually" in (e["label"] or "")
+        if "pick a cell" in (e["label"] or "").lower()
     ]
-    assert len(pickers) == 1
-    assert pickers[0]["expanded"] is False
+    assert len(pickers) == 0
+    # Both selectboxes rendered.
+    labels = [s["label"] for s in selectbox_calls]
+    assert "Entry offset" in labels
+    assert "Exit offset" in labels
 
 
 # ============================================================
