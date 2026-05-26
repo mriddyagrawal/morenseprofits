@@ -36,7 +36,7 @@ import pandas as pd
 
 from src.config import RESULTS_DIR
 from src.data import spot_loader, trading_calendar
-from src.data.errors import MissingDataError
+from src.data.errors import MissingDataError, OfflineCacheMiss
 from src.engine import results as _results
 from src.engine.pnl import price_trade
 from src.strategies.base import Trade
@@ -45,10 +45,18 @@ from src.strategies.short_straddle import NoLiquidStrikeError
 
 
 # Skip reasons — anything in this tuple is "absent data", logged + skipped.
-# OfflineCacheMiss is intentionally NOT in this list — it propagates per
-# SPECS §6a's class-distinction rule (a cold offline cache is operator
-# error, not "no data").
+# Two variants:
+#   _SKIPPABLE_ERRORS         : normal (online) sweeps. OfflineCacheMiss is
+#                                NOT here — per SPECS §6a, a cold offline
+#                                cache is operator error, loud-fail.
+#   _SKIPPABLE_ERRORS_CACHE_ONLY : cache_only=True sweeps explicitly opt
+#                                into using ONLY what's on disk; missing
+#                                cache entries become per-cell skips, not
+#                                fatal crashes.
 _SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)
+_SKIPPABLE_ERRORS_CACHE_ONLY = (
+    MissingDataError, NoLiquidStrikeError, OfflineCacheMiss,
+)
 
 
 # ------------------------------------------------------------
@@ -97,11 +105,12 @@ def _worker_run(args: tuple) -> tuple:
     returns (task_args, result) so the main process can pair skips back
     to their (strategy, symbol, expiry, entry, exit) for the skip log
     regardless of completion order."""
-    s, sym, exp, eo, xo, offline = args
+    s, sym, exp, eo, xo, offline, cache_only = args
     result = sweep_one(
         s, sym, exp, eo, xo,
         today_fn=_worker_today_fn,
         offline=offline,
+        cache_only=cache_only,
     )
     return ((s, sym, exp, eo, xo), result)
 
@@ -137,6 +146,7 @@ def sweep_one(
     *,
     today_fn: Callable[[], date] = date.today,
     offline: bool = False,
+    cache_only: bool = False,
 ) -> dict | None | str:
     """Price ONE backtest cell: (strategy, symbol, expiry, offsets).
 
@@ -145,6 +155,11 @@ def sweep_one(
     entry_spot, exit_spot, run_id-deferred). Returns ``None`` if the
     task is skipped due to a SKIPPABLE_ERROR (logged separately by the
     sweeper).
+
+    cache_only=True: implies offline=True AND OfflineCacheMiss is
+    treated as a skip (not a fatal crash). For wide sweeps where the
+    operator has explicitly opted into "use whatever's already cached;
+    skip anything missing" semantics — the network never gets touched.
 
     Pure function of its inputs (modulo `today_fn` injection) — no
     shared mutable state, no global I/O beyond the read-only cache.
@@ -157,6 +172,10 @@ def sweep_one(
             f"entry_offset_td ({entry_offset_td}) must be > exit_offset_td "
             f"({exit_offset_td}); larger offset = further back in time"
         )
+
+    if cache_only:
+        offline = True
+    skip_classes = _SKIPPABLE_ERRORS_CACHE_ONLY if cache_only else _SKIPPABLE_ERRORS
 
     strategy = get_strategy(strategy_name)
 
@@ -197,7 +216,7 @@ def sweep_one(
             hold_trading_days=int(entry_offset_td) - int(exit_offset_td),
             today_fn=today_fn,
         )
-    except _SKIPPABLE_ERRORS as e:
+    except skip_classes as e:
         # Return BOTH the exception class name (for groupby/counts) AND
         # the message (for analyst-facing drill-down "why was this cell
         # skipped" tooltips). Format: "skip:ClassName|message". Class
@@ -236,6 +255,7 @@ def sweep_grid(
     force: bool = False,
     n_workers: int = 1,
     show_progress: bool = False,
+    cache_only: bool = False,
 ) -> pd.DataFrame:
     """Cartesian-product sweep over the given grid.
 
@@ -258,6 +278,14 @@ def sweep_grid(
     show_progress=True wraps the iteration in tqdm for a per-cell bar —
     cheap, optional; tqdm is in requirements.txt for the prefetch script
     already.
+
+    cache_only=True: workers never hit NSE. The whole sweep runs against
+    only the on-disk cache; any (symbol, expiry, strike, type) tuple
+    not in cache becomes a per-cell skip with skip_reason
+    ``OfflineCacheMiss`` (and the verbatim message in skip_detail). Use
+    when the wide sweep's open-expiry staleness check would otherwise
+    push workers into NSE refetches that throttle the sweep — the
+    operator has accepted "slightly stale data + size > newness".
     """
     if run_id is None:
         run_id = _compute_run_id(
@@ -313,7 +341,10 @@ def sweep_grid(
 
     if n_workers > 1:
         today_date = today_fn()
-        worker_args = [(s, sym, exp, eo, xo, offline) for (s, sym, exp, eo, xo) in tasks]
+        worker_args = [
+            (s, sym, exp, eo, xo, offline, cache_only)
+            for (s, sym, exp, eo, xo) in tasks
+        ]
         # chunksize keeps Pool scheduling efficient for 100k+-task sweeps;
         # too small → IPC overhead, too large → bursty tqdm + poor tail
         # work-stealing. Tuned to ~220 cells/chunk on the 450k wide-sweep
@@ -339,7 +370,7 @@ def sweep_grid(
         for (s, sym, exp, eo, xo) in it:
             result = sweep_one(
                 s, sym, exp, eo, xo,
-                today_fn=today_fn, offline=offline,
+                today_fn=today_fn, offline=offline, cache_only=cache_only,
             )
             _handle((s, sym, exp, eo, xo), result)
 
