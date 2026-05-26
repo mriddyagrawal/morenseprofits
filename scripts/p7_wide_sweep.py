@@ -128,59 +128,13 @@ def main() -> int:
     )
     print(f"  run_id (sha-trunc): {run_id}")
 
-    # ============================================================
-    # Pre-warm open-expiry data before spawning Pool workers.
-    # ============================================================
-    # Workers spawned via mp.Pool are fresh processes and don't share
-    # the parent's in-memory LRU. If we let 8 workers concurrently hit
-    # NSE for the same open-expiry contracts, NSE rate-limits them and
-    # the sweep crawls. Pre-warming serially in the main process
-    # populates the *on-disk* cache; workers then read from a fresh
-    # cache and never call NSE.
-    today = TODAY_FN()
-    open_expiries = [e for e in expiries if e >= today]
-    if open_expiries:
-        _h(f"Pre-warming open-expiry data ({len(open_expiries)} expiry/expiries)")
-        for sym in SYMBOLS:
-            # Spot for current year — gets refetched once here, serialized
-            # so workers later hit a fresh cache deterministically.
-            try:
-                spot_loader.load_spot(
-                    sym, date(today.year, 1, 1), today,
-                    today_fn=TODAY_FN,
-                )
-            except Exception as e:
-                print(f"  ⚠ spot pre-warm {sym} {today.year} failed ({type(e).__name__})")
-        upper_symbols = [sym.upper() for sym in SYMBOLS]
-        for exp in open_expiries:
-            try:
-                bhav = bhavcopy_fo_loader.load_bhavcopy_fo(today)
-                mask = (
-                    bhav["symbol"].isin(upper_symbols)
-                    & (bhav["instrument"] == "OPTSTK")
-                    & (bhav["expiry"] == pd.Timestamp(exp))
-                )
-                live_strikes = sorted({
-                    int(k) for k in bhav.loc[mask, "strike"].dropna().tolist()
-                })
-            except Exception as e:
-                print(f"  ⚠ bhavcopy pre-warm {exp} failed ({type(e).__name__})")
-                continue
-            for sym in SYMBOLS:
-                for strike in live_strikes:
-                    for ot in ("CE", "PE"):
-                        try:
-                            options_loader.load_option(
-                                sym, exp, strike, ot, exp, exp,
-                                today_fn=TODAY_FN,
-                            )
-                        except Exception:
-                            pass  # cells with this strike will skip in the parallel pass
-            print(f"  pre-warmed {exp}: {len(live_strikes)} strikes × {len(SYMBOLS)} syms × 2 types")
-    else:
-        _h("Pre-warm — no open expiries in the grid; skipping")
+    # Pre-warm is gone — superseded by cache_only=True below. Workers
+    # never touch NSE: any (sym, expiry, strike, type) tuple not in the
+    # on-disk cache becomes a per-cell skip with reason OfflineCacheMiss
+    # (the verbatim message goes to skip_detail, surfaced in the
+    # heatmap drill-down's Skipped Expiries section).
 
-    _h(f"Running sweep (n_workers={N_WORKERS}; force=False; cache-hit short-circuits)")
+    _h(f"Running sweep (n_workers={N_WORKERS}; cache_only=True; force=False; cache-hit short-circuits)")
     t0 = time.perf_counter()
     df = sweep_grid(
         strategies=STRATEGIES,
@@ -193,6 +147,7 @@ def main() -> int:
         force=False,
         n_workers=N_WORKERS,
         show_progress=True,
+        cache_only=True,
     )
     t_total = time.perf_counter() - t0
     _h(f"Sweep complete — {t_total:.1f}s ({t_total / max(n_cells_planned, 1) * 1000:.1f}ms/cell wall-clock)")
