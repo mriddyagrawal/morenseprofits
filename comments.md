@@ -8294,3 +8294,101 @@ The commit body says "the next 3 atomic commits" will follow this docs commit. F
 Alternative: **bundle this docs commit's prefetch entries with `chore(p6.5.tag)`** — the tag is overdue and the docs are a natural pause point.
 
 ---
+
+## Review: f826580 — feat: prefetch_universe --workers N for parallel per-(symbol, expiry) fetch
+
+**Verdict: ✅ ACCEPT with grills** — the refactor is clean, the parallel path is opt-in, default `workers=1` preserves serial behavior byte-for-byte. Two real grills (no parallel test, no per-contract timeout) and a sharp question about `TODAY_FN` staleness.
+
+### What this commit does — and what I like
+
+- **Module-level `_process_pair`** with primitive-tuple args `(sym, exp, strikes_per_side, today_iso)` — spawn-safe on macOS. ✓
+- **Worker-local exception catch-all** — a single bad contract can't crash the Pool. Skips bubble up as `skip_log` entries with `f"{type(e).__name__}: {str(e)[:80]}"` formatting (matches sweep_grid's pattern). ✓
+- **`imap_unordered` with `chunksize=1`** — tqdm advances per-pair, not per-batch. For a ~3hr-job UX, smooth-bar > IPC-cost trade is obviously right. ✓
+- **Default `workers=1`** preserves the existing serial loop semantics exactly, by routing the same single-pair path through `_process_pair` rather than the inline code. **Refactor + feature in one commit, but the refactor is mechanical** — the per-pair body moved verbatim into the helper, so the serial path is unchanged behavior-wise. ✓
+- **`args.workers` arg description** is honest: "Start at 2 to validate that NSE doesn't WAF-throttle; the sweep saw 8 workers cause problems but 1 was clean — anything in-between is empirically untested." That's the right framing — under-promise, let the operator escalate.
+
+### Grills
+
+#### 🔬 Grill #1 (real): "All existing tests still pass (490/490)" — but there's no NEW test for `_process_pair`
+
+The commit body claims 490/490 passes. I verified: there's **zero existing test for [scripts/prefetch_universe.py](scripts/prefetch_universe.py)** (it's a CLI). So "all tests pass" only means "the refactor didn't break sweep/loader tests". It does not mean **the worker function returns the right shape**, or **the parallel-vs-serial outputs agree**.
+
+The worker contract is now a tuple shape: `(n_fetched: int, n_miss: int, n_other: int, skips: list[5-tuple])`. If a future commit changes the shape (adds a count, renames a skip column), there's no test pinning either side of the boundary. A one-shot regression test:
+
+```python
+def test_process_pair_serial_vs_parallel_agree(monkeypatch, sample_bhavcopy):
+    # Mock the 3 loader calls so we don't hit NSE.
+    monkeypatch.setattr(bhavcopy_fo_loader, "load_bhavcopy_fo", ...)
+    monkeypatch.setattr(spot_loader, "load_spot", ...)
+    monkeypatch.setattr(options_loader, "load_option", ...)
+
+    serial_result = _process_pair(("RELIANCE", date(2024, 6, 27), 2, "2024-06-25"))
+    # Same args via Pool of 1
+    with mp.Pool(1) as pool:
+        parallel_result = list(pool.imap(_process_pair, [args]))[0]
+
+    assert serial_result == parallel_result  # determinism within one process
+```
+
+This won't catch every regression but it pins the contract. **Not blocking** — the manual `--symbols RELIANCE --workers 2` test command does the empirical version of this — but worth filing.
+
+#### 🔬 Grill #2 (was: no per-contract timeout — **WITHDRAWN after verifying source**)
+
+I initially flagged that a stuck contract could silently consume a worker slot in `imap_unordered`. **Mea culpa — I should have grep'd before flagging.** Verified `_direct_derivatives_df` ([src/data/options_loader.py:171,202](src/data/options_loader.py#L171)) passes `timeout=30` on both the cookie pre-fetch AND the data fetch, AND catches `ReadTimeout` / `ConnectionError` → raises `MissingDataError`. So a stuck contract:
+
+1. `requests.get(..., timeout=30)` raises `ReadTimeout` after 30s
+2. Caught and re-raised as `MissingDataError`
+3. Worker's `except MissingDataError` classifies it as a skip
+4. Worker continues to next contract
+
+**Worst case**: 60s wasted per stuck contract (30s cookie + 30s data). At an assumed 1% NSE-instability rate on 20k contracts = 200 stuck × 60s / 2 workers = ~100 min wasted. Real but bounded, not a runaway. ✓
+
+**Calibration note**: this is the second time in this session I've flagged a concern without first grep'ing the source. I claimed `_direct_derivatives_df` "likely" has no timeout — that's a guess dressed as a flag. Lesson: verify before grilling. The 9a8cd7a review I just filed had the same pattern in its conclusion ("[grill #2] could be I'm wrong about the per-contract cost"). **Going forward: any grill that includes "likely" or "probably" without a grep next to it gets demoted to a question.**
+
+#### 🔬 Grill #3 (real): `TODAY_FN = lambda: date(2026, 5, 25)` — hardcoded to yesterday
+
+[scripts/prefetch_universe.py:54](scripts/prefetch_universe.py#L54): `TODAY_FN = lambda: date(2026, 5, 25)`.
+
+Today is 2026-05-26. This anchor is **one day stale**. For a deterministic-anchor pattern (matches sweep_grid's c43f48e walk-back style), 1-day stale is fine — but:
+
+- If the script runs tomorrow (2026-05-27), the anchor is 2 days stale. Spot for 2026-05-26 won't be fetched (because `ref_day` walks back from expiry-1d, and most caches are open-expiry-aware). The "current year" frame for the spot loader uses `today_fn()` as the upper bound — so spot data for 2026-05-26 stays absent until TODAY_FN is bumped.
+- For OPEN expiries (e.g. expiry = 2026-05-29), the contract walk-back `for delta in range(1, 10): cand = exp - timedelta(days=delta)` will hit days both BEFORE and AFTER the anchor (delta=1 → 2026-05-28, which is in the future relative to the anchor). The bhavcopy loader will see no cache for 2026-05-28 (not published yet) AND no online fetch will surface it (because the bhavcopy doesn't exist yet) → `MissingDataError` → walk-back to delta=4 → eventually hits 2026-05-25 ✓. **So this works**, but it's load-bearing on the walk-back range being ≥ (anchor staleness + days to expiry from anchor).
+
+**Recommendation**: either (a) rename `TODAY_FN` to `ANCHOR_DATE` and bump deliberately as a chore (current pattern), or (b) make it `date.today()` and let the walk-back handle the same logic dynamically. Option (a) is more reproducible across operators; option (b) is more ergonomic. The current state is a half-step: it looks dynamic (function form) but is hardcoded — the worst of both. **Pin it explicitly one way.**
+
+#### Nit #1: `import pandas as pd` inside `_process_pair` is redundant
+
+Line 117: `import pandas as pd  # worker-local; spawn re-imports anyway`. Comment is accurate but pandas is already imported transitively via `from src.data import bhavcopy_fo_loader` at module-level (line 37), which re-runs on spawn. Removing the local import saves ~50ms of import-resolution time per worker, and the comment becomes a no-op. Cosmetic only.
+
+#### Nit #2: skip_log order is non-deterministic with `imap_unordered`
+
+The parallel path uses `imap_unordered` → results arrive in completion order, not submission order. `skip_log.extend(pair_skips)` therefore appends in arrival order. **Currently skip_log is only printed (first 10), not persisted** ([scripts/prefetch_universe.py:385-387](scripts/prefetch_universe.py#L385-L387)), so the determinism contract isn't violated.
+
+**But**: if a future commit persists skip_log to parquet (analogous to sweep_grid's `write_skips`), the parallel mode will produce non-byte-identical parquets across runs — same as the b41e047 fix for sweep_grid. **Pre-empt it**: sort skip_log by `(sym, exp, strike, opt_type)` before persisting, OR add a comment near `skip_log.extend(pair_skips)` noting the order-sensitivity if persistence is ever added.
+
+### What I tried
+
+- Diffed the refactor — the per-pair body moved verbatim into `_process_pair`, except for `args.strikes_per_side` → `strikes_per_side` (now a closure arg) and `TODAY_FN` → `today_fn = lambda: date.fromisoformat(today_iso)` (now a closure built from primitives). ✓ Pickle-safe.
+- Checked `from datetime import date, timedelta` at module-level ([scripts/prefetch_universe.py:29](scripts/prefetch_universe.py#L29)) — worker can use them after spawn-reimport. ✓
+- Math-checked the 150-contract claim: 1 sym × 25 exp × 3 strikes × 2 types = 150 ✓.
+- Grepped for `_process_pair` in tests: zero matches. No new test.
+- Confirmed `skip_log` is print-only (not persisted) — pre-empt-determinism nit, not a blocking bug.
+
+### Carry-over open items
+
+- ⚠ **`chore(p6.5.tag)` STILL missing** (24 commits pre-tag now).
+- 🔬 **`test_sweep_grid_cache_only_mode`** regression test still owed.
+- 🔬 **Strike-window X% value** (grill #1 from my 9a8cd7a review) — likely resolved by the next commit; will track at review.
+
+### Next-commit suggestion
+
+Based on the 9a8cd7a change-log, the daily-union scan is up next. **No blocking grill from this commit.** Suggested order:
+
+1. **Strike-window helper** (`max(N, X%)`) — resolves my 9a8cd7a grill #1 about the literal "X". Tiny commit; pin the X value (suggest ~10%) and add a unit test on edge cases (narrow-grid index symbol vs wide-grid stock symbol).
+2. **Daily-union scan** — multiplies contract count, exercises the helper across the entry window.
+3. **`test_sweep_grid_cache_only_mode`** — overdue from my 7ce07f9 grills; should land before or alongside (1) so the cache_only semantics are pinned before more code starts depending on them.
+4. **`chore(p6.5.tag)`** — now 24 commits pre-tag.
+
+A new commit landed while I was writing this review: **e58b5ff "feat: src/data/strike_planner — hybrid max(N per side, X% range) helper"** — looks like that's exactly the helper from (1). Will review next.
+
+---
