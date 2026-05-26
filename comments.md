@@ -9855,3 +9855,127 @@ ace31eb (yoy_sparkline) already landed. I should review it next.
 That's a coherent "drill-down honesty milestone". Tag it.
 
 ---
+
+## Review: ace31eb + e62998b — yoy_sparkline + table tabs + std-bias + empty-state
+
+**Verdict: ✅ ACCEPT both** — reviewing together because they close out the drill-down port as a coherent pair. ace31eb fills the Across Years stub; e62998b lands the final three mockup elements (tabs / std-bias footer / empty-state). One real math nit on the std-bias caveat numbers; everything else is solid.
+
+### ace31eb — yoy_sparkline: stability check, not trend
+
+The right framing in the subtitle: "Stability check · N year(s) observed in sweep". **NOT** "YoY trend" (overstates signal from 2-3 points) or "performance over time" (vague). The honest single-year fallback is the load-bearing detail:
+
+> "Stability check unavailable — cell spans only 1 year. Need ≥ 2 to plot."
+
+Refusing to draw a single-point "line" is exactly right. A misleading line would be worse than no chart. ✓
+
+**Implementation choices**:
+- `mode="lines+markers+text"` — labels each year's mean ROI directly on the chart. For 5-6 years, no clutter.
+- `height=120` + no gridlines + no y-axis ticks → sparkline aesthetic. ✓
+- `#d4ff3a` lemon-lime accent matching mockup.
+- `hovertemplate` gives precise `:+.1f%` on hover — the rounded labels don't hide precision.
+
+### 🔬 ace31eb Grill (real, soft): yoy uses **mean** ROI per year; headline uses **median**
+
+The hero metric is `roi_series.median()` (line 718 area). The sparkline uses `groupby("year").mean()`. Two different summary statistics for the same underlying data, presented near each other.
+
+**Why this is a real concern**:
+- The mean is more sensitive to outliers within each year. A 2024 with one big-winner trade would show inflated 2024 sparkline mean even if the median was modest.
+- Comparing "mean by year" against "median overall" doesn't compose cleanly. An analyst seeing "median 50% overall, 2024 mean 80%" might reason "2024 was great" when 2024's median could be 30%.
+
+**Why it's defensible**:
+- Per-year n is small (5-10 trades). Median of 5 values is jumpy — depends heavily on the middle one. Mean smooths.
+- A sparkline is for VISUAL trend perception; smoothness matters more than statistical purity.
+
+**Recommendation**: change to median for consistency, OR add the median as a second line/marker, OR change the headline-hero to also use mean. **Smallest change**: switch sparkline to median.
+
+If you keep mean, add a 1-line caption note: "_per-year mean (not median); for small-N year smoothness_". Otherwise the inconsistency is invisible to the analyst.
+
+### e62998b — All / Winners / Losers tabs
+
+`st.tabs()` with counts in labels: `All (24) / Winners (13) / Losers (9)`. Counts visible without entering the tab → operator knows the imbalance at a glance. ✓
+
+**Filtering logic**: Winners = `net_pnl > 0`, Losers = `<=0`. **Trades with exactly zero P&L go to Losers.** Tiny edge case (after fees, zero is rare) but worth noting. Could rename to "Non-positive" for technical purity; "Losers" is the operator's mental model so the current wording wins.
+
+**Compositional honesty**: the table itself uses `expiry`-sort (from the still-current `sort_values("expiry")` ← which BUILDER reverted in c1522b8). Per the commit body: "Bar-chart sort stays by expiry (operator-requested, not by ROI)." So that's the resolved direction — expiry-sort is the chosen default, not the e51d566 ROI-desc that c1522b8 silently reverted. **This commit body's parenthetical IS the missing "why was e51d566 reverted" explanation** I asked for in my c1522b8 review. Closes that grill retroactively.
+
+### e62998b — Empty-state: explicit positive disclosure
+
+```python
+if len(cell_skips) > 0:
+    _render_skipped_section(cell_skips)
+else:
+    st.markdown(f"_**No skipped expiries** — all {len(rows)} priced cleanly._")
+```
+
+This is **asymmetric conservatism in reverse**: typically the system over-warns on losses. But the same principle applies to dispatching trust: if the dashboard ONLY surfaces problems when they exist, silence is ambiguous (is it clean, or did the check break?). An explicit "no skipped expiries — all N priced cleanly" makes the absence-of-problem affirmative. ✓
+
+### 🔬 e62998b Grill (real, math): std-bias caveat numbers mix variance-bias and std-bias
+
+The caveat:
+
+> "_std (ddof=0) is observed-sample dispersion, not a population estimate. Treat as a lower bound on true population variance — small-N groups understate spread by ~20% at n=5, ~2.5% at n=20._"
+
+Two numbers, two different bias formulas:
+
+| n | Variance bias `(n-1)/n` | Std bias `sqrt((n-1)/n)` |
+|---|---|---|
+| 5 | 4/5 = **20%** | sqrt(0.8) ≈ **10.6%** |
+| 20 | 19/20 = 5% | sqrt(0.95) ≈ **2.5%** |
+
+- "~20% at n=5" → matches **variance** bias.
+- "~2.5% at n=20" → matches **std** bias.
+
+The two numbers can't both be right for the same quantity. Either both are variance (20% / 5%) or both are std (10% / 2.5%).
+
+**The caveat's prose mixes both quantities too**: "treat as a lower bound on true population **variance**" (variance) → "understate **spread** by..." (ambiguous, but "spread" is usually std).
+
+**Recommendation**: pick one quantity (std or variance) and use it consistently. Suggested rewrite (std-coherent):
+
+> "_std (ddof=0) understates population std by ~10% at n=5, ~2.5% at n=20. Treat as a lower bound on true dispersion._"
+
+Or variance-coherent:
+
+> "_var (ddof=0) understates population variance by ~20% at n=5, ~5% at n=20. The displayed std equals √var so it inherits a smaller bias (~10% at n=5)._"
+
+The std-coherent form is the easier amendment. **Not blocking** — the qualitative message (small-N std is biased down) is correct and useful. But the numbers don't compose mathematically.
+
+### Other observations
+
+**Closes the 5-commit drill-down port**: commit body claims "~95% of design/Complete analytical content; the 5% gap is cosmetic (typography mix, letter badges, exact yellow-callout texture) per user direction." Honest scoping — naming the gap explicitly is better than claiming completeness.
+
+**5 commits to close the port**:
+1. e51d566 — sort fix (later reverted by c1522b8).
+2. a549df5 — rule card v1 (later replaced by c1522b8).
+3. c1522b8 — 3-card top row + silent reverts.
+4. aa19bac — bootstrap CI.
+5. d96e038 — auto-detected callouts.
+6. ace31eb — yoy_sparkline.
+7. e62998b — tabs + std-bias + empty-state.
+
+That's actually **7 commits**, not 5. Two were partially-rolled-back. The commit body's "5-commit drill-down port" undersells the work; the actual port took 7 commits + 2 partial-reverts. **Same commit-body honesty grill as c1522b8** applies here. Not pushing for a fix; just noting the pattern continues.
+
+### What I tried
+
+- Worked the std-bias math: `(n-1)/n` for variance vs `sqrt((n-1)/n)` for std → confirmed the caveat's two numbers come from different formulas.
+- Verified the yoy sparkline reads from existing columns (no schema changes) — confirmed `rows["expiry"].dt.year` derivation.
+- Counted commits in the drill-down port arc → 7 actual + 2 reverts, not 5.
+- Cross-referenced the e62998b parenthetical "(operator-requested, not by ROI)" against the c1522b8 silent revert → this IS the missing explanation. Closes my c1522b8 grill #1.
+
+### Carry-over open items — substantially smaller now
+
+- 🚦 **Click fix browser smoke-test verdict** — STILL OPEN. The drill-down is now ~95% of mockup; the smoke-test should cover the full vertical: click → drill-down → tabs → callouts → sparkline → std-bias footer.
+- 🚨 **`chore(p6.5.tag)`** at 39 commits pre-tag. The drill-down port is done. **There is no better moment to tag than NOW.** The next commit will either be a follow-up polish (smaller change) or a new direction (Compare-cells / Export-rule / live-run findings). Either way, the tag should land BEFORE that next commit.
+- 🔬 **Live-run validation** for prefetch redesign — still open.
+
+### Next-commit suggestion
+
+**`chore(p6.5.tag)` is now urgent.** Reasons:
+1. The drill-down port is at 95% — coherent milestone.
+2. 39 commits since last tag — the bisect-cost of any future regression is high.
+3. The next BUILDER move (Compare impl, Export impl, polish, or smoke-test response) all benefit from a tagged baseline to diff against.
+
+After the tag: the operator's browser smoke-test verdict is the next forcing function. Either it passes (→ live-run validation, then Compare-cells), or it fails (→ streamlit-plotly-events fallback).
+
+**Strong recommendation**: BUILDER should NOT land another feature commit before `chore(p6.5.tag)`. The drill-down port is the right place to draw the line.
+
+---
