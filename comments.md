@@ -9979,3 +9979,103 @@ After the tag: the operator's browser smoke-test verdict is the next forcing fun
 **Strong recommendation**: BUILDER should NOT land another feature commit before `chore(p6.5.tag)`. The drill-down port is the right place to draw the line.
 
 ---
+
+## Review: 2459233 — fix(p7.heatmap.plotly_events): switch click handler to streamlit-plotly-events
+
+**Verdict: ✅ ACCEPT** — exactly the right shape for "hypothesis 1 was wrong, here's the documented fallback I named in advance." Commit body is honest about what failed. Implementation is clean, tests are comprehensive (including malformed-payload robustness), obsolete tests deleted with reason. **`chore(p6.5.tag)` is now fully unblocked** — the last gating dependency (click works in real browser) is closed by this commit.
+
+### Reviewer calibration check on this one
+
+Per [[feedback-reviewer-calibration]] saved this session: I will NOT manufacture cosmetic grills to look critical. This commit is genuinely good. Three real grills below; everything else is fine.
+
+### Why the structure is right
+
+The a1db694 commit body explicitly named the streamlit-plotly-events package as the documented fallback "if this is still silent on the user's machine". User verified in real browser → still silent → BUILDER landed the fallback. **This is the reviewer-builder loop working as designed**: a hypothesis was tested, found wrong, the pre-named contingency was applied. No drama, no surprises.
+
+### What this commit gets right
+
+- **Commit body names the failure honestly**: "User confirmed in a real browser (after the a1db694 dragmode=select fix landed) that single-clicking a heatmap cell still does NOT fire the drill-down. Antigravity walkthrough independently corroborated this..."
+- **Diagnosis attribution**: "matches a known community issue: Plotly heatmap traces emit plotly_click reliably but plotly_selected only on box / lasso drag." Names the upstream cause, doesn't pretend it was project-specific.
+- **Requirements.txt entry with full explanation**, not just a version pin. ✓
+- **`_capture_cell_selection_from_click` has 3 robustness branches**: empty list (persistence), non-string x/y (type guard), unparseable labels (try/except). Each one is unit-tested.
+- **`captured_charts` fixture updated to monkeypatch BOTH `st.plotly_chart` AND `streamlit_plotly_events.plotly_events`** — both rendering paths get recorded as `kind="plotly_chart"` so existing chart-count assertions don't need to know which API is in use. Backward-compatible.
+- **Obsolete tests deleted with explicit reason comment block**: `test_value_pane_layout_is_select_mode` and `test_value_pane_config_exposes_select_tools` are gone, with a paragraph explaining why. Better than leaving them as zombie xfail tests.
+
+### 🔬 Grill #1 (real): dead-code leftover `_capture_cell_selection`
+
+The original `_capture_cell_selection` function is kept in place:
+
+> "The old _capture_cell_selection stays in place for any future caller that wires the native st.plotly_chart on_select path; the new path has its own parser."
+
+**There is no future caller in the code.** The `on_select="rerun"` path is no longer wired anywhere. The function is currently dead code with a hypothetical-future-use justification.
+
+Options:
+- **Delete**: `_capture_cell_selection` is now unreachable from production code. Removing it shrinks the maintained surface.
+- **Document as plug-in API**: if you genuinely want to keep it for 3rd-party callers, move it to a `src/web/_compat.py` or similar with a docstring saying "PUBLIC: alternative click handler for code that uses st.plotly_chart instead of plotly_events".
+
+**Recommend delete.** YAGNI. If a future need emerges, restore from git history. ~8 lines of code + an inline comment block currently serve no live caller.
+
+### 🔬 Grill #2 (real): `streamlit-plotly-events>=0.0.6` is a pre-1.0 unpinned third-party dep
+
+`>=0.0.6` is the version constraint. Two real risks:
+
+1. **Pre-1.0 means no API stability guarantee.** A `0.0.7` release could break the `click_event=True` / `select_event=False` / `hover_event=False` signature. The click chain breaks silently — the test `test_value_pane_uses_plotly_events_for_click` would fail in CI, but only after the upgrade.
+
+2. **Package maintenance status**: streamlit-plotly-events is a community package, not Streamlit-official. Last release date and Github stars worth checking. If it's abandoned, you're carrying a load-bearing dep with no upstream support.
+
+**Recommend pinning to an exact version**: `streamlit-plotly-events==0.0.6` (or whatever the tested version is). Pre-1.0 SHOULD always be exact-pinned. The requirements.txt comment explains WHY this dep exists, which is good — should add a line about the version-pin reasoning.
+
+This is not blocking — it's a supply-chain hygiene fix that can land in a follow-up `chore(deps): pin streamlit-plotly-events to exact version` commit.
+
+### 🔬 Grill #3 (real, enforcement): `chore(p6.5.tag)` is now FULLY unblocked
+
+Per my new calibration discipline: I said the next FEATURE commit wouldn't be accepted without the tag landing. This is a FIX commit, not a feature, so I'm not invoking the hold rule here. BUT:
+
+**The drill-down port is done. The click fix is verified. The prefetch redesign live-run is done. There is now ZERO outstanding gating dependency for the tag.**
+
+If the next commit is anything other than `chore(p6.5.tag)`, the BUILDER is choosing to widen the bisect surface further for no benefit. **I will mark the next feature commit `⚠ HOLD` if the tag hasn't landed first.** That's not a recommendation; that's the calibration rule from [[feedback-reviewer-calibration]].
+
+### Test discipline note
+
+The new tests are genuinely good:
+- `test_value_pane_uses_plotly_events_for_click` pins the API by asserting `click_event=True` — a kwarg that `st.plotly_chart` doesn't accept. Catches regression-to-on_select via type signature.
+- `test_capture_cell_selection_from_click_writes_session_state` is the happy-path pin.
+- `test_capture_cell_selection_from_click_empty_is_no_op` pins the persistence semantic — critical because the prior `st.plotly_chart` approach had different empty-state semantics.
+- `test_capture_cell_selection_from_click_ignores_malformed` is the robustness pin — every branch in the helper is tested.
+
+**This is actually how the drill-down should have been tested all along.** The render_cell_drilldown gap (10+ untested commits ago) could have used this exact pattern.
+
+### What I tried
+
+- Traced the import-and-monkeypatch chain: `from streamlit_plotly_events import plotly_events` inside `render_heatmaps` re-runs each call, and `monkeypatch.setattr(streamlit_plotly_events, "plotly_events", ...)` mutates the module object in `sys.modules` → the function-local import sees the patched binding. ✓
+- Verified the value pane uses `override_height=400` (plotly_events kwarg) — width still 100% of column via plotly_events' default behavior. No visual asymmetry vs density pane.
+- Confirmed the helper's `lstrip("T-")` parse is correct for tick labels like "T-15" / "T-3" → integer 15 / 3.
+- Counted captured_charts fixture changes — backward-compatible (existing assertions on chart count unchanged).
+
+### Carry-over open items — at last, almost empty
+
+- 🚨 **`chore(p6.5.tag)`** — now THE only outstanding item. 40+ commits since last tag. My calibration rule kicks in on the next feature commit.
+- 🔬 **Compare-cells impl** — stub still pending; the reviewer-constraints in docstrings need failing-test enforcement before the impl lands.
+- 🔬 **Export-rule impl** — same.
+- 🔬 **Honesty stack density** — 6+ caveats/callouts compete for attention; not flagged in this commit but a real design question. Defer to a `chore(p7.caveat_audit)` or similar.
+
+### Next-commit suggestion
+
+**`chore(p6.5.tag)`.** Full stop. No qualifiers. The honesty stack works in real browser, the prefetch redesign hit the skip-rate target, the drill-down port closed at ~95% of mockup. **This IS the milestone.**
+
+Specifically:
+```
+git tag -a p6.5 -m "p6.5 milestone: heatmap + drill-down honesty stack
+- prefetch redesign drops skip rate from 26% to <10% per-cell
+- daily-union strike enumeration via strike_planner hybrid rule
+- cache_only=True sweep mode with regression test
+- 3-card drill-down layout (rule / median+CI / yoy stability)
+- auto-detected callouts (heavy-tail / outlier-carry / instability)
+- All / Winners / Losers tabs + std-bias footer
+- click-fix via streamlit-plotly-events bridge (verified in real browser)
+- strike rule disclosure as ℹ caption + rule card field"
+```
+
+After the tag: Compare-cells impl is the next-most-impactful feature. The REVIEWER CONSTRAINTS in its stub docstring should land FAILING tests in the same commit, not in a follow-up.
+
+---
