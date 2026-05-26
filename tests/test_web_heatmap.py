@@ -415,6 +415,60 @@ def test_value_pane_layout_is_select_mode(captured_charts):
     assert value_fig.layout.clickmode == "event+select"
 
 
+# ============================================================
+# feat(p7.heatmap.strike_disclosure): caption under selectors
+# ============================================================
+
+def test_selector_renders_strike_rule_caption(monkeypatch):
+    """The strategy selector must surface the strike-selection rule
+    via st.caption(\"ℹ Strike rule: …\") so the analyst sees WHICH
+    strikes the priced trades used. The string itself is owned by
+    each strategy's display_strike_rule (tested separately)."""
+    import src.web.heatmap as hm
+
+    captions: list[str] = []
+    selectbox_state: dict[str, str] = {}
+
+    def fake_selectbox(label, *, options, index=0, key=None, help=None):
+        # Return the chosen option; persist in session_state mock.
+        pick = options[index]
+        selectbox_state[key] = pick
+        return pick
+
+    def fake_caption(msg, **_):
+        captions.append(msg)
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n):
+        return [_NullCtx() for _ in range(n if isinstance(n, int) else len(n))]
+
+    monkeypatch.setattr(hm.st, "selectbox", fake_selectbox)
+    monkeypatch.setattr(hm.st, "caption", fake_caption)
+    monkeypatch.setattr(hm.st, "columns", fake_columns)
+    monkeypatch.setattr(hm.st, "session_state", {})
+
+    df = pd.DataFrame([_row(entry=15, exit_=1, roi_pct_annualized=42.0)])
+    strategy, symbol = hm._selector(df)
+    assert strategy == "S"
+    assert symbol == "X"
+    # The caption may degrade gracefully if get_strategy fails on "S"
+    # (which it will — "S" isn't a registered name). The TRY/EXCEPT
+    # guard inside _selector swallows that; nothing crashes. To test
+    # the actual rendering path, use a real strategy name:
+    df_real = pd.DataFrame([
+        _row(entry=15, exit_=1, roi_pct_annualized=42.0,
+             strategy="short_straddle", symbol="RELIANCE"),
+    ])
+    captions.clear()
+    hm._selector(df_real)
+    strike_caps = [c for c in captions if "Strike rule:" in c]
+    assert len(strike_caps) == 1
+    assert "ATM" in strike_caps[0]  # short_straddle's rule mentions ATM
+
+
 def test_value_pane_config_exposes_select_tools(captured_charts):
     """Modebar surface: box-select + lasso buttons added, Plotly logo
     suppressed. Gives the operator a visible affordance for explicit

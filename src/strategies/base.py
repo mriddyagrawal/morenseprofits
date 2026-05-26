@@ -111,3 +111,14 @@ class Strategy(Protocol):
         spot_at_entry: float,
         params: dict,
     ) -> list[Trade]: ...
+
+    def display_strike_rule(self, params: dict | None = None) -> str:
+        """One-line, human-readable description of the strike(s) this
+        strategy picks at entry. Surfaced under the strategy selectbox
+        on the Heatmap tab so the analyst can see WHICH STRIKES the
+        historical trades used (otherwise buried in source defaults).
+
+        ``params`` reflects the same overrides ``generate_trades`` would
+        apply (e.g. ``{"strike_offset_pct": 0.03}`` for a strangle).
+        ``None`` → use the strategy's default offsets."""
+        ...

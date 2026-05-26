@@ -70,3 +70,13 @@ class LongStrangle:
             strategy=self.name,
             params=out_params,
         )]
+
+    def display_strike_rule(self, params: dict | None = None) -> str:
+        """OTM symmetric: CE at spot×(1+offset), PE at spot×(1−offset).
+        Reflects ``strike_offset_pct`` override in ``params``."""
+        offset = float((params or {}).get("strike_offset_pct", DEFAULT_STRIKE_OFFSET_PCT))
+        pct = offset * 100
+        return (
+            f"{pct:g}% OTM each side — nearest listed to "
+            f"spot×{1 + offset:g} (CE), spot×{1 - offset:g} (PE)"
+        )

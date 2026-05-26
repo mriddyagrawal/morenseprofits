@@ -86,6 +86,10 @@ class ShortStraddle:
             params=params or {},
         )]
 
+    def display_strike_rule(self, params: dict | None = None) -> str:
+        """Short straddle has no strike offset; both legs sit at ATM."""
+        return "ATM — nearest listed strike to entry-day spot close"
+
 
 def _pick_atm_strike(
     symbol: str,

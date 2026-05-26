@@ -71,6 +71,22 @@ def _selector(
             index=available_symbols.index(default_sym),
             key="mp_heatmap_symbol",
         )
+
+    # Honesty caption: surface the strike-selection rule the strategy
+    # actually used so the analyst can see WHICH STRIKES the priced
+    # trades touched (otherwise buried in src/strategies/*.py defaults).
+    # Reads from the strategy implementation, not duplicated copy.
+    try:
+        from src.strategies.registry import get_strategy
+        strat_obj = get_strategy(strategy)
+        st.caption(f"ℹ Strike rule: {strat_obj.display_strike_rule()}")
+    except Exception:
+        # Defensive: if the registry / display_strike_rule isn't
+        # available for this strategy (3rd-party plug-in, future
+        # strategy that hasn't implemented the protocol yet), silently
+        # skip the caption rather than crash the whole tab.
+        pass
+
     return strategy, symbol
 
 

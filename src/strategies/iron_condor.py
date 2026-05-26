@@ -116,6 +116,18 @@ class IronCondor:
             params=out_params,
         )]
 
+    def display_strike_rule(self, params: dict | None = None) -> str:
+        """Four-leg: inner SELL at ±inner_offset, outer BUY at ±outer_offset.
+        Reflects both overrides in ``params``."""
+        p = params or {}
+        inner = float(p.get("inner_offset_pct", DEFAULT_INNER_OFFSET_PCT))
+        outer = float(p.get("outer_offset_pct", DEFAULT_OUTER_OFFSET_PCT))
+        return (
+            f"Inner SELL at ±{inner * 100:g}% OTM ; "
+            f"Outer BUY at ±{outer * 100:g}% OTM "
+            f"(all nearest listed)"
+        )
+
 
 def _pick_condor_strikes(
     symbol: str,

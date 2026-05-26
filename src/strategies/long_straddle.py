@@ -65,3 +65,7 @@ class LongStraddle:
             strategy=self.name,
             params=params or {},
         )]
+
+    def display_strike_rule(self, params: dict | None = None) -> str:
+        """Long straddle has no strike offset; both legs sit at ATM."""
+        return "ATM — nearest listed strike to entry-day spot close"
