@@ -416,13 +416,17 @@ def test_naming_rule_values_have_percent_suffix(captured_metrics):
 # heatmap traces don't emit reliably on single click.
 # ============================================================
 
-def test_value_pane_uses_plotly_events_for_click(captured_charts):
-    """The value pane must invoke streamlit_plotly_events.plotly_events
-    with click_event=True (NOT st.plotly_chart with on_select). This
-    is the only reliable way to catch heatmap clicks across browsers
-    on Streamlit 1.57 / Plotly 6.7. Verified empirically via headless-
-    browser walkthrough — synthetic clicks don't propagate through
-    Streamlit's plotly_selected listener for heatmap traces."""
+def test_value_pane_uses_native_plotly_chart_with_on_select(captured_charts):
+    """The value pane MUST use st.plotly_chart with on_select="rerun"
+    and selection_mode=("points",). The earlier attempt to swap in
+    streamlit_plotly_events broke heatmap rendering (the archived
+    2022 component is incompatible with Plotly 6.7 / Streamlit 1.57 —
+    chart came up blank with default integer axes). Native render
+    preserves the categorical T-N tick labels and shows the trace.
+
+    Click reliability across browsers is handled by the manual-picker
+    selectbox fallback (tested separately) rather than by replacing
+    the renderer. Belt-and-suspenders, not all-eggs-in-one-basket."""
     rows = []
     for e in (15, 10, 5):
         for x in (3, 1):
@@ -430,17 +434,14 @@ def test_value_pane_uses_plotly_events_for_click(captured_charts):
                 rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
 
-    # plotly_events is recorded with kind="plotly_chart" + the kwargs
-    # it was called with; the value-pane chart is the FIRST plotly
-    # render in the captured stream.
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
     value_kwargs = charts[0]["kwargs"]
-    # plotly_events-specific kwarg: click_event=True. st.plotly_chart
-    # doesn't accept this kwarg, so its presence proves the value pane
-    # routed through plotly_events.
-    assert value_kwargs.get("click_event") is True
-    assert value_kwargs.get("select_event") is False
-    assert value_kwargs.get("hover_event") is False
+    # st.plotly_chart-specific signals: on_select + selection_mode.
+    # streamlit_plotly_events doesn't accept these kwargs, so their
+    # presence proves we're on the native path.
+    assert value_kwargs.get("on_select") == "rerun"
+    assert value_kwargs.get("selection_mode") == ("points",)
+    assert value_kwargs.get("use_container_width") is True
 
 
 def test_capture_cell_selection_from_click_writes_session_state(monkeypatch):

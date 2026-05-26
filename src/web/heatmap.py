@@ -487,26 +487,30 @@ def render_heatmaps(
     )
 
     # Side-by-side render. Each chart claims its column.
-    # Value pane uses streamlit-plotly-events to listen to plotly_click
-    # directly. Streamlit's native ``on_select="rerun"`` listens for
-    # plotly_selected, which Plotly heatmap traces don't reliably emit
-    # on single click (verified against streamlit 1.57 / plotly 6.7 in
-    # a real browser session — synthetic click events don't propagate
-    # selection through the websocket boundary). plotly_events binds
-    # to plotly_click on the JS side and round-trips the clicked
-    # point's x/y as a Python list.
+    # Value pane uses st.plotly_chart with on_select="rerun" — this is
+    # native, renders cleanly (preserves categorical T-N tick labels),
+    # and the heatmap shows. The previous attempt to use
+    # streamlit_plotly_events broke rendering: the chart came up blank
+    # with default integer axes (the embedded React frontend in the
+    # archived 2022 package is incompatible with Plotly 6.7 / Streamlit
+    # 1.57 for heatmap traces).
+    #
+    # on_select=rerun catches plotly_selected reliably on box / lasso
+    # drag, and on some browsers also on single-click (Plotly's click
+    # semantics for heatmaps are weakly documented). When the click
+    # path fails, the operator falls through to the manual cell-picker
+    # selectbox below — that's the load-bearing fallback per
+    # commit 384c65e (bug-fixed in 5b0c722).
     cols = st.columns(2)
     with cols[0]:
-        from streamlit_plotly_events import plotly_events
-        clicked = plotly_events(
+        selected = st.plotly_chart(
             value_fig,
-            click_event=True,
-            select_event=False,
-            hover_event=False,
-            override_height=400,
-            key="mp_heatmap_value_click",
+            use_container_width=True,
+            key="mp_heatmap_value_chart",
+            on_select="rerun",
+            selection_mode=("points",),
         )
-        _capture_cell_selection_from_click(clicked)
+        _capture_cell_selection(selected)
     with cols[1]:
         st.plotly_chart(
             density_fig,
