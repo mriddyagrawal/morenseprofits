@@ -8754,3 +8754,110 @@ If the operator wants to do the live-run before tagging, that's also fine — bu
 After the tag: the heatmap click fix is the next-most-impactful item. The Plotly `dragmode="select"` 4-line patch was discussed pre-context-compaction; that's worth surfacing back as a single small commit.
 
 ---
+
+## Review: a1db694 — fix(p7.heatmap.click): dragmode=select + clickmode=event+select so cell-click drills down
+
+**Verdict: ✅ ACCEPT** — exactly the shape a "best-guess UI fix on undocumented Plotly behavior" commit should have. Targeted 4-line layout patch, pinning tests for the layout settings, honest-failure note naming the fallback. The only confidence-gating step is browser smoke-test by the operator — that's a limit of unit tests, not of this commit.
+
+### Why I'm comfortable with this without verifying it in a browser
+
+The commit makes the SMALLEST possible change to test the hypothesis the other reviewer diagnosed pre-compaction:
+- **Hypothesis**: Plotly heatmap traces fire `plotly_click` but not `plotly_selected`; Streamlit's `on_select="rerun"` listens for `plotly_selected`; so click → drill-down chain is broken in the middle.
+- **Fix**: put the chart into `dragmode="select"` + `clickmode="event+select"` so a 1-pixel click registers as a 1-cell box-select, which DOES emit `plotly_selected`.
+- **Fallback if hypothesis is wrong**: streamlit-plotly-events package, listens to `plotly_click` directly.
+
+The commit body documents all three — hypothesis, fix, fallback — and explicitly flags the uncertainty:
+
+> Honest-failure note: heatmap-trace clickmode semantics aren't formally documented (Plotly docs cover scatter cleanly, heatmap less so). If this is still silent on the user's machine, the documented fallback is the streamlit-plotly-events package (third-party, ~10 lines wiring, listens to plotly_click directly). That's a separate commit if needed.
+
+**This is the right disclosure shape**. The operator knows what's being tried, what the next move is if it fails, and approximately how big that next move is. Compare against the alternative: silently shipping a fix and waiting for the user to report no change. The honesty note saves a round-trip.
+
+### Pinning tests — what they catch (and what they can't)
+
+```python
+def test_value_pane_layout_is_select_mode(captured_charts):
+    assert value_fig.layout.dragmode == "select"
+    assert value_fig.layout.clickmode == "event+select"
+
+def test_value_pane_config_exposes_select_tools(captured_charts):
+    assert "select2d" in cfg["modeBarButtonsToAdd"]
+    assert "lasso2d" in cfg["modeBarButtonsToAdd"]
+    assert cfg["displaylogo"] is False
+```
+
+**What these tests guard against**: a future refactor that drops the layout settings ("eh, dragmode defaults to zoom, who needs select"). The tests will go red the instant either constant is removed.
+
+**What they cannot guard against**: whether `dragmode="select"` + `clickmode="event+select"` actually makes a heatmap trace fire `plotly_selected` on click. That's a property of the Plotly JS bundle's runtime behavior, not of the Python-side fig object. Unit tests can't reach into a browser DOM.
+
+This is fine. The test is the right SHAPE — it pins the structural fix and lets the browser-smoke-test handle the behavioral verification. Acknowledging the test scope explicitly:
+
+| Failure mode | Caught by unit test? | Caught by browser smoke-test? |
+|---|---|---|
+| Layout settings removed in future refactor | ✓ | ✓ (drill-down breaks) |
+| Plotly upgrade changes heatmap select semantics | ✗ | ✓ |
+| Streamlit downgrades on_select handling | ✗ | ✓ |
+| `_capture_cell_selection` accidentally short-circuits | ✗ | ✓ |
+
+Three of four failure modes need browser verification. **This is why the operator-smoke-test is non-negotiable** — there's no substitute available short of a Playwright + Streamlit-testing-tools rig (Phase-7 polish at most).
+
+### Fixture change — sensible
+
+```python
+def fake_plotly_chart(fig, **kw):
+    events.append({"kind": "plotly_chart", "fig": fig, "kwargs": kw})
+```
+
+Previously dropped kwargs; now captures them. Needed to inspect the `config={...}` dict from inside the test. **One-line backward-compatible enhancement** — existing tests reading `event["fig"]` are unaffected. ✓
+
+### Grills
+
+#### 🔬 Grill #1 (real but soft): clickmode="event+select" on heatmap traces is the load-bearing unknown
+
+The fix conflates two hypotheses:
+- (a) `dragmode="select"` switches the cursor-default behavior from zoom to select-box drag → drag-rectangles fire `plotly_selected`. **This is well-documented for scatter and almost certainly works for heatmap.**
+- (b) `clickmode="event+select"` makes a single-click register as a 1-pixel box-select → click fires `plotly_selected`. **This is the under-documented part.**
+
+If (b) doesn't work on heatmap (because Plotly's heatmap trace explicitly opts out of click-to-select), then operators would have to DRAG over a cell to trigger drill-down, not single-click. Visually it'd look like the modebar surfaces "Box Select" as an icon — operator's mental model becomes "drag to drill, not click". Not catastrophic, but not the original UX the design called for.
+
+**What to watch for in the browser smoke-test**:
+1. Click a cell → does the right-side drill-down panel update? (validates hypothesis (b))
+2. Drag a box around a cell → does the drill-down panel update? (validates hypothesis (a))
+3. If (1) fails but (2) succeeds, the fallback is a no-op for clicks; need streamlit-plotly-events.
+
+#### Nit: `dragmode="select"` makes box-zoom less accessible
+
+Previously, the default `dragmode="zoom"` (Plotly's default) means box-DRAG = zoom-in. After this commit, box-drag = select. To zoom in, the operator must click the modebar's zoom-box icon first. **Trade-off**: zoom is now a 2-click action; select is the 1-click default. For a 8-row × 4-column heatmap, zoom is rarely needed (the entire grid fits in one screen). Select-by-default is the right choice for this UI.
+
+**Worth a UX note in the docstring or commit body** acknowledging the trade-off. The PR body doesn't mention it; an operator who expects zoom-on-drag would be momentarily confused.
+
+#### Density pane left in default `dragmode` — correct
+
+The right pane uses `st.plotly_chart(density_fig, ...)` WITHOUT `on_select` (per heatmap.py:457 line context — the diff shows `cols[1]` as density). Since no drill-down depends on density-pane selection, no reason to switch its dragmode. Correctly scoped. ✓
+
+### What I tried
+
+- Read the diff in [src/web/heatmap.py:395-410](src/web/heatmap.py#L395) — `dragmode` + `clickmode` go into `value_fig.update_layout(...)`.
+- Verified the config kwarg is on the LEFT pane's `st.plotly_chart` (value), not the right (density). ✓
+- Confirmed `fake_plotly_chart` fixture change is backward-compatible — existing tests don't access `event["kwargs"]`, so adding the key doesn't break them.
+- Counted lines of streamlit-plotly-events fallback per the commit body's "~10 lines wiring" claim — checks out (an `events = plotly_events(fig, click_event=True, ...)` call replaces `st.plotly_chart`).
+
+### Carry-over open items
+
+- 🚦 **Operator browser smoke-test** for the click fix is now the gating action. Suggested test list:
+  1. Open the Heatmap tab.
+  2. Click a non-empty cell (high-n, value-saturated to be visually obvious).
+  3. Verify the drill-down panel below the heatmap updates with that cell's row.
+  4. Drag-box over a cell (using modebar's select-box icon) → verify same drill-down behavior.
+  5. If (3) silent but (4) works → fallback to streamlit-plotly-events.
+- ⚠ **`chore(p6.5.tag)`** now at 30 commits pre-tag. Two natural tagging windows passed; the next one is **after the click fix is verified** (which closes the last open functional gap).
+- 🔬 **Live-run validation** for the prefetch redesign (still open).
+
+### Next-commit suggestion
+
+**Pause for operator browser smoke-test before any more commits.** Reason: if the fix doesn't work, the next commit is the streamlit-plotly-events fallback. If it does work, the next commit is `chore(p6.5.tag)`. Either way, the operator's browser test gates which path to take. Landing more commits before that test introduces churn — the tag becomes 31, 32, 33 commits overdue while we don't even know if the user-reported bug is closed.
+
+After the smoke-test:
+- **Click fix works** → `chore(p6.5.tag)` → live-run validation of the prefetch redesign.
+- **Click fix doesn't work** → streamlit-plotly-events fallback (small) → repeat smoke-test → `chore(p6.5.tag)`.
+
+---
