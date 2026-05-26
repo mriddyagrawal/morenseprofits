@@ -3306,6 +3306,87 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of 6f52e65 — perf: p7_wide_sweep pre-warms open-expiry data before spawning Pool
+
+**Verdict:** ✅ accept — **smart follow-up to f69019f closes the multi-worker first-call cold-fetch concern.**
+
+**Phase / commit goal:** f69019f added in-process LRU caches, but those are **per-worker**. On the first call within each worker, the LRU is cold; if the on-disk cache is ALSO stale (open-expiry staleness check triggers), the worker hits NSE. With 8 workers concurrently hitting the SAME open-expiry contracts on first-call, NSE rate-limits and the sweep crawls. **Pre-warm phase** runs serially in main process BEFORE spawning Pool — populates the **on-disk cache** so workers' first-call disk reads (which fill their own LRUs) get fresh data without touching NSE.
+
+**Two-layer optimization stack now**:
+1. **f69019f LRU caches** — eliminates intra-worker disk re-reads (within-worker memoization).
+2. **6f52e65 pre-warm** — eliminates inter-worker NSE rate-limit (cross-worker disk cache freshness).
+
+Both needed for the sweep to be both fast AND NSE-polite.
+
+### What works
+
+- **Scoped to open expiries only** ([scripts/p7_wide_sweep.py:101](scripts/p7_wide_sweep.py#L101)): `open_expiries = [e for e in expiries if e >= today]`. Closed (past) expiries' data is stable on disk and doesn't trigger staleness refetch. **For the §3.2 sweep (May 2024 → May 2026) running on 2026-05-26**, only the May 2026 expiry might be open. **Correct scoping**: most expiries skip pre-warm entirely.
+- **Three-tier pre-warm**:
+  1. **Current-year spot per symbol** ([scripts/p7_wide_sweep.py:106-113](scripts/p7_wide_sweep.py#L106-L113)) — refreshes the open-year spot parquet.
+  2. **Bhavcopy for today** ([scripts/p7_wide_sweep.py:115-124](scripts/p7_wide_sweep.py#L115-L124)) — enumerates live strikes from the most recent trading session.
+  3. **Every (symbol, strike, CE/PE) for each open expiry** ([scripts/p7_wide_sweep.py:125-134](scripts/p7_wide_sweep.py#L125-L134)) — triggers the staleness refresh + cache write per contract.
+- **Defensive `try/except` blocks** absorb pre-warm failures so the main sweep still runs. Failed-pre-warm cells just become cold-fetches at sweep time (worse case = degraded perf, not crash).
+- **Cost analysis in commit body**: ~30-60 sec pre-warm (260 contracts × ~150 ms — mostly cookie pre-fetch) saves ~10+ min of NSE-throttled crawl. **Net win: ~10x cost-benefit ratio.**
+- **Bhavcopy strike enumeration uses CROSS-SYMBOL union** ([scripts/p7_wide_sweep.py:118-122](scripts/p7_wide_sweep.py#L118-L122)): collects the union of strikes that ANY symbol traded today for the expiry. **Overshoots**: a RELIANCE-only strike gets requested for HDFCBANK; gets a MissingDataError; `try/except` absorbs. **Slight inefficiency** but the cost (extra HTTP roundtrips for non-existent contracts) is bounded by the cookie pre-fetch + politeness delay = ~1-2 sec per failed lookup. Cosmetic.
+
+**489/489 still passes** (no test changes; script-level perf addition).
+
+### Blocking issues: None.
+
+### Non-blocking observations
+
+1. **🔬 `today` may not be a trading day**: `bhavcopy_fo_loader.load_bhavcopy_fo(today)` ([scripts/p7_wide_sweep.py:116](scripts/p7_wide_sweep.py#L116)) raises `MissingDataError` for weekends/holidays. The outer `try: ... except Exception:` catches it and prints a warning, then skips that expiry's pre-warm. **Workers will then cold-fetch** that expiry's contracts → re-introduces the NSE-throttle risk for those contracts. **Better**: walk back to find the most recent trading day's bhavcopy (similar to `prefetch_universe.py:_pick_reference_day`). Cosmetic; the `try/except` makes it graceful, not catastrophic.
+
+2. **Cross-symbol strike union overshoots** — flagged above. **More precise alternative**: enumerate `(sym, strike)` pairs from each symbol's filtered bhavcopy rows. But the cost is bounded and the simple approach works. Cosmetic.
+
+3. **Bare `except Exception` in 3 places** ([scripts/p7_wide_sweep.py:114, 124, 139](scripts/p7_wide_sweep.py)) — swallows KeyboardInterrupt, SystemExit, MemoryError. Cosmetic for operator tooling; the pre-warm output prints diagnostic warnings.
+
+4. **Pre-warm only in p7_wide_sweep.py — NOT in p6_sweep.py**. **Defensible**: p6_sweep is the smaller §3.2 sweep where open-expiry incidence is lower and the working set is smaller. Could be a Phase-7 polish to extract a `_prewarm_open_expiries(symbols, expiries, today)` helper into `src/data/prefetch.py` and use it from both scripts. **DRY opportunity**; doesn't block.
+
+5. **The pre-warm runs in main process** — its LRU is filled. But workers SPAWN fresh; the LRU benefit is workers reading from a fresh on-disk cache (not from inherited in-memory state). **Correctly understood and described in the commit body.**
+
+6. **Pre-warm cost ~30-60 sec is added on top of sweep wall-clock** — worth surfacing as a separate progress section in the script output. Currently it just prints "Pre-warming open-expiry data..." then summary lines per expiry. **tqdm progress bar** for the per-contract loop would match the sweep's UX style. Cosmetic.
+
+### Domain / correctness checks
+
+- **Determinism**: ✓ pre-warm is idempotent (cache.write overwrite=True via 8419a8c); subsequent re-runs hit cache and skip.
+- **NSE-politeness**: ✓ pre-warm serializes the open-expiry fetches; politeness delay (f4aea02) still applies per contract.
+- **No cache pollution**: ✓ pre-warm goes through standard `load_*` APIs; same on-disk + LRU semantics.
+- **Workers still hit disk on first-call**: ✓ correctly understood; LRU fills per-worker on first cell touching each (symbol, year) / (date) / (contract).
+
+### Strategic sequencing observation
+
+**Three consecutive commits form the perf-correctness arc** for the 450k-cell wide sweep:
+- f69019f — LRU caches (intra-worker)
+- 6f52e65 — pre-warm (inter-worker, on-disk freshness)
+- (pending) live-run validation — does the combined effect deliver the ~3-5× speedup predicted?
+
+**Expected combined effect**: 
+- Pre-warm: ~30-60 sec.
+- Sweep with LRU + fresh disk cache: ~3-4 min.
+- Total wall-clock: ~4-5 min for 450k cells. 
+- **Down from ~10-15 min pre-optimization. 2.5-3× end-to-end speedup.**
+
+### Carry-over open flags
+
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now ~17 commits pre-tag.
+- 🔬 **No regression tests** for the perf optimizations (LRU hit-rate, pre-warm correctness). The autouse fixture clears the LRU per-test; a perf-pinning test would assert `cache_info().hits > 0` on the second call.
+
+### What I tried
+
+- Read [scripts/p7_wide_sweep.py:93-141](scripts/p7_wide_sweep.py#L93-L141) end-to-end.
+- Verified `open_expiries` scoping (only expiries >= today get pre-warmed).
+- Confirmed bhavcopy_fo_loader call goes through the LRU path post-f69019f.
+- 489/489 unchanged.
+
+### Next-commit suggestion
+
+1. **Live-run validation**: `python scripts/p7_wide_sweep.py` end-to-end. Print wall-clock breakdown (pre-warm time + sweep time + total). Confirm the predicted ~4-5 min total. Operator-tooling smoke; not a commit.
+2. **`chore(p6.5.tag)`** — long overdue.
+3. **Phase 7 proper**: diagnostics tab / export buttons / regime drill-down per fd72b85 PLAN.
+
+---
+
 ## Review of f69019f — perf: in-process LRU caches at data-layer hot path
 
 **Verdict:** ✅ accept — **closes the perf gap I diagnosed directly**, matches my recommendation, and adds the test-isolation fixture I would have flagged as missing.
