@@ -151,15 +151,17 @@ def main() -> int:
                 )
             except Exception as e:
                 print(f"  ⚠ spot pre-warm {sym} {today.year} failed ({type(e).__name__})")
+        upper_symbols = [sym.upper() for sym in SYMBOLS]
         for exp in open_expiries:
             try:
                 bhav = bhavcopy_fo_loader.load_bhavcopy_fo(today)
+                mask = (
+                    bhav["symbol"].isin(upper_symbols)
+                    & (bhav["instrument"] == "OPTSTK")
+                    & (bhav["expiry"] == pd.Timestamp(exp))
+                )
                 live_strikes = sorted({
-                    int(s) for s in bhav[
-                        (bhav["symbol"].isin([s.upper() for s in SYMBOLS]))
-                        & (bhav["instrument"] == "OPTSTK")
-                        & (bhav["expiry"] == pd.Timestamp(exp))
-                    ]["strike"].dropna().tolist()
+                    int(k) for k in bhav.loc[mask, "strike"].dropna().tolist()
                 })
             except Exception as e:
                 print(f"  ⚠ bhavcopy pre-warm {exp} failed ({type(e).__name__})")
