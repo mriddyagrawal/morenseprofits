@@ -689,6 +689,33 @@ def render_cell_drilldown(
         _render_skipped_section(cell_skips)
         return
 
+    # ---- Selected Cell rule card -----------------------------
+    # Mirrors the design/Complete mockup's left-card. Surfaces the
+    # rule's deployment-spec fields (strategy × symbol, entry/exit
+    # offsets, strike rule) in one place so the analyst can read the
+    # whole rule without context-switching. Taking a screenshot of
+    # this block documents the trading rule for the trade journal.
+    with st.container(border=True):
+        st.caption("SELECTED CELL")
+        st.markdown(f"**{strategy}** × **{symbol}**")
+        rc1, rc2, rc3 = st.columns([1, 1, 2])
+        rc1.markdown(f"**Entry offset**  \nT-{entry_td}")
+        rc2.markdown(f"**Exit offset**  \nT-{exit_td}")
+        # Strike rule — read from strategy registry so the wording
+        # stays in sync with what generate_trades actually picks.
+        try:
+            from src.strategies.registry import get_strategy
+            sample_params = rows.iloc[0].get("params_json", "{}") if len(rows) else "{}"
+            import json
+            try:
+                params_dict = json.loads(sample_params) if isinstance(sample_params, str) else {}
+            except (ValueError, TypeError):
+                params_dict = {}
+            strike_rule = get_strategy(strategy).display_strike_rule(params_dict)
+        except Exception:
+            strike_rule = "—"
+        rc3.markdown(f"**Strike rule**  \n{strike_rule}")
+
     # ---- Summary stats row -----------------------------------
     from src.web._format import format_inr
     n = len(rows)
