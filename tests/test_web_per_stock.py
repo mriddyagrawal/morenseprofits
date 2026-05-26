@@ -35,12 +35,14 @@ def captured_metrics(monkeypatch):
 
 
 def _row(strategy="A", symbol="X", net_pnl=100.0,
-         roi_pct=1.0, roi_pct_annualized=12.0,
+         roi_pct=1.0,
          entry=15, exit_=1):
+    """Per-trade ROI per p7.expiry_roi. The aggregate function
+    requires ``roi_pct_annualized`` as input, so we synthesize one."""
     return {
         "strategy": strategy, "symbol": symbol,
         "net_pnl": net_pnl, "roi_pct": roi_pct,
-        "roi_pct_annualized": roi_pct_annualized,
+        "roi_pct_annualized": roi_pct * 12.0,
         "entry_offset_td": entry, "exit_offset_td": exit_,
     }
 
@@ -83,14 +85,14 @@ def test_top_strategy_picked_by_median_ann_roi(captured_metrics):
     """3 strategies on RELIANCE: A median=10%, B median=30%, C median=20%.
     Top strategy card → B."""
     rows = (
-        [_row(strategy="A", symbol="RELIANCE", roi_pct_annualized=10.0)] * 6 +
-        [_row(strategy="B", symbol="RELIANCE", roi_pct_annualized=30.0)] * 6 +
-        [_row(strategy="C", symbol="RELIANCE", roi_pct_annualized=20.0)] * 6
+        [_row(strategy="A", symbol="RELIANCE", roi_pct=10.0)] * 6 +
+        [_row(strategy="B", symbol="RELIANCE", roi_pct=30.0)] * 6 +
+        [_row(strategy="C", symbol="RELIANCE", roi_pct=20.0)] * 6
     )
     render_headline(pd.DataFrame(rows), symbol="RELIANCE", min_n=5)
     top = captured_metrics[0]
     assert top["value"] == "B"
-    assert "+30.0%/yr" in top["delta"]
+    assert "+30.0%" in top["delta"]
 
 
 def test_symbol_win_rate_card_format_is_percentage(captured_metrics):
@@ -119,9 +121,9 @@ def test_strategies_above_benchmark_count(captured_metrics):
     """Of 3 strategies, 2 with median ann ROI > 0, 1 with < 0 →
     '2/3' value, subtitle names the benchmark."""
     rows = (
-        [_row(strategy="A", symbol="X", roi_pct_annualized=10.0)] * 6 +
-        [_row(strategy="B", symbol="X", roi_pct_annualized=20.0)] * 6 +
-        [_row(strategy="C", symbol="X", roi_pct_annualized=-5.0)] * 6
+        [_row(strategy="A", symbol="X", roi_pct=10.0)] * 6 +
+        [_row(strategy="B", symbol="X", roi_pct=20.0)] * 6 +
+        [_row(strategy="C", symbol="X", roi_pct=-5.0)] * 6
     )
     render_headline(pd.DataFrame(rows), symbol="X", min_n=5)
     benchmark = captured_metrics[3]
@@ -197,9 +199,9 @@ def test_dashboard_sort_order_median_ann_roi_desc(captured_dash):
     """Cards sorted by median ann ROI DESC so visually-best appears
     top-left of the grid."""
     rows = (
-        [_row(strategy="A", symbol="X", roi_pct_annualized=10.0)] * 6 +
-        [_row(strategy="B", symbol="X", roi_pct_annualized=40.0)] * 6 +
-        [_row(strategy="C", symbol="X", roi_pct_annualized=25.0)] * 6
+        [_row(strategy="A", symbol="X", roi_pct=10.0)] * 6 +
+        [_row(strategy="B", symbol="X", roi_pct=40.0)] * 6 +
+        [_row(strategy="C", symbol="X", roi_pct=25.0)] * 6
     )
     render_strategy_dashboard(pd.DataFrame(rows), symbol="X", min_n=5)
     headings = [

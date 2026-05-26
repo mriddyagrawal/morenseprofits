@@ -33,13 +33,16 @@ def captured_metrics(monkeypatch):
 
 
 def _row(strategy="S", symbol="X", year=2024, month=1,
-         net_pnl=100.0, roi_pct=1.0, roi_pct_annualized=12.0):
+         net_pnl=100.0, roi_pct=1.0):
+    """Build a minimal trends-row dict. Per-trade ROI per
+    p7.expiry_roi; aggregate function still REQUIRES
+    ``roi_pct_annualized`` as input column so we synthesize it."""
     return {
         "strategy": strategy, "symbol": symbol,
         "expiry": pd.Timestamp(f"{year}-{month:02d}-15"),
         "entry_offset_td": 15, "exit_offset_td": 1,
         "net_pnl": net_pnl, "roi_pct": roi_pct,
-        "roi_pct_annualized": roi_pct_annualized,
+        "roi_pct_annualized": roi_pct * 12.0,
     }
 
 
@@ -79,36 +82,36 @@ def test_no_trades_for_selected_pair_renders_dashes(captured_metrics):
 # ============================================================
 
 def test_best_and_worst_month_identified(captured_metrics):
-    """Jan is best (50%/yr), Mar is worst (-20%/yr). Each month
+    """Jan is best (50%), Mar is worst (-20%). Each month
     has N=6 trades (above min_n=5)."""
     rows = (
-        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
-        [_row(year=2024, month=2, roi_pct_annualized=20.0)] * 6 +
-        [_row(year=2024, month=3, roi_pct_annualized=-20.0)] * 6
+        [_row(year=2024, month=1, roi_pct=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct=20.0)] * 6 +
+        [_row(year=2024, month=3, roi_pct=-20.0)] * 6
     )
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     best = captured_metrics[0]
     worst = captured_metrics[1]
-    assert "+50.0%/yr" in best["value"]
+    assert "+50.0%" in best["value"]
     # After cleanup-2: month rendered as "Jan" / "Feb" / ... via _MONTH_LABELS
     assert "Jan" in best["delta"]
-    assert "-20.0%/yr" in worst["value"]
+    assert "-20.0%" in worst["value"]
     assert "Mar" in worst["delta"]
 
 
 def test_tightest_month_std_card_identifies_lowest_std(captured_metrics):
     """Month with the smallest std_roi_pct_annualized = tightest."""
     rows = (
-        # month 1: 6 identical trades at 30%/yr → std=0
-        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 6 +
+        # month 1: 6 identical trades at 30% → std=0
+        [_row(year=2024, month=1, roi_pct=30.0)] * 6 +
         # month 2: varied trades → larger std
-        [_row(year=2024, month=2, roi_pct_annualized=10.0)] * 3 +
-        [_row(year=2024, month=2, roi_pct_annualized=50.0)] * 3
+        [_row(year=2024, month=2, roi_pct=10.0)] * 3 +
+        [_row(year=2024, month=2, roi_pct=50.0)] * 3
     )
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     tightest = captured_metrics[2]
-    # Month 1's std = 0 → "±0.0%/yr"; subtitle names "Jan" (post-cleanup-2)
-    assert "±0.0%/yr" in tightest["value"]
+    # Month 1's std = 0 → "±0.0%"; subtitle names "Jan" (post-cleanup-2)
+    assert "±0.0%" in tightest["value"]
     assert "Jan" in tightest["delta"]
     assert "consistent" in tightest["delta"].lower()
 
@@ -117,14 +120,14 @@ def test_latest_year_roi_with_prior_year_delta(captured_metrics):
     """2024 latest year, prior was 2023 — subtitle shows "vs 2023:
     +X.X pp" (percentage points delta)."""
     rows = (
-        # 2023: median 20%/yr
-        [_row(year=2023, month=1, roi_pct_annualized=20.0)] * 6 +
-        # 2024: median 50%/yr → +30 pp vs 2023
-        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6
+        # 2023: median 20%
+        [_row(year=2023, month=1, roi_pct=20.0)] * 6 +
+        # 2024: median 50% → +30 pp vs 2023
+        [_row(year=2024, month=1, roi_pct=50.0)] * 6
     )
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     latest = captured_metrics[3]
-    assert "+50.0%/yr" in latest["value"]
+    assert "+50.0%" in latest["value"]
     assert "2024" in latest["delta"]
     assert "vs 2023" in latest["delta"]
     assert "+30.0 pp" in latest["delta"]
@@ -133,10 +136,10 @@ def test_latest_year_roi_with_prior_year_delta(captured_metrics):
 def test_latest_year_card_single_year_omits_delta(captured_metrics):
     """Only one eligible year → "no prior year for delta" subtitle.
     NEVER a fake +0 pp."""
-    rows = [_row(year=2024, month=1, roi_pct_annualized=25.0)] * 6
+    rows = [_row(year=2024, month=1, roi_pct=25.0)] * 6
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     latest = captured_metrics[3]
-    assert "+25.0%/yr" in latest["value"]
+    assert "+25.0%" in latest["value"]
     assert "no prior year" in latest["delta"]
 
 
@@ -145,8 +148,8 @@ def test_all_months_below_min_n_dashes_for_month_cards(captured_metrics):
     yearly card may still render IF year-level n ≥ min_n."""
     rows = (
         # 3 trades in month 1 (below min_n=5)
-        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 3 +
-        [_row(year=2024, month=2, roi_pct_annualized=10.0)] * 2
+        [_row(year=2024, month=1, roi_pct=50.0)] * 3 +
+        [_row(year=2024, month=2, roi_pct=10.0)] * 2
         # Total across months = 5 → year-level passes min_n=5
     )
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
@@ -200,7 +203,7 @@ def test_yoy_single_year_renders_empty_state(captured_charts):
     → trends_yoy_single_year message; NO plotly chart rendered (a
     one-point "line" isn't a trend)."""
     # 6 trades all in 2024 → 1 eligible year only
-    rows = [_row(year=2024, month=1, roi_pct_annualized=20.0)] * 6
+    rows = [_row(year=2024, month=1, roi_pct=20.0)] * 6
     render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     kinds = [e["kind"] for e in captured_charts]
     assert "info" in kinds
@@ -213,8 +216,8 @@ def test_yoy_two_years_renders_line(captured_charts):
     """≥2 eligible years → real plotly_chart; line connects per-year
     medians."""
     rows = (
-        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 6 +
-        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 6
+        [_row(year=2023, month=1, roi_pct=15.0)] * 6 +
+        [_row(year=2024, month=1, roi_pct=30.0)] * 6
     )
     render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
@@ -230,8 +233,8 @@ def test_yoy_thin_years_suppressed(captured_charts):
     If only 1 year clears threshold, single-year empty-state fires."""
     rows = (
         # 2023 has N=2 (below min_n=5) — should be suppressed
-        [_row(year=2023, month=1, roi_pct_annualized=99.0)] * 2 +
-        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 6
+        [_row(year=2023, month=1, roi_pct=99.0)] * 2 +
+        [_row(year=2024, month=1, roi_pct=30.0)] * 6
     )
     render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     kinds = [e["kind"] for e in captured_charts]
@@ -245,8 +248,8 @@ def test_yoy_hover_surfaces_n_per_year(captured_charts):
     hover MUST surface N alongside the median so operator distinguishes
     real drift from thin-sample noise."""
     rows = (
-        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 6 +
-        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 24
+        [_row(year=2023, month=1, roi_pct=15.0)] * 6 +
+        [_row(year=2024, month=1, roi_pct=30.0)] * 24
     )
     render_yoy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     trace = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"].data[0]
@@ -283,7 +286,7 @@ def test_yoy_n_silent_on_single_year(captured_charts):
     single-year branch — the main yoy already showed the empty-state
     message; duplicating it via a second info box would be banner
     blindness. yoy_n stays silent here per DESIGN_SPEC §10 reading."""
-    rows = [_row(year=2024, month=1, roi_pct_annualized=20.0)] * 6
+    rows = [_row(year=2024, month=1, roi_pct=20.0)] * 6
     render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     assert len(captured_charts) == 0
 
@@ -307,8 +310,8 @@ def test_yoy_n_renders_two_traces_on_multi_year_data(captured_charts):
     """Two eligible years → exactly one Plotly figure with 2 traces:
     Bar (sample size) + Scatter (win rate)."""
     rows = (
-        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 8 +
-        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 12
+        [_row(year=2023, month=1, roi_pct=15.0)] * 8 +
+        [_row(year=2024, month=1, roi_pct=30.0)] * 12
     )
     render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
@@ -326,8 +329,8 @@ def test_yoy_n_win_rate_yaxis_bounded_0_100(captured_charts):
     Plotly auto-zoom on (95%, 100%) would mid-color a 4-pp difference
     as visually dramatic."""
     rows = (
-        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 8 +
-        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 12
+        [_row(year=2023, month=1, roi_pct=15.0)] * 8 +
+        [_row(year=2024, month=1, roi_pct=30.0)] * 12
     )
     render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     fig = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"]
@@ -341,8 +344,8 @@ def test_yoy_n_bar_heights_match_sample_sizes(captured_charts):
     pin so a future refactor that swaps in mean_n_trades silently
     is caught."""
     rows = (
-        [_row(year=2023, month=1, roi_pct_annualized=15.0)] * 8 +
-        [_row(year=2024, month=1, roi_pct_annualized=30.0)] * 12
+        [_row(year=2023, month=1, roi_pct=15.0)] * 8 +
+        [_row(year=2024, month=1, roi_pct=30.0)] * 12
     )
     render_yoy_n(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     fig = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"]
@@ -358,7 +361,7 @@ def test_yoy_n_bar_heights_match_sample_sizes(captured_charts):
 def test_moy_single_month_renders_empty_state(captured_charts):
     """LOAD-BEARING per DESIGN_SPEC §2.6: <2 distinct eligible
     months → trends_moy_single_month message; NO bar chart."""
-    rows = [_row(year=2024, month=1, roi_pct_annualized=20.0)] * 6
+    rows = [_row(year=2024, month=1, roi_pct=20.0)] * 6
     render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     kinds = [e["kind"] for e in captured_charts]
     assert "info" in kinds
@@ -370,9 +373,9 @@ def test_moy_single_month_renders_empty_state(captured_charts):
 def test_moy_multi_month_renders_bar(captured_charts):
     """≥2 eligible months → real bar chart with month-labelled x-axis."""
     rows = (
-        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
-        [_row(year=2024, month=2, roi_pct_annualized=20.0)] * 6 +
-        [_row(year=2024, month=3, roi_pct_annualized=-10.0)] * 6
+        [_row(year=2024, month=1, roi_pct=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct=20.0)] * 6 +
+        [_row(year=2024, month=3, roi_pct=-10.0)] * 6
     )
     render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
@@ -389,8 +392,8 @@ def test_moy_bars_colored_by_value_with_zmid_zero(captured_charts):
     around zero — red for losing months, green for winning. cmid=0
     pinned so a future refactor that swaps to sequential is caught."""
     rows = (
-        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
-        [_row(year=2024, month=2, roi_pct_annualized=-30.0)] * 6
+        [_row(year=2024, month=1, roi_pct=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct=-30.0)] * 6
     )
     render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     bar = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"].data[0]
@@ -404,8 +407,8 @@ def test_moy_hover_surfaces_n_per_month(captured_charts):
     """Same N-discipline as YoY hover: customdata carries N so
     seasonality calls can be cross-checked against sample size."""
     rows = (
-        [_row(year=2024, month=1, roi_pct_annualized=50.0)] * 6 +
-        [_row(year=2024, month=2, roi_pct_annualized=20.0)] * 8
+        [_row(year=2024, month=1, roi_pct=50.0)] * 6 +
+        [_row(year=2024, month=2, roi_pct=20.0)] * 8
     )
     render_moy(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     bar = next(e for e in captured_charts if e["kind"] == "plotly_chart")["fig"].data[0]
@@ -431,8 +434,8 @@ def test_moy_silent_on_empty_or_missing_pair(captured_charts):
 
 
 def test_naming_rule_pct_cards_have_percent_suffix(captured_metrics):
-    """LOAD-BEARING §2.5: best/worst/latest values end in % or %/yr."""
-    rows = [_row(year=2024, month=1, roi_pct_annualized=42.0)] * 6
+    """LOAD-BEARING §2.5: best/worst/latest values end in % or %."""
+    rows = [_row(year=2024, month=1, roi_pct=42.0)] * 6
     render_headline(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     for m in captured_metrics:
         if m["value"] != "—":

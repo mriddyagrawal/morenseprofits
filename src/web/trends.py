@@ -8,9 +8,9 @@ picked via in-tab selectors — a trend across multiple pairs
 averages out the signal we're looking for.
 
 §2.5 Trends row:
-  BEST MONTH        summarize_by_month top row by median ann ROI
+  BEST MONTH        summarize_by_month top row by median per-trade ROI
   WORST MONTH       bottom row
-  TIGHTEST MONTH STD  summarize_by_month std_roi_pct_annualized.idxmin()
+  TIGHTEST MONTH STD  summarize_by_month std_roi_pct.idxmin()
   LATEST YEAR ROI   summarize_by_year most-recent-year median
                     + subtitle: "vs prior year ±X.X pp"
 """
@@ -120,12 +120,12 @@ def render_headline(
     with cols[0]:
         if len(monthly_eligible) > 0:
             best = monthly_eligible.loc[
-                monthly_eligible["median_roi_pct_annualized"].idxmax()
+                monthly_eligible["median_roi_pct"].idxmax()
             ]
             st.metric(
                 "Best month",
-                format_pct(best["median_roi_pct_annualized"],
-                           signed=True, annualized=True),
+                format_pct(best["median_roi_pct"],
+                           signed=True),
                 f"{_MONTH_LABELS[int(best['month']) - 1]} (N={int(best['n_trades'])})",
                 delta_color="off",
             )
@@ -138,12 +138,12 @@ def render_headline(
     with cols[1]:
         if len(monthly_eligible) > 0:
             worst = monthly_eligible.loc[
-                monthly_eligible["median_roi_pct_annualized"].idxmin()
+                monthly_eligible["median_roi_pct"].idxmin()
             ]
             st.metric(
                 "Worst month",
-                format_pct(worst["median_roi_pct_annualized"],
-                           signed=True, annualized=True),
+                format_pct(worst["median_roi_pct"],
+                           signed=True),
                 f"{_MONTH_LABELS[int(worst['month']) - 1]} (N={int(worst['n_trades'])})",
                 delta_color="off",
             )
@@ -156,12 +156,12 @@ def render_headline(
     with cols[2]:
         if len(monthly_eligible) > 0:
             tightest = monthly_eligible.loc[
-                monthly_eligible["std_roi_pct_annualized"].idxmin()
+                monthly_eligible["std_roi_pct"].idxmin()
             ]
-            std_val = float(tightest["std_roi_pct_annualized"])
+            std_val = float(tightest["std_roi_pct"])
             st.metric(
                 "Tightest month std",
-                f"±{std_val:.1f}%/yr",
+                f"±{std_val:.1f}%",
                 f"{_MONTH_LABELS[int(tightest['month']) - 1]} (most consistent)",
                 delta_color="off",
             )
@@ -174,13 +174,13 @@ def render_headline(
     with cols[3]:
         if len(yearly_eligible) >= 1:
             latest = yearly_eligible.sort_values("year").iloc[-1]
-            latest_val = float(latest["median_roi_pct_annualized"])
-            value_str = format_pct(latest_val, signed=True, annualized=True)
+            latest_val = float(latest["median_roi_pct"])
+            value_str = format_pct(latest_val, signed=True)
             # "vs prior year ±X.X pp" subtitle requires ≥2 years
             if len(yearly_eligible) >= 2:
                 prior = yearly_eligible.sort_values("year").iloc[-2]
                 delta_pp = (latest_val
-                            - float(prior["median_roi_pct_annualized"]))
+                            - float(prior["median_roi_pct"]))
                 sign = "+" if delta_pp >= 0 else ""
                 subtitle = (
                     f"{int(latest['year'])} (vs {int(prior['year'])}: "
@@ -211,7 +211,7 @@ def render_yoy(
     symbol: Optional[str],
     min_n: int,
 ) -> None:
-    """Plotly line chart: median_roi_pct_annualized over years for
+    """Plotly line chart: median_roi_pct over years for
     one (strategy, symbol) pair. Years with N < min_n excluded.
 
     Empty-state per DESIGN_SPEC §2.6: <2 distinct eligible years →
@@ -237,7 +237,7 @@ def render_yoy(
         return
 
     years = eligible["year"].astype(int).tolist()
-    medians = eligible["median_roi_pct_annualized"].astype(float).tolist()
+    medians = eligible["median_roi_pct"].astype(float).tolist()
     n_per_year = eligible["n_trades"].astype(int).tolist()
 
     # Neutral steelblue — was green before, but that miscolored
@@ -256,7 +256,7 @@ def render_yoy(
         customdata=[[n] for n in n_per_year],
         hovertemplate=(
             "<b>%{x}</b><br>"
-            "Median ROI/yr: %{y:+.1f}%<br>"
+            "Median ROI: %{y:+.1f}%<br>"
             "N: %{customdata[0]}"
             "<extra></extra>"
         ),
@@ -265,9 +265,9 @@ def render_yoy(
     # drift on a chart auto-zoomed to [40%, 60%] reads more dramatic
     # than the underlying data warrants.
     fig.update_layout(
-        title=f"YoY median ROI/yr — {strategy} × {symbol}",
+        title=f"YoY median ROI — {strategy} × {symbol}",
         xaxis_title="Year",
-        yaxis_title="Median ROI/yr (%)",
+        yaxis_title="Median ROI (%)",
         height=380,
         margin=dict(l=60, r=40, t=50, b=50),
         showlegend=False,
@@ -379,7 +379,7 @@ def render_moy(
     symbol: Optional[str],
     min_n: int,
 ) -> None:
-    """Plotly bar chart of median_roi_pct_annualized by calendar
+    """Plotly bar chart of median_roi_pct by calendar
     month (Jan-Dec, folded across years) for one (strategy, symbol)
     pair. Months with N < min_n excluded.
 
@@ -407,7 +407,7 @@ def render_moy(
         return
 
     months = eligible["month"].astype(int).tolist()
-    medians = eligible["median_roi_pct_annualized"].astype(float).tolist()
+    medians = eligible["median_roi_pct"].astype(float).tolist()
     n_per_month = eligible["n_trades"].astype(int).tolist()
     labels = [_MONTH_LABELS[m - 1] for m in months]
 
@@ -418,7 +418,7 @@ def render_moy(
             color=medians,           # color BY value
             colorscale="RdYlGn",     # diverging per §2.3
             cmid=0,                  # white at breakeven
-            colorbar=dict(title="%/yr", x=1.02),
+            colorbar=dict(title="%", x=1.02),
         ),
         # Show N per bar in the hover so a "best month" call can be
         # cross-checked against sample size (same discipline as YoY
@@ -426,7 +426,7 @@ def render_moy(
         customdata=[[n] for n in n_per_month],
         hovertemplate=(
             "<b>%{x}</b><br>"
-            "Median ROI/yr: %{y:+.1f}%<br>"
+            "Median ROI: %{y:+.1f}%<br>"
             "N: %{customdata[0]}"
             "<extra></extra>"
         ),
@@ -441,7 +441,7 @@ def render_moy(
     fig.update_layout(
         title=f"Month-of-year seasonality — {strategy} × {symbol}",
         xaxis_title="Month",
-        yaxis_title="Median ROI/yr (%)",
+        yaxis_title="Median ROI (%)",
         height=420,
         margin=dict(l=60, r=60, t=50, b=50),
         showlegend=False,

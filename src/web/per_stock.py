@@ -14,10 +14,10 @@ is navigation-within-filter only. Resolves the "two sources of
 truth" hazard.
 
 §2.5 Per-stock row:
-  TOP STRATEGY         best median_roi_pct_annualized for selected symbol
+  TOP STRATEGY         best median_roi_pct for selected symbol
   SYMBOL WIN RATE      overall win rate for the symbol
   SYMBOL TOTAL P&L     sum of net_pnl for the symbol
-  STRATEGIES ABOVE BENCHMARK  count where median ann ROI > 0
+  STRATEGIES ABOVE BENCHMARK  count where median per-trade ROI > 0
 """
 from __future__ import annotations
 
@@ -128,12 +128,12 @@ def render_headline(
     with cols[0]:
         if len(eligible) > 0:
             top = eligible.loc[
-                eligible["median_roi_pct_annualized"].idxmax()
+                eligible["median_roi_pct"].idxmax()
             ]
             st.metric(
                 "Top strategy",
                 str(top["strategy"]),
-                f"{format_pct(top['median_roi_pct_annualized'], signed=True, annualized=True)} median ann.",
+                f"{format_pct(top['median_roi_pct'], signed=True)} median ROI",
                 delta_color="off",
             )
         else:
@@ -170,12 +170,12 @@ def render_headline(
 
     # === Card 4 — STRATEGIES ABOVE BENCHMARK ==============
     n_strats_total = int(len(summary))
-    n_above = int((summary["median_roi_pct_annualized"] > 0).sum())
+    n_above = int((summary["median_roi_pct"] > 0).sum())
     with cols[3]:
         st.metric(
             "Strategies above benchmark",
             f"{n_above}/{n_strats_total}",
-            "median ann ROI > 0% (breakeven)",
+            "median per-trade ROI > 0% (breakeven)",
             delta_color="off",
         )
 
@@ -229,7 +229,7 @@ def render_strategy_dashboard(
     min_n: int,
 ) -> None:
     """Per-symbol small-multiples grid: one card per strategy. Each
-    card shows N, win %, median ann ROI, and a sparkline of the
+    card shows N, win %, median per-trade ROI, and a sparkline of the
     per-trade net_pnl series.
 
     Cards laid out _CARDS_PER_ROW per row.
@@ -247,11 +247,11 @@ def render_strategy_dashboard(
         st.info(f"No trades for {symbol} in this sweep.")
         return
 
-    # One row per strategy for this symbol; sort by median ann ROI DESC
+    # One row per strategy for this symbol; sort by median per-trade ROI DESC
     # so the visually-most-interesting cards are top-left.
     summary = summarize_by_stock_strategy(sym_df)
     summary = summary.sort_values(
-        "median_roi_pct_annualized", ascending=False,
+        "median_roi_pct", ascending=False,
     ).reset_index(drop=True)
 
     if len(summary) == 0:
@@ -279,9 +279,9 @@ def render_strategy_dashboard(
                     st.caption("Win %")
                     st.markdown(f"**{format_pct(row['win_rate_pct'])}**")
                 with sub[2]:
-                    st.caption("Median ROI/yr")
+                    st.caption("Median ROI")
                     st.markdown(
-                        f"**{format_pct(row['median_roi_pct_annualized'], signed=True, annualized=True)}**"
+                        f"**{format_pct(row['median_roi_pct'], signed=True)}**"
                     )
                 # Sparkline of this strategy's per-trade net_pnl
                 strat_trades = sym_df[sym_df["strategy"] == strat]
