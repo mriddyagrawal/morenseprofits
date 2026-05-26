@@ -15,9 +15,16 @@ import pandas as pd
 
 # Threshold defaults — defended in the docstrings on each detector.
 # Exposed as module constants so future tuning lands in one place.
-HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS = 20.0
-OUTLIER_CARRY_PNL_SHARE = 0.50
-INSTABILITY_STD_TO_MEDIAN_RATIO = 3.0
+#
+# Per p7.expiry_roi: thresholds are calibrated against PER-TRADE ROI
+# (not annualized). The earlier 20-pt heavy-tail threshold was tuned
+# for annualized %; under per-trade scale (~1/12 of annualized for
+# typical monthly holds) a 20-pt gap would essentially never fire.
+# Dropped to 3.0 pts so the detector remains meaningfully responsive
+# to skew on per-trade ROI distributions.
+HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS = 3.0
+OUTLIER_CARRY_PNL_SHARE = 0.50           # scale-invariant (ratio of |P&L|)
+INSTABILITY_STD_TO_MEDIAN_RATIO = 3.0    # scale-invariant (ratio)
 
 
 def interpret_cell_stats(rows: pd.DataFrame) -> list[str]:
@@ -41,12 +48,13 @@ def interpret_cell_stats(rows: pd.DataFrame) -> list[str]:
     public surface stays tiny — one input, one output):
 
       1. Heavy-tail signal: ``mean − median ≥ HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS``
-         (default 20 pts). For short-vol strategies, mean >> median means
+         (default 3.0 pts; calibrated for PER-TRADE ROI scale per
+         p7.expiry_roi). For short-vol strategies, mean >> median means
          winners cluster near the mode but losers are deep — i.e. tail
          risk hidden under a benign median. The threshold is in ROI-pct
-         points (annualized), not a ratio, because the absolute gap is
-         the operator's intuition: "the average expected value is N pts
-         higher than the typical outcome — that gap is the tail."
+         points, not a ratio, because the absolute gap is the operator's
+         intuition: "the average expected value is N pts higher than the
+         typical outcome — that gap is the tail."
 
       2. Outlier-carry: a single trade's net_pnl is ≥ OUTLIER_CARRY_PNL_
          SHARE of the cell's TOTAL net_pnl. Threshold default 0.50 — one
