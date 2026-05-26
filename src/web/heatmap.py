@@ -395,6 +395,16 @@ def render_heatmaps(
         yaxis_title="Entry offset",
         height=400,
         margin=dict(l=60, r=60, t=50, b=50),
+        # Phase-7 fix: Plotly heatmap traces emit ``plotly_click`` but
+        # not ``plotly_selected`` on a single-click; Streamlit's
+        # ``on_select="rerun"`` listens primarily for ``plotly_selected``.
+        # Putting the chart into select-mode by default lets a 1-pixel
+        # click register as a 1-cell box-select, so the drill-down fires.
+        # If a future Plotly release changes heatmap click semantics and
+        # this becomes a no-op, the documented fallback is the
+        # streamlit-plotly-events package (see commit body).
+        dragmode="select",
+        clickmode="event+select",
     )
 
     # === Right pane — sample density (sequential blues) ====
@@ -441,6 +451,14 @@ def render_heatmaps(
             key="mp_heatmap_value_chart",
             on_select="rerun",
             selection_mode="points",
+            # Surface the box / lasso select buttons in the modebar so
+            # operators who prefer explicit drag-selection over click
+            # have the tools visible. ``displaylogo=False`` drops the
+            # Plotly-logo button (just clutter for an internal tool).
+            config={
+                "modeBarButtonsToAdd": ["select2d", "lasso2d"],
+                "displaylogo": False,
+            },
         )
         _capture_cell_selection(selected)
     with cols[1]:

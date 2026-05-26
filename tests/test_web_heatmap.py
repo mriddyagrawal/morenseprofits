@@ -173,7 +173,7 @@ def captured_charts(monkeypatch):
         return [_NullCtx() for _ in range(n)]
 
     def fake_plotly_chart(fig, **kw):
-        events.append({"kind": "plotly_chart", "fig": fig})
+        events.append({"kind": "plotly_chart", "fig": fig, "kwargs": kw})
 
     def fake_info(msg, **_):
         events.append({"kind": "info", "msg": msg})
@@ -389,3 +389,47 @@ def test_naming_rule_values_have_percent_suffix(captured_metrics):
             assert "%" in m["value"]
             # Bare "₹" should never appear in a percentage card
             assert "₹" not in m["value"]
+
+
+# ============================================================
+# fix(p7.heatmap.click): value pane must enter select-mode so clicks
+# register as 1-cell box-selects and fire on_select="rerun" — the
+# drill-down depended on this.
+# ============================================================
+
+def test_value_pane_layout_is_select_mode(captured_charts):
+    """Pinned at render time: dragmode=select + clickmode=event+select
+    on the value pane's layout. Without these, a single click on a
+    heatmap cell emits plotly_click but not plotly_selected — and
+    streamlit's on_select listens for the latter."""
+    rows = []
+    for e in (15, 10, 5):
+        for x in (3, 1):
+            for _ in range(6):
+                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+
+    charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
+    value_fig = charts[0]["fig"]
+    assert value_fig.layout.dragmode == "select"
+    assert value_fig.layout.clickmode == "event+select"
+
+
+def test_value_pane_config_exposes_select_tools(captured_charts):
+    """Modebar surface: box-select + lasso buttons added, Plotly logo
+    suppressed. Gives the operator a visible affordance for explicit
+    drag-selection if click-to-select isn't intuitive."""
+    rows = []
+    for e in (15, 10, 5):
+        for x in (3, 1):
+            for _ in range(6):
+                rows.append(_row(entry=e, exit_=x, roi_pct_annualized=50.0))
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+
+    charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
+    value_kwargs = charts[0]["kwargs"]
+    assert "config" in value_kwargs
+    cfg = value_kwargs["config"]
+    assert "select2d" in cfg["modeBarButtonsToAdd"]
+    assert "lasso2d" in cfg["modeBarButtonsToAdd"]
+    assert cfg["displaylogo"] is False
