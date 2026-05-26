@@ -35,6 +35,7 @@ sys.path.insert(0, str(REPO))
 from tqdm import tqdm  # noqa: E402
 
 from src.data import bhavcopy_fo_loader, expiry_calendar, options_loader, spot_loader, trading_calendar  # noqa: E402
+from src.data.strike_planner import strikes_around_spot_hybrid  # noqa: E402
 from src.data.errors import MissingDataError  # noqa: E402
 
 
@@ -48,7 +49,12 @@ DEFAULT_SYMBOLS = [
     "SBIN",       "AXISBANK",   "KOTAKBANK",  "BHARTIARTL", "LT",
 ]
 
-DEFAULT_STRIKES_PER_SIDE = 6   # ATM + 6 above + 6 below = 13 strikes
+DEFAULT_STRIKES_PER_SIDE = 6      # min strikes each side of ATM (per-day rule)
+DEFAULT_STRIKES_PCT = 0.05        # min %-of-spot window around ATM (per-day rule)
+DEFAULT_ENTRY_WINDOW_DAYS = 70    # calendar days back from expiry to scan spot
+                                  # (~45 trading days; the sweep's T-45..T-1 grid
+                                  # depth — strikes the strategy could pick across
+                                  # any entry in that window must be cached)
 DEFAULT_START = date(2024, 5, 1)
 DEFAULT_END = date(2026, 5, 31)
 TODAY_FN = lambda: date(2026, 5, 25)
@@ -82,44 +88,30 @@ def _pick_reference_day(expiry: date, bhavcopy_dates: list[date]) -> date | None
     return None
 
 
-def _strikes_around_atm(strike_grid: list[int], spot: float, per_side: int) -> list[int]:
-    """Pick ``2*per_side + 1`` strikes from ``strike_grid`` centered
-    on ``spot``: the ATM strike (nearest to spot) plus per_side strikes
-    above and below.
-
-    Edge cases:
-      - Grid has fewer than 2*per_side+1 strikes → return all of them.
-      - ATM is near the edge of the grid → still return up to
-        2*per_side+1 strikes (just biased to the available side).
-    """
-    if not strike_grid:
-        return []
-    sorted_strikes = sorted(strike_grid)
-    # Find ATM index (nearest to spot)
-    atm_idx = min(
-        range(len(sorted_strikes)),
-        key=lambda i: (abs(sorted_strikes[i] - spot), sorted_strikes[i]),
-    )
-    lo = max(0, atm_idx - per_side)
-    hi = min(len(sorted_strikes), atm_idx + per_side + 1)
-    return sorted_strikes[lo:hi]
-
-
 # ============================================================
 # Per-pair worker — used by both the serial loop and mp.Pool.
 # Module-level (not closure) so mp.spawn can pickle it.
 # ============================================================
 def _process_pair(args_tuple: tuple) -> tuple[int, int, int, list]:
-    """Process one (symbol, expiry) pair: pick strikes around the
-    reference-day ATM, fetch CE + PE for each, return per-pair counts +
-    skip-log entries. Catches every exception locally so a Pool worker
-    can't bring down the whole prefetch on a single bad contract.
+    """Process one (symbol, expiry) pair: scan the spot history across
+    the entry window, compute hybrid (N per side, X% range) strikes per
+    day, union the picks, fetch CE + PE for the union. Catches every
+    exception locally so a Pool worker can't bring down the whole
+    prefetch on a single bad contract.
 
-    args_tuple: (symbol, expiry, strikes_per_side, today_iso) — all
-    primitives so multiprocessing.spawn pickling works on macOS.
+    Why daily-union: the sweep prices entries up to T-45 days before
+    expiry using THAT day's spot to pick the strategy's strike (SPECS
+    §5). When spot drifts across the window, the strikes the strategy
+    picks span a wider range than any single reference day's ATM ± N.
+    Union'ing over the window guarantees cache coverage for every cell
+    the sweep will price.
+
+    args_tuple: (symbol, expiry, strikes_per_side, strikes_pct,
+    entry_window_days, today_iso) — all primitives so
+    multiprocessing.spawn pickling works on macOS.
     """
     import pandas as pd  # worker-local; spawn re-imports anyway
-    sym, exp, strikes_per_side, today_iso = args_tuple
+    sym, exp, strikes_per_side, strikes_pct, entry_window_days, today_iso = args_tuple
     today_fn = lambda: date.fromisoformat(today_iso)
 
     n_fetched = 0
@@ -128,16 +120,17 @@ def _process_pair(args_tuple: tuple) -> tuple[int, int, int, list]:
     skips: list[tuple[str, date, int, str, str]] = []
 
     try:
-        # Walk back from expiry-1d to find a usable bhavcopy.
+        # Walk back from expiry-1d to find a usable bhavcopy as the
+        # canonical strike grid. (Strikes only get added over time, so
+        # the near-expiry bhavcopy has the superset of strikes the
+        # strategy could possibly pick across the entry window.)
         bc = None
-        ref_day = exp - timedelta(days=1)
         for delta in range(1, 10):
             cand = exp - timedelta(days=delta)
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     bc = bhavcopy_fo_loader.load_bhavcopy_fo(cand)
-                ref_day = cand
                 break
             except MissingDataError:
                 continue
@@ -156,13 +149,29 @@ def _process_pair(args_tuple: tuple) -> tuple[int, int, int, list]:
             skips.append((sym, exp, 0, "all", "no strikes in bhavcopy"))
             return 0, 0, 1, skips
 
-        spot_df = spot_loader.load_spot(sym, ref_day, ref_day, today_fn=today_fn)
+        # Spot history across the entry window. load_spot naturally
+        # filters to trading days only (the spot parquet has 1 row per
+        # trading day).
+        window_start = exp - timedelta(days=entry_window_days)
+        window_end = exp - timedelta(days=1)
+        spot_df = spot_loader.load_spot(sym, window_start, window_end, today_fn=today_fn)
         if spot_df.empty:
-            skips.append((sym, exp, 0, "all", "no spot at ref_day"))
+            skips.append((sym, exp, 0, "all", "no spot in entry window"))
             return 0, 0, 1, skips
-        spot = float(spot_df.iloc[0]["close"])
 
-        picked_strikes = _strikes_around_atm(strike_grid, spot, strikes_per_side)
+        # For each day in the window, compute the hybrid strike set the
+        # strategy could pick if entry were on that day. Union across all
+        # days = the cache-coverage set we need.
+        picked: set[int] = set()
+        for close in spot_df["close"].astype(float).tolist():
+            picked.update(
+                strikes_around_spot_hybrid(
+                    strike_grid, close,
+                    per_side=strikes_per_side,
+                    pct_window=strikes_pct,
+                )
+            )
+        picked_strikes = sorted(picked)
 
         for strike in picked_strikes:
             for opt_type in ("CE", "PE"):
@@ -201,8 +210,22 @@ def main() -> int:
     )
     ap.add_argument(
         "--strikes-per-side", type=int, default=DEFAULT_STRIKES_PER_SIDE,
-        help=f"Strikes above + below ATM each (default {DEFAULT_STRIKES_PER_SIDE}; "
-             f"total = 2*N + 1 with ATM)",
+        help=f"Min strikes each side of ATM per day (default "
+             f"{DEFAULT_STRIKES_PER_SIDE}). Combined with --strikes-pct "
+             f"via max() — wider rule wins.",
+    )
+    ap.add_argument(
+        "--strikes-pct", type=float, default=DEFAULT_STRIKES_PCT,
+        help=f"Min %-of-spot window each side of ATM per day "
+             f"(default {DEFAULT_STRIKES_PCT}). Combined with "
+             f"--strikes-per-side via max().",
+    )
+    ap.add_argument(
+        "--entry-window-days", type=int, default=DEFAULT_ENTRY_WINDOW_DAYS,
+        help=f"Calendar days before expiry to scan for spot history; "
+             f"strikes the strategy could pick on any day in that window "
+             f"are union'd and cached (default {DEFAULT_ENTRY_WINDOW_DAYS}, "
+             f"~45 trading days = the sweep grid depth).",
     )
     ap.add_argument(
         "--start", type=lambda s: date.fromisoformat(s),
@@ -238,14 +261,15 @@ def main() -> int:
     args = ap.parse_args()
 
     symbols: list[str] = args.symbols
-    n_strikes = 2 * args.strikes_per_side + 1
 
-    _h(f"Pre-cache universe — {len(symbols)} symbols × ~24 expiries × "
-       f"{n_strikes} strikes × 2 option_types")
-    print(f"  symbols          = {symbols}")
-    print(f"  strikes_per_side = {args.strikes_per_side}  → {n_strikes} strikes/expiry")
-    print(f"  expiry range     = {args.start} → {args.end}")
-    print(f"  cache dir        = data/cache/options/  (gitignored)")
+    _h(f"Pre-cache universe — {len(symbols)} symbols × ~24 expiries")
+    print(f"  symbols           = {symbols}")
+    print(f"  strikes_per_side  = {args.strikes_per_side}  (per-day rule, min N strikes each side of ATM)")
+    print(f"  strikes_pct       = {args.strikes_pct:.2%}  (per-day rule, min %-of-spot window each side)")
+    print(f"  entry_window_days = {args.entry_window_days}  (calendar days back from expiry to scan spot)")
+    print(f"  workers           = {args.workers}  (>1 → parallel mp.Pool over (sym, expiry) pairs)")
+    print(f"  expiry range      = {args.start} → {args.end}")
+    print(f"  cache dir         = data/cache/options/  (gitignored)")
 
     t_start = time.perf_counter()
 
@@ -332,9 +356,8 @@ def main() -> int:
     # ============================================================
     # Step 4 — for each (symbol, expiry), pick strikes + fetch
     # ============================================================
-    _h("Step 4 — fetch CE + PE for ATM ± N strikes per (symbol, expiry)")
-    expected_contracts = total_pairs * n_strikes * 2
-    print(f"  expected contracts: {expected_contracts}")
+    _h("Step 4 — daily spot-scan → union strikes → fetch CE + PE per (symbol, expiry)")
+    print(f"  per-pair contract count varies (depends on spot drift across the entry window)")
     print(f"  (cache-first — already-cached contracts skip immediately)")
 
     n_fetched = 0
@@ -346,15 +369,17 @@ def main() -> int:
         (sym, exp) for sym, exps in expiries_by_symbol.items() for exp in exps
     ]
 
+    worker_args = [
+        (sym, exp, args.strikes_per_side, args.strikes_pct,
+         args.entry_window_days, TODAY_FN().isoformat())
+        for (sym, exp) in work_units
+    ]
+
     if args.workers > 1:
         # Parallel path. Each worker is a fresh process; spawns its own
         # NSE Session per call (inside options_loader._direct_derivatives_df).
         # imap_unordered streams results as workers finish so tqdm advances
         # smoothly.
-        worker_args = [
-            (sym, exp, args.strikes_per_side, TODAY_FN().isoformat())
-            for (sym, exp) in work_units
-        ]
         with mp.Pool(processes=args.workers) as pool:
             it = pool.imap_unordered(_process_pair, worker_args, chunksize=1)
             for pair_n_fetched, pair_n_miss, pair_n_other, pair_skips in tqdm(
@@ -365,10 +390,8 @@ def main() -> int:
                 n_skipped_other += pair_n_other
                 skip_log.extend(pair_skips)
     else:
-        for sym, exp in tqdm(work_units, desc="(symbol, expiry)", unit="pair"):
-            pair_n_fetched, pair_n_miss, pair_n_other, pair_skips = _process_pair(
-                (sym, exp, args.strikes_per_side, TODAY_FN().isoformat()),
-            )
+        for arg in tqdm(worker_args, desc="(symbol, expiry)", unit="pair"):
+            pair_n_fetched, pair_n_miss, pair_n_other, pair_skips = _process_pair(arg)
             n_fetched += pair_n_fetched
             n_skipped_missing += pair_n_miss
             n_skipped_other += pair_n_other
@@ -379,7 +402,8 @@ def main() -> int:
     # ============================================================
     t_total = time.perf_counter() - t_start
     _h(f"DONE — {t_total/60:.1f} min ({t_total:.0f}s)")
-    print(f"  contracts loaded (cache-hit or fresh): {n_fetched}/{expected_contracts}")
+    total_attempts = n_fetched + n_skipped_missing + n_skipped_other
+    print(f"  contracts loaded (cache-hit or fresh): {n_fetched}/{total_attempts}")
     print(f"  skipped (missing data): {n_skipped_missing}")
     print(f"  skipped (other errors): {n_skipped_other}")
     if skip_log:
@@ -387,7 +411,7 @@ def main() -> int:
         for sym, exp, strike, opt, reason in skip_log[:10]:
             print(f"    {sym} {exp} {strike}-{opt}: {reason}")
 
-    return 0 if (n_skipped_other + n_skipped_missing) < 0.1 * expected_contracts else 1
+    return 0 if (n_skipped_other + n_skipped_missing) < 0.1 * max(total_attempts, 1) else 1
 
 
 if __name__ == "__main__":
