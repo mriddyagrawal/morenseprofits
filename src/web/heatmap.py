@@ -630,19 +630,12 @@ def render_cell_drilldown(
         return
 
     entry_td, exit_td = sel
-    # Sort by ROI descending so the waterfall reads as a distribution
-    # SHAPE (left-heavy = wins concentrated, right-tail = losers) rather
-    # than as a noisy time series. Per-trade table inherits the same
-    # order so "best trades" are top-of-table — operator asking "is
-    # this rule reliable?" gets the answer at a glance.
     rows = df[
         (df["strategy"] == strategy)
         & (df["symbol"] == symbol)
         & (df["entry_offset_td"] == entry_td)
         & (df["exit_offset_td"] == exit_td)
-    ].copy().sort_values(
-        "roi_pct_annualized", ascending=False,
-    ).reset_index(drop=True)
+    ].copy().sort_values("expiry").reset_index(drop=True)
 
     # Skips matching the same cell — surface even if 0 priced trades.
     if skips_df is not None and len(skips_df) > 0:
@@ -689,76 +682,78 @@ def render_cell_drilldown(
         _render_skipped_section(cell_skips)
         return
 
-    # ---- Selected Cell rule card -----------------------------
-    # Mirrors the design/Complete mockup's left-card. Surfaces the
-    # rule's deployment-spec fields (strategy × symbol, entry/exit
-    # offsets, strike rule) in one place so the analyst can read the
-    # whole rule without context-switching. Taking a screenshot of
-    # this block documents the trading rule for the trade journal.
-    with st.container(border=True):
-        st.caption("SELECTED CELL")
-        st.markdown(f"**{strategy}** × **{symbol}**")
-        rc1, rc2, rc3 = st.columns([1, 1, 2])
-        rc1.markdown(f"**Entry offset**  \nT-{entry_td}")
-        rc2.markdown(f"**Exit offset**  \nT-{exit_td}")
-        # Strike rule — read from strategy registry so the wording
-        # stays in sync with what generate_trades actually picks.
-        try:
-            from src.strategies.registry import get_strategy
-            sample_params = rows.iloc[0].get("params_json", "{}") if len(rows) else "{}"
-            import json
-            try:
-                params_dict = json.loads(sample_params) if isinstance(sample_params, str) else {}
-            except (ValueError, TypeError):
-                params_dict = {}
-            strike_rule = get_strategy(strategy).display_strike_rule(params_dict)
-        except Exception:
-            strike_rule = "—"
-        rc3.markdown(f"**Strike rule**  \n{strike_rule}")
-
-    # ---- Summary stats row -----------------------------------
+    # ---- Top row: 3 cards ------------------------------------
+    # Selected Cell (rule card) / Median Hero / Across Years.
+    # Matches the design/Complete mockup's three-question layout:
+    # what is this trade? what's the result? does it hold up?
     from src.web._format import format_inr
     n = len(rows)
     pnl_series = rows["net_pnl"]
     roi_series = rows["roi_pct_annualized"]
     n_win = int((pnl_series > 0).sum())
-    s = st.columns(6)
-    s[0].metric("N trades", f"{n}")
-    s[1].metric(
-        "Win rate", format_pct(100.0 * n_win / max(n, 1))
-    )
-    s[2].metric(
-        "Median ROI/yr",
-        format_pct(float(roi_series.median()), signed=True, annualized=True),
-    )
-    s[3].metric(
-        "Mean ROI/yr",
-        format_pct(float(roi_series.mean()), signed=True, annualized=True),
-    )
-    s[4].metric(
-        "Best ROI/yr",
-        format_pct(float(roi_series.max()), signed=True, annualized=True),
-    )
-    s[5].metric(
-        "Worst ROI/yr",
-        format_pct(float(roi_series.min()), signed=True, annualized=True),
-    )
 
-    s2 = st.columns(4)
-    s2[0].metric(
-        "Total net P&L", format_inr(float(pnl_series.sum()))
-    )
-    s2[1].metric(
-        "Best single trade", format_inr(float(pnl_series.max()))
-    )
-    s2[2].metric(
-        "Worst single trade", format_inr(float(pnl_series.min()))
-    )
-    s2[3].metric(
-        "Std ROI/yr",
-        f"±{float(roi_series.std(ddof=0)):.1f}%"
-        if n > 1 else "—",
-    )
+    card_left, card_mid, card_right = st.columns([1, 1, 1])
+
+    # --- Left card: Selected Cell (rule) ----------------------
+    # The deployable trade specification. Equal weight given to every
+    # field — strike rule sits next to entry/exit offsets as a peer,
+    # not a tooltip, so this card is a self-contained spec the analyst
+    # could screenshot for their trade journal.
+    with card_left:
+        st.markdown("**SELECTED CELL**")
+        st.markdown(f"### {strategy} × {symbol}")
+        try:
+            from src.strategies.registry import get_strategy
+            strike_rule = get_strategy(strategy).display_strike_rule()
+        except Exception:
+            strike_rule = "(strike rule unavailable for this strategy)"
+        spec_rows = pd.DataFrame({
+            "field": ["Entry offset", "Exit offset", "Strike rule"],
+            "value": [f"T-{entry_td}", f"T-{exit_td}", strike_rule],
+        })
+        st.dataframe(spec_rows, hide_index=True, use_container_width=True)
+
+    # --- Middle card: Median ROI hero + stats grid ------------
+    # The headline number first, then the stats grid below so the
+    # eye lands on "is this profitable?" before getting into N,
+    # win-rate, etc.
+    with card_mid:
+        st.markdown("**MEDIAN ROI / ANNUALIZED**")
+        st.metric(
+            "Median ROI/yr",
+            format_pct(float(roi_series.median()), signed=True, annualized=True),
+            label_visibility="collapsed",
+        )
+        # 6-cell stats grid. Sub-headers above the values so the
+        # eye-fixation order matches the mockup (N → Win → Mean,
+        # Std → Σ Net P&L → Worst).
+        g1 = st.columns(3)
+        g1[0].metric("N", f"{n}")
+        g1[1].metric(
+            "Win",
+            format_pct(100.0 * n_win / max(n, 1)),
+        )
+        g1[2].metric(
+            "Mean",
+            format_pct(float(roi_series.mean()), signed=True, annualized=True),
+        )
+        g2 = st.columns(3)
+        g2[0].metric(
+            "Std (ddof=0)",
+            f"{float(roi_series.std(ddof=0)):.1f}" if n > 1 else "—",
+        )
+        g2[1].metric("Σ Net P&L", format_inr(float(pnl_series.sum())))
+        g2[2].metric("Worst trade", format_inr(float(pnl_series.min())))
+
+    # --- Right card: Across Years (sparkline placeholder) -----
+    # YoY mini-chart lands in feat(p7.drilldown.yoy_sparkline). This
+    # commit just reserves the card slot so the layout is final and
+    # the chart commit is a small additive change.
+    with card_right:
+        st.markdown("**ACROSS YEARS**")
+        st.caption(
+            "_Stability check — sparkline lands in a follow-up commit._"
+        )
 
     # ---- ROI distribution mini-chart -------------------------
     # Lets the analyst see at a glance whether the cell's median is
@@ -786,11 +781,8 @@ def render_cell_drilldown(
         annotation_position="top right",
     )
     dist_fig.update_layout(
-        title=(
-            f"Per-expiry ROI · {len(rows)} trades · sorted descending "
-            f"· 0% baseline · color = sign"
-        ),
-        xaxis_title="Expiry (sorted by ROI/yr, not chronological)",
+        title="ROI/yr per expiry — outlier + regime spotter",
+        xaxis_title="Expiry",
         yaxis_title="ROI/yr (%)",
         height=280,
         margin=dict(l=60, r=40, t=50, b=40),
