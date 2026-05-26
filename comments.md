@@ -3306,6 +3306,86 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of f69019f — perf: in-process LRU caches at data-layer hot path
+
+**Verdict:** ✅ accept — **closes the perf gap I diagnosed directly**, matches my recommendation, and adds the test-isolation fixture I would have flagged as missing.
+
+**Phase / commit goal:** Reviewer-diagnosed perf gap. Every sweep cell triggered 5-7 disk reads with massive redundancy: same year of spot read ~72k times per symbol, same bhavcopy ~30× per date, same contract ~600× across (entry, exit) pairs. 450k cells × ~5 reads × ~3 ms = ~110 min of pure disk IO. **In-process `functools.lru_cache` at three points** drops this to a small first-call cost per worker.
+
+### What works (item-by-item)
+
+1. **All three loaders memoized** ([src/data/spot_loader.py:163-180](src/data/spot_loader.py#L163-L180), [src/data/bhavcopy_fo_loader.py:304-308](src/data/bhavcopy_fo_loader.py#L304-L308), [src/data/options_loader.py:427-449](src/data/options_loader.py#L427-L449)):
+   - `_load_year_cached` (spot) — `maxsize=32` (10 syms × 3 yr fits in 30 entries).
+   - `_load_bhavcopy_fo_cached` — `maxsize=512` (months of dates).
+   - `_load_full_contract_cached` (options) — `maxsize=2048` (working set for 6,240-contract wide sweep).
+2. **Cache keys are well-chosen**:
+   - **`today_iso: str`** in spot + options keys — invalidates open-year/open-expiry entries on date roll. ✓
+   - **`offline: bool`** in all keys — different branch behavior means different result; correctly keyed.
+   - **NOT** in bhavcopy key (correctly omitted — past trade_date bhavcopy is immutable on NSE, independent of today). ✓ Subtle, right call.
+   - **`expiry_iso: str` + `strike: float` + `option_type: str`** identify the contract uniquely. ✓
+3. **`force_refresh=True` bypasses the LRU entirely** ([spot_loader.py:210-214](src/data/spot_loader.py#L210-L214), [options_loader.py:563-567](src/data/options_loader.py#L563-L567)) — calls `_load_year` / `_load_full_contract_impl` directly. **Correct**: "I want fresh data" should never serve memoized data.
+4. **`_load_full_contract_impl` split from the LRU wrapper** ([options_loader.py:452-459](src/data/options_loader.py#L452-L459)) — `force_refresh=True` and tests can call the impl directly without polluting the cache. **Clean separation; the right architecture.**
+5. **Returns the FULL frame; consumers apply their own window filter** ([spot_loader.py:171-173](src/data/spot_loader.py#L171-L173), [options_loader.py:547-549](src/data/options_loader.py#L547-L549)) — `.loc[mask].reset_index(drop=True)` produces a new DataFrame so the cached value is read-only in practice. Same pattern I recommended.
+6. **🔬 `tests/conftest.py` autouse fixture clears all 3 caches** before AND after every test ([tests/conftest.py:27-38](tests/conftest.py#L27-L38)). **Without this, mock-based tests would silently serve memoized data from a prior test.** BUILDER closed this risk preemptively — I would have flagged it as the #1 correctness concern if it were missing.
+7. **Docstrings capture the WHY with concrete numbers**: "600-pair × 24-expiry × 3-strategy sweep redundantly re-reads the same contract parquet ~600× per tuple". Future contributor understands the optimization.
+8. **Multi-worker safety**: each Pool worker is a fresh Python process; LRU is per-process; first-call disk hit per worker; subsequent calls within that worker hit memory. ✓ Determinism unchanged.
+9. **Memory budget conservative** (commit body: ~800 MB across 8 workers worst-case). Actual peak likely closer to ~100-200 MB (options frames are ~5 KB each in practice, not 50 KB serialized). Well within 32GB host.
+10. **489/489 full suite passes**.
+
+### Sanity-check on the speedup claim
+
+Commit body: "disk IO drops from ~110 min single-threaded equivalent to ~4 min."
+
+- Without LRU: 450k cells × ~5 reads × ~3 ms = ~110 min (single-threaded disk IO).
+- With LRU: ~6,240 + ~500 + ~30 = ~7,000 cache fills per worker × 8 workers = ~56k disk reads instead of 2.25M. **40× reduction.**
+- 56k × 3 ms / 8 workers parallel = ~21 sec disk IO + pricing-math overhead.
+- Wall-clock estimate: ~3-4 min. ✓ **Matches BUILDER's claim. My pre-fix estimate was 2-3 min; the slightly-more-conservative ~4 min accounts for IPC overhead and Python-level loop cost.**
+
+### Blocking issues: None.
+
+### Non-blocking observations
+
+1. **No regression test for the LRU caches themselves** — there's no `test_load_spot_is_cached` that calls twice and asserts the second call doesn't hit `_load_year` (e.g., via `cache_info()`). **Acceptable**: the autouse fixture ensures tests still pass without the LRU; the LRU is purely a perf optimization. **A pinning test would protect against accidental future removal**: someone refactors `load_spot`, drops the `_load_year_cached` call, tests pass, perf silently regresses 30×. Recommend a small follow-up test that asserts `cache_info().hits > 0` on the second call.
+
+2. **🔬 `force_refresh=True` doesn't repopulate the LRU**: after a force refresh fetch + cache.write, the LRU still holds the old value. Subsequent default (non-force) calls in the same worker process would hit the stale LRU entry until eviction. **For sweep_grid this doesn't happen** (no force_refresh in the hot path). **For interactive REPL** (`load_option(force_refresh=True)` then `load_option()` again), the second call would silently return stale data. `functools.lru_cache` has no public "set" API, so a clean fix would require a custom cache. **Defer to Phase-7+ if it ever matters operationally.**
+
+3. **`@functools.lru_cache` decorates a function that takes hashable args.** All args here are hashable (str / float / int / bool / str). ✓ No surprises.
+
+4. **`lambda: today` inside `_load_year_cached`** ([spot_loader.py:178](src/data/spot_loader.py#L178)) — creates a fresh lambda per call. Trivial overhead (~µs); cached call avoids the underlying disk hit which dominates by 1000×.
+
+5. **Pathological date-roll case**: a sweep that crosses midnight (running 6+ hours) would see `today_iso` change → every spot/options call after midnight is a cache miss → re-fills the LRU. **Not a correctness issue** (just an extra disk-IO burst at midnight). Phase-7 polish: `today_iso` rounded to start-of-day at sweep start might be more stable. Cosmetic.
+
+6. **`maxsize` choices are tuned for the §3.2 wide sweep specifically.** For 100-symbol future sweeps, `maxsize=32` on spot wouldn't fit all (symbol, year) combos → LRU evictions → cache misses on long-running sweeps. **The defaults work for the v1 universe; need re-tuning for Phase-7+ universe expansion.** Worth a comment near the maxsize constants ("tuned for ~10 syms × 3 yrs; widen for larger universes").
+
+### Strategic value
+
+This commit **directly closes my flagged perf gap from my last reply to the user**. The reviewer→builder loop is operating at a high level of fidelity:
+- I diagnosed: "no in-process memoization at the loader layer; 2.7M parquet reads on warm cache."
+- BUILDER implemented: per-loader LRU caches with sensible keys + maxsize + force_refresh bypass + test isolation fixture.
+- **The autouse fixture was the testing concern I would have raised; BUILDER added it preemptively.**
+
+### Carry-over open flags
+
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now ~16 commits pre-tag.
+- 🔬 **Regression tests** for parallel-skips (b41e047), cache.write race (54850d4 + 8419a8c), AND now the LRU cache hit-rate (this commit). All three are "lock the gain we just made" tests.
+
+### What I tried
+
+- Read [spot_loader.py:104-226](src/data/spot_loader.py), [bhavcopy_fo_loader.py:295-368](src/data/bhavcopy_fo_loader.py), [options_loader.py:425-575](src/data/options_loader.py), [conftest.py](tests/conftest.py) end-to-end.
+- Verified cache keys: `today_iso` invalidates open-data correctly; bhavcopy excludes today_iso correctly.
+- `pytest tests/` → 489/489 (autouse fixture prevents pollution).
+- Sanity-checked speedup math.
+
+### Next-commit suggestion
+
+1. **Land `chore(p6.5.tag)` NOW** — ~16 commits is past any reasonable phase boundary. Either tag at the appropriate Phase-6 SHA OR fold p7.x into v0.6-ui and adjust DESIGN_SPEC.
+2. **Run `python scripts/p7_wide_sweep.py` live with the new LRU** to validate the expected ~3-5× speedup. If wall-clock drops from ~10-15 min to ~3-4 min as predicted, the commit pays for itself within the first run.
+3. **Small follow-up**: regression test pinning the LRU hit rate, so a future refactor that removes the `_load_year_cached` call gets caught by CI/pytest.
+
+After that → Phase 7 proper (diagnostics tab, exports, regime drill-down per the user-frozen scope).
+
+---
+
 ## Review of e5762d9 + 0b567af — feat: skip_detail in data layer + drill-down surfaces skipped expiries
 
 **Verdict:** ✅ accept (both commits, paired)
