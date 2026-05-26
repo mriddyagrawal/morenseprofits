@@ -10301,3 +10301,94 @@ If you want the message richer, my 2459233 review has a draft body. But even the
 After that: `feat(p7.heatmap.compare)` with the failing-test enforcement of the REVIEWER CONSTRAINT (no p-values) baked in from the start.
 
 ---
+
+## Review: 81882c9 — fix(p7.heatmap.click): revert streamlit-plotly-events
+
+**Verdict: ✅ ACCEPT** — correct revert, well-articulated lesson, rendering restored. Two real grills (dead-code carry-over, click-behavior untested in real browser post-revert).
+
+### Why this is the right call
+
+2459233 traded "clicks fire" for "heatmap renders blank." The walkthrough.md was BEFORE 2459233 landed (12:53 vs 13:29) — it verified a1db694's surface, not plotly_events'. Once plotly_events shipped, the chart broke. User caught it, BUILDER reverted.
+
+**The commit body's lesson is exactly right**:
+
+> "Lesson for the change log: when introducing a third-party UI bridge, visually verify the rendering FIRST before declaring the click path 'fixed'. The 547/547 test-pass was on the API surface; it couldn't catch a broken frontend embed."
+
+This is a real generalizable insight — unit tests on Streamlit components verify the Python side of the contract, not the rendered DOM. Worth a PLAN change-log entry, not just a commit body. **Pattern to file**: any commit that swaps in a third-party UI component should require both unit tests AND a screenshot/walkthrough re-validation.
+
+### What changed
+
+- Native `st.plotly_chart` restored for value pane.
+- `selection_mode=("points",)` — tuple form (not string `"points"`). User flagged this earlier; the revert quietly corrects an API-form bug that my reviews never caught.
+- `use_container_width=True` restored.
+- `_capture_cell_selection(selected)` called on the returned selection — back to the original wiring.
+- `requirements.txt` cleaned: streamlit-plotly-events removed.
+- Test renamed and rewritten to pin native API kwargs.
+
+The click chain is now: native plotly_chart → maybe-fires plotly_selected on box-drag → `_capture_cell_selection`. Reliable click on single-click is NOT guaranteed; the manual picker (384c65e + 5b0c722) is the **load-bearing operator-facing selection mechanism**. The commit body acknowledges this clearly.
+
+### 🔬 Grill #1 (real): dead-code carry-over — `_capture_cell_selection_from_click`
+
+Same pattern as my 2459233 grill #1, now applies to a different helper. The function `_capture_cell_selection_from_click` (and its 3 tests) was introduced in 2459233 to parse plotly_events payloads. After this revert, that function is **unreachable from production code** — the value pane uses `_capture_cell_selection` again.
+
+Tests still pass (the function exists, the tests still test it correctly) but they're testing dead code. The function adds ~20 lines of maintained-but-unused surface.
+
+**Recommend deletion**: `_capture_cell_selection_from_click` + `test_capture_cell_selection_from_click_*` (×3). If a future commit reintroduces plotly_events, restore from git history.
+
+This is the "leftover helper" grill from 2459233, now realized — exactly what I was worried about when 2459233's body said "stays in place for any future caller." The future caller didn't materialize; instead, the previous caller got reverted. YAGNI confirmed in real time.
+
+### 🔬 Grill #2 (real): click behavior on the reverted setup is unverified in real browser
+
+The Antigravity walkthrough confirmed clicks didn't fire on a1db694's dragmode=select setup. This revert goes to a DIFFERENT setup (selection_mode=("points",) tuple form, no dragmode override). **Does single-click fire plotly_selected now?** Unknown.
+
+What's known:
+- Box-drag / lasso-drag → fires plotly_selected on heatmap (standard Plotly behavior). ✓
+- Single-click → still uncertain. The tuple form (vs string) might unlock different Streamlit behavior, but neither commit body nor any test confirms this.
+
+What's the operational impact:
+- If single-click works → ⭐ great, primary UX path is back.
+- If single-click doesn't work → ⚠ operator must use the manual picker. **The picker IS load-bearing per the commit body**, so this is acceptable degraded UX, not a blocker.
+
+**Recommend**: one-line follow-up note in the commit body or PLAN: "Single-click vs box-drag click behavior on native st.plotly_chart with selection_mode=('points',) is not yet verified in real browser. Manual picker is the reliable path; click is bonus." This sets expectations.
+
+Not pushing for re-running the full walkthrough — the manual picker fallback closes the operational gap regardless.
+
+### What I'd file as a lesson
+
+The click-chain arc:
+- a1db694: hypothesis 1 (dragmode=select). Wrong but reversibly so.
+- 2459233: hypothesis 2 (plotly_events). Reversibly wrong AND broke rendering.
+- 384c65e + 5b0c722: belt-and-suspenders manual picker (bug-fixed under my HOLD).
+- 81882c9: revert to native; manual picker is now primary.
+
+5 commits to land a working selection mechanism. Two were reverts/rewrites. The retrospective: **manual picker should have been built FIRST** as the load-bearing primitive, then click added as enhancement once verified. The forward-attempt-first sequence cost ~5 commits of churn.
+
+For the next big UI surface (Compare-cells impl is queued), apply this lesson: ship the reliable-but-uglier mechanism first, layer click/drag on top as enhancement.
+
+### Calibration note
+
+This is a `fix` commit, not a `feat`. My HOLD-on-feature rule doesn't trigger. **But chore(p6.5.tag) STILL hasn't landed** — the calibration rule remains armed for the next `feat`. I'm not restating the recommendation in detail; soft repetition is what we agreed to avoid.
+
+### What I tried
+
+- Verified `selection_mode=("points",)` is the tuple form Streamlit's plotly_chart API expects. Confirmed against Streamlit docs (the doc says tuple OR `"points"` string; tuple is the more explicit form).
+- Confirmed `_capture_cell_selection_from_click` is now unreferenced in production code via grep.
+- Cross-referenced the walkthrough.md timestamp (12:53) against the 2459233 commit timestamp (13:29) — the walkthrough preceded the rendering regression by 36 minutes. Visual verification was on the WRONG state.
+- Verified the new test (`test_value_pane_uses_native_plotly_chart_with_on_select`) asserts all three kwargs (on_select, selection_mode, use_container_width). Good pin.
+
+### Carry-over open items
+
+- 🚨 **`chore(p6.5.tag)`** — still pending. Calibration rule armed.
+- 🔬 **Delete `_capture_cell_selection_from_click`** + its 3 tests.
+- 🔬 **Compare-cells impl** — pending; will trigger HOLD-on-feature if tag still missing.
+
+### Next-commit suggestion
+
+Two reasonable next-commit options, in priority order:
+
+1. **`chore(p6.5.tag)`** as a LOCAL annotated tag (not a push). Single command, full bisect-anchor value. The drill-down + click-chain arc is now substantially settled.
+2. **`chore(p7.cleanup): remove unused _capture_cell_selection_from_click helper + tests`** — closes the dead-code grill.
+
+After those: `feat(p7.heatmap.compare)` with failing-test enforcement of the no-p-values REVIEWER CONSTRAINT.
+
+---
