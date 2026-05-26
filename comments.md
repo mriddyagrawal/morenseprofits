@@ -10544,3 +10544,123 @@ Two equally-reasonable next moves:
 Personal preference: (1) first, because dead-code accumulates faster than features need it, AND it's a 5-minute change. Then (2).
 
 ---
+
+## Review: 39d1ba1 — feat: universe expands 10 → 41 (full 40 blue chips + PNB)
+
+**Verdict: ✅ ACCEPT** — sensible atomic bundle (prefetch + sweep in one commit), correct sourcing pattern (`blue_chip()` prevents drift). One real grill on PNB hardcoding location, plus a few notes on the compute-cost surface this opens up.
+
+### Why the atomic bundle is the right call here
+
+This is the rare case where bundling violates the nuclear-commits discipline correctly. Commit body's reasoning:
+
+> "Both files MUST move together. Running the sweep against symbols that weren't prefetched produces OfflineCacheMiss for every cell. Atomic update prevents that window."
+
+**This is correct.** Splitting it would create a real bisect-window where either the prefetch is bigger than the sweep (wasted fetching) or the sweep is bigger than the prefetch (every cell skips). Nuclear-commits is about reviewability; this commit's content is small enough (45 lines) to review as one unit, and the atomicity has operational value.
+
+Worth pinning as a generic exception: **"atomic-with" constraint between scripts that share state warrants single-commit landing.**
+
+### Sourcing from `blue_chip()` — correct DRY pattern
+
+Both scripts now derive their symbol list from `src.universe.blue_chip.blue_chip()` at import time. Verified:
+- [src/universe/blue_chip.py:56](src/universe/blue_chip.py#L56) has signature `def blue_chip(as_of: date) -> list[str]` — the `as_of` is required but ignored in v1 (per docstring: "v1 ignores `as_of` and always returns the same snapshot").
+- Both scripts call `blue_chip(date.today())` — date is ignored, list returned is the 40-name `_BLUE_CHIP_V1` snapshot.
+- Sweep helper (`_build_symbols`) and prefetch helper (`_build_default_symbols`) both append `+ ["PNB"]`.
+
+**This kills drift risk**: a future edit to `blue_chip.py` propagates to both scripts automatically. ✓ The pattern is the right one.
+
+### 🔬 Grill #1 (real, small): PNB lives in two places now
+
+PNB is hardcoded:
+- [scripts/prefetch_universe.py:_build_default_symbols](scripts/prefetch_universe.py) → `blue_chip(_date.today()) + ["PNB"]`
+- [scripts/p7_wide_sweep.py:_build_symbols](scripts/p7_wide_sweep.py) → `blue_chip(date.today()) + ["PNB"]`
+
+**Two copies.** If a third script (Phase-7 trade-level drill-down? export tools?) needs the same universe, PNB will need to be added there too. Eventually one place forgets and the universes drift.
+
+**Recommend**: add PNB to a `WATCHLIST_EXTRAS` constant in `src/universe/` (could be `src/universe/blue_chip.py` itself, or a new `src/universe/watchlist.py`). Then both scripts import it:
+
+```python
+# src/universe/watchlist.py
+WATCHLIST_EXTRAS: list[str] = ["PNB"]  # not in blue_chip 40 but operator requested
+
+# scripts/*.py
+from src.universe.blue_chip import blue_chip
+from src.universe.watchlist import WATCHLIST_EXTRAS
+symbols = blue_chip(date.today()) + WATCHLIST_EXTRAS
+```
+
+Same number of lines per script, but ONE place defines PNB. Could land as `chore(p7.universe): centralize watchlist extras`. Not urgent.
+
+### 🔬 Grill #2 (small, defensive): no dedup if `blue_chip()` ever adds PNB
+
+`blue_chip() + ["PNB"]` doesn't check for duplicates. If the canonical blue-chip list ever rebalances to include PNB, it'll appear twice in the symbol list → sweep runs PNB twice → duplicate rows in results.
+
+**1-line defense**:
+```python
+symbols = blue_chip(date.today())
+return symbols if "PNB" in symbols else symbols + ["PNB"]
+```
+
+OR use a set-with-order-preservation:
+```python
+from collections import OrderedDict
+return list(OrderedDict.fromkeys(blue_chip(date.today()) + ["PNB"]))
+```
+
+Vanishingly unlikely failure mode — but the fix is trivial. Cosmetic.
+
+### 🔬 Grill #3 (real, contextual): survivorship surface increased ~4×
+
+[SPECS.md:638](SPECS.md#L638) (§6b.3) flags the survivorship bias of the blue-chip-40 snapshot. The drill-down already surfaces `SURVIVORSHIP_CAVEAT`. **But the bias EXPOSURE just grew.**
+
+10 symbols × 25 expiries × 600 (entry, exit) pairs × 3 strategies = 450k cells.
+41 symbols × 25 expiries × 600 pairs × 3 strategies = **1.85M cells**.
+
+**4.1× larger search space.** With more cells, more "good rules" surface by chance. The multiple-comparisons hazard I flagged for Compare-cells / Export-rule is now LARGER. The Export-rule's MULTIPLE_COMPARISONS_CAVEAT will need to reference the universe-size factor explicitly — selection from 1.85M is meaningfully worse than from 450k.
+
+**Recommendation**: when Compare-cells / Export-rule impls land, include the cell-count in the caveat numerator. E.g.:
+
+> "_Selecting one rule from ~1.85M candidates (sweep universe). Per-rule backtest doesn't capture the selection bias this introduces. At α=0.05, a fully random universe would surface ~92k 'significant' rules._"
+
+The number changes if universe scales. Bake it in as a `caveats.py` function, not a hardcoded string.
+
+### Compute heads-up — math checks out
+
+Commit body's wall-clock estimates:
+- **Sweep**: 1.85M cells / 1000 cells/sec / 60 = 30.8 min ✓ (close to the claimed "~30 min").
+- **Prefetch single-worker**: 41 syms × ~25 expiries × ~45 strikes × 2 types ≈ 92k contracts. At ~1.5 sec/contract (per my earlier mental model from the f826580 review) → 38 hours single-thread. At 4 workers: ~9-10 hours. The commit body's "5-7 hours" claim assumes faster per-contract rate than I estimated.
+
+**Bound check**: 4 workers × 1 contract/sec aggregate = 4 contract/sec → 92k / 4 = ~6.4 hours. Matches the commit's lower bound. Reasonable.
+
+**Heads-up that's NOT in the commit body**: NSE rate-limit risk. 4 workers × 1/0.5s sleep = 8 req/sec aggregate. The previous sweep tripped WAF at ~16 req/sec (8 workers × 2 req/contract — though contract = cookie + data, so really ~16 req/sec). 4 workers should be safe at ~8 req/sec. **But test this on a small subset (e.g. `--symbols RELIANCE --strikes-per-side 1 --workers 4`) before committing to the 5-7 hour run.** The f826580 review's escalation ladder (2→4→6) still applies.
+
+### Calibration note
+
+This commit is a `feat` and the tag still hasn't landed. I'm continuing to NOT enforce HOLD per my 357c2c1 calibration relaxation. The content here is operationally meaningful (universe expansion is real progress), and the wall-clock estimates show the BUILDER is thinking ahead about the operator's experience.
+
+### What I tried
+
+- Verified `blue_chip(as_of)` signature accepts a date and returns 40-name list ([src/universe/blue_chip.py:56](src/universe/blue_chip.py#L56)).
+- Math-checked the sweep wall-clock: 1.85M / 1000 / 60 = 30.8 min ✓.
+- Cross-referenced the survivorship-bias mention against SPECS §6b.3 and SURVIVORSHIP_CAVEAT. Caveat IS surfaced; just the EXPOSURE grew.
+- Confirmed both scripts use the same `blue_chip() + ["PNB"]` pattern (verified PNB appears at the end of both helper functions' output).
+- Spot-checked that v1 ignores `as_of` so import-time evaluation (vs sweep-time) doesn't matter for the symbol list.
+
+### Carry-over open items
+
+- 🔬 **PNB centralization** — small `chore(p7.universe): centralize watchlist extras` follow-up.
+- 🔬 **MULTIPLE_COMPARISONS_CAVEAT must reflect new cell count** when Compare/Export impls land.
+- 🔬 **Prefetch run** — test at 2 workers first on small subset before the 5-7 hour run.
+- 🔬 **Dead-code `_capture_cell_selection_from_click`** — still pending.
+
+### Next-commit suggestion
+
+The wall-clock cost of the universe expansion ($~5-7 hours prefetch + ~30 min sweep) means the next operator action is probably:
+
+1. **Smoke-test prefetch** with `--symbols RELIANCE --strikes-per-side 1 --workers 2` (~5 min) to verify the 41-symbol code path works end-to-end on a tiny subset.
+2. If that's clean, kick off the big prefetch (overnight or `--workers 4`).
+3. After prefetch completes, run the wide-sweep.
+4. Validate the new sweep matches expectations vs the 10-symbol baseline at run_id `c20b2006913c`.
+
+**For the BUILDER's next commit**: probably the dead-code cleanup or Compare-cells impl, while the prefetch runs in the background. The 5-7 hour prefetch is an opportunity to land 2-3 small commits without churn pressure.
+
+---
