@@ -10079,3 +10079,127 @@ git tag -a p6.5 -m "p6.5 milestone: heatmap + drill-down honesty stack
 After the tag: Compare-cells impl is the next-most-impactful feature. The REVIEWER CONSTRAINTS in its stub docstring should land FAILING tests in the same commit, not in a follow-up.
 
 ---
+
+## Review: 384c65e — feat(p7.heatmap.manual_cell_picker): selectbox fallback
+
+**Verdict: ⚠ HOLD — three blocking issues.**
+
+This is the first commit where I'm applying my new calibration discipline from [[feedback-reviewer-calibration]] saved this session. Per that rule, when soft recommendations have been ignored repeatedly, the next feature commit gets HOLD. I'm enforcing it on three independent grounds — any one alone would justify the HOLD.
+
+### 🚨 Grill #1 (BLOCKING): the "only write when user interacted" guard is BROKEN
+
+The intended logic:
+
+> "Only writes session state when the user ACTIVELY picks something different from the current selection."
+
+The actual code:
+
+```python
+sel = st.session_state.get("mp_heatmap_selected_cell")
+cur_entry = sel[0] if sel and sel[0] in available_entries else available_entries[0]
+cur_exit = sel[1] if sel and sel[1] in available_exits else available_exits[-1]
+# selectboxes default to cur_entry / cur_exit ...
+if (entry_pick, exit_pick) != sel:
+    if entry_pick > exit_pick:
+        st.session_state["mp_heatmap_selected_cell"] = (entry_pick, exit_pick)
+```
+
+**On first render with no prior selection**:
+- `sel` is `None`.
+- `cur_entry = available_entries[0]` (highest T-N, e.g. T-45).
+- `cur_exit = available_exits[-1]` (lowest T-N, e.g. T-1).
+- Selectboxes return their defaults: `entry_pick = T-45`, `exit_pick = T-1`.
+- The check `(T-45, T-1) != None` is always **True** — a tuple is never equal to None.
+- `entry_pick > exit_pick` (45 > 1) is True.
+- **Write fires.** Session state gets `(T-45, T-1)`.
+
+Consequence: on first page load with no prior click, the manual picker UNCONDITIONALLY auto-selects a cell the operator didn't request. The drill-down opens automatically with that default cell. **The "empty state — pick a cell" UX is destroyed.**
+
+**Fix**: the guard needs to distinguish "first-render default" from "user actively picked". Pattern that works:
+
+```python
+# Sentinel: only write when the user has actually opened the expander
+# AND changed a value. st.session_state["mp_heatmap_manual_entry"] is
+# only set after the widget renders; absent on first render.
+prev_manual = st.session_state.get("_mp_heatmap_manual_prev")
+new_manual = (entry_pick, exit_pick)
+if prev_manual is not None and new_manual != prev_manual:
+    if entry_pick > exit_pick:
+        st.session_state["mp_heatmap_selected_cell"] = new_manual
+st.session_state["_mp_heatmap_manual_prev"] = new_manual
+```
+
+The point: use a SEPARATE tracking key (`_mp_heatmap_manual_prev`) to detect transitions, not compare against `sel` (which is the wrong reference frame).
+
+### 🚨 Grill #2 (BLOCKING): zero new tests for 39 lines of new UI logic
+
+The commit body says "Tests stay green (547/547). The fallback is operator-facing, no behavior change to the underlying state machine."
+
+This is the **exact pattern** I flagged in my last review (2459233) as the right test discipline going forward: the click-helper got 4 new tests pinning API surface + parse logic + persistence + robustness. **The manual picker is functionally equivalent infrastructure for picking a cell — it should have parallel test coverage.**
+
+Specifically:
+- `test_manual_picker_does_not_overwrite_sel_on_first_render` — would have caught grill #1.
+- `test_manual_picker_writes_session_state_when_user_changes_selection` — happy path.
+- `test_manual_picker_respects_entry_gt_exit_constraint` — pins the `if entry_pick > exit_pick` guard.
+- `test_manual_picker_collapsed_by_default` — pins the UX promise.
+
+Per my calibration rule from [[feedback-reviewer-calibration]]: "When the same gap (e.g. 'no test for X') appears in 3+ consecutive reviews as 'non-blocking', the 4th occurrence should mark the commit `⚠ HOLD` until addressed." We're past 7 drill-down commits without tests. This one's blocking.
+
+### 🚨 Grill #3 (BLOCKING per calibration rule): `chore(p6.5.tag)` was supposed to land BEFORE this commit
+
+Per my 2459233 review's enforcement language: "If the next commit is anything other than `chore(p6.5.tag)`, the BUILDER is choosing to widen the bisect surface further for no benefit. **I will mark the next feature commit `⚠ HOLD` if the tag hasn't landed first.**"
+
+This is the next feature commit. Tag hasn't landed. **HOLD enforced.**
+
+This isn't punitive — it's the calibration line I drew explicitly so the soft-recommendation loop ends. The tag has been recommended 6+ times across multiple reviews with escalating language. Without enforcement, the recommendation is noise.
+
+### Beyond the blocking issues — the design question
+
+**Belt-and-suspenders is premature defense.** streamlit-plotly-events JUST landed in 2459233. The walkthrough confirmed clicks worked-or-failed under different conditions. The first fallback hasn't been validated in production yet, and we're already shipping a second fallback.
+
+**Alternative ordering**:
+1. Pin streamlit-plotly-events to exact version (grill #2 from 2459233 review).
+2. Let operator use the click chain for a few real sessions.
+3. If clicks fail → land manual picker AS A REAL FIX with the bug-#1 logic and test coverage.
+
+The current 384c65e is "I'm worried this might break so here's defensive UI that itself has a bug and no tests." That's worse than the failure mode it's hedging against — the click chain works (verified by Antigravity walkthrough on most of the surface; user can confirm rest).
+
+### What this commit gets right (in case the fixes happen quickly)
+
+The structural choices are good:
+- Expander COLLAPSED by default — main flow stays clean. ✓
+- Writes to the SAME session_state key as the click handler — drill-down reads it indifferently. ✓
+- Honors `entry > exit` constraint. ✓
+- `format_func=lambda v: f"T-{v}"` makes selectboxes match the chart's tick-label convention. ✓
+- Uses `available_entries` / `available_exits` from `values.index` / `values.columns` — picks up the actual data shape, not hardcoded ranges. ✓
+
+If grill #1 is fixed and tests added, the commit content is fine. The HOLD is on the gaps, not the design.
+
+### What I tried
+
+- Traced the on-first-render logic step-by-step → confirmed the `(entry_pick, exit_pick) != sel` check is always True when sel=None.
+- Cross-referenced the test-discipline pattern from 2459233 → this commit should have followed the same template.
+- Verified the tag-enforcement rule from [[feedback-reviewer-calibration]] applies (this IS a `feat` commit, tag hasn't landed).
+- Confirmed `available_entries[0]` (highest T-N) and `available_exits[-1]` (lowest T-N) are the actual selectbox defaults given the `sorted(..., reverse=True)` order.
+
+### Carry-over open items
+
+- 🚨 **HOLD this commit** until grills #1-3 are addressed.
+- 🚨 **`chore(p6.5.tag)`** — the actual unblock.
+
+### What "address" looks like
+
+**Smallest path to ✅ ACCEPT**:
+1. Fix grill #1 with the sentinel-tracking pattern (or equivalent).
+2. Add 4 unit tests pinning the corrected behavior (first-render-no-op, change-fires, constraint-respected, collapsed-default).
+3. Land `chore(p6.5.tag)` BEFORE re-pushing this commit (or bundle them in the right order).
+
+**Bigger redesign path (if the BUILDER prefers)**:
+- Revert this commit.
+- Pin streamlit-plotly-events==0.0.6.
+- Land `chore(p6.5.tag)`.
+- Wait for real-session signal on whether clicks actually need a fallback.
+
+Either path works. Status quo doesn't.
+
+---
