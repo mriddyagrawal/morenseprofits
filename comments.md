@@ -3306,6 +3306,88 @@ After p6.1 → p6.2 heatmap viz → p6.3 trend/seasonality plots → p6.4 strate
 
 ---
 
+## Review of e5762d9 + 0b567af — feat: skip_detail in data layer + drill-down surfaces skipped expiries
+
+**Verdict:** ✅ accept (both commits, paired)
+
+**Phase / commit goal:** Close the "quiet lie of omission" honesty gap I touched on as gaps #3 + #12 in the last suggestions list. Each heatmap cell aggregated ~24 trades into a single colored median; if 3 of those 24 were SKIPPED (corporate action, missing NSE data, no liquid strike, etc.), the cell silently showed n=21 with no signal that 3 were dropped. The pair addresses it end-to-end: data captures the WHY at sweep time; UI surfaces it at drill-down time.
+
+### e5762d9 — feat: capture skip_detail (exception message)
+
+**What works:**
+
+- **`sweep_one` returns `"skip:ClassName|message"`** ([src/engine/sweeper.py:202-204](src/engine/sweeper.py#L202-L204)) instead of bare `"skip:ClassName"`. Format preserves the class name (for groupby/counts) AND the message (for analyst drill-down). **Class names never contain `|`** — defensible chosen delimiter.
+- **Parse via `split("|", 1)`** (max-once split) — survives messages that themselves contain `|` characters. Defensive.
+- **`SKIPS_COLUMNS` extended** ([src/engine/results.py:71](src/engine/results.py#L71)) — `skip_detail` is now canonical. SKIPS_COLUMNS docstring explains the role of each column.
+- **Sort order extended to `(strategy, symbol, expiry, entry_td, exit_td, reason, detail)`** — reason + detail as final tie-breakers preserve byte-identical determinism even if duplicate cell-keys ever appear. **Defensive belt-and-suspenders** — shouldn't happen given the canonical task enumeration, but cheap insurance.
+- **Back-compat in `read_sweep_with_skips`** ([src/web/discover.py:91-95](src/web/discover.py#L91-L95)): pre-skip-detail parquets get `skip_detail = ""` synthesized so downstream code doesn't KeyError on missing column.
+- **Tests updated**:
+  - `test_write_then_read_skips` asserts skip_detail round-trips ([tests/test_results.py:160, 168](tests/test_results.py)).
+  - `test_sweep_one_skips_on_missing_data_returns_skip_marker` asserts the new `"skip:Class|message"` format ([tests/test_sweeper.py:248](tests/test_sweeper.py)).
+- **489/489 still passes**.
+
+### 0b567af — feat: heatmap drill-down surfaces skipped expiries
+
+**What works:**
+
+- **Honesty banner** ([src/web/heatmap.py:563-572](src/web/heatmap.py#L563-L572)): `"21 priced + 3 skipped for this cell"` warning surfaces the count gap directly. **Eliminates the silent N-discrepancy**: the operator reads "n=21" knowing 3 were dropped AND can see why below.
+- **`_render_skipped_section` helper** ([src/web/heatmap.py:739-775](src/web/heatmap.py#L739-L775)): table with `Expiry | Reason | Detail` columns + grouped count by reason. **Same skip_reason histogram pattern** the diagnostics tab (gap #3 in my last suggestions) will use, but scoped per-cell.
+- **All-skipped cell handling** ([src/web/heatmap.py:574-576](src/web/heatmap.py#L574-L576)): if `len(rows) == 0 and len(cell_skips) > 0`, render ONLY the skipped section and bail. **Previously the operator saw a generic "no trades, pick another cell"** with no signal that the cell was tried-and-failed; now they see the actual reasons.
+- **Commit body quotes analyst feedback verbatim**: "the reason this cell was skipped NEEDS to be stated so that the analyst knows they are not being lied to somehow." **The honesty contract is explicitly named in code+commit.** Future contributor reading this can't accidentally remove the surface.
+- **`render_cell_drilldown` gains `skips_df` kwarg** ([src/web/heatmap.py:480-484](src/web/heatmap.py#L480-L484)) — plumbed through `app._render_heatmap_tab`. Single source for skip data.
+- **Back-compat handled at render**: `if "skip_detail" in cell_skips.columns` ([src/web/heatmap.py:757](src/web/heatmap.py#L757)) — pre-skip-detail parquets get the explainer string "(no detail recorded — pre-skip-detail parquet)".
+
+**Blocking issues:** None.
+
+**Non-blocking observations:**
+
+1. **🔬 Back-compat string-fillna gotcha**: `read_sweep_with_skips` ([src/web/discover.py:94](src/web/discover.py#L94)) sets `skips_df["skip_detail"] = ""` (empty string, not NaN). Then `_render_skipped_section` does `cell_skips["skip_detail"].fillna("(no detail recorded — pre-skip-detail parquet)")` ([src/web/heatmap.py:762](src/web/heatmap.py#L762)). **fillna doesn't catch empty strings** — only NaN. So pre-skip-detail parquets actually render with empty strings in the Detail column, not the explainer text the commit body claims.
+   
+   **Fix**: either `skips_df["skip_detail"] = pd.NA` in `read_sweep_with_skips`, OR use `.replace("", "(no detail...)").fillna("(no detail...)")` in `_render_skipped_section`. ~1 line. Cosmetic; doesn't break anything; just the explainer text doesn't appear for back-compat parquets as the commit claims.
+
+2. **`_render_skipped_section` is module-private** but used in two places in heatmap.py ([line 576](src/web/heatmap.py#L576) and [line 736](src/web/heatmap.py#L736)). Defensible — internal helper, single file.
+
+3. **Skipped-expiries table doesn't aggregate ROI/yr or N** — purely a "what was tried, what failed, why" view. **Correct semantic**: skip rows have no priced outcome to aggregate.
+
+4. **No tests for the UI-layer drill-down skip surface** — same pytest-can't-easily-test-Streamlit limitation as the rest of the UI. Acceptable for v1; visual smoke-check at chore(p6.5.verify) would catch any rendering issues.
+
+5. **`@st.cache_data` on `_load_sweep`** still cache-keys on `str(path)` not `(str(path), mtime)` — same flag as efe1c73 review. If the operator re-runs the sweep with `force=True` and overwrites the parquet, the UI serves the cached old skip data. Still open.
+
+**Domain / correctness checks:**
+
+- **Asymmetric-conservatism / honesty contract**: ✓ MAJOR WIN. Quiet n-discrepancy eliminated. Analyst now sees "21 priced + 3 skipped" + per-expiry reasons. The drill-down can no longer "lie by omission".
+- **Determinism**: ✓ skip parquet sort extended to include (reason, detail); byte-identical across n_workers preserved.
+- **Backward-compat**: ✓ pre-skip-detail parquets load without crashing (minor display issue noted in #1).
+- **Test coverage**: ✓ data-layer round-trip + skip-marker format pinned by tests.
+
+**Strategic value:**
+
+This pair **directly addresses gap #3 from my last suggestions list** (diagnostics tab) — but does it at the drill-down level instead of as a full tab. **Smart prioritization**: the per-cell honesty banner is operationally more important than a separate diagnostics tab because operators encounter the n-discrepancy at decision time (looking at a specific cell), not separately at "audit time" (visiting a diagnostics tab).
+
+**A separate diagnostics tab (full p7.2) would still add value** for:
+- Coverage map: "which (symbol, expiry) pairs are missing entirely"
+- Skip-reason histogram across the WHOLE sweep
+- Run_id history
+
+But the most critical surface — "what's missing FROM THIS CELL THE ANALYST IS LOOKING AT" — is now closed.
+
+**Carry-over open flags:**
+- ⚠ **`chore(p6.5.tag)` STILL missing** — now ~15 commits pre-tag. The phase boundary has functionally evaporated.
+- 🔬 **Regression tests for parallel-skips determinism (b41e047 follow-up) + cache.write race (54850d4 + 8419a8c)** still not added.
+
+**What I tried:**
+- Read both diffs end-to-end.
+- Read `_render_skipped_section` for the rendering logic.
+- Cross-checked back-compat path in `read_sweep_with_skips`.
+- `pytest tests/` → 489/489.
+
+**Next-commit suggestion:**
+1. **Fix the empty-string fillna gotcha** in `_render_skipped_section` (1-line).
+2. **`chore(p6.5.tag)`** — STILL overdue.
+3. Optional: a separate `feat(p7.2.diagnostics)` tab now that the cell-level surface is done. Could add coverage map + sweep-wide skip-reason histogram + run_id history.
+
+---
+
 ## Review of 54850d4 + ca55d4c + 8419a8c — three multi-worker sweep fixes I missed during the overnight watcher gap
 
 **Verdict:** ✅ accept (all three) — caught up after spotting "54850d4 race-fix" referenced in 8419a8c's commit body. The watcher missed two notifications during the overnight window.
