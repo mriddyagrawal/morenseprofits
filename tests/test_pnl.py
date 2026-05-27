@@ -13,7 +13,14 @@ import pandas as pd
 import pytest
 
 from src.data.errors import IlliquidLegError, LookaheadError, MissingDataError
-from src.engine.pnl import price_trade, _pick_close_on, _price_one_leg
+from src.engine.pnl import (
+    TURNOVER_SCALE_FACTOR,
+    _compute_vwap,
+    _pick_close_on,
+    _pick_fill_price,
+    _price_one_leg,
+    price_trade,
+)
 from src.engine.slippage import SlippageModelV1
 from src.strategies.base import Leg, Trade
 
@@ -334,6 +341,178 @@ def test_illiquid_leg_error_is_a_missing_data_error():
     any sweeper-side changes. Pinned because flipping the inheritance
     would silently turn skipped cells into propagating exceptions."""
     assert issubclass(IlliquidLegError, MissingDataError)
+
+
+# ============================================================
+# VWAP fill price — feat(p7.pricing.vwap_fill)
+# ============================================================
+
+def _option_frame_with_vwap(
+    dates_closes_lots_vols_ois_turnovers: list[tuple[date, float, int, int, int, float]],
+) -> pd.DataFrame:
+    """Like ``_option_frame_with_liquidity`` but also emits the
+    ``turnover`` column (in lakhs of rupees per NSE convention) so the
+    VWAP-fill path is exercised. For each row, turnover is what NSE
+    would report: ``vwap_rupees × volume_shares / TURNOVER_SCALE_FACTOR``
+    where vwap_rupees is the average price the contract cleared at.
+
+    Tests can choose vwap_rupees ≈ close for healthy data (assertion
+    passes), or set them divergent to exercise the units-sanity
+    failure branch."""
+    return pd.DataFrame({
+        "date": pd.Series(
+            [pd.Timestamp(d) for d, *_ in dates_closes_lots_vols_ois_turnovers],
+            dtype="datetime64[us]",
+        ),
+        "close": [c for _, c, *_ in dates_closes_lots_vols_ois_turnovers],
+        "lot_size": pd.array(
+            [l for _, _, l, *_ in dates_closes_lots_vols_ois_turnovers],
+            dtype="int64",
+        ),
+        "volume": pd.array(
+            [v for _, _, _, v, *_ in dates_closes_lots_vols_ois_turnovers],
+            dtype="int64",
+        ),
+        "oi": pd.array(
+            [o for _, _, _, _, o, _ in dates_closes_lots_vols_ois_turnovers],
+            dtype="Int64",
+        ),
+        "turnover": [t for _, _, _, _, _, t in dates_closes_lots_vols_ois_turnovers],
+    })
+
+
+def test_vwap_fill_used_when_turnover_present():
+    """When turnover is present and units pass the sanity band, the
+    engine fills at VWAP = turnover * scale / volume instead of close.
+
+    Fixture: close=100, volume=10,000 shares, turnover=9.8 lakhs of
+    rupees → vwap = 9.8 * 100,000 / 10,000 = 98. Fills at 98, not 100."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    # entry: close=100, volume=10000, turnover=9.8 lakhs → vwap=98
+    # exit:  close=20, volume=5000, turnover=1.0 lakh   → vwap=20
+    df = _option_frame_with_vwap([
+        (entry, 100.0, 250, 10000, 5000, 9.8),
+        (exit_,  20.0, 250,  5000, 4500, 1.0),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # SELL @ entry VWAP=98, BUY back @ exit VWAP=20
+    # gross = (98 - 20) × 250 = 19,500 (not 20,000 if close was used)
+    assert out["gross_pnl"] == pytest.approx(19500.0, abs=1e-6)
+
+
+def test_vwap_falls_back_to_close_when_turnover_nan():
+    """Legacy parquets ingested before the turnover column landed have
+    NaN in that column. VWAP fill must fall back to close in that case
+    so legacy cache keeps producing the pre-VWAP P&L numbers."""
+    import math
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_vwap([
+        (entry, 100.0, 250, 10000, 5000, math.nan),
+        (exit_,  20.0, 250,  5000, 4500, math.nan),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # Fallback to close: SELL @100, BUY back @20 → gross = (100-20)×250 = 20,000
+    assert out["gross_pnl"] == pytest.approx(20000.0, abs=1e-6)
+
+
+def test_vwap_units_sanity_assertion_fires_on_lakhs_vs_rupees_mismatch():
+    """If NSE shifts PREMIUM VALUE from lakhs to raw rupees (or any
+    units regression), the computed VWAP would be 100,000× too small
+    relative to close. The units-sanity assertion in _pick_fill_price
+    refuses to book a trade against a fill price 5 orders of magnitude
+    off rather than silently using it.
+
+    Simulating the bug: turnover that, when scaled, gives vwap=0.001
+    while close=100 → ratio 0.00001, far outside [0.5, 2.0]."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    # turnover=0.0001 lakhs → vwap = 0.0001 * 100,000 / 10000 = 0.001
+    # close=100 → ratio = 0.00001 → fires assertion
+    df = _option_frame_with_vwap([
+        (entry, 100.0, 250, 10000, 5000, 0.0001),
+        (exit_,  20.0, 250,  5000, 4500, 1.0),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    with pytest.raises(MissingDataError, match="VWAP/close ratio"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
+
+
+def test_vwap_falls_back_to_close_when_volume_zero():
+    """Defensive: the liquidity gate above already rejects volume=0,
+    so this branch is technically dead code in production. But the
+    helper ``_compute_vwap`` is independently callable and must return
+    None on volume=0 to avoid divide-by-zero, so this pins the
+    contract directly."""
+    assert _compute_vwap(turnover=10.0, volume=0) is None
+    assert _compute_vwap(turnover=10.0, volume=None) is None
+    assert _compute_vwap(turnover=None, volume=100) is None
+
+
+def test_compute_vwap_units_match_lakhs_convention():
+    """Pin the units invariant directly: 10 lakhs of turnover over
+    50,000 shares → VWAP = 10 * 100,000 / 50,000 = 20 rupees per share.
+    Anti-regression for the TURNOVER_SCALE_FACTOR constant."""
+    assert _compute_vwap(turnover=10.0, volume=50_000) == pytest.approx(20.0)
+    # Direct check that the scale factor is the lakhs-to-rupees magic
+    # number; if a future contributor flips it to 1 (assuming rupees),
+    # this test fires.
+    assert TURNOVER_SCALE_FACTOR == 100_000.0
+
+
+def test_vwap_legs_json_carries_entry_turnover_and_exit_turnover():
+    """Per-leg audit telemetry: the trade's legs_json must include
+    entry_turnover + exit_turnover so post-hoc analysis can identify
+    cells where VWAP and close diverged significantly. Confirms the
+    leg-result dict surfaces them."""
+    import json
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_vwap([
+        (entry, 100.0, 250, 10000, 5000, 9.8),
+        (exit_,  20.0, 250,  5000, 4500, 1.0),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    legs = json.loads(out["legs_json"])
+    assert len(legs) == 1
+    assert legs[0]["entry_turnover"] == pytest.approx(9.8)
+    assert legs[0]["exit_turnover"] == pytest.approx(1.0)
 
 
 def test_gate_silent_when_volume_oi_columns_absent():

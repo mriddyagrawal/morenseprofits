@@ -53,20 +53,80 @@ from src.strategies.base import Leg, Trade, side_sign
 LoadOptionFn = Callable[..., pd.DataFrame]
 
 
-def _pick_close_on(
-    df: pd.DataFrame, target: date, *, context: str,
-) -> tuple[float, int, int | None, int | None]:
-    """Return (close, lot_size, volume, oi) for the row whose date equals
-    ``target``. ``volume``/``oi`` are returned as ``None`` if those columns
-    are absent (test fixtures use minimal frames); production loader frames
-    always carry them per §2.3.
+# Units conversion for NSE F&O turnover.
+#
+# NSE's per-contract historical archive reports total traded value
+# (``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE") in LAKHS of rupees, not
+# raw rupees. Verified against jugaad-data's legacy schema where the
+# same field appears as ``VAL_INLAKH`` — the units are literally in
+# the column name. The modern direct-fetch API follows the same
+# convention.
+#
+# To compute a per-share VWAP in rupees: ``turnover * 100_000 / volume``.
+# A median-ratio sanity check fires per-leg (see _pick_fill_price) so
+# if NSE ever shifts the convention the wrong value surfaces loudly
+# rather than silently producing fill prices off by 5 orders of
+# magnitude.
+TURNOVER_SCALE_FACTOR = 100_000.0
 
-    Raises ``MissingDataError`` if no such row exists; raises
+# VWAP-vs-close ratio bounds for the units-sanity assertion. A real
+# day's VWAP should land within the day's OHLC range; for any but the
+# most pathological intraday-trajectory contract, VWAP and close
+# should be within roughly 50% of each other. Tighter bounds risk
+# false positives on legitimately-volatile days; looser bounds risk
+# masking a real units bug.
+_VWAP_CLOSE_RATIO_MIN = 0.5
+_VWAP_CLOSE_RATIO_MAX = 2.0
+
+
+def _compute_vwap(turnover: float | None, volume: int | None) -> float | None:
+    """Daily volume-weighted average price from turnover + volume.
+    Returns None if either input is missing/NaN/zero — caller falls
+    back to ``close`` in that case.
+
+    Units: turnover is lakhs of rupees per NSE's historical archive
+    convention (see ``TURNOVER_SCALE_FACTOR``), volume is shares.
+    Output is rupees per share — directly comparable to ``close``."""
+    if turnover is None or volume is None or volume == 0:
+        return None
+    if pd.isna(turnover):
+        return None
+    return float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
+
+
+def _pick_fill_price(
+    df: pd.DataFrame, target: date, *, context: str,
+) -> tuple[float, int, int | None, int | None, float | None]:
+    """Return (fill_px, lot_size, volume, oi, turnover) for the row
+    whose date equals ``target``. ``fill_px`` is VWAP (turnover *
+    scale / volume) when turnover + volume are both present and the
+    VWAP-vs-close ratio passes a sanity check; falls back to ``close``
+    otherwise.
+
+    Why VWAP over close: close is the day's last trade, which on a
+    thin-volume day can be a small print far from where the bulk of
+    volume cleared. VWAP represents the volume-weighted centre of mass
+    of the day's trading — materially closer to a real fill price
+    than close for thin strikes.
+
+    Sanity check: if a row has turnover + volume but the computed VWAP
+    lands outside [0.5×, 2.0×] of close, raises ``MissingDataError``
+    pointing at a likely units bug (NSE shifted convention, or a
+    parser regression). This is a research-honesty trip-wire: silently
+    producing a fill price 100,000× off close would be the worst
+    failure mode the units risk can produce; failing loudly is the
+    right behavior.
+
+    ``volume`` / ``oi`` / ``turnover`` are returned as ``None`` if
+    those columns are absent (legacy minimal test fixtures); production
+    loader frames always carry them per §2.3.
+
+    Raises ``MissingDataError`` if no row matches ``target``, or
     ``LookaheadError`` if multiple rows share the date (parser bug).
-    Does NOT check for rows past ``target`` — that lookahead check is
-    enforced ONCE per leg in ``_price_one_leg`` against
-    ``trade.exit_date`` (the trade's outer bound), since the kernel
-    legitimately needs both entry and exit rows in the same frame."""
+    Lookahead-vs-exit_date is enforced ONCE per leg in
+    ``_price_one_leg`` against the trade's outer bound; this helper
+    only validates duplicate-date.
+    """
     if df.empty:
         raise MissingDataError(
             f"{context}: load_option returned empty frame; no price to use"
@@ -82,13 +142,62 @@ def _pick_close_on(
             f"a parser bug, refusing to pick one silently"
         )
     r = row.iloc[0]
+    close = float(r["close"])
     volume: int | None = None
     oi: int | None = None
+    turnover: float | None = None
     if "volume" in row.columns and pd.notna(r["volume"]):
         volume = int(r["volume"])
     if "oi" in row.columns and pd.notna(r["oi"]):
         oi = int(r["oi"])
-    return float(r["close"]), int(r["lot_size"]), volume, oi
+    if "turnover" in row.columns and pd.notna(r["turnover"]):
+        turnover = float(r["turnover"])
+
+    vwap = _compute_vwap(turnover, volume)
+    if vwap is None:
+        # No turnover available (legacy cache, NaN turnover, zero
+        # volume). Use close — same behavior as pre-VWAP.
+        fill_px = close
+    else:
+        # Units-sanity assertion: VWAP / close must land in the
+        # plausible band. Outside the band points at a NSE units
+        # shift OR a parser regression; either way the engine should
+        # refuse to book a trade rather than silently use a fill price
+        # off by orders of magnitude.
+        ratio = vwap / close if close != 0 else float("inf")
+        if not (_VWAP_CLOSE_RATIO_MIN <= ratio <= _VWAP_CLOSE_RATIO_MAX):
+            raise MissingDataError(
+                f"{context}: VWAP/close ratio {ratio:.4g} outside "
+                f"[{_VWAP_CLOSE_RATIO_MIN}, {_VWAP_CLOSE_RATIO_MAX}] on "
+                f"{target} — likely a units mismatch on PREMIUM VALUE "
+                f"(turnover={turnover}, volume={volume}, close={close}, "
+                f"computed vwap={vwap:.4f}). Refusing to book a trade "
+                f"against a suspicious fill price."
+            )
+        fill_px = vwap
+    return fill_px, int(r["lot_size"]), volume, oi, turnover
+
+
+# Backward-compat shim: existing callers (and the public price_trade
+# entry point) call ``_pick_close_on`` and expect the 4-tuple. Keep
+# the old name as an alias that drops the turnover field, while the
+# kernel internally uses ``_pick_fill_price``. This avoids touching
+# the public test surface for callers that don't need turnover.
+def _pick_close_on(
+    df: pd.DataFrame, target: date, *, context: str,
+) -> tuple[float, int, int | None, int | None]:
+    """Legacy 4-tuple wrapper around ``_pick_fill_price``. Returned
+    fill price is VWAP (when available) or close (fallback), but the
+    column is still named ``close`` historically for callers that
+    haven't been migrated to the new helper.
+
+    New code should call ``_pick_fill_price`` directly and use the
+    5-tuple form to get turnover for downstream audit / VWAP-divergence
+    analysis."""
+    fill_px, lot_size, volume, oi, _turnover = _pick_fill_price(
+        df, target, context=context,
+    )
+    return fill_px, lot_size, volume, oi
 
 
 def _price_one_leg(
@@ -124,10 +233,10 @@ def _price_one_leg(
             f"{context}: frame contains rows past exit_date {trade.exit_date}: "
             f"{[str(d) for d in offenders]}. Look-ahead bias would leak."
         )
-    entry_px, entry_lot, entry_vol, entry_oi = _pick_close_on(
+    entry_px, entry_lot, entry_vol, entry_oi, entry_turnover = _pick_fill_price(
         df, trade.entry_date, context=f"{context} entry",
     )
-    exit_px, exit_lot, exit_vol, exit_oi = _pick_close_on(
+    exit_px, exit_lot, exit_vol, exit_oi, exit_turnover = _pick_fill_price(
         df, trade.exit_date, context=f"{context} exit",
     )
     # Lot size at ENTRY differing from EXIT means the contract straddled
@@ -178,8 +287,8 @@ def _price_one_leg(
         "side": leg.side,
         "qty_lots": leg.qty_lots,
         "lot_size": entry_lot,
-        "entry_px": entry_px,                  # raw close from loader
-        "exit_px": exit_px,                    # raw close from loader
+        "entry_px": entry_px,                  # VWAP if available, else close
+        "exit_px": exit_px,                    # VWAP if available, else close
         "entry_px_realized": entry_px_realized,  # post-slippage
         "exit_px_realized": exit_px_realized,    # post-slippage
         # Liquidity at entry + exit (shares units; contracts = vol/lot_size).
@@ -189,6 +298,13 @@ def _price_one_leg(
         "exit_volume": exit_vol,
         "entry_oi": entry_oi,
         "exit_oi": exit_oi,
+        # Per-leg turnover (in lakhs of rupees, NSE convention) for post-
+        # hoc audit of VWAP vs close divergence. NaN on legacy parquets
+        # whose ingest predated the turnover column landing — downstream
+        # consumers should handle that by falling back to ``entry_px``
+        # (which already encodes the choice between VWAP and close).
+        "entry_turnover": entry_turnover,
+        "exit_turnover": exit_turnover,
         "gross_pnl": gross,
     }
 
