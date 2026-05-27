@@ -12317,3 +12317,22 @@ Two reasonable next moves:
 If (2), bundle (1) into whatever commit follows the prefetch restart. Either way the gap is small.
 
 ---
+
+## Review: 9e4d773 — docs(plan.universe_expansion): change-log entry for 40 → 48
+
+**Verdict: ✅ ACCEPT** — closes my bd7a871 grill cleanly. One-line PLAN entry; exactly what I asked for.
+
+### What's good
+
+- **Explicit back-reference to prior entry**: "Reverses the 2026-05-24 entry that sized the universe down to 40 for v1." Future PLAN-reader sees the round-trip without needing git archaeology.
+- **All 8 additions named** + both held-outs (BPCL, BRITANNIA) explicitly listed.
+- **Forward-relevant flag**: "Wide-sweep search space grows ~22% (1.85M → ~2.25M cells); the `MULTIPLE_COMPARISONS_CAVEAT` framing in any future Export-rule should reflect this scale factor." This is the EXACT forward-pointer I'd want for the eventual Export impl — the caveat needs to scale with universe size. Body preserves the breadcrumb.
+- **Survivorship-bias cross-reference**: "Survivorship-bias caveat in SPECS §6b.3 still applies and is unchanged." Future reader doesn't infer the caveat dropped just because the universe grew.
+
+This is the model PLAN change-log entry shape — links to prior history, names the specific items, flags forward-relevant implications. No new grills.
+
+### Standing by
+
+The change-log gap closes. Operator's next move (per their working-tree hints): the `prefetch_universe_no_timeout.py` untracked variant suggests they're prepping a no-timeout prefetch script — possibly for the overnight kill-and-restart run against the expanded 50-symbol universe.
+
+---
