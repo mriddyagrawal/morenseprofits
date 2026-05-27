@@ -11707,3 +11707,64 @@ Whatever order you pick — go. The 4-commit plan is well-shaped. Per the calibr
 And going forward: I'll be more careful about skew-direction claims. The f9da84d miscall is logged as a calibration point. Thanks for pushing back on the math instead of accepting a wrong grill — that's the loop working.
 
 ---
+
+## Review: ceffd71 — chore(prefetch.log_width): widen skip-msg truncation 80 → 200
+
+**Verdict: ✅ ACCEPT** — small focused cosmetic chore. Concrete justification in the body (85-char typical error gets cut mid-string at 80), 3 sites updated consistently, honest about the in-flight-workers caveat.
+
+### What's good
+
+- **Concrete numerical justification**: body shows a real example MissingDataError at 85 chars, explains why 80 cuts mid-string. Not hand-wavy.
+- **All 3 sites updated**: MissingDataError branch, generic Exception branch, outer try-except wrapper. Pattern-consistent.
+- **Honest body note** on the in-flight prefetch: "workers spawned with old code will continue to log at 80 chars". Operator knows what to expect.
+- **Pure cosmetic**: no behavior change, no test needed.
+- **Grep'd**: confirmed no OTHER `str(e)[:80]` patterns elsewhere in src/ scripts/ tests/. The 80-char convention isn't repeated anywhere else, so this is fully scoped.
+
+### One micro-nit (not blocking)
+
+Why 200 specifically? Not justified in the body — could be 256, 500, 1000. The 85-char example only requires ~120 to fit comfortably with margin. 200 is plenty but feels arbitrary; a power-of-2 like 256 would match conventional log-width choices and round-trip more cleanly in `[:N]` mental math.
+
+Not worth a follow-up. Just noting.
+
+### Calibration: this is what cosmetic chores SHOULD look like
+
+Tiny scope, concrete example, all sites updated, honest about edge cases. The reviewer-builder loop benefits from these landing without ceremony — operator value (readable logs) compounds.
+
+---
+
+## Review: a80a437 — chore(universe.bhel): add BHEL alongside PNB
+
+**Verdict: ✅ ACCEPT** — same pattern as PNB addition. 41 → 42 symbols (40 blue chips + PNB + BHEL). Operator-requested extra, mirrored across the prefetch + sweep scripts.
+
+### Carry-over visibility from 39d1ba1 grill #1
+
+My 39d1ba1 review flagged: "PNB is hardcoded in BOTH scripts. Two copies. If a third script needs the same universe, PNB will need to be added there too. Recommend centralize as `WATCHLIST_EXTRAS` in `src/universe/`."
+
+This commit makes it 2 extras × 2 sites = 4 places to update. Still manageable, but the centralize-able pattern is now more visible:
+
+```python
+# src/universe/watchlist.py (proposed)
+WATCHLIST_EXTRAS: list[str] = ["PNB", "BHEL"]  # not in blue_chip 40
+```
+
+Then both scripts import. Adding a 3rd extra becomes a 1-line change in one place.
+
+**Not pushing for this NOW** — the operator requested BHEL, BUILDER added it the simplest way, the lockstep contract is preserved (commit body explicitly calls this out). The refactor opportunity is documented; if/when a 3rd extra is requested OR a 3rd script needs the universe, that's the moment to centralize.
+
+### What's good
+
+- **Lockstep maintained**: both scripts updated atomically — same reasoning as 39d1ba1's "atomic bundle for sweep + prefetch".
+- **Comment honesty**: "Neither extra is in the blue-chip 40; both were explicitly added by the operator" (in prefetch helper docstring). Documents the deviation from the canonical universe list.
+- **Sweep helper count comment updated**: "42 symbols (40 blue chips + PNB + BHEL)". Easy to audit.
+- **In-flight prefetch impact noted**: "won't pick up BHEL until restart — that's the natural moment to also pull the just-landed turnover ingest change (next commit) into the cache." Operator knows the restart bundles two improvements.
+
+### Looking ahead
+
+Per the af9be68 consultation, the next commit (Commit 2 from the plan, ingest fix) is the natural restart trigger. **Three updates compound at prefetch restart**:
+1. BHEL added (this commit).
+2. Wider skip-msg truncation (ceffd71).
+3. Turnover ingested into cache (next commit per pricing arc).
+
+That's a good bundle to gate on a restart. The operator can let the in-flight 52%-prefetch finish OR kill-and-restart to get all three improvements immediately.
+
+---
