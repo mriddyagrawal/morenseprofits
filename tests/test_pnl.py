@@ -12,7 +12,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from src.data.errors import LookaheadError, MissingDataError
+from src.data.errors import IlliquidLegError, LookaheadError, MissingDataError
 from src.engine.pnl import price_trade, _pick_close_on, _price_one_leg
 from src.engine.slippage import SlippageModelV1
 from src.strategies.base import Leg, Trade
@@ -203,6 +203,162 @@ def test_missing_data_at_exit_raises():
     )
     with pytest.raises(MissingDataError, match="no traded row on"):
         price_trade(trade, load_option_fn=load, today_fn=lambda: date(2026, 5, 24), slippage_model=_NO_SLIPPAGE)
+
+
+# ============================================================
+# Liquidity gate — IlliquidLegError on entry/exit volume == 0 or
+# entry oi == 0 (feat(p7.pricing.liquidity_gate))
+# ============================================================
+
+def _option_frame_with_liquidity(
+    dates_closes_lots_vols_ois: list[tuple[date, float, int, int, int]],
+) -> pd.DataFrame:
+    """Like _option_frame but with explicit volume + oi columns so the
+    liquidity-gate path is exercised. Production loaders always emit
+    these per §2.3; the minimal _option_frame in the same module
+    omits them so legacy tests stay backward-compatible (gate becomes
+    a no-op when volume/oi columns absent)."""
+    return pd.DataFrame({
+        "date": pd.Series(
+            [pd.Timestamp(d) for d, _, _, _, _ in dates_closes_lots_vols_ois],
+            dtype="datetime64[us]",
+        ),
+        "close": [c for _, c, _, _, _ in dates_closes_lots_vols_ois],
+        "lot_size": pd.array(
+            [l for _, _, l, _, _ in dates_closes_lots_vols_ois], dtype="int64",
+        ),
+        "volume": pd.array(
+            [v for _, _, _, v, _ in dates_closes_lots_vols_ois], dtype="int64",
+        ),
+        "oi": pd.array(
+            [o for _, _, _, _, o in dates_closes_lots_vols_ois], dtype="Int64",
+        ),
+    })
+
+
+def test_illiquid_entry_volume_raises():
+    """Entry day with volume=0 → IlliquidLegError. The published close
+    on a zero-volume day is NSE's theoretical fallback, not a price any
+    participant transacted at. Engine refuses to book the trade."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_liquidity([
+        (entry, 100.0, 250, 0, 5000),    # entry: volume=0 → illiquid
+        (exit_, 10.0, 250, 8000, 4500),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    with pytest.raises(IlliquidLegError, match="entry_volume=0"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
+
+
+def test_illiquid_exit_volume_raises():
+    """Exit day with volume=0 → IlliquidLegError. Same reasoning as
+    entry — exit close on a zero-volume day is theoretical."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_liquidity([
+        (entry, 100.0, 250, 8000, 5000),
+        (exit_, 10.0, 250, 0, 4500),    # exit: volume=0 → illiquid
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    with pytest.raises(IlliquidLegError, match="exit_volume=0"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
+
+
+def test_illiquid_entry_oi_raises():
+    """Entry day with oi=0 → IlliquidLegError. Zero open interest
+    means no live positions in this strike — no counterparty to
+    transact against, even if a small volume technically traded."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_liquidity([
+        (entry, 100.0, 250, 8000, 0),    # entry: oi=0 → illiquid
+        (exit_, 10.0, 250, 8000, 4500),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    with pytest.raises(IlliquidLegError, match="entry_oi=0"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
+
+
+def test_liquid_leg_prices_normally():
+    """Happy path: positive volume on entry + exit, positive entry OI →
+    trade prices normally. Regression guard so the gate doesn't fire on
+    legitimately-traded legs."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_liquidity([
+        (entry, 100.0, 250, 8000, 5000),
+        (exit_, 10.0, 250, 7500, 4500),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # Short CE: SELL @100, BUY back @10 → gross = (100-10) × 250 = 22,500
+    assert out["gross_pnl"] == pytest.approx(22500.0, abs=1e-6)
+
+
+def test_illiquid_leg_error_is_a_missing_data_error():
+    """IlliquidLegError extends MissingDataError so the sweeper's
+    existing `except MissingDataError` skip-loop catches it without
+    any sweeper-side changes. Pinned because flipping the inheritance
+    would silently turn skipped cells into propagating exceptions."""
+    assert issubclass(IlliquidLegError, MissingDataError)
+
+
+def test_gate_silent_when_volume_oi_columns_absent():
+    """Backward-compat: minimal test fixtures from _option_frame
+    (which omits volume + oi columns) skip the gate entirely.
+    _pick_close_on returns None for missing columns; ``None == 0`` is
+    False in Python, so the gate predicate is a no-op. Existing tests
+    relying on this minimal fixture continue to pass without
+    modification."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame([(entry, 100.0, 250), (exit_, 10.0, 250)])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # Trade prices through despite no volume/oi telemetry — confirms
+    # the gate's predicate is no-op when columns absent.
+    assert out["gross_pnl"] == pytest.approx(22500.0, abs=1e-6)
 
 
 def test_lot_size_change_mid_contract_skipped_as_missing_data():

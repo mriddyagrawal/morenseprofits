@@ -40,7 +40,7 @@ from typing import Callable
 import pandas as pd
 
 from src.data import options_loader
-from src.data.errors import LookaheadError, MissingDataError
+from src.data.errors import IlliquidLegError, LookaheadError, MissingDataError
 from src.engine.costs import COST_MODEL_V1, CostModelV1
 from src.engine.margin import MARGIN_MODEL_V1, MarginModelV1
 from src.engine.slippage import SLIPPAGE_MODEL_V1, SlippageModelV1
@@ -145,6 +145,26 @@ def _price_one_leg(
             f"(split / bonus / merger). Skipping — pricing across the "
             f"adjustment requires strike+qty ratio'ing we don't model yet."
         )
+
+    # Liquidity gate (p7.pricing.liquidity_gate): refuse to book a trade
+    # whose entry or exit leg had ZERO traded contracts, or whose entry
+    # day had ZERO open interest. NSE often publishes a close even when
+    # nothing traded (theoretical fallback baked into the close field);
+    # without this gate, the engine books a P&L on a price no participant
+    # transacted at. The gate uses fields the loader already surfaces
+    # (volume, oi) — no new data, no new fetches.
+    #
+    # Single skip reason (IlliquidLegError) for both volume=0 and oi=0
+    # cases; the per-leg numbers are captured in the message for audit.
+    # See errors.py::IlliquidLegError for the research-honesty-vs-deploy-
+    # readiness caveat.
+    if entry_vol == 0 or exit_vol == 0 or entry_oi == 0:
+        raise IlliquidLegError(
+            f"{context}: leg illiquid — "
+            f"entry_volume={entry_vol}, exit_volume={exit_vol}, "
+            f"entry_oi={entry_oi}. No real fill possible; skipping."
+        )
+
     # Apply slippage to raw closes (SPECS §4b): the engine transacts at
     # entry_px_realized / exit_px_realized, not at the raw close.
     entry_px_realized, exit_px_realized = slippage_model.realized_entry_exit(

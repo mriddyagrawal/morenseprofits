@@ -54,3 +54,20 @@ class MissingDataError(DataError):
     Callers iterating candidate dates (e.g. expiry-calendar building) use
     this to distinguish "no data here" from "the network blew up" — the
     latter raises `requests.RequestException` and is NOT wrapped."""
+
+
+class IlliquidLegError(MissingDataError):
+    """Raised by ``src.engine.pnl._price_one_leg`` when a leg's entry or
+    exit row had ZERO traded contracts that day, or when the entry's
+    open interest was zero. The engine refuses to book a trade against
+    a "fill" that never happened — a published close with volume=0 is
+    NSE's theoretical fallback, not a price any participant transacted
+    at. Surfaces as a clean skip in ``sweep_*_skipped.parquet`` with
+    skip_reason="IlliquidLegError" via the existing sweeper machinery
+    that already catches ``MissingDataError``.
+
+    NOTE: this is a research-honesty improvement, not a deploy-
+    readiness signal. "Backtest skips a zero-volume cell" ≠ "a real
+    broker can fill at the surviving cells' assumed prices" — the
+    latter requires broker-API smoke tests before any rule is run with
+    real capital."""
