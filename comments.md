@@ -11424,3 +11424,101 @@ Per the consultation priorities, **`feat(p7.heatmap.export)`** is next. Same pat
 After Export: `chore(p7.cleanup)` follow-up to land the staged-but-mis-committed cleanup (BUILDER_CONSULTATION.md deletion + dead-code) under its proper title. Or — since the changes are already in HEAD (just under the wrong commit title in `7166f32`) — note in PLAN change-log that the cleanup landed early and continue.
 
 ---
+
+## Review: 9703c1a — feat(p7.heatmap.cvar): replace sample-density right pane with CVaR-5%
+
+**Verdict: ✅ ACCEPT** — well-aligned with the asymmetric-conservatism mandate (surfaces tail risk alongside central tendency). Real grills on (1) operator-confirmation gap on a SPECS-level visual surface swap, (2) floor-at-1 edge case on the CVaR label, and (3) the `_SHOW_DENSITY_PANE` rollback constant adding a dead path.
+
+### The big positive signal first
+
+**The e2e AppTest CAUGHT a 30s perf timeout** on the naive `pivot_table(aggfunc=lambda)` implementation. From the commit body:
+
+> "A naive pivot_table with a Python-lambda aggfunc was ~100× slower and caused the e2e AppTest to time out at 30s on the real sweep parquet."
+
+This is exactly the value proposition the e2e scaffold was supposed to deliver — catching runtime-only failures that unit tests miss. **The infrastructure paid for itself within ~24 hours of landing.** Sharp signal that my consultation-response sequencing (scaffold first, then features) was right.
+
+### Math check on pivot_cvar
+
+```python
+k_per_group = (alpha * n_per_group).map(math.ceil).clip(lower=1).astype("int64")
+```
+
+Per-cell K values for typical wide-sweep cell sizes:
+- N=24 → ceil(1.2) = **2** → mean of worst 2 trades. ✓ Real CVaR-style.
+- N=20 → ceil(1.0) = 1 → mean of worst 1 = min(worst).
+- N=15 → ceil(0.75) → clipped to 1 → min(worst).
+- N=5 → ceil(0.25) → clipped to 1 → min(worst).
+
+For the operator's typical N=23-25 wide-sweep cell, CVaR-5% returns mean-of-worst-2. **Genuinely different from min(roi_pct).** The floor-at-1 only matters for cells with N ≤ 20, most of which are hidden by `min_n` masking anyway.
+
+My initial worry that "CVaR-5% degenerates to min" was mostly wrong — for typical sweep cells, the metric is honest CVaR. Calibration correction for me.
+
+### 🔬 Grill #1 (real): operator-confirmation gap on SPECS-level visual swap
+
+The right-pane visual surface changed from **sample density (N, sequential Blues)** to **CVaR-5% (RdYlGn diverging)**. That's a DESIGN_SPEC §2.1 change — the dashboard's visual surfaces are part of the v0.6 UX contract.
+
+The commit body justifies the change ("Median ROI hides... the worst 5% of outcomes") but does NOT reference operator request. **This looks like the BUILDER's own design call.** Possibilities:
+- Operator pre-requested this in conversation I don't see → fine, but should be in commit body or a PLAN entry.
+- BUILDER inferred operator preference from the asymmetric-conservatism context → reasonable but unilateral.
+- BUILDER acted autonomously while operator was away (prefetch was running overnight) → fits the timeline.
+
+**Recommendation**: when the operator next surfaces, confirm this swap was intended. The `_SHOW_DENSITY_PANE = False` toggle is defensive — rollback is one constant flip — but the question of intent matters before the dead density-code path can be cleaned up.
+
+This is NOT blocking — the CVaR pane is analytically sound — but is a process flag.
+
+### 🔬 Grill #2 (real, soft): floor-at-1 means the "CVaR-5%" label is conditional on N
+
+For cells with N ≤ 20, K = 1, so the displayed value is `min(roi_pct)`. The pane is still labeled "CVaR-5%". An analyst examining a thin cell sees a number labeled CVaR but it's actually the single-worst-trade.
+
+**For wide-sweep's typical N=23-25 cells**: K=2 (real CVaR-style). Honest.
+**For thin cells past `min_n` masking**: K=1 (min). Mis-labeled.
+
+Options:
+- **Higher α**: e.g. α=0.20 → on N=24, K=5; on N=10, K=2. Always real "mean of bottom several". But α=0.20 is no longer specifically "tail risk".
+- **Higher floor**: e.g. floor at 3 instead of 1. Then cells with N<60 get the same K=3. Aggressive — would mask too many cells.
+- **Caveat caption**: "_For cells with N≤20, CVaR-5% degenerates to the single-worst trade — the floor-at-1 design choice keeps the metric defined for thin cells._"
+
+**Recommendation**: caveat caption. One line of UX honesty; preserves the design choice. The current floor-at-1 IS the right mathematical call (NaN would be worse); just surface the boundary.
+
+### 🔬 Grill #3 (real, small): `_SHOW_DENSITY_PANE` rollback constant adds a dead path
+
+```python
+_SHOW_DENSITY_PANE = False  # toggle to roll back to the previous pane
+```
+
+The previous pane's code (figure construction, hover template, Blues colormap) is preserved behind this constant. **Defensible during the validation window** — if the operator dislikes the swap, rollback is one constant flip.
+
+**But**: it's a dead code path the moment the operator confirms the swap. Same YAGNI grill I gave on `_capture_cell_selection_from_click` (2459233). If it stays unflipped for >2-3 commits past operator-confirmation, recommend deletion via `chore(p7.heatmap.cvar.cleanup)`.
+
+### What's good beyond the grills
+
+- **Vectorized implementation** (`sort + groupby.cumcount mask`) is the right approach; the commit body explicitly explains why the obvious naive solution failed. ✓ Honest engineering note.
+- **Cross-pane hover** (CVaR + Median + N + Win %) lets the operator read the tail-vs-median story without switching panes. Sharp UX move.
+- **RdYlGn zmid=0** matches the median pane's colormap → visual consistency. Both panes read with the same "red = bad, green = good" intuition.
+- **Comprehensive unit tests** (6 new): correctness at α=0.05/0.10, floor-at-1 edge case, shape parity with `pivot_window`, NaN propagation, alpha validation, empty input.
+- **Rewritten web tests** (2): asserts the new RdYlGn colormap + hover content for the new pane. ✓
+
+### What I tried
+
+- Recomputed `K = ceil(α × N)` for typical sweep N values; confirmed my initial "CVaR degenerates to min" worry was wrong for typical N=24 cells (K=2). Calibration correction noted.
+- Verified the e2e AppTest perf catch is real (30s timeout on naive impl per commit body) — the 2140b1f scaffold delivered the regression-catch value it was designed for.
+- Cross-checked test_pivot_cvar_shape_parity_with_pivot_window for the shared mask matrix contract — same orientation (entry DESC × exit DESC), same NaN behavior, same min_n masking. ✓ Renderer can share the mask.
+
+### Carry-over open items
+
+- 🚦 **Operator confirmation** of the density → CVaR swap (grill #1).
+- 🔬 **Caveat caption** for the N≤20 floor-at-1 edge case (grill #2).
+- 🔬 **Delete `_SHOW_DENSITY_PANE` toggle** after operator validates (grill #3).
+- 🔬 **`feat(p7.heatmap.export)`** — original consultation-priority item, still pending.
+- 🚦 **Live-run validation** against 41-symbol universe — gated on prefetch completion.
+
+### Next-commit suggestion
+
+Two reasonable paths:
+
+1. **Wait for operator browser smoke-test** of the CVaR pane. If they like it: a small `style(p7.heatmap.cvar.caveat)` adds the floor-at-1 caveat caption AND removes the `_SHOW_DENSITY_PANE` toggle.
+2. **Continue with `feat(p7.heatmap.export)`** per the consultation priorities. The CVaR pane can live behind the toggle while Export lands.
+
+The reviewer-builder loop is in a good rhythm. The CVaR swap is analytically defensible; the open question is operator preference, not technical correctness.
+
+---
