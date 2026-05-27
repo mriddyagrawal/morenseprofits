@@ -115,6 +115,7 @@ in the future) — so narrow-window callers later don't re-fetch.
 | `settle_price` | `float64` | NSE daily settlement of the option |
 | `lot_size` | `int64` (plain) | from `MARKET LOT` — historical per row per §4 rule 3; never absent in jugaad output |
 | `volume` | `int64` (plain) | from `TOTAL TRADED QUANTITY` — in **share units**, NOT contract units. ``contracts = volume // lot_size`` if needed |
+| `turnover` | `float64` | from `FH_TOT_TRADED_VAL` (legacy bhavcopy: `VAL_INLAKH`) — total traded value of the contract for the day, **in LAKHS of rupees** (NOT raw rupees). Combined with `volume` it yields a daily VWAP via `turnover × 100_000 / volume` (see §4b for fill-price semantics). Added to schema in `p7.pricing` arc; legacy parquets from before that arc lack the column and load as NaN — the engine's VWAP path falls back to `close` in that case. |
 | `oi` | `Int64` (nullable) | from `OPEN INTEREST`. jugaad emits float64 with occasional NaN; cast to nullable per §2.0/§2.4 convention |
 | `oi_change` | `Int64` (nullable) | from `CHANGE IN OI`. Same nullable reasoning |
 
@@ -508,21 +509,66 @@ Until then, `MARGIN_MODEL_V1` is what every backtest uses, and the
 four caveats above are baked into the engine's documentation so no
 downstream consumer can claim ignorance.
 
-## 4b. Slippage model (frozen)
+## 4b. Fill price + slippage model (frozen)
 
-Bid-ask spread on NSE blue-chip options is ~1-2% of premium. Backtesting
-at the daily close (which is the LAST traded price, not where bids/asks
-sat) systematically over-promises: you don't actually transact at close.
+### 4b.1 Fill-price source (updated in p7.pricing arc)
 
-Slippage MOVES the price *against you* regardless of direction:
+The engine fills each leg at the day's **VWAP** (volume-weighted
+average price) when both `turnover` and `volume` columns are present
+in the loader frame:
 
-  - When you BUY (opening long or closing short): you pay UP — close × (1 + slippage_pct)
-  - When you SELL (opening short or closing long): you receive DOWN — close × (1 − slippage_pct)
+```
+fill_px = turnover × TURNOVER_SCALE_FACTOR / volume   # in rupees per share
+```
+
+with `TURNOVER_SCALE_FACTOR = 100_000.0` because NSE F&O `FH_TOT_TRADED_VAL`
+is reported in lakhs of rupees (verified against jugaad-data's legacy
+`VAL_INLAKH` field — units literally in the column name).
+
+**Fallback**: if `turnover` is absent (legacy cached parquets from
+before p7.pricing arc) or NaN, the engine falls back to the day's
+`close`. Same behavior as pre-VWAP.
+
+**Why VWAP over close**: close is the day's LAST traded print —
+on a thin-volume day that can be a small late-session trade far from
+where the bulk of volume cleared. VWAP represents the volume-weighted
+centre of mass of the day's trading, materially closer to a plausible
+fill price.
+
+**Units-sanity assertion**: per leg, if the computed VWAP / close
+ratio lands outside `[0.5, 2.0]`, `_pick_fill_price` raises
+`MissingDataError` with a "likely a units mismatch on PREMIUM VALUE"
+diagnostic. This is a research-honesty trip-wire: silently producing
+fill prices 5 orders of magnitude off close would be the worst
+failure mode if NSE ever shifts the lakhs convention. **Observed
+operator-side effect**: this skip can also fire on legitimately
+volatile days where close is genuinely an unreliable fillable-price
+proxy — the skip is intentional in those cases (research-honest), not
+a bug.
+
+The leg-result dict surfaces `entry_turnover` / `exit_turnover` (both
+in lakhs of rupees, NSE convention) into the trade's `legs_json` for
+post-hoc audit of VWAP-vs-close divergence.
+
+### 4b.2 Slippage model
+
+Bid-ask spread on NSE blue-chip options is ~1-2% of premium. Even
+with VWAP as the fill-price proxy, the realized fill systematically
+sits inside the bid-ask spread: you transact at the side of the
+spread that's against you, not at the centre.
+
+Slippage MOVES the price *against you* regardless of direction. The
+slippage layer operates on the raw fill price returned by §4b.1
+(VWAP when available, else close) — it doesn't care which source the
+raw fill came from.
+
+  - When you BUY (opening long or closing short): you pay UP — fill_px × (1 + slippage_pct)
+  - When you SELL (opening short or closing long): you receive DOWN — fill_px × (1 − slippage_pct)
 
 So for our canonical short straddle (SELL CE + SELL PE; close = BUY both):
 
-  - entry CE (SELL): realized = close × (1 − pct) (less premium received)
-  - exit  CE (BUY):  realized = close × (1 + pct) (more premium paid to close)
+  - entry CE (SELL): realized = fill_px × (1 − pct) (less premium received)
+  - exit  CE (BUY):  realized = fill_px × (1 + pct) (more premium paid to close)
   - same for PE
 
 Net effect on gross P&L is *asymmetric in the right direction*:
@@ -544,15 +590,17 @@ Per-leg realized-price formula:
 ```python
 side_at_open  = leg.side                                 # SELL or BUY
 side_at_close = {"SELL": "BUY", "BUY": "SELL"}[leg.side]
-entry_realized = entry_close × (1 - pct if side_at_open  == "SELL" else 1 + pct)
-exit_realized  = exit_close  × (1 - pct if side_at_close == "SELL" else 1 + pct)
+entry_realized = entry_fill_px × (1 - pct if side_at_open  == "SELL" else 1 + pct)
+exit_realized  = exit_fill_px  × (1 - pct if side_at_close == "SELL" else 1 + pct)
 ```
 
+where `entry_fill_px` / `exit_fill_px` come from §4b.1 (VWAP or close).
 Then `gross_pnl_per_leg = (entry_realized − exit_realized) × side_sign × qty × lot_size`.
 
-The engine emits both `entry_px` (raw close — what the data layer
-returned) and `entry_px_realized` (post-slippage — what the engine
-actually transacts at). `gross_pnl` uses realized. Audit trail intact.
+The engine emits both `entry_px` (raw fill — VWAP if available else
+close, what the data layer returned) and `entry_px_realized` (post-
+slippage — what the engine actually transacts at). `gross_pnl` uses
+realized. Audit trail intact.
 
 **Calibration**: For our canonical RELIANCE Jan-2024 short straddle
 at 1% slippage, the realized P&L drops from +₹910 (no slippage) to
@@ -660,7 +708,7 @@ the classifier's per-call computation runs in <100ms on a warm cache.
 
 - Caches are **append-mostly**. We never overwrite a parquet that contains real historical data unless `--force-refresh` is passed via CLI.
 - Schema changes bump a `CACHE_VERSION` constant in `src/data/cache.py`; on bump, the cache directory is moved to `data/cache.v{N-1}/` (manual cleanup, never automatic deletion).
-- **Additive vs breaking.** Adding a new schema family (e.g. §2.4 bhavcopy_fo added in p1.3.0) does **not** bump `CACHE_VERSION` — existing on-disk data is unaffected. Only a change to an *existing* schema's column set or dtypes triggers a bump.
+- **Additive vs breaking.** Adding a new schema family (e.g. §2.4 bhavcopy_fo added in p1.3.0) does **not** bump `CACHE_VERSION` — existing on-disk data is unaffected. **Additive columns to an existing schema** (e.g. §2.2 `turnover` added in the p7.pricing arc) also do not bump — legacy parquets continue to load and the missing column surfaces as NaN, which downstream code is expected to handle via fallback (see §4b.1 for the VWAP-vs-close example). **Only renames, dtype changes, and column removals from an existing schema trigger a bump** — those are the ones that break a reader's expectations of what's present.
 
 ## 6c. Sweeper + results store (Phase 4)
 
@@ -729,6 +777,8 @@ Test pattern: `test_byte_identical_under_parallelization` runs the same sweep wi
 ```python
 class DataError(Exception): ...
 class MissingDataError(DataError): ...            # leg/spot missing for required date
+class IlliquidLegError(MissingDataError): ...     # leg's entry/exit volume = 0 OR entry oi = 0
+                                                  # (added in p7.pricing arc; see §4b.1)
 class NoLiquidStrikeError(DataError): ...         # no strikes traded on entry_date
 class CacheCorruptError(DataError): ...
 class BhavcopyFormatError(DataError): ...         # CSV header matches neither pre/post Jul-8-2024 schema
@@ -737,6 +787,8 @@ class StrategyConfigError(ValueError): ...        # bad params dict
 ```
 
 The engine prefers loud failure over silent fallback. The sweeper catches `DataError` and records skip-reason; uncaught exceptions are bugs.
+
+**`IlliquidLegError`** is a research-honesty gate, not a deploy-readiness signal: a leg with `entry_volume = 0` means NSE published a close with no participant transactions that day (theoretical fallback baked into the close field), so booking a trade against that "fill" is dishonest. The gate fires when entry OR exit volume is zero, or when entry open interest is zero. Skip log records `skip_reason="IlliquidLegError"` with the per-leg numbers in `skip_detail`. NOT a substitute for broker-API smoke tests: "backtest skips a zero-volume cell" ≠ "a real broker can fill at the surviving cells' assumed VWAP" — the latter requires live validation.
 
 ## 9. Testing conventions
 
