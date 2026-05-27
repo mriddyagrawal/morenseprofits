@@ -44,15 +44,15 @@ from src.data.errors import MissingDataError  # noqa: E402
 # ============================================================
 def _build_default_symbols() -> list[str]:
     """40 NSE blue chips (sourced from src.universe.blue_chip — the
-    canonical universe list) + PNB. PNB isn't in the blue-chip 40 but
-    the operator explicitly asked for it.
+    canonical universe list) + PNB + BHEL. Neither extra is in the
+    blue-chip 40; both were explicitly added by the operator.
 
     Computed at import time so the universe stays in lockstep with
     src/universe/blue_chip.py — no drift if the blue-chip list ever
     updates. Operator can still override the full list with --symbols."""
     from datetime import date as _date
     from src.universe.blue_chip import blue_chip
-    return blue_chip(_date.today()) + ["PNB"]
+    return blue_chip(_date.today()) + ["PNB", "BHEL"]
 
 
 DEFAULT_SYMBOLS = _build_default_symbols()

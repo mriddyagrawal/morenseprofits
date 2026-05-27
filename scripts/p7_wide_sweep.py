@@ -41,16 +41,16 @@ from src.engine.sweeper import _compute_run_id, sweep_grid  # noqa: E402
 
 
 def _build_symbols() -> list[str]:
-    """40 NSE blue chips (sourced from src.universe.blue_chip) + PNB.
-    Mirrors scripts/prefetch_universe.py's DEFAULT_SYMBOLS so the sweep
-    universe and the prefetch universe stay in lockstep — sweep
-    against a stock that wasn't prefetched would just produce
+    """40 NSE blue chips (sourced from src.universe.blue_chip) + PNB
+    + BHEL. Mirrors scripts/prefetch_universe.py's DEFAULT_SYMBOLS so
+    the sweep universe and the prefetch universe stay in lockstep —
+    sweep against a stock that wasn't prefetched would just produce
     OfflineCacheMiss skips for every cell."""
     from src.universe.blue_chip import blue_chip
-    return blue_chip(date.today()) + ["PNB"]
+    return blue_chip(date.today()) + ["PNB", "BHEL"]
 
 
-SYMBOLS = _build_symbols()   # 41 symbols (40 blue chips + PNB)
+SYMBOLS = _build_symbols()   # 42 symbols (40 blue chips + PNB + BHEL)
 STRATEGIES = ["short_straddle", "short_strangle", "iron_condor"]
 ENTRY_OFFSETS_TD = list(range(1, 46))   # T-45 ... T-1
 EXIT_OFFSETS_TD = list(range(0, 16))    # T-0  ... T-15
