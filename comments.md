@@ -11768,3 +11768,80 @@ Per the af9be68 consultation, the next commit (Commit 2 from the plan, ingest fi
 That's a good bundle to gate on a restart. The operator can let the in-flight 52%-prefetch finish OR kill-and-restart to get all three improvements immediately.
 
 ---
+
+## Review: 94d535f — feat(p7.pricing.liquidity_gate): Commit 1 of pricing arc
+
+**Verdict: ✅ ACCEPT** — matches the consultation plan precisely. Six tests cover every predicate path + happy-path + inheritance contract + backward-compat. The honesty disclaimer I suggested in my consultation response §6 is pinned verbatim in the `IlliquidLegError` docstring. One real grill on entry-only OI asymmetry, plus a cosmetic test-count nit.
+
+### What's good
+
+- **The honesty disclaimer in `IlliquidLegError`'s docstring** is exactly my suggested §6 addition, verbatim:
+
+> "NOTE: this is a research-honesty improvement, not a deploy-readiness signal. 'Backtest skips a zero-volume cell' ≠ 'a real broker can fill at the surviving cells' assumed prices' — the latter requires broker-API smoke tests before any rule is run with real capital."
+
+  Pinning it in the error class's docstring (vs the commit body alone) means anyone touching this code or reading skip-log analysis sees the caveat. Right surface. ✓
+
+- **Inheritance contract test** (`test_illiquid_leg_error_is_a_missing_data_error`) is the sharp move. Without it, a future refactor could accidentally make `IlliquidLegError` extend `Exception` directly — silent regression where every skipped illiquid cell becomes a propagating exception that kills the sweep. The test pins the contract.
+
+- **Backward-compat verified**: `_pick_close_on` uses `pd.notna(r["volume"])` ([src/engine/pnl.py:87](src/engine/pnl.py#L87)) → returns `None` for NaN/NA OR for missing columns. Gate predicate `entry_vol == 0` evaluates False when `entry_vol is None`. ✓ Silent no-op for legacy minimal fixtures.
+
+  I was about to flag `pd.NA` semantics (`pd.NA == 0` returns `<NA>` which raises in boolean context). Pre-verified the loader's normalization — `pd.notna` gate runs first, so the gate predicate only sees `int` or `None`. Grill withdrawn before publication.
+
+- **Single combined skip reason** per consultation Q1 — per-leg numbers captured in the error message for audit-via-grep. Matches what I confirmed in my consultation response.
+
+- **No sweeper changes**: `IlliquidLegError(MissingDataError)` is caught by existing `_SKIPPABLE_ERRORS` / `_SKIPPABLE_ERRORS_CACHE_ONLY` tuples. Skip log gets `skip_reason="IlliquidLegError"` automatically via `type(e).__name__`. Clean leverage of existing machinery.
+
+- **`_option_frame_with_liquidity` helper** for new tests instead of retrofitting legacy `_option_frame`. Preserves old test fixtures' "minimal" semantics while letting new tests exercise the production-shape volume/oi path. Right scope.
+
+### 🔬 Grill #1 (real): why entry_oi=0 but not exit_oi=0? Worth documenting
+
+The gate predicate is `entry_vol == 0 or exit_vol == 0 or entry_oi == 0`. **Volume is checked on both endpoints; OI only on entry.**
+
+Defensible asymmetry — entry OI confirms the contract was actively held at trade-open; exit OI may have legitimately decayed as positions closed during the hold period. **But the docstring and commit body don't explain this.** A reader checking why no `exit_oi == 0` check is left to infer.
+
+**Recommendation**: 1-line note in either the inline comment or the error class docstring:
+
+> "OI is checked only on entry — at exit, low OI may reflect normal position-closing decay, not unavailability."
+
+Edge case worth noting: a contract with `entry_oi > 0` but `exit_oi == 0` AND `exit_vol > 0`. Someone traded that exit day (so volume passes), but no positions are held overnight after (OI is zero). Currently the gate accepts this. Probably fine — the exit fill is real. But the asymmetry deserves explanation.
+
+### 🔬 Nit (cosmetic): test count off-by-one
+
+Commit body says "5 new in tests/test_pnl.py". I count **6** new tests:
+1. `test_illiquid_entry_volume_raises`
+2. `test_illiquid_exit_volume_raises`
+3. `test_illiquid_entry_oi_raises`
+4. `test_liquid_leg_prices_normally`
+5. `test_illiquid_leg_error_is_a_missing_data_error`
+6. `test_gate_silent_when_volume_oi_columns_absent`
+
+569 - 563 = 6 net new tests. Math checks at 6, body says 5. Off by one. Cosmetic.
+
+### What I'd accept-with-minor-followup
+
+A 1-line docstring note on the entry-OI asymmetry, OR a separate `test_exit_oi_zero_does_not_raise` test that documents-via-test that this is intentional behavior. Either works.
+
+### What's NOT a grill
+
+- **No e2e AppTest update**: the existing scaffold boots against an existing sweep parquet built pre-gate, so it won't exercise IlliquidLegError skips. Acceptable scope — unit tests cover the gate's correctness. After the next sweep (with cache_only=True against new data), the e2e tests will naturally exercise both gated and ungated cells.
+- **Performance**: 1 comparison per leg pricing. Cheap. No grill.
+- **Schema unchanged**: Commit 1 is gate-only; the schema additions (`entry_turnover`, `exit_turnover`) come in Commit 3 per the consultation plan. ✓ Right scope.
+
+### Pricing-arc progress
+
+| Commit | Status |
+|---|---|
+| 1. `feat(p7.pricing.liquidity_gate)` | ✅ this commit |
+| 2. `chore(data.options_loader.turnover)` | pending; per consultation §4 the ingest fix should land before prefetch restart |
+| 3. `feat(p7.pricing.vwap_fill)` | pending |
+| 4. `feat(p7.pricing.liquidity_gate.tighten)` | deferred until live-run calibrates K |
+
+The order ended up as gate-first (your preference), not ingest-first (my slight preference). Both work. The in-flight prefetch will pick up turnover at restart regardless.
+
+### Next-commit suggestion
+
+`chore(data.options_loader.turnover)` per the consultation plan. Body §4 already drafted the change: add `"PREMIUM VALUE": "turnover"` to `_RENAMES`, add `turnover` to dtype coercion loop, write 2 tests. Should be ~5+20 LOC.
+
+Then prefetch restart picks up turnover. Then Commit 3 (VWAP) reads it.
+
+---
