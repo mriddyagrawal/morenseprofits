@@ -11845,3 +11845,85 @@ The order ended up as gate-first (your preference), not ingest-first (my slight 
 Then prefetch restart picks up turnover. Then Commit 3 (VWAP) reads it.
 
 ---
+
+## Review: 8caa0cd — chore(data.options_loader.turnover): Commit 2 of pricing arc
+
+**Verdict: ✅ ACCEPT with one real grill (CACHE_VERSION + SPECS §2.2 update missing).** Pure ingest plumbing — turnover is now carried through normalize. The units-deferred-to-math-site engineering judgment is sound. Three real grills: CACHE_VERSION not bumped, SPECS §2.2 schema not updated, light test coverage vs consultation plan.
+
+### What's good
+
+- **Units-deferred-to-math-site decision is the right engineering call.** Per the inline comment + commit body: NSE reports `FH_TOT_TRADED_VAL` in lakhs of rupees (×10⁵), but this commit deliberately doesn't apply the scale factor. Reasoning: keep units logic at the math site (VWAP fill in Commit 3) with a median-ratio assertion to fail loudly if NSE shifts the convention. **One place to update if NSE migrates archive format.** ✓ Sharp.
+- **Inline comment block is comprehensive** — names the source column (FH_TOT_TRADED_VAL), the rename target ("turnover"), the units note, AND the legacy-cache implication. Future reader has full context.
+- **`pd.to_numeric(errors="coerce")` pattern reused** — empty-string / whitespace turnover degrades to NaN, doesn't crash. Same defensive pattern as the existing float-coerced columns.
+- **569/569 still passes** — purely additive, no behavior change for existing callers.
+
+### 🔬 Grill #1 (real): CACHE_VERSION not bumped despite SPECS §6b.4 saying it should
+
+[SPECS.md §6b.4](SPECS.md#L6b4) is explicit:
+
+> "Adding a new schema family (e.g. §2.4 bhavcopy_fo added in p1.3.0) does **not** bump `CACHE_VERSION` — existing on-disk data is unaffected. Only a change to an *existing* schema's column set or dtypes triggers a bump."
+
+**This commit changes an existing schema (§2.2 options) by adding a column to the column set.** Per SPECS, that triggers a CACHE_VERSION bump. The diff doesn't bump it.
+
+Two ways to reconcile:
+1. **Bump CACHE_VERSION** (per current SPECS). Existing cache directory moves aside per src/data/cache.py:23-28 logic; operator re-fetches OR works against a fresh empty cache. Heavy operational cost; ~50k existing cached contracts would be invalidated.
+2. **Amend SPECS §6b.4** to carve out additive-column changes: "additive columns to an existing schema's column set do not trigger a bump; renames, dtype changes, and column removals do." Then this commit is in compliance.
+
+**Pragmatic call**: the change IS purely additive. Old parquets still have every column they used to. The "new column missing" case is handled by Commit 3's fallback. The current behavior matches what an additive-column-bumps-OK rule would allow.
+
+**Recommendation**: amend SPECS §6b.4 in a separate `docs(specs.6b4.additive)` commit before Commit 3 lands, OR add a one-line note to this commit's body acknowledging that the SPECS rule is being interpreted as additive-friendly. Either way: the SPECS-vs-behavior mismatch is currently real and should be resolved explicitly, not silently.
+
+This isn't blocking — Commit 3's defensive fallback covers the operational case — but the SPECS contract is the kind of thing that drifts silently if not surfaced.
+
+### 🔬 Grill #2 (real, small): SPECS §2.2 schema table not updated to include `turnover`
+
+[SPECS.md:95](SPECS.md#L95) defines the §2.2 options schema. The schema documentation should list `turnover` (between `volume` and `oi`, per the new column order in the test fix). Currently the SPECS file doesn't mention turnover in §2.2.
+
+**This is the documentation half of the additive change.** Code now produces turnover; SPECS still says it doesn't. A future reader checking "what columns does §2.2 carry?" would be misled.
+
+**Recommendation**: bundle the SPECS update into this commit (`chore(data.options_loader.turnover) [+ specs §2.2 update]`) OR follow up immediately with `docs(specs.2.2.turnover)`. Either works; sooner is better.
+
+### 🔬 Grill #3 (real, small): test coverage light vs consultation plan
+
+Consultation §4 commit-plan said:
+
+> "**Tests** (`tests/test_options_loader.py`):
+> - Normalised frame from a known-good NSE response carries the `turnover` column with positive float values.
+> - Empty NSE response still normalises cleanly (no missing-column crash on the new schema).
+> **LOC estimate**: ~5 LOC code + ~20 LOC tests."
+
+This commit lands ~5 LOC of test changes (one existing test updated to include `turnover` in expected column order). **The two new test cases the consultation plan called for didn't land:**
+1. Positive-value test ("real responses produce positive turnover").
+2. Empty-response normalize-cleanly test.
+
+The existing test update is necessary but not sufficient. **The two missing tests would pin behavior**, especially the "empty response doesn't crash" case which is the typical NSE-on-bad-day failure mode.
+
+**Recommendation**: add the 2 missing tests as part of this commit OR a `test(p7.options_loader.turnover.coverage)` follow-up. Estimated 20 LOC per the consultation plan; right scope.
+
+### What's NOT a grill
+
+- **Legacy cache compatibility deferred to Commit 3**: that's the right place. Commit 3's VWAP function falls back to close when turnover is missing. ✓
+- **Inline comment placement**: above `_RENAMES` makes the change discoverable from the rename declaration. ✓
+- **Float64 dtype choice**: matches the other price-coerced columns. ✓
+- **No CACHE_VERSION bump for the test schema reordering**: tests don't touch on-disk parquets in their assertions. ✓
+
+### Pricing-arc progress
+
+| Commit | Status |
+|---|---|
+| 1. `feat(p7.pricing.liquidity_gate)` | ✅ landed (94d535f) |
+| 2. `chore(data.options_loader.turnover)` | ✅ this commit |
+| 3. `feat(p7.pricing.vwap_fill)` | pending — needs the units median-ratio assertion |
+| 4. `feat(p7.pricing.liquidity_gate.tighten)` | deferred per consultation |
+
+### Next-commit suggestion
+
+Three reasonable next moves, in order of importance:
+
+1. **`docs(specs.6b4.additive) + (specs.2.2.turnover)`** — single commit, addresses grills #1 + #2. The SPECS update is small (one paragraph + one table row); deferring it lets the spec drift.
+2. **`feat(p7.pricing.vwap_fill)`** — Commit 3 of the pricing arc per the consultation plan. Includes the median-ratio assertion to verify the lakhs convention.
+3. **`test(p7.options_loader.turnover.coverage)`** — grill #3 follow-up. Could bundle with (1) if scope allows.
+
+If you bundle (1) + (3) into a single `docs+test(p7.options_loader.turnover.gaps)` commit and land it before Commit 3, the pricing arc has clean foundations. Then Commit 3 (VWAP) lands knowing both SPECS and tests are in sync.
+
+---
