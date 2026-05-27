@@ -30,7 +30,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.analytics.aggregate import MIN_N_FOR_RANKING
-from src.analytics.heatmap import pivot_counts, pivot_window
+from src.analytics.heatmap import pivot_counts, pivot_cvar, pivot_window
 from src.web._filter import filter_pair
 from src.web._format import format_pct
 from src.web.empty_state import render_empty
@@ -303,6 +303,15 @@ def _build_customdata(
     return out
 
 
+# --- Right-pane mode toggle ----------------------------------
+# Right pane currently shows CVaR-5% (tail-mean per cell) — the metric
+# that surfaces what median ROI hides for short-vol strategies.
+# Set ``_SHOW_DENSITY_PANE = True`` to swap back to the original sample-
+# density (n_trades) pane. The density code path is preserved below
+# (figure construction + hover template) so the flip is one constant.
+_SHOW_DENSITY_PANE = False
+
+
 def render_heatmaps(
     df: pd.DataFrame,
     *,
@@ -319,8 +328,17 @@ def render_heatmaps(
                    §2.3, NEVER sequential — a first-negative-cell
                    on a later sweep would otherwise render mid-green
                    and mislead.
-      Right pane — SAMPLE DENSITY (n_trades per cell). Sequential
-                   Blues colormap; 0 = white.
+      Right pane — CVaR-5% per cell (mean of worst 5% of per-trade
+                   ROI outcomes). Same RdYlGn diverging colormap with
+                   zmid=0: deep red = catastrophic tail, near-white =
+                   breakeven worst-case, green = even the bottom 5%
+                   were positive. Surfaces exactly the thing median
+                   ROI hides — two cells with identical medians can
+                   have wildly different worst-case behavior.
+
+                   The original sample-density (n_trades) right pane
+                   is preserved behind ``_SHOW_DENSITY_PANE`` for
+                   rollback; toggle the constant to flip back.
 
     Both panes share orientation per DESIGN_SPEC §2.2: index =
     entry_offset_td DESC (T-15 at top), columns = exit_offset_td
@@ -340,6 +358,7 @@ def render_heatmaps(
 
     values = pivot_window(df, strategy=strategy, symbol=symbol)
     counts = pivot_counts(df, strategy=strategy, symbol=symbol)
+    cvar = pivot_cvar(df, strategy=strategy, symbol=symbol)
     if values.empty:
         st.info(
             f"No (entry × exit) cells available for {strategy} × {symbol}. "
@@ -424,7 +443,53 @@ def render_heatmaps(
         clickmode="event+select",
     )
 
+    # === Right pane — CVaR-5% per cell (diverging RdYlGn) ====
+    # CVaR-5% = mean of the worst 5% of per-trade ROI within each cell.
+    # Surfaces exactly the tail-risk dimension median ROI hides for
+    # short-vol strategies: two cells with identical medians can have
+    # wildly different worst-case behavior; the cell with worse CVaR is
+    # the one that ends careers when a tail event arrives.
+    # Same min_n mask as the value pane so the operator's "this cell is
+    # too thin" gate applies uniformly across both views.
+    cvar_masked = cvar.where(counts >= min_n) if not cvar.empty else cvar
+    cvar_z = cvar_masked.values if not cvar_masked.empty else None
+    cvar_fig = go.Figure(data=go.Heatmap(
+        z=cvar_z,
+        x=exit_ticks,
+        y=entry_ticks,
+        colorscale="RdYlGn",
+        zmid=0,
+        text=[[
+            f"{cvar_z[i][j]:+.0f}%" if cvar_z is not None
+            and cvar_z[i][j] == cvar_z[i][j] else ""
+            for j in range(cvar_z.shape[1] if cvar_z is not None else 0)
+        ] for i in range(cvar_z.shape[0] if cvar_z is not None else 0)],
+        texttemplate="%{text}",
+        textfont={"size": 12},
+        colorbar={"title": "%", "x": 1.02},
+        hoverongaps=False,
+        customdata=custom,
+        hovertemplate=(
+            "<b>entry %{y}, exit %{x}</b><br>"
+            "CVaR-5%%: %{z:+.1f}%%<br>"
+            "Median ROI: %{customdata[4]}<br>"
+            "N: %{customdata[0]}<br>"
+            "Win rate: %{customdata[1]}"
+            "<extra></extra>"
+        ),
+    ))
+    cvar_fig.update_layout(
+        title="CVaR-5% (mean of worst 5% of trades)",
+        xaxis_title="Exit offset",
+        yaxis_title="Entry offset",
+        height=400,
+        margin=dict(l=60, r=60, t=50, b=50),
+    )
+
     # === Right pane — sample density (sequential blues) ====
+    # PRESERVED for rollback; not rendered while _SHOW_DENSITY_PANE is
+    # False. The CVaR pane above replaces it as the right-side surface
+    # per the operator's tail-risk-over-sample-count preference.
     density_z = counts.values
     density_fig = go.Figure(data=go.Heatmap(
         z=density_z,
@@ -483,11 +548,21 @@ def render_heatmaps(
         )
         _capture_cell_selection(selected)
     with cols[1]:
-        st.plotly_chart(
-            density_fig,
-            use_container_width=True,
-            key="mp_heatmap_density_chart",
-        )
+        # Right-pane routing per ``_SHOW_DENSITY_PANE``. CVaR is the
+        # default surface; the density chart is preserved for one-line
+        # rollback if the operator wants the sample-count view back.
+        if _SHOW_DENSITY_PANE:
+            st.plotly_chart(
+                density_fig,
+                use_container_width=True,
+                key="mp_heatmap_density_chart",
+            )
+        else:
+            st.plotly_chart(
+                cvar_fig,
+                use_container_width=True,
+                key="mp_heatmap_cvar_chart",
+            )
 
     # std-bias tooltip text per DESIGN_SPEC §2.2 — surface as a small
     # caption below the panes since Plotly hovertemplates can't carry

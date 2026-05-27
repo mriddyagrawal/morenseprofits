@@ -32,6 +32,8 @@ forced annualization.
 """
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 
 
@@ -113,6 +115,105 @@ def pivot_window(
     )
     # Descending sort so T-15 is at top (visual convention: entry
     # furthest back at top, exit closest to expiry at right).
+    return pivot.sort_index(ascending=False).sort_index(axis=1, ascending=False)
+
+
+def pivot_cvar(
+    results_df: pd.DataFrame,
+    *,
+    strategy: str | None = None,
+    symbol: str | None = None,
+    value_col: str = "roi_pct",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Per-cell CVaR-α: mean of the worst-α fraction of per-trade
+    outcomes within each ``(entry_offset_td, exit_offset_td)`` cell.
+
+    Default α = 0.05 → mean of the bottom 5% of trades. For typical p7
+    sweep cells (N ≈ 25 trades), the bottom 5% is the 2 worst trades;
+    for thinner cells (N < 20) the count floors to 1, so the metric is
+    defined whenever the cell has ≥ 1 trade. Floor-at-1 makes the
+    metric an honest "what would the worst-trade outcome have been" for
+    thin cells rather than producing NaN where a single number IS the
+    answer.
+
+    Why this metric alongside ``pivot_window`` (median):
+        Median ROI hides exactly the thing that kills short-vol
+        strategies — the worst 5% of outcomes. Two cells with identical
+        medians can have wildly different worst-case behavior; the cell
+        with worse CVaR is the one that ends careers when a real-world
+        tail event arrives. Surfacing CVaR per cell lets the operator
+        pick the median-AND-tail-favorable region, not the median-only-
+        favorable one.
+
+    Args:
+        results_df: per-trade frame from the sweep parquet. Must carry
+            the structural keys + ``value_col``.
+        strategy / symbol: pin one slice. Same semantics as
+            ``pivot_window`` — either or both may be ``None`` to
+            aggregate.
+        value_col: which per-trade ROI column to compute the tail mean
+            on. Defaults to ``roi_pct`` (per-trade ROI), matching the
+            project-wide unit choice from p7.expiry_roi.
+        alpha: tail fraction. 0.05 → worst 5%. Must be in (0, 1).
+
+    Returns:
+        DataFrame matching ``pivot_window``'s shape (entry_offset_td
+        DESC × exit_offset_td DESC). Missing cells → NaN. Empty input
+        → empty DataFrame.
+    """
+    filtered = _filter(results_df, strategy=strategy, symbol=symbol)
+    if value_col not in results_df.columns:
+        raise ValueError(
+            f"value_col {value_col!r} not in results frame columns; "
+            f"got {sorted(results_df.columns)}"
+        )
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"alpha must be in (0, 1); got {alpha}")
+    if len(filtered) == 0:
+        return pd.DataFrame()
+
+    # Vectorised bottom-α-mean via sort + cumcount mask. A pivot_table
+    # with a Python-lambda aggfunc is ~100× slower against a full-sweep
+    # slice (Pandas falls back to per-group Python iteration); the e2e
+    # AppTest times out at 30s on real data with the naive approach.
+    # This implementation:
+    #   1. Drops NaN in value_col,
+    #   2. Sorts ascending so the K worst values land at the head of
+    #      each group,
+    #   3. Computes a within-group rank via cumcount,
+    #   4. Masks to ranks ≤ K_per_group, where K = max(1, ceil(α·N)),
+    #   5. Means the survivors per cell, then pivots.
+    sorted_df = (
+        filtered[["entry_offset_td", "exit_offset_td", value_col]]
+        .dropna(subset=[value_col])
+        .sort_values(value_col, kind="mergesort")
+    )
+    if sorted_df.empty:
+        return pd.DataFrame()
+    groups = sorted_df.groupby(
+        ["entry_offset_td", "exit_offset_td"], sort=False,
+    )
+    n_per_group = groups[value_col].transform("size")
+    # ceil(α·N) floored at 1 so thin cells (e.g. N=5, α=0.05) still
+    # produce a defined CVaR — the worst single trade IS the honest
+    # tail estimate when N is small.
+    k_per_group = (
+        (alpha * n_per_group).map(math.ceil).clip(lower=1).astype("int64")
+    )
+    rank_per_group = groups.cumcount() + 1   # 1-based, sorted ascending
+    bottom_mask = rank_per_group <= k_per_group
+    bottom = sorted_df[bottom_mask]
+    cell_means = (
+        bottom.groupby(["entry_offset_td", "exit_offset_td"], sort=False)[value_col]
+        .mean()
+        .reset_index()
+    )
+    pivot = cell_means.pivot(
+        index="entry_offset_td",
+        columns="exit_offset_td",
+        values=value_col,
+    )
     return pivot.sort_index(ascending=False).sort_index(axis=1, ascending=False)
 
 

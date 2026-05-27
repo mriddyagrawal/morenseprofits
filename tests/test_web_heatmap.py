@@ -223,7 +223,8 @@ def test_heatmaps_render_two_plotly_charts(captured_charts):
                 rows.append(_row(entry=e, exit_=x, roi_pct=50.0))
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
     charts = [e for e in captured_charts if e["kind"] == "plotly_chart"]
-    assert len(charts) == 2  # value pane + density pane
+    assert len(charts) == 2  # value pane + CVaR pane (density preserved
+    # behind _SHOW_DENSITY_PANE constant; right pane shows CVaR by default)
 
 
 def _first_color(trace) -> str:
@@ -260,20 +261,26 @@ def test_value_pane_uses_diverging_rdylgn_colormap(captured_charts):
     assert trace.zmid == 0
 
 
-def test_density_pane_uses_sequential_blues(captured_charts):
-    """LOAD-BEARING per DESIGN_SPEC §2.3: density pane uses sequential
-    Blues; 0 = white, max = dark blue. Fingerprint on first/last rgb."""
+def test_cvar_pane_uses_diverging_rdylgn_colormap(captured_charts):
+    """LOAD-BEARING: CVaR pane uses the same diverging RdYlGn (zmid=0)
+    palette as the median pane. Sequential would mid-color first-
+    negative cells on a later sweep and lie about tail risk — same
+    honesty failure as on the median pane. Replaces the previous
+    density-pane Blues test now that the right pane shows tail-mean,
+    not sample count."""
     rows = [_row(entry=e, exit_=x, roi_pct=50.0)
             for e in (15, 10) for x in (3, 1) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
-    density_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][1]["fig"]
-    trace = density_fig.data[0]
+    cvar_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][1]["fig"]
+    trace = cvar_fig.data[0]
     first_rgb = _first_color(trace).lower()
     last_rgb = _last_color(trace).lower()
-    # Blues first stop is near-white (very high all RGB)
-    assert "rgb(247,251,255)" in first_rgb or "rgb(255" in first_rgb, first_rgb
-    # Blues last stop is dark blue (low R, low G, high B)
-    assert "rgb(8,48,107)" in last_rgb or "rgb(8" in last_rgb, last_rgb
+    # RdYlGn first stop is red (high R, low G, low B)
+    assert "rgb(165" in first_rgb or "rgb(255" in first_rgb, first_rgb
+    # RdYlGn last stop is green
+    assert "rgb(0," in last_rgb or "rgb(26," in last_rgb, last_rgb
+    # zmid pinned at 0 — diverging-around-breakeven for tail mean too
+    assert trace.zmid == 0
 
 
 def test_single_axis_empty_state(captured_charts):
@@ -365,17 +372,20 @@ def test_hover_template_includes_all_load_bearing_fields(captured_charts):
     assert "%" in sample_win
 
 
-def test_density_pane_hover_references_value_via_customdata(captured_charts):
-    """Density pane shows N as the main z; hover should ALSO surface
-    the cell's median ROI so the operator doesn't need to switch
-    panes."""
+def test_cvar_pane_hover_includes_median_and_n(captured_charts):
+    """CVaR pane primary z is the worst-5% tail mean; hover must ALSO
+    surface the cell's median ROI + N so the operator can cross-
+    reference the tail-vs-median story without switching panes.
+    Replaces the density-pane hover test; the analytical surface
+    swap is the only material change to assert."""
     rows = [_row(entry=e, exit_=x, roi_pct=42.0)
             for e in (15, 10) for x in (3, 1) for _ in range(6)]
     render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
-    density_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][1]["fig"]
-    tmpl = density_fig.data[0].hovertemplate
-    assert "N:" in tmpl
+    cvar_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][1]["fig"]
+    tmpl = cvar_fig.data[0].hovertemplate
+    assert "CVaR" in tmpl
     assert "Median ROI" in tmpl  # via customdata[4]
+    assert "N:" in tmpl              # via customdata[0]
     assert "Win rate" in tmpl       # via customdata[1]
 
 

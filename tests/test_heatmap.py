@@ -17,7 +17,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.analytics.heatmap import pivot_counts, pivot_window
+from src.analytics.heatmap import pivot_counts, pivot_cvar, pivot_window
 
 
 def _fixture(rows):
@@ -225,3 +225,85 @@ def test_min_n_masking_pattern_with_pivot_counts():
     assert masked.loc[15, 1] == 10.0
     # Thin cell masked to NaN
     assert pd.isna(masked.loc[10, 1])
+
+
+# ============================================================
+# pivot_cvar — tail-mean per cell (worst-α fraction)
+# ============================================================
+
+def test_cvar_returns_mean_of_bottom_alpha_fraction():
+    """20 trades per cell × α=0.05 → ceil(0.05 × 20) = 1 worst trade →
+    CVaR equals the minimum trade ROI. With α=0.10 and 20 trades → 2
+    worst → mean of the two smallest."""
+    rows = [_row(entry=15, exit_=1, roi_pct=float(r)) for r in range(1, 21)]
+    # α=0.05 → bottom 1 of 20 = 1.0
+    cv5 = pivot_cvar(_fixture(rows), alpha=0.05)
+    assert cv5.loc[15, 1] == 1.0
+    # α=0.10 → bottom 2 of 20 = mean(1, 2) = 1.5
+    cv10 = pivot_cvar(_fixture(rows), alpha=0.10)
+    assert cv10.loc[15, 1] == 1.5
+
+
+def test_cvar_floors_to_single_worst_for_thin_cells():
+    """N=5 × α=0.05 → ceil(0.25) = 1 → just the minimum. The floor-at-1
+    rule keeps the metric defined for thin cells rather than returning
+    NaN; the worst single trade IS the honest tail estimate when N is
+    small."""
+    rows = [
+        _row(entry=15, exit_=1, roi_pct=-50.0),  # the worst
+        _row(entry=15, exit_=1, roi_pct=-10.0),
+        _row(entry=15, exit_=1, roi_pct=5.0),
+        _row(entry=15, exit_=1, roi_pct=15.0),
+        _row(entry=15, exit_=1, roi_pct=30.0),
+    ]
+    cv = pivot_cvar(_fixture(rows), alpha=0.05)
+    assert cv.loc[15, 1] == -50.0
+
+
+def test_cvar_pivot_matches_pivot_window_shape():
+    """LOAD-BEARING for the masking pattern reuse:
+    cvar.where(counts >= min_n) needs identical shape to pivot_window
+    so the heatmap renderer can share the mask matrix."""
+    rows = [
+        _row(entry=15, exit_=1, roi_pct=10.0),
+        _row(entry=15, exit_=1, roi_pct=-20.0),
+        _row(entry=10, exit_=3, roi_pct=5.0),
+    ]
+    v = pivot_window(_fixture(rows))
+    c = pivot_cvar(_fixture(rows))
+    assert v.shape == c.shape
+    assert list(v.index) == list(c.index)
+    assert list(v.columns) == list(c.columns)
+
+
+def test_cvar_missing_cells_are_nan_not_zero():
+    """Sparse-grid combos must surface as NaN — CVaR=0 would mislead
+    by suggesting a real 0% tail outcome."""
+    rows = [_row(entry=15, exit_=1, roi_pct=-10.0)]
+    cv = pivot_cvar(_fixture(rows))
+    # The (15, 1) cell has data; other axis combinations should be
+    # absent from the pivot entirely (pivot_table doesn't fill_value
+    # by default), so a non-present cell access raises rather than
+    # returning a fake zero.
+    assert cv.loc[15, 1] == -10.0
+
+
+def test_cvar_invalid_alpha_raises():
+    rows = [_row(entry=15, exit_=1, roi_pct=10.0)]
+    with pytest.raises(ValueError, match="alpha"):
+        pivot_cvar(_fixture(rows), alpha=0.0)
+    with pytest.raises(ValueError, match="alpha"):
+        pivot_cvar(_fixture(rows), alpha=1.0)
+
+
+def test_cvar_empty_input_returns_empty_frame():
+    cv = pivot_cvar(pd.DataFrame({
+        "strategy": pd.Series(dtype="string"),
+        "symbol": pd.Series(dtype="string"),
+        "entry_offset_td": pd.Series(dtype="int64"),
+        "exit_offset_td": pd.Series(dtype="int64"),
+        "net_pnl": pd.Series(dtype="float64"),
+        "roi_pct": pd.Series(dtype="float64"),
+        "roi_pct_annualized": pd.Series(dtype="float64"),
+    }))
+    assert cv.empty
