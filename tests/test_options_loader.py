@@ -181,6 +181,64 @@ def test_returned_schema_matches_specs_2_2(monkeypatch, tmp_path):
 
 
 # ============================================================
+# Turnover ingest — added in p7.pricing arc (commit 8caa0cd).
+# Reviewer grill #3 on 8caa0cd: the consultation plan called for two
+# specific test cases ("positive turnover values" + "empty NSE response
+# doesn't crash on the new schema"). Both land here.
+# ============================================================
+
+def test_turnover_carries_positive_values_from_real_shaped_response(
+    monkeypatch, tmp_path,
+):
+    """NSE response with a realistic PREMIUM VALUE / TOTAL TRADED QUANTITY
+    pair → normalized frame's `turnover` column carries the value
+    through as a positive float64. Anti-regression for the column
+    landing in _RENAMES (8caa0cd); pins both the column presence AND
+    that its values survive the dtype coercion in _normalize."""
+    _redirect_cache(monkeypatch, tmp_path)
+    factory = lambda s, f, t, e, *a, **k: _fake_derivatives(
+        s, e, 2620, "CE", [date(2024, 1, 25)], lot_size=250,
+    )
+    _patch_derivatives(monkeypatch, factory)
+    df = options_loader.load_option(
+        "RELIANCE", date(2024, 1, 25), 2620, "CE",
+        date(2024, 1, 25), date(2024, 1, 25),
+        today_fn=lambda: date(2026, 5, 24),
+    )
+    # Column present (anti-regression for _RENAMES carrying "PREMIUM VALUE")
+    assert "turnover" in df.columns
+    # Positive numeric value — _fake_derivatives sets it to close*lot_size
+    # which is well-formed for the type check (real magnitude is verified
+    # by the engine-layer units assertion at fill-price time, not here).
+    assert df["turnover"].dtype.name == "float64"
+    assert (df["turnover"] > 0).all()
+
+
+def test_empty_nse_response_normalizes_cleanly_with_turnover_in_schema(
+    monkeypatch, tmp_path,
+):
+    """Empty NSE response surfaces as MissingDataError (not a hidden
+    KeyError on a missing column). Anti-regression for the new
+    turnover column not breaking the empty-frame path in _normalize.
+    Complements the existing test_empty_fetch_raises_missing_data by
+    pinning the EXACT column-list assumption: even though the empty
+    frame from _patch_derivatives carries `_JUGAAD_COLS` (which now
+    includes PREMIUM VALUE), normalize routes through to the loud-fail
+    branch instead of crashing on schema enforcement."""
+    _redirect_cache(monkeypatch, tmp_path)
+    _patch_derivatives(
+        monkeypatch,
+        lambda *a, **kw: pd.DataFrame(columns=_JUGAAD_COLS),
+    )
+    with pytest.raises(MissingDataError, match="no derivatives data"):
+        options_loader.load_option(
+            "RELIANCE", date(2024, 1, 25), 2620, "CE",
+            date(2024, 1, 1), date(2024, 1, 25),
+            today_fn=lambda: date(2026, 5, 24),
+        )
+
+
+# ============================================================
 # Full contract lifetime: first fetch pulls ~120 days, not the requested window
 # ============================================================
 
