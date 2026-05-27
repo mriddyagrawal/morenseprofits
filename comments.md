@@ -12149,3 +12149,61 @@ Operator action: prefetch restart → fresh wide-sweep with cache_only=True → 
 The reviewer-builder loop on the pricing arc is at rest. Next BUILDER commit is presumably either (a) an operator-surfaced follow-up after the live-run, OR (b) the start of a new arc (likely Phase 8 MCP server scoping if all goes well).
 
 ---
+
+## Review: 6ccc820 — chore(prefetch.tqdm.contracts): tqdm bar tracks contracts not pairs
+
+**Verdict: ✅ ACCEPT** — sensible UX fix to the prefetch's misleading-ETA problem. Concrete justification (per-pair contract count varies 10×+), `pairs={done}/{total}` postfix preserves the pair-orientation view. One small cosmetic grill on comment placement.
+
+### Why this matters
+
+Per-pair contract count varies wildly (min 6, max 130+ per the commit body). A pair-count bar at "50% pairs done" gives misleading ETA if the remaining pairs happen to be volatile names with 130 contracts each. **Switching the primary unit to contracts means the rate (contracts/sec) and ETA (contracts remaining ÷ rate) are in the right units from minute 1.** Sharp operator-UX move.
+
+### What's good
+
+- **`ESTIMATED_CONTRACTS_PER_PAIR = 54` is empirically derived**: "Empirically observed median from the existing cache: ~54 contracts per (sym, expiry) pair." Real evidence, not guess.
+- **tqdm graceful over/undershoot acknowledged**: "tqdm gracefully handles over- and under-shoot of the estimate, so the constant just needs to be in the right order of magnitude." Right scope for the estimate.
+- **`set_postfix(pairs=N/M)` preserves orientation**: the bar's primary unit is contracts, but the operator can still see "where in the universe am I" via the pair counter. Best of both views.
+- **Both parallel and serial branches updated identically**. ✓ Pattern consistency.
+- **Honest no-test-surface note**: "tqdm rendering isn't unit-testable. Syntax verified; existing 577 tests unaffected (prefetch is a script, not imported by the test suite)." Accurate scoping.
+
+### 🔬 Grill (small, cosmetic): orphan comment fragment in the DEFAULTS section
+
+The new `ESTIMATED_CONTRACTS_PER_PAIR` constant + its 7-line explanation block was inserted INTO the middle of an existing multi-line trailing comment on `DEFAULT_ENTRY_WINDOW_DAYS`. Resulting state at [scripts/prefetch_universe.py:62-74](scripts/prefetch_universe.py#L62):
+
+```python
+DEFAULT_ENTRY_WINDOW_DAYS = 70    # calendar days back from expiry to scan spot
+                                  # (~45 trading days; the sweep's T-45..T-1 grid
+                                  # depth — strikes the strategy could pick across
+
+# Used only to seed the Step-4 tqdm bar's `total=` so the ETA + %-complete
+# numbers are meaningful from the first pair. Empirically observed median
+# from the existing cache: ~54 contracts per (sym, expiry) pair. ...
+ESTIMATED_CONTRACTS_PER_PAIR = 54
+                                  # any entry in that window must be cached)
+```
+
+**The last line `# any entry in that window must be cached)` is now visually orphaned** — it appears directly below `ESTIMATED_CONTRACTS_PER_PAIR` but semantically completes the multi-line comment for `DEFAULT_ENTRY_WINDOW_DAYS` (note the closing paren matches "Phrase that started 5 lines up").
+
+A future reader scanning this file will be confused about which constant the closing parenthetical belongs to.
+
+**Easy fixes** (either):
+- Move `ESTIMATED_CONTRACTS_PER_PAIR + comment block` ABOVE the entire `DEFAULT_ENTRY_WINDOW_DAYS` declaration.
+- OR move the dangling `# any entry in that window must be cached)` UP to be part of the `DEFAULT_ENTRY_WINDOW_DAYS` indent-aligned trailing comment block.
+
+Cosmetic, not blocking. Worth a 2-line fix in the next commit that touches this file.
+
+### What I tried
+
+- Verified both parallel and serial branches use the same `with tqdm(...) as pbar` + `pbar.update(...)` + `pbar.set_postfix(...)` pattern. Symmetric implementation. ✓
+- Read the actual file at HEAD to confirm the comment-orphaning is real (not just a diff-artifact). Confirmed at line 74.
+- Cross-checked that `pairs_done = 0` is initialized BEFORE the if/else branch so it's in scope for both paths. ✓
+
+### Carry-over open items
+
+- 🔬 **Operator action**: prefetch restart → live-run validation. This commit makes the restart's progress display more honest (better ETA, clearer rate). Slight QoL improvement during the long wait.
+
+### Next-commit suggestion
+
+If the BUILDER touches this file again soon, fix the orphan comment as a 2-line cleanup. Otherwise: live-run validation is the next operator-owned step. The tqdm UX fix makes that wait less painful.
+
+---
