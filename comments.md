@@ -12097,3 +12097,55 @@ Two natural moves:
 After those: the pricing arc closes cleanly. Whatever's next (Phase 8 MCP server, or operator-surfaced new direction) starts from a clean baseline.
 
 ---
+
+## Review (catch-up): 3f6f0b6 — test(p7.options_loader.turnover.coverage)
+
+**Verdict: ✅ ACCEPT** — exactly the test-coverage follow-up I asked for in 8caa0cd grill #3. Two new tests matching the consultation plan verbatim. Both have explicit attribution in their docstrings.
+
+**Note on the catch-up**: this commit landed at 02:00, between my f6ced30 review and the watcher notification I responded to. The watcher fired on cb6ad92 (my own review commit) right after 3f6f0b6, and I didn't notice the gap. Operator-flagged the miss. Logging this as a check pattern: when a watcher notification arrives that I authored, re-grep `git log` for anything between my last reviewed commit and HEAD before assuming I'm caught up.
+
+### What landed
+
+Two tests addressing 8caa0cd grill #3's deferred consultation-plan items:
+
+**`test_turnover_carries_positive_values_from_real_shaped_response`**
+- Column presence (`"turnover" in df.columns`) — anti-regression for `_RENAMES` carrying "PREMIUM VALUE".
+- Dtype check (`float64`) — anti-regression for the dtype coercion loop in `_normalize`.
+- Positivity check (`df["turnover"] > 0`).all()` — sanity check on value-passthrough.
+- **Smart scope note in docstring**: "real magnitude is verified by the engine-layer units assertion at fill-price time, not here." Test does what it should; defers the cross-layer magnitude check to where it's load-bearing (the engine's `[0.5, 2.0]` sanity band).
+
+**`test_empty_nse_response_normalizes_cleanly_with_turnover_in_schema`**
+- Empty NSE response routes to `MissingDataError` (loud-fail) rather than crashing on schema enforcement.
+- **Catches a subtle edge**: even when the empty frame's column list carries `_JUGAAD_COLS` (now including PREMIUM VALUE), the load path correctly routes to loud-fail. Pins the schema-list-assumption explicitly.
+- Complements the pre-existing `test_empty_fetch_raises_missing_data` rather than duplicating it.
+
+### What's good
+
+- **Grill attribution in docstrings**: both tests open with "Reviewer grill #3 on 8caa0cd flagged..." and trace the consultation plan. Future maintainer reading these tests sees WHY they exist, not just WHAT they assert.
+- **Defers magnitude checks to the right layer**: the positivity test doesn't try to validate that `turnover` is in "the right units" — that's a cross-layer concern handled by the engine's units-sanity assertion. Test scope matches what the test can pin without coupling to the engine.
+- **Edge-case test is the sharpest**: the empty-frame-with-the-new-column-in-schema case is exactly the kind of subtle thing that would have escaped notice without explicit testing.
+- **577 = 575 + 2**. Math checks. ✓
+
+### Pricing arc — fully closed
+
+| Commit | Status |
+|---|---|
+| 1. `feat(p7.pricing.liquidity_gate)` | ✅ 94d535f |
+| 2. `chore(data.options_loader.turnover)` | ✅ 8caa0cd |
+| 3. `feat(p7.pricing.vwap_fill)` | ✅ 6356b90 |
+| 4. `docs(specs.pricing_arc)` | ✅ f6ced30 |
+| 5. `test(p7.options_loader.turnover.coverage)` | ✅ this commit |
+
+**5 commits, all closed at the spec + code + test level.** The only remaining open item is operator-owned: live-run validation against the 42-symbol universe after prefetch restart.
+
+### Next step
+
+Operator action: prefetch restart → fresh wide-sweep with cache_only=True → analyst review of:
+- Skip rate (vs the 26% pre-pricing-arc baseline).
+- IlliquidLegError fraction (validity gate's bite).
+- VWAP-vs-close divergence (legs_json `entry_turnover`/`exit_turnover` audit).
+- Any spurious sanity-band fires (legitimately-volatile days flagged correctly?).
+
+The reviewer-builder loop on the pricing arc is at rest. Next BUILDER commit is presumably either (a) an operator-surfaced follow-up after the live-run, OR (b) the start of a new arc (likely Phase 8 MCP server scoping if all goes well).
+
+---
