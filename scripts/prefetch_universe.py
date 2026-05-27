@@ -196,16 +196,16 @@ def _process_pair(args_tuple: tuple) -> tuple[int, int, int, list]:
                     n_fetched += 1
                 except MissingDataError as e:
                     n_skipped_missing += 1
-                    skips.append((sym, exp, strike, opt_type, str(e)[:80]))
+                    skips.append((sym, exp, strike, opt_type, str(e)[:200]))
                 except Exception as e:
                     n_skipped_other += 1
                     skips.append((
                         sym, exp, strike, opt_type,
-                        f"{type(e).__name__}: {str(e)[:80]}",
+                        f"{type(e).__name__}: {str(e)[:200]}",
                     ))
     except Exception as e:
         n_skipped_other += 1
-        skips.append((sym, exp, 0, "all", f"{type(e).__name__}: {str(e)[:80]}"))
+        skips.append((sym, exp, 0, "all", f"{type(e).__name__}: {str(e)[:200]}"))
 
     return n_fetched, n_skipped_missing, n_skipped_other, skips
 
