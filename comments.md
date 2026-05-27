@@ -11927,3 +11927,107 @@ Three reasonable next moves, in order of importance:
 If you bundle (1) + (3) into a single `docs+test(p7.options_loader.turnover.gaps)` commit and land it before Commit 3, the pricing arc has clean foundations. Then Commit 3 (VWAP) lands knowing both SPECS and tests are in sync.
 
 ---
+
+## Review: 6356b90 — feat(p7.pricing.vwap_fill): Commit 3 of pricing arc
+
+**Verdict: ✅ ACCEPT** — high implementation quality (magic-number provenance, sanity-assertion as research-honesty trip-wire, defensive shim, 6 comprehensive tests). One real grill on SPECS §4b drift, one soft observation on the sanity-band tightness for volatile contracts.
+
+### What's notably good
+
+- **Magic number with PROVENANCE EVIDENCE**: `TURNOVER_SCALE_FACTOR = 100_000.0` is documented as "Verified against jugaad-data's legacy schema where the same field appears literally as ``VAL_INLAKH`` — units pinned in the column name." This is exactly the level of evidence I want for any magic number that converts units. ✓
+- **Sanity-band assertion**: `if not (0.5 <= ratio <= 2.0): raise MissingDataError`. **Research-honesty trip-wire**. Loud failure beats silent 5-orders-of-magnitude-off fill prices. The docstring explicitly names this framing. ✓
+- **`_compute_vwap` defensive None returns**: handles None turnover, None volume, NaN turnover, zero volume — every degenerate case routes to close-fallback. ✓
+- **Backward-compat shim `_pick_close_on`** keeps the 4-tuple form. Verified `tests/test_pnl.py:19` imports it directly, so this isn't dead code. (Withdrew my pre-publication YAGNI grill.)
+- **Pinning test for the constant value** (`test_compute_vwap_units_match_lakhs_convention`): asserts `TURNOVER_SCALE_FACTOR == 100_000.0` directly. Anti-regression if a future contributor flips to 1 assuming rupees. Sharp.
+- **End-to-end legs_json test** (`test_vwap_legs_json_carries_entry_turnover_and_exit_turnover`): exercises the production audit-telemetry path including JSON deserialization. Catches schema-drift between dict construction + serialization + readback.
+- **Per-leg telemetry via legs_json (not flat schema)**: matches the existing pattern for `volume`/`oi`. No flat `RESULTS_COLUMNS` change needed → no schema-drift test breakage. Better than my consultation suggestion of OPTIONAL_RESULT_COLUMNS. ✓
+
+### 🔬 Grill #1 (real): SPECS §4b drift — engine pricing model changed, spec didn't
+
+[SPECS §4b](SPECS.md#L511) opens with:
+
+> "Bid-ask spread on NSE blue-chip options is ~1-2% of premium. Backtesting at the **daily close** (which is the LAST traded price, not where bids/asks sat) systematically over-promises: you don't actually transact at close."
+
+**The engine now uses VWAP, not close.** The §4b opening paragraph is the documentation half of this commit's behavior change. Future readers checking "what fill price does the engine use?" would be misled by SPECS.
+
+Same drift concern as the 8caa0cd CACHE_VERSION + §2.2 issue. Three commits in this arc, three SPECS-drift gaps:
+1. Commit 1 (gate) → no spec section on liquidity gating exists (could be a new sub-section or amendment to §4b).
+2. Commit 2 (turnover ingest) → §2.2 schema doesn't list `turnover`, §6b.4 CACHE_VERSION question.
+3. Commit 3 (VWAP) → §4b opening paragraph contradicts the new behavior.
+
+**Recommendation**: bundle all SPECS updates into one `docs(specs.pricing_arc)` commit BEFORE the operator runs the pricing-arc-validated sweep. That sweep IS the live-run validation; its results need to be readable against an updated spec, not a stale one.
+
+Suggested edits to §4b:
+- Opening para: "Backtesting at the daily VWAP (turnover × scale / volume; falls back to close when turnover unavailable) is materially closer to a real fill price than the daily close, which is the LAST traded print."
+- New subsection §4b.2 (or wherever fits): "Fill-price source", documenting the VWAP fallback chain + the units-sanity assertion + the `[0.5, 2.0]` band.
+
+### 🔬 Grill #2 (soft, real): sanity-band [0.5, 2.0] may be tight for legitimately-volatile contracts
+
+The band catches cases where VWAP / close diverges by more than 2× or less than 0.5×. For options on a day where the underlying jumps 20% and the option doubles or halves intraday, **VWAP could legitimately land outside the band**.
+
+**Trade-off**:
+- Tight band → catches units bugs early; SKIPS volatile days where close is least trustworthy as a fillable price.
+- Loose band → fewer false positives; tolerates units bugs silently if NSE flips convention.
+
+**The current call (tight band) is defensible** because the days where VWAP/close diverges most ARE the days the engine should be least confident about. Skipping them IS the research-honest move.
+
+But: an operator might see a higher skip rate post-VWAP than pre-VWAP and wonder why. Worth a 1-line caveat in either the IlliquidLegError docstring OR the MissingDataError message: "VWAP/close ratio outside band → typically a volatile day where close is unreliable; skip is intentional."
+
+Not blocking — the assertion error message is already detailed — but operator-facing framing would clarify.
+
+### 🔬 Grill #3 (small, drift): `entry_turnover` / `exit_turnover` semantics in legs_json not documented
+
+The new keys in legs_json:
+- `entry_turnover` (in lakhs of rupees, NSE convention)
+- `exit_turnover` (in lakhs of rupees, NSE convention)
+- `entry_px` (NEW SEMANTICS: VWAP if available, else close)
+- `exit_px` (NEW SEMANTICS: VWAP if available, else close)
+
+The code comment inside `_price_one_leg` documents this:
+> "Per-leg turnover (in lakhs of rupees, NSE convention) for post-hoc audit of VWAP vs close divergence."
+
+But that's an inline comment, not a spec / public docstring. **A future Phase 8 (MCP server) consumer reading legs_json would have no way to know `entry_turnover` is in lakhs without grep'ing the engine source.**
+
+Recommend the SPECS update (grill #1) also mention the legs_json field additions and their units.
+
+### Sanity-band edge case worth noting
+
+Code: `ratio = vwap / close if close != 0 else float("inf")`.
+- If close = 0 AND vwap is finite → ratio = inf → outside band → fires.
+- If close = 0 AND vwap = None (no turnover) → fill_px = close = 0 → engine tries to use 0 as fill price.
+
+The second case is pre-existing (would happen pre-VWAP too) but worth noting that this commit doesn't fix it. Probably should be caught by the liquidity gate from Commit 1 (volume=0 → IlliquidLegError) but only if the close=0 corresponds to volume=0. If close=0 happens with volume>0 (NSE data quirk), that's a separate edge.
+
+Not in scope for this commit.
+
+### What I tried
+
+- Verified `_pick_close_on` IS imported by tests (`tests/test_pnl.py:19`), so the backward-compat shim isn't dead code. Pre-publication YAGNI grill withdrawn.
+- Worked through the units math: turnover (lakhs) × 100_000 / volume (shares) = rupees per share. ✓ Correct.
+- Sanity-band [0.5, 2.0] checked against typical OHLC bounds. Generous enough for stable contracts; tight enough to catch a units-shift bug (which would land >5 orders of magnitude off).
+- Read SPECS §4b — confirmed it still says "daily close" as the fill price, contradicting this commit's behavior.
+
+### Pricing-arc progress
+
+| Commit | Status |
+|---|---|
+| 1. `feat(p7.pricing.liquidity_gate)` | ✅ landed (94d535f) |
+| 2. `chore(data.options_loader.turnover)` | ✅ landed (8caa0cd) |
+| 3. `feat(p7.pricing.vwap_fill)` | ✅ this commit |
+| 4. `feat(p7.pricing.liquidity_gate.tighten)` | deferred per consultation |
+
+**3-of-3 functional commits landed.** All three commits' bodies + the implementation quality are HIGH. The cross-commit SPECS-drift gap is the only real concern.
+
+### Next-commit suggestion
+
+**`docs(specs.pricing_arc)` consolidating SPECS updates from all three commits.** Before the operator runs the live-run validation against the new pricing engine. Suggested scope:
+
+1. SPECS §2.2 schema table: add `turnover` (float64, lakhs of rupees, NSE convention).
+2. SPECS §4b opening paragraph: "daily close" → "daily VWAP (with close fallback)".
+3. SPECS §4b new subsection on fill-price source + sanity-band.
+4. SPECS §6b.4: decide between (a) bump CACHE_VERSION OR (b) carve out additive-column changes. State the chosen interpretation.
+5. SPECS §4: new sub-section on `IlliquidLegError` (the validity gate from Commit 1). What triggers it, what skip log captures.
+
+That's a single ~50-100 line docs commit that closes the entire arc's spec drift. After it: live-run validation (prefetch restart → fresh sweep with cache_only=True → analyst review of skip rate + VWAP-vs-close divergence).
+
+---
