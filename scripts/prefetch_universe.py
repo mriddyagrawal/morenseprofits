@@ -62,6 +62,7 @@ DEFAULT_STRIKES_PCT = 0.05        # min %-of-spot window around ATM (per-day rul
 DEFAULT_ENTRY_WINDOW_DAYS = 70    # calendar days back from expiry to scan spot
                                   # (~45 trading days; the sweep's T-45..T-1 grid
                                   # depth — strikes the strategy could pick across
+                                  # any entry in that window must be cached)
 
 # Used only to seed the Step-4 tqdm bar's `total=` so the ETA + %-complete
 # numbers are meaningful from the first pair. Empirically observed median
@@ -71,7 +72,6 @@ DEFAULT_ENTRY_WINDOW_DAYS = 70    # calendar days back from expiry to scan spot
 # and under-shoot of the estimate, so the constant just needs to be in the
 # right order of magnitude.
 ESTIMATED_CONTRACTS_PER_PAIR = 54
-                                  # any entry in that window must be cached)
 DEFAULT_START = date(2024, 5, 1)
 DEFAULT_END = date(2026, 5, 31)
 TODAY_FN = lambda: date(2026, 5, 25)
