@@ -12224,3 +12224,44 @@ This is the tightest reviewer-builder cycle of the session:
 No grills. Standing by.
 
 ---
+
+## Review: 1628784 — revert(prefetch.tqdm): roll back contract-counting bar attempt
+
+**Verdict: ✅ ACCEPT** — operator caught what I missed; revert is the right call given operator preference. Honest commit body names what was wrong, names what the proper fix would be, and frames the rollback as preferring "known limitation" over "fake precision."
+
+### What I missed in the 6ccc820 review
+
+Operator pushback (verbatim direction): "you just estimated the number of contracts. 54 isn't even always correct."
+
+My 6ccc820 review accepted the BUILDER's framing — "ESTIMATED_CONTRACTS_PER_PAIR = 54 is empirically derived, real evidence not guess" — and waved at "tqdm graceful over/undershoot acknowledged" as if that resolved the ETA accuracy concern. **It didn't.** tqdm's graceful overshoot just means it doesn't crash; ETA = `(total − done) / rate` is still wrong by the same factor the estimate is wrong by.
+
+The contract-counting bar replaced one misleading-ETA problem (pair counts hide per-pair work) with another (estimated total hides actual contract count). **Same shape of failure, different units.**
+
+Logged this as a calibration miss earlier in chat. Same class as the f9da84d skew-direction failure: anchored on the commit body's framing instead of working through the math from first principles.
+
+### What the revert gets right
+
+- **Reverts BOTH 6ccc820 AND 630e45c**: the orphan-comment fix was a cosmetic follow-up to the now-reverted feature. Clean rollback bundle.
+- **Honest framing in commit body**: "Returning to the pair-based bar — the original misleading-ETA issue remains (50% pairs done ≠ 50% wall-clock done when remaining pairs are volatile names), but is preferred over the inaccurate-estimate version. Honest framing: this is a known UX limitation, not a fix."
+- **Names the proper fix**: "serial pre-pass that walks every (sym, expiry), runs the strike-grid discovery against the already-cached bhavcopy + spot, and sums the exact contract counts before launching workers." Defers the refactor because the operator chose to. ✓
+- **No behavior change to the fetch path**: just the tqdm display. Pure UX rollback.
+
+### Calibration loop signal
+
+This is the second time in the session a wrong claim from me got reversed via operator-driven correction (after f9da84d skew direction). Both times the BUILDER and operator did the math I should have done. **The fix in both cases was: work the math from first principles, don't anchor on the commit body's framing.**
+
+The loop is working — wrong things are getting reversed in ~5 minutes — but I'd rather catch these in review than have the operator catch them post-acceptance. New memory pattern logged earlier.
+
+### Next-commit suggestion
+
+Two real options:
+
+1. **`feat(prefetch.tqdm.real_total)`**: implement the 2-pass approach the body names. Pre-pass walks bhavcopy + spot, sums strikes per pair, primes tqdm with the true total. Pre-pass is fast (~seconds, no NSE calls). Real engineering, real fix. Probably ~50 LOC + tests.
+
+2. **Status quo**: accept the pair-bar's known limitation. Operator's call.
+
+Operator already chose option 2 (revert). If they later want option 1, the body documents the path.
+
+Standing by.
+
+---
