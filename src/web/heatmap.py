@@ -227,11 +227,16 @@ def _build_customdata(
     entry_index,
     exit_columns,
 ):
-    """Build a (H, W, 5) per-cell-stats array of STRINGS for Plotly's
+    """Build a (H, W, 6) per-cell-stats array of STRINGS for Plotly's
     customdata channel:
 
         customdata[i][j] = [n_trades_str, win_rate_str, std_roi_str,
-                            total_net_pnl_str, median_roi_str]
+                            total_net_pnl_str, median_roi_str, mean_roi_str]
+
+    Slot [4] (median) and [5] (mean) carry the central-tendency choices
+    surfaced by the median/mean aggfunc toggle; the heatmap hover
+    template addresses whichever is selected. Both are always populated
+    so toggling the radio is a pure render change, no recomputation.
 
     Aligned with the value/density heatmap grids (entry rows × exit
     columns).
@@ -269,6 +274,7 @@ def _build_customdata(
             "std": grouped["roi_pct"].std(ddof=0),
             "total_pnl": grouped["net_pnl"].sum(),
             "median_roi": grouped["roi_pct"].median(),
+            "mean_roi": grouped["roi_pct"].mean(),
         }).reset_index()
         stats["win_rate"] = 100.0 * stats["n_win"] / stats["n"]
         # Index lookup by (entry, exit) tuple
@@ -276,7 +282,7 @@ def _build_customdata(
     else:
         stats = pd.DataFrame()
 
-    out = np.empty((H, W, 5), dtype=object)
+    out = np.empty((H, W, 6), dtype=object)
     for i, e in enumerate(entry_index):
         for j, x in enumerate(exit_columns):
             if (e, x) in stats.index:
@@ -292,6 +298,9 @@ def _build_customdata(
                 out[i, j, 4] = format_pct(
                     float(row["median_roi"]), signed=True,
                 )
+                out[i, j, 5] = format_pct(
+                    float(row["mean_roi"]), signed=True,
+                )
             else:
                 # Zero-count cell — every field "—" so hover doesn't
                 # mislead with "Median ROI: +0.0%" on no data.
@@ -300,6 +309,7 @@ def _build_customdata(
                 out[i, j, 2] = "—"
                 out[i, j, 3] = "—"
                 out[i, j, 4] = "—"
+                out[i, j, 5] = "—"
     return out
 
 
@@ -310,6 +320,49 @@ def _build_customdata(
 # density (n_trades) pane. The density code path is preserved below
 # (figure construction + hover template) so the flip is one constant.
 _SHOW_DENSITY_PANE = False
+
+
+# --- Median / mean aggfunc toggle ----------------------------
+# Session-state key holding the operator's choice between median (robust
+# to outliers; default) and mean (sensitive to tail events; pairs with
+# the right-pane CVaR-5% to surface the head-vs-tail story directly).
+# Stored as the displayed label ("Median" / "Mean"); helpers below
+# normalise to the lowercase pandas aggfunc string.
+_AGGFUNC_SESSION_KEY = "mp_heatmap_aggfunc"
+
+
+def render_heatmap_aggfunc_toggle() -> str:
+    """Render the median/mean radio above the dual heatmaps. Returns
+    the canonical lowercase aggfunc string ('median' or 'mean') ready
+    for ``pivot_window(aggfunc=...)``.
+
+    Default = "Median" — robust to outliers in small per-cell samples,
+    matches pre-toggle behavior so existing sessions see no change.
+    The mean view amplifies extreme trades; combined with the CVaR-5%
+    right pane it lets the operator read head-vs-tail directly without
+    swapping tabs."""
+    label = st.radio(
+        "Cell aggregation",
+        options=["Median", "Mean"],
+        index=0,
+        horizontal=True,
+        key=_AGGFUNC_SESSION_KEY,
+        help=(
+            "Median is robust to outliers in small per-cell samples "
+            "(N ≈ 24). Mean amplifies extreme trades — pairs with the "
+            "CVaR-5% right pane to surface the head-vs-tail story."
+        ),
+    )
+    return label.lower()
+
+
+def get_heatmap_aggfunc() -> str:
+    """Read the current aggfunc choice without rendering the widget.
+    Used by callers that need the value but render the widget elsewhere
+    (e.g. ``render_heatmaps`` itself drives the toggle). Returns
+    'median' (default) or 'mean'."""
+    label = st.session_state.get(_AGGFUNC_SESSION_KEY, "Median")
+    return label.lower()
 
 
 def render_heatmaps(
@@ -356,7 +409,18 @@ def render_heatmaps(
         render_empty("leaderboard_no_rows_after_filters")
         return
 
-    values = pivot_window(df, strategy=strategy, symbol=symbol)
+    # Render the median/mean toggle FIRST so the operator's choice
+    # drives both the pivot below and the hover-template labels. The
+    # widget persists in session_state across reruns; this call also
+    # re-renders the radio every refresh, which is the Streamlit way.
+    aggfunc = render_heatmap_aggfunc_toggle()
+    agg_label = "Median" if aggfunc == "median" else "Mean"
+    # customdata index for the selected aggregate: [4] = median, [5] = mean.
+    # Both are always populated in _build_customdata so this is purely a
+    # render-time pick — no recomputation when the operator flips.
+    agg_customdata_idx = 4 if aggfunc == "median" else 5
+
+    values = pivot_window(df, strategy=strategy, symbol=symbol, aggfunc=aggfunc)
     counts = pivot_counts(df, strategy=strategy, symbol=symbol)
     cvar = pivot_cvar(df, strategy=strategy, symbol=symbol)
     if values.empty:
@@ -417,7 +481,7 @@ def render_heatmaps(
         customdata=custom,
         hovertemplate=(
             "<b>entry %{y}, exit %{x}</b><br>"
-            "Median ROI: %{customdata[4]}<br>"
+            f"{agg_label} ROI: %{{customdata[{agg_customdata_idx}]}}<br>"
             "N: %{customdata[0]}<br>"
             "Win rate: %{customdata[1]}<br>"
             "Std ROI: %{customdata[2]}<br>"
@@ -426,7 +490,7 @@ def render_heatmaps(
         ),
     ))
     value_fig.update_layout(
-        title="Median ROI",
+        title=f"{agg_label} ROI",
         xaxis_title="Exit offset",
         yaxis_title="Entry offset",
         height=400,
@@ -472,7 +536,7 @@ def render_heatmaps(
         hovertemplate=(
             "<b>entry %{y}, exit %{x}</b><br>"
             "CVaR-5%%: %{z:+.1f}%%<br>"
-            "Median ROI: %{customdata[4]}<br>"
+            f"{agg_label} ROI: %{{customdata[{agg_customdata_idx}]}}<br>"
             "N: %{customdata[0]}<br>"
             "Win rate: %{customdata[1]}"
             "<extra></extra>"
@@ -509,7 +573,7 @@ def render_heatmaps(
         hovertemplate=(
             "<b>entry %{y}, exit %{x}</b><br>"
             "N: %{z}<br>"
-            "Median ROI: %{customdata[4]}<br>"
+            f"{agg_label} ROI: %{{customdata[{agg_customdata_idx}]}}<br>"
             "Win rate: %{customdata[1]}"
             "<extra></extra>"
         ),

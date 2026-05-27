@@ -199,11 +199,17 @@ def captured_charts(monkeypatch):
     def fake_caption(msg, **_):
         events.append({"kind": "caption", "msg": msg})
 
+    def fake_radio(label, options, index=0, **_):
+        # Tests that want to exercise a non-default selection patch
+        # this fixture's behavior by re-monkeypatching st.radio inline.
+        return options[index]
+
     import src.web.heatmap as hm
     monkeypatch.setattr(hm.st, "columns", fake_columns)
     monkeypatch.setattr(hm.st, "plotly_chart", fake_plotly_chart)
     monkeypatch.setattr(hm.st, "info", fake_info)
     monkeypatch.setattr(hm.st, "caption", fake_caption)
+    monkeypatch.setattr(hm.st, "radio", fake_radio)
     # streamlit_plotly_events is imported INSIDE render_heatmaps; patch
     # at its source so the import inside the function picks it up.
     import streamlit_plotly_events
@@ -259,6 +265,63 @@ def test_value_pane_uses_diverging_rdylgn_colormap(captured_charts):
     assert "rgb(0," in last_rgb or "rgb(26," in last_rgb, last_rgb
     # zmid pinned at 0 — the diverging-around-breakeven anchor
     assert trace.zmid == 0
+
+
+def test_aggfunc_toggle_defaults_to_median(captured_charts):
+    """No session_state pre-seed → toggle returns 'Median' → left-pane
+    title is 'Median ROI' and the hover surfaces the median customdata
+    slot. Anti-regression for the default-behavior contract."""
+    rows = [_row(entry=e, exit_=x, roi_pct=42.0)
+            for e in (15, 10) for x in (3, 1) for _ in range(6)]
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
+    assert value_fig.layout.title.text == "Median ROI"
+    assert "Median ROI" in value_fig.data[0].hovertemplate
+    # Default routes to customdata slot [4] (median); slot [5] (mean) is
+    # populated but not surfaced.
+    assert "customdata[4]" in value_fig.data[0].hovertemplate
+
+
+def test_aggfunc_toggle_mean_swaps_title_and_hover(captured_charts, monkeypatch):
+    """When the operator picks 'Mean', the left-pane title flips to
+    'Mean ROI' and the hover template addresses customdata slot [5]
+    (the mean string). The pivot itself also recomputes via
+    aggfunc='mean' — verified indirectly: a deliberately skewed cell's
+    annotation must differ from the median-default render."""
+    import src.web.heatmap as hm
+    # Override the fixture's default-Median radio with one that picks Mean.
+    monkeypatch.setattr(hm.st, "radio", lambda *a, **kw: "Mean")
+
+    # Skewed cell: 5 trades at 10%, 1 trade at 1000% → mean ≫ median.
+    rows = []
+    for _ in range(5):
+        rows.append(_row(entry=15, exit_=1, roi_pct=10.0))
+    rows.append(_row(entry=15, exit_=1, roi_pct=1000.0))
+    # Need a second visible cell for the 2×N axes contract.
+    for _ in range(5):
+        rows.append(_row(entry=15, exit_=3, roi_pct=10.0))
+    for _ in range(5):
+        rows.append(_row(entry=10, exit_=1, roi_pct=10.0))
+    rows.append(_row(entry=10, exit_=1, roi_pct=1000.0))
+    for _ in range(5):
+        rows.append(_row(entry=10, exit_=3, roi_pct=10.0))
+
+    render_heatmaps(pd.DataFrame(rows), strategy="S", symbol="X", min_n=5)
+    value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
+    assert value_fig.layout.title.text == "Mean ROI"
+    assert "Mean ROI" in value_fig.data[0].hovertemplate
+    # Mean route uses customdata slot [5].
+    assert "customdata[5]" in value_fig.data[0].hovertemplate
+    # The skewed cell (15,1) should render its MEAN annotation
+    # (10×5 + 1000)/6 ≈ 175 — well clear of the median (10).
+    text = value_fig.data[0].text
+    # First row (entry=15), first column (exit=3 leftmost desc, then exit=1).
+    # Layout: index DESC (15 top, 10 bottom), columns DESC (3 left, 1 right).
+    # So (15, 1) is row 0 column 1.
+    cell_label = text[0][1]
+    assert cell_label.startswith("+") and "1" in cell_label, (
+        f"expected skewed mean ~175, got {cell_label!r}"
+    )
 
 
 def test_cvar_pane_uses_diverging_rdylgn_colormap(captured_charts):
@@ -332,8 +395,10 @@ def test_cells_have_customdata_for_hover_tooltips(captured_charts):
     value_fig = [e for e in captured_charts if e["kind"] == "plotly_chart"][0]["fig"]
     trace = value_fig.data[0]
     cd = trace.customdata
-    # Shape: (H, W, 5) — object dtype (strings)
-    assert cd.shape == (2, 2, 5)
+    # Shape: (H, W, 6) — object dtype (strings). Slot [4] = median ROI,
+    # slot [5] = mean ROI; the heatmap hover surfaces whichever the
+    # median/mean toggle selects.
+    assert cd.shape == (2, 2, 6)
     # All visible cells have N=6 (rendered as "6" string)
     assert (cd[:, :, 0] == "6").all()
     # All winning trades → win_rate = 100% (rendered as "100.0%" string)
@@ -502,7 +567,14 @@ def _render_heatmaps_with_data(monkeypatch):
     monkeypatch.setattr(hm.st, "selectbox", fake_selectbox)
     monkeypatch.setattr(hm.st, "expander", fake_expander)
     monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
-    monkeypatch.setattr(hm.st, "radio", lambda *a, **k: "Drill-down")
+    # Two radios in render_heatmaps now: the aggfunc toggle
+    # (options=["Median", "Mean"]) and the cell-action mode
+    # (options=["Drill-down", ...]). Return options[0] so each radio
+    # gets its proper default (Median / Drill-down respectively).
+    monkeypatch.setattr(
+        hm.st, "radio",
+        lambda label, options=("Drill-down",), **k: options[0],
+    )
     monkeypatch.setattr(hm.st, "caption", lambda *a, **k: None)
     monkeypatch.setattr(hm.st, "plotly_chart", lambda *a, **k: None)
     import streamlit_plotly_events
@@ -574,7 +646,14 @@ def test_manual_picker_writes_session_state_when_user_changes_selection(monkeypa
     monkeypatch.setattr(hm.st, "selectbox", fake_selectbox)
     monkeypatch.setattr(hm.st, "expander", fake_expander)
     monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
-    monkeypatch.setattr(hm.st, "radio", lambda *a, **k: "Drill-down")
+    # Two radios in render_heatmaps now: the aggfunc toggle
+    # (options=["Median", "Mean"]) and the cell-action mode
+    # (options=["Drill-down", ...]). Return options[0] so each radio
+    # gets its proper default (Median / Drill-down respectively).
+    monkeypatch.setattr(
+        hm.st, "radio",
+        lambda label, options=("Drill-down",), **k: options[0],
+    )
     monkeypatch.setattr(hm.st, "caption", lambda *a, **k: None)
     monkeypatch.setattr(hm.st, "plotly_chart", lambda *a, **k: None)
     import streamlit_plotly_events
@@ -624,7 +703,14 @@ def test_manual_picker_respects_entry_gt_exit_constraint(monkeypatch):
     monkeypatch.setattr(hm.st, "selectbox", fake_selectbox)
     monkeypatch.setattr(hm.st, "expander", fake_expander)
     monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
-    monkeypatch.setattr(hm.st, "radio", lambda *a, **k: "Drill-down")
+    # Two radios in render_heatmaps now: the aggfunc toggle
+    # (options=["Median", "Mean"]) and the cell-action mode
+    # (options=["Drill-down", ...]). Return options[0] so each radio
+    # gets its proper default (Median / Drill-down respectively).
+    monkeypatch.setattr(
+        hm.st, "radio",
+        lambda label, options=("Drill-down",), **k: options[0],
+    )
     monkeypatch.setattr(hm.st, "caption", lambda *a, **k: None)
     monkeypatch.setattr(hm.st, "plotly_chart", lambda *a, **k: None)
     import streamlit_plotly_events
