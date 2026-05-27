@@ -9,14 +9,14 @@ from src.universe import blue_chip as bc_mod
 from src.universe.blue_chip import blue_chip
 
 
-def test_returns_exactly_40_symbols():
+def test_returns_exactly_48_symbols():
     out = blue_chip(date(2024, 7, 1))
-    assert len(out) == 40, f"v1 universe must be 40 stocks per SPECS §6b.1"
+    assert len(out) == 48, f"v1 universe is 48 stocks (NIFTY-50 minus 2 thin-liquidity hold-outs)"
 
 
 def test_symbols_are_unique():
     out = blue_chip(date(2024, 7, 1))
-    assert len(set(out)) == 40, "blue_chip must contain no duplicates"
+    assert len(set(out)) == 48, "blue_chip must contain no duplicates"
 
 
 def test_symbols_are_alphabetically_sorted():
@@ -68,6 +68,6 @@ def test_internal_invariants_hold_on_import():
     """The module-level asserts in blue_chip.py would fire at import
     time if invariants broke — but if `python -O` is used, asserts get
     stripped. Re-check defensively here in tests."""
-    assert len(bc_mod._BLUE_CHIP_V1) == 40
-    assert len(set(bc_mod._BLUE_CHIP_V1)) == 40
+    assert len(bc_mod._BLUE_CHIP_V1) == 48
+    assert len(set(bc_mod._BLUE_CHIP_V1)) == 48
     assert list(bc_mod._BLUE_CHIP_V1) == sorted(bc_mod._BLUE_CHIP_V1)

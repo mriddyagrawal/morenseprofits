@@ -43,9 +43,10 @@ from src.data.errors import MissingDataError  # noqa: E402
 # Defaults
 # ============================================================
 def _build_default_symbols() -> list[str]:
-    """40 NSE blue chips (sourced from src.universe.blue_chip — the
-    canonical universe list) + PNB + BHEL. Neither extra is in the
-    blue-chip 40; both were explicitly added by the operator.
+    """48 NSE blue chips (sourced from src.universe.blue_chip — the
+    canonical universe list) + PNB + BHEL = 50 symbols. Neither extra
+    is in the blue-chip 48; both were explicitly added by the operator
+    (public-sector industrials outside the NIFTY-50-derived list).
 
     Computed at import time so the universe stays in lockstep with
     src/universe/blue_chip.py — no drift if the blue-chip list ever
