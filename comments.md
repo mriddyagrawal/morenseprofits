@@ -11522,3 +11522,79 @@ Two reasonable paths:
 The reviewer-builder loop is in a good rhythm. The CVaR swap is analytically defensible; the open question is operator preference, not technical correctness.
 
 ---
+
+## Review: f9da84d — feat(p7.heatmap.aggfunc_toggle): median ↔ mean radio
+
+**Verdict: ✅ ACCEPT** — additive change that preserves the default (Median), with the sharp test design I've been wanting to see. One real grill on missing asymmetric-conservatism caveat when Mean is selected.
+
+### Why this is well-shaped
+
+- **Additive, not breaking**: default `"Median"` preserves every existing operator's view. Toggle is opt-in. Backward-compatible session state.
+- **Both customdata slots ALWAYS populated**: extending `(H,W,5)` → `(H,W,6)` means toggling is a pure render change, no recomputation in the customdata layer. Cheap operation per render.
+- **Hover follows the toggle** on both panes (including density pane behind `_SHOW_DENSITY_PANE`) — visual consistency.
+- **Less concerning than the CVaR pane swap (9703c1a)**: that one REPLACED a surface; this one ADDS a control. Operators who don't toggle see no change.
+
+### The test is the sharpest move in this commit
+
+```python
+test_aggfunc_toggle_mean_swaps_title_and_hover:
+  # 5 trades at 10%, 1 trade at 1000%
+  # median = 10, mean = 175
+  # asserts displayed annotation reflects MEAN (~175), not just label flip
+```
+
+This is the **"prove behavior, not just appearance"** pattern I've been praising. It's not enough to assert "title says Mean ROI"; the test forces a deliberately skewed cell where median ≠ mean and asserts the pivot ACTUALLY recomputed with `aggfunc='mean'`. **If a future refactor leaves the title swap intact but breaks the aggfunc plumbing, this test fires.** Right design.
+
+Same pattern as the two-assertion drill-down test in 2140b1f (CI caption AND std-bias footer = ran to completion). Behavioral testing > visual testing.
+
+### 🔬 Grill #1 (real): no asymmetric-conservatism caveat when Mean is selected
+
+This is the real one. The commit body justifies the toggle:
+
+> "mean amplifies the same tail events CVaR is summarising"
+
+That's TRUE — and exactly why median is the default. For short-vol strategies (short_straddle, short_strangle, iron_condor), the typical P&L shape is "many small wins, rare big losses." **Mean is BIASED HIGH** because the few big losses get averaged into the headline number, but operators reading "Mean ROI 8%" easily forget that the mean is hiding the tail.
+
+The asymmetric-conservatism mandate says **over-warn losses, under-promise gains**. The default Median view does this naturally. **The Mean view does the opposite** unless the operator is reading it alongside CVaR-5% (the "head-vs-tail story" framing).
+
+**Recommendation**: when Mean is the active aggfunc, surface a caveat caption above or below the heatmap:
+
+> "_Mean is sensitive to tail outliers. For short-vol strategies, mean can paint cells greener than the typical-trade outcome (median) suggests. Cross-reference with the CVaR-5% pane for tail risk._"
+
+One line. Surfaces the trade-off explicitly. Aligns with the existing pattern of caveat captions on the strike-rule disclosure, the std-bias footer, the heavy-tail auto-callouts.
+
+Without this, an operator who toggles to Mean for the first time and sees a row of green cells might form a wrong impression that disappears when they toggle back.
+
+### Calibration on grill scope
+
+I'm NOT grilling on:
+- "Mean amplifies tails" — that's the commit's stated reason for the toggle existing.
+- "Toggle UX is fine" — additive, opt-in, default preserves old behavior.
+- "Customdata shape change" — backward-compatible test update done.
+- "Tests don't cover the density pane's hover toggle" — defensible since density is hidden behind `_SHOW_DENSITY_PANE = False`; testing rollback behavior is lower priority.
+
+Just the caveat. One line of UX honesty when the operator chooses the less-conservative view.
+
+### What I tried
+
+- Re-read the test that uses (5×10%, 1×1000%) — confirmed median=10 vs mean=175 differential. Test assertion proves the pivot fires `aggfunc='mean'`, not just the label changes.
+- Verified the `(H,W,5)` → `(H,W,6)` shape extension is the only customdata change — slot [5] is additive, slots [0..4] unchanged. Backward-compatible.
+- Cross-checked manual-picker test mock fix: `lambda: options[0]` correctly returns the right default for EACH radio (Median for aggfunc, Drill-down for cell-action mode).
+
+### Carry-over open items
+
+- 🔬 **Mean-view caveat caption** (grill above).
+- 🚦 **Operator-confirmation** on the CVaR pane swap (9703c1a grill #1) — still open.
+- 🔬 **`feat(p7.heatmap.export)`** — still pending from consultation priorities.
+- 🚦 **Live-run validation** against 41-symbol universe — gated on prefetch completion.
+
+### Next-commit suggestion
+
+Three reasonable paths:
+1. **Add the mean-view caveat** (`style(p7.heatmap.aggfunc.caveat)`) — small, single line, addresses grill #1.
+2. **Continue with `feat(p7.heatmap.export)`** per the original consultation priorities.
+3. **Wait for operator browser smoke-test** of both the CVaR pane AND the toggle.
+
+Personal preference: (1) first — small focused honesty surface that doesn't depend on operator return. Then (2) while waiting for live-run.
+
+---
