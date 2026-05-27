@@ -62,6 +62,15 @@ DEFAULT_STRIKES_PCT = 0.05        # min %-of-spot window around ATM (per-day rul
 DEFAULT_ENTRY_WINDOW_DAYS = 70    # calendar days back from expiry to scan spot
                                   # (~45 trading days; the sweep's T-45..T-1 grid
                                   # depth — strikes the strategy could pick across
+
+# Used only to seed the Step-4 tqdm bar's `total=` so the ETA + %-complete
+# numbers are meaningful from the first pair. Empirically observed median
+# from the existing cache: ~54 contracts per (sym, expiry) pair. The real
+# count per pair varies widely (min 6, max 130+) depending on how much the
+# underlying drifted across the entry window; tqdm gracefully handles over-
+# and under-shoot of the estimate, so the constant just needs to be in the
+# right order of magnitude.
+ESTIMATED_CONTRACTS_PER_PAIR = 54
                                   # any entry in that window must be cached)
 DEFAULT_START = date(2024, 5, 1)
 DEFAULT_END = date(2026, 5, 31)
@@ -383,27 +392,52 @@ def main() -> int:
         for (sym, exp) in work_units
     ]
 
+    # Bar tracks contract attempts (not pairs) because per-pair attempt
+    # count varies 10×+ across the universe — a pair-count bar's ETA
+    # is misleading. tqdm's total is seeded from the observed-median
+    # estimate (see ESTIMATED_CONTRACTS_PER_PAIR); the bar over- or
+    # under-shoots a bit as real per-pair counts diverge from the
+    # median, which tqdm handles gracefully. ``pairs_done`` postfix
+    # keeps the pair view visible for orientation.
+    estimated_total_contracts = (
+        len(worker_args) * ESTIMATED_CONTRACTS_PER_PAIR
+    )
+    pairs_done = 0
+
     if args.workers > 1:
         # Parallel path. Each worker is a fresh process; spawns its own
         # NSE Session per call (inside options_loader._direct_derivatives_df).
         # imap_unordered streams results as workers finish so tqdm advances
         # smoothly.
-        with mp.Pool(processes=args.workers) as pool:
+        with mp.Pool(processes=args.workers) as pool, tqdm(
+            total=estimated_total_contracts,
+            desc=f"contracts ({len(worker_args)} pairs)",
+            unit="contract",
+        ) as pbar:
             it = pool.imap_unordered(_process_pair, worker_args, chunksize=1)
-            for pair_n_fetched, pair_n_miss, pair_n_other, pair_skips in tqdm(
-                it, total=len(worker_args), desc="(symbol, expiry)", unit="pair",
-            ):
+            for pair_n_fetched, pair_n_miss, pair_n_other, pair_skips in it:
                 n_fetched += pair_n_fetched
                 n_skipped_missing += pair_n_miss
                 n_skipped_other += pair_n_other
                 skip_log.extend(pair_skips)
+                pairs_done += 1
+                pbar.update(pair_n_fetched + pair_n_miss + pair_n_other)
+                pbar.set_postfix(pairs=f"{pairs_done}/{len(worker_args)}")
     else:
-        for arg in tqdm(worker_args, desc="(symbol, expiry)", unit="pair"):
-            pair_n_fetched, pair_n_miss, pair_n_other, pair_skips = _process_pair(arg)
-            n_fetched += pair_n_fetched
-            n_skipped_missing += pair_n_miss
-            n_skipped_other += pair_n_other
-            skip_log.extend(pair_skips)
+        with tqdm(
+            total=estimated_total_contracts,
+            desc=f"contracts ({len(worker_args)} pairs)",
+            unit="contract",
+        ) as pbar:
+            for arg in worker_args:
+                pair_n_fetched, pair_n_miss, pair_n_other, pair_skips = _process_pair(arg)
+                n_fetched += pair_n_fetched
+                n_skipped_missing += pair_n_miss
+                n_skipped_other += pair_n_other
+                skip_log.extend(pair_skips)
+                pairs_done += 1
+                pbar.update(pair_n_fetched + pair_n_miss + pair_n_other)
+                pbar.set_postfix(pairs=f"{pairs_done}/{len(worker_args)}")
 
     # ============================================================
     # Summary
