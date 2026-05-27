@@ -12031,3 +12031,69 @@ Not in scope for this commit.
 That's a single ~50-100 line docs commit that closes the entire arc's spec drift. After it: live-run validation (prefetch restart → fresh sweep with cache_only=True → analyst review of skip rate + VWAP-vs-close divergence).
 
 ---
+
+## Review: f6ced30 — docs(specs.pricing_arc): close cross-commit SPECS drift
+
+**Verdict: ✅ ACCEPT** — exactly the bundled docs commit I recommended in my 6356b90 next-commit suggestion. All cross-arc SPECS drift grills closed cleanly. 82 lines of edits, +67/-15, single docs commit closes 5 spec gaps from 3 prior commits.
+
+### My grills, addressed
+
+Tracking against grills from the 3-commit arc:
+
+| Grill | Source | Status |
+|---|---|---|
+| §4b drift (engine uses VWAP, spec says close) | 6356b90 #1 | ✅ §4b restructured into §4b.1 + §4b.2; new §4b.1 documents VWAP-or-close hierarchy + TURNOVER_SCALE_FACTOR provenance + [0.5, 2.0] sanity band + legs_json telemetry |
+| Operator-facing caveat on volatile-day skips | 6356b90 #2 | ✅ §4b.1 includes: "Observed operator-side effect: this skip can also fire on legitimately volatile days where close is genuinely an unreliable fillable-price proxy — the skip is intentional in those cases (research-honest), not a bug." Verbatim what I'd asked for. |
+| legs_json semantics undocumented | 6356b90 #3 | ✅ §4b.1: "The leg-result dict surfaces `entry_turnover` / `exit_turnover` (both in lakhs of rupees, NSE convention) into the trade's `legs_json` for post-hoc audit." |
+| CACHE_VERSION not bumped despite §6b.4 rule | 8caa0cd #1 | ✅ §6b.4 amended: "**Additive columns to an existing schema** also do not bump — legacy parquets continue to load and the missing column surfaces as NaN, which downstream code is expected to handle via fallback. Only renames, dtype changes, and column removals from an existing schema trigger a bump." Chosen the SPEC-amendment path (vs the heavy bump path) — sensible. |
+| §2.2 schema doesn't list turnover | 8caa0cd #2 | ✅ `turnover` row added to the schema table at line 118. Documents the lakhs-of-rupees unit, the VWAP semantics, and the backward-compat behavior. |
+| IlliquidLegError taxonomy | 94d535f follow-up | ✅ §8 error-taxonomy section adds `IlliquidLegError` + the "research-honesty improvement, not deploy-readiness signal" disclaimer verbatim. Cross-references §4b.1. |
+
+**6-of-6 SPECS gaps closed in one commit.** Right discipline.
+
+### What's notably good
+
+- **Bundled approach matches my recommendation**: rather than 5 separate docs commits, one consolidated commit closes the entire arc's spec drift. Operationally cleaner; bisect-friendly (the arc's docs land as one unit).
+- **§6b.4 amendment chose the spec-amend path over CACHE_VERSION bump**: per my consultation Q1-style analysis, the additive-friendly carve-out is the right interpretation. The bump path would have invalidated ~50K cached contracts for an additive change — heavy operational cost for no real reader-expectation break.
+- **§4b restructure is clean** (4b → 4b.1 + 4b.2): the new subsection structure separates "where does the fill price come from?" from "what slippage transformation is applied?". Mirrors the code's `_pick_fill_price` → `slippage_model.realized_entry_exit` flow.
+- **Body honestly names the still-open follow-up**: "`test(p7.options_loader.turnover.coverage)` — consultation plan called for two test cases (positive-value test + empty-response test) that didn't land in 8caa0cd. Will follow up." Acknowledges grill #3 from 8caa0cd is pending.
+- **Cross-references in the new sections**: §2.2 turnover row → §4b for semantics. §6b.4 → §4b.1 for the fallback example. §8 IlliquidLegError → §4b.1 for the volume/oi gate. Discoverable from any entry point.
+
+### 🔬 One observation (NOT a grill, just noting)
+
+The new §8 IlliquidLegError entry says: "The gate fires when entry OR exit volume is zero, or when entry open interest is zero." This pins the BEHAVIOR — what the gate does — but doesn't pin the RATIONALE — why entry-OI but not exit-OI.
+
+My 94d535f grill #1 asked for the rationale ("OI is checked only on entry — at exit, low OI may reflect normal position-closing decay, not unavailability"). The behavior is documented; the rationale isn't.
+
+**Not blocking** — the behavior is the load-bearing fact; the rationale is engineering-judgment that a future maintainer can puzzle out by reading the code comments. But surfacing the rationale in SPECS would future-proof against a "wait, why not symmetric OI check?" question.
+
+### Pricing arc — fully closed at the SPECS level
+
+| Commit | Status |
+|---|---|
+| 1. `feat(p7.pricing.liquidity_gate)` | ✅ landed (94d535f) |
+| 2. `chore(data.options_loader.turnover)` | ✅ landed (8caa0cd) |
+| 3. `feat(p7.pricing.vwap_fill)` | ✅ landed (6356b90) |
+| 4. `docs(specs.pricing_arc)` | ✅ this commit |
+| (deferred) `feat(p7.pricing.liquidity_gate.tighten)` | per consultation |
+
+**Functional + docs complete.** Two open follow-ups:
+1. `test(p7.options_loader.turnover.coverage)` — 2 missing tests acknowledged in this commit's body.
+2. Live-run validation against the 42-symbol universe — operator-owned, gated on prefetch restart.
+
+### What I tried
+
+- Cross-referenced each of my 6 grills against the SPECS diff — all 6 closed.
+- Read the new §4b.1 carefully: VWAP-or-close hierarchy ✓, TURNOVER_SCALE_FACTOR provenance ✓, sanity-band documented ✓, legs_json telemetry documented ✓, volatile-day caveat documented ✓ (the one I specifically asked for).
+- Verified §6b.4 amendment path is internally consistent: the "additive column doesn't bump" rule matches the "new schema family doesn't bump" rule already in place. Consistent reasoning.
+- Confirmed the §8 IlliquidLegError entry pins the behavior + the research-honesty disclaimer; just the entry-OI rationale is unpinned (small observation, not blocking).
+
+### Next-commit suggestion
+
+Two natural moves:
+1. **`test(p7.options_loader.turnover.coverage)`** — the 2 missing tests from 8caa0cd's coverage gap. Small commit (~20 LOC), closes the only remaining open item from the pricing arc.
+2. **Operator action**: prefetch restart → live-run validation. Bundles BHEL addition + wider truncation + turnover ingest + the gate + VWAP fill into a single fresh sweep. Skip rate + VWAP-vs-close divergence are the analyst signals.
+
+After those: the pricing arc closes cleanly. Whatever's next (Phase 8 MCP server, or operator-surfaced new direction) starts from a clean baseline.
+
+---
