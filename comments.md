@@ -12265,3 +12265,55 @@ Operator already chose option 2 (revert). If they later want option 1, the body 
 Standing by.
 
 ---
+
+## Review: bd7a871 — chore(universe.expand_to_50): blue_chip 40 → 48
+
+**Verdict: ✅ ACCEPT** — operator-requested universe expansion. Adds 8 previously-excluded NIFTY-50 members (APOLLOHOSP, DIVISLAB, HDFCLIFE, LTIM, SBILIFE, SHRIRAMFIN, TATACONSUM, TRENT). Total universe → 50 (48 blue chips + PNB + BHEL). One real grill (PLAN change-log not updated), two carry-over observations.
+
+### What's good
+
+- **Alphabetical order maintained**: traced each insert (APOLLOHOSP between ADANIPORTS and ASIANPAINT, DIVISLAB between COALINDIA and DRREDDY, LTIM between LT and M&M, etc.). Existing `assert list(_BLUE_CHIP_V1) == sorted(_BLUE_CHIP_V1)` catches any drift. ✓
+- **Held-out names explicitly listed**: BPCL, BRITANNIA — "historical thin-liquidity hold-outs" — in both commit body AND blue_chip.py docstring. Future maintainer can grep for these names to find the reasoning. ✓
+- **Docstring updated comprehensively**: "Why 40 (not 50)" → "Why 48 (not 50)" includes the expansion-history narrative ("Originally 40 under the 'minus 10 thin names' v1 ask; expanded to 48 in May 2026 once the prefetch pipeline + dashboard could absorb the extra contracts"). Future reader gets the why. ✓
+- **In-flight prefetch implication acknowledged**: "started at 42 symbols won't pick up these additions until restart." Operator-aware framing. ✓
+- **Wall-clock estimate provided**: "8 new symbols' contracts fresh (~3,000 additional contract fetches ≈ +30-60 min wall-clock)". Operator gets a planning number for the next restart.
+- **Helpers auto-pick up the expansion**: `_build_default_symbols` / `_build_symbols` in scripts read from `blue_chip()` so no script-source changes needed beyond docstring updates.
+
+### 🔬 Grill (real, small): PLAN.md change-log not updated
+
+PLAN.md already has a change-log entry from the original v1 sizing:
+
+> 2026-05-24 — **Phase-2 blue-chip universe sized down from 50 to 40 per user direction** ("just kinda good is fine; reporting/analysis quality matters more than exact composition"). The 10 dropped members were the lower-options-liquidity tail of Nifty 50.
+
+This commit reverses that direction (40 → 48). **PLAN.md should have a corresponding change-log entry**, otherwise a future reader sees "sized down to 40" without seeing "later expanded to 48", and the universe-history reads as out-of-date.
+
+Suggested entry (similar shape to others):
+
+> 2026-05-28 — **Blue-chip universe expanded from 40 to 48** ahead of the overnight prefetch run, once the prefetch + dashboard had absorbed the original-42 universe's compute cost. Added the 8 NIFTY-50 members previously excluded as thin-options-liquidity (APOLLOHOSP, DIVISLAB, HDFCLIFE, LTIM, SBILIFE, SHRIRAMFIN, TATACONSUM, TRENT). BPCL + BRITANNIA still held out. Total universe = 50 (48 blue chips + PNB + BHEL).
+
+One-line PLAN update; small commit. **Not blocking** — universe-history is reconstructible from git log — but PLAN is the documentation surface that's supposed to survive without git archaeology.
+
+### 🔬 Carry-over observations
+
+**(1) PNB / BHEL still script-level extras** (from my 39d1ba1 grill #1). The WATCHLIST_EXTRAS centralization pattern would now have 2 extras × 2 sites = 4 places. Still not pushing for the refactor — the lockstep is preserved and the operator has higher-priority work. Just noting the carry-over.
+
+**(2) Multiple-comparisons surface grew ~22%**: 42 → 50 symbols. The wide-sweep search space grows from ~1.85M cells to ~2.25M cells. The Export-rule's MULTIPLE_COMPARISONS_CAVEAT — when that impl lands — should reflect the universe-size factor. Same flag I raised in 39d1ba1; just bigger now.
+
+### What I tried
+
+- Verified alphabetical ordering of every insert in the 48-tuple. ✓
+- Cross-checked the 8 new names against mid-2024 NIFTY-50 composition: all members. ✓
+- Confirmed PNB + BHEL still appear in script-level `_build_*_symbols` helpers (not promoted to blue_chip). ✓
+- Searched PLAN.md for a 2026-05-28 entry on universe expansion. None present.
+- Math check: 42 → 50 = ~+19% symbols; sweep cells 1.85M → ~2.25M = +22%. ✓
+
+### Next-commit suggestion
+
+Two reasonable next moves:
+
+1. **`docs(plan.universe_expansion)`** — one-line PLAN.md change-log entry per my grill. Small, closes the documentation gap.
+2. **Operator action**: kill-and-restart prefetch to absorb the 8 new symbols + the pricing-arc improvements (gate + turnover + VWAP) in one fresh cache. The "in-flight at 42 symbols" data becomes a baseline; the next run becomes the validation against the new pricing engine + expanded universe.
+
+If (2), bundle (1) into whatever commit follows the prefetch restart. Either way the gap is small.
+
+---
