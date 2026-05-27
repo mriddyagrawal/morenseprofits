@@ -164,14 +164,15 @@ def test_returned_schema_matches_specs_2_2(monkeypatch, tmp_path):
     expected_cols = [
         "date", "symbol", "expiry", "option_type", "strike",
         "open", "high", "low", "close", "ltp", "settle_price",
-        "lot_size", "volume", "oi", "oi_change",
+        "lot_size", "volume", "turnover", "oi", "oi_change",
     ]
     assert list(df.columns) == expected_cols
     assert pd.api.types.is_datetime64_any_dtype(df["date"])
     assert pd.api.types.is_datetime64_any_dtype(df["expiry"])
     assert df["symbol"].dtype == pd.StringDtype()
     assert df["option_type"].dtype == pd.StringDtype()
-    for c in ("strike", "open", "high", "low", "close", "ltp", "settle_price"):
+    for c in ("strike", "open", "high", "low", "close", "ltp",
+              "settle_price", "turnover"):
         assert df[c].dtype.name == "float64"
     assert df["lot_size"].dtype.name == "int64"
     assert df["volume"].dtype.name == "int64"

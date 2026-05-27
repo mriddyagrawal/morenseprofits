@@ -280,6 +280,23 @@ def derivatives_df(symbol, from_date, to_date, expiry_date,
 
 
 # jugaad column → SPECS §2.2 column
+#
+# ``turnover`` (NSE: ``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE") is the
+# day's total traded value for this contract. With ``volume`` (total
+# quantity in shares per §2.3), it lets the pricing engine compute a
+# daily VWAP — materially better than ``close`` for thin strikes where
+# a single late print can be far from where the bulk of volume cleared.
+#
+# UNITS NOTE: NSE F&O bhavcopy historically reports FH_TOT_TRADED_VAL
+# in lakhs of rupees (×10⁵). The pricing engine is responsible for
+# applying any scale factor when computing VWAP; this _RENAMES step
+# only carries the raw column through unchanged. A median-ratio
+# assertion will live alongside the VWAP fill code (next commit) to
+# bake in the units invariant and fail loudly if NSE ever shifts the
+# scale convention. Legacy cached parquets DO NOT carry turnover;
+# loading them post-this-change yields NaN in the column, which the
+# next-commit VWAP fill function falls back from gracefully to
+# ``close``.
 _RENAMES = {
     "DATE": "date",
     "SYMBOL": "symbol",
@@ -294,6 +311,7 @@ _RENAMES = {
     "SETTLE PRICE": "settle_price",
     "MARKET LOT": "lot_size",
     "TOTAL TRADED QUANTITY": "volume",
+    "PREMIUM VALUE": "turnover",
     "OPEN INTEREST": "oi",
     "CHANGE IN OI": "oi_change",
 }
@@ -310,7 +328,8 @@ def _normalize(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     # (whitespace, strings) to NaN rather than crashing. NSE
     # occasionally returns settlement-only rows with empty trade-price
     # fields; tolerating NaN here keeps the contract usable.
-    for col in ("strike", "open", "high", "low", "close", "ltp", "settle_price"):
+    for col in ("strike", "open", "high", "low", "close", "ltp",
+                "settle_price", "turnover"):
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
     # Essential-row filter: rows missing lot_size or volume can't be
     # priced (no contract size = no P&L). NSE rarely emits such rows
