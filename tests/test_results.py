@@ -138,6 +138,62 @@ def test_read_results_raises_when_file_missing():
 
 
 # ============================================================
+# Engine version stamp — added pre-Phase-8 MCP arc so list_runs can
+# identify which engine behavior produced each result on disk
+# ============================================================
+
+def test_write_results_stamps_engine_version_in_parquet_metadata():
+    """Every fresh write must carry ENGINE_VERSION in the parquet's
+    file-level KV metadata. MCP's list_runs reads this to identify
+    pre-arc vs post-arc parquets without column-shape inspection."""
+    df = pd.DataFrame([_full_row()])
+    r.write_results(df, run_id="stamp_test")
+    meta = r.read_run_metadata("stamp_test")
+    assert meta.get("engine_version") == r.ENGINE_VERSION
+
+
+def test_write_then_read_round_trips_after_metadata_stamp():
+    """Anti-regression: switching write_results from df.to_parquet to
+    pa.Table.from_pandas + pq.write_table to enable metadata stamping
+    must NOT change the data round-trip. read_results must continue
+    to return the same frame shape + values as before."""
+    df = pd.DataFrame([_full_row()])
+    r.write_results(df, run_id="roundtrip_stamped")
+    back = r.read_results("roundtrip_stamped")
+    assert len(back) == 1
+    assert back.iloc[0]["net_pnl"] == 422.57
+    assert back.iloc[0]["strategy"] == "short_straddle"
+
+
+def test_read_run_metadata_returns_empty_dict_for_missing_run_id():
+    """Missing parquet → empty dict (not raise). MCP list_runs will
+    skip absent runs naturally rather than crash the tool call."""
+    assert r.read_run_metadata("does_not_exist") == {}
+
+
+def test_read_run_metadata_handles_legacy_unstamped_parquet(tmp_path, monkeypatch):
+    """Legacy parquets written before the engine-version stamp landed
+    have only pandas' own injected schema metadata (b'pandas' key).
+    read_run_metadata must return an empty dict in that case (after
+    filtering out the b'pandas' housekeeping) so MCP's list_runs can
+    apply the 'pre-p7.pricing_arc' inferred caveat rather than crash.
+
+    The b'pandas' key is pandas' standard parquet round-trip metadata
+    — schema + dtype info, not the engine stamp we're looking for."""
+    monkeypatch.setattr(r, "RESULTS_DIR", tmp_path)
+    df = pd.DataFrame([_full_row()])
+    # Write via the LEGACY path (df.to_parquet directly) to simulate
+    # a pre-stamp parquet on disk.
+    path = r.results_path("legacy_unstamped")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    r.canonical_column_order(df).to_parquet(path, index=False)
+    meta = r.read_run_metadata("legacy_unstamped")
+    # Empty dict (post pandas-key filter) → MCP treats this as pre-arc
+    # and surfaces the appropriate caveats.
+    assert meta == {}
+
+
+# ============================================================
 # Skip-log write / read
 # ============================================================
 

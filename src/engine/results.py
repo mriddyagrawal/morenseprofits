@@ -15,8 +15,30 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from src.config import RESULTS_DIR
+
+
+# ============================================================
+# Engine version stamp — see SPECS §6c.4 + PLAN Phase 8 (MCP)
+# ============================================================
+#
+# Stamped into every sweep parquet's file-level metadata at write time
+# so downstream tooling can identify which engine behavior produced
+# the result without column-shape inspection. Bumped explicitly when
+# pricing / costs / gates behavior changes meaningfully:
+#
+#   "p7.pricing_arc"   - includes IlliquidLegError gate (94d535f)
+#                        + VWAP fill price with close fallback (6356b90)
+#                        + turnover ingest (8caa0cd)
+#
+# Legacy parquets (written before this stamp landed) return an empty
+# dict from read_run_metadata — readers should treat absent stamps
+# as "pre-p7.pricing_arc" with the matching caveats (phantom-fill on
+# zero-volume legs likely present).
+ENGINE_VERSION = "p7.pricing_arc"
 
 
 # ============================================================
@@ -160,7 +182,14 @@ def canonical_column_order(df: pd.DataFrame) -> pd.DataFrame:
 def write_results(df: pd.DataFrame, run_id: str, name: str = "sweep") -> Path:
     """Persist results frame to its canonical path. Asserts the frame
     has at least the RESULTS_COLUMNS schema before writing — better to
-    fail loud on the writer than to corrupt the on-disk format."""
+    fail loud on the writer than to corrupt the on-disk format.
+
+    Stamps ``ENGINE_VERSION`` into the parquet's file-level metadata
+    so ``read_run_metadata`` can identify the engine behavior that
+    produced this output later (Phase-8 MCP server's ``list_runs``
+    relies on this to flag pre-arc vs post-arc parquets explicitly
+    rather than column-inspecting). Goes via pyarrow because pandas'
+    ``DataFrame.to_parquet`` doesn't expose KV-metadata stamping."""
     missing = set(RESULTS_COLUMNS) - set(df.columns)
     if missing:
         raise ValueError(
@@ -169,7 +198,13 @@ def write_results(df: pd.DataFrame, run_id: str, name: str = "sweep") -> Path:
         )
     path = results_path(run_id, name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    canonical_column_order(df).to_parquet(path, index=False)
+    table = pa.Table.from_pandas(canonical_column_order(df), preserve_index=False)
+    # Merge into existing pandas-injected metadata rather than replacing,
+    # so the DataFrame round-trip (dtypes, etc.) stays intact.
+    existing_meta = dict(table.schema.metadata or {})
+    existing_meta[b"engine_version"] = ENGINE_VERSION.encode("utf-8")
+    table = table.replace_schema_metadata(existing_meta)
+    pq.write_table(table, path)
     return path
 
 
@@ -216,3 +251,43 @@ def read_skips(run_id: str, name: str = "sweep") -> pd.DataFrame:
     if not path.exists():
         return empty_skips_frame()
     return pd.read_parquet(path)
+
+
+def read_run_metadata(run_id: str, name: str = "sweep") -> dict[str, str]:
+    """Return the file-level KV metadata of a sweep parquet, decoded as
+    ``{str: str}``. Used by the Phase-8 MCP server's ``list_runs`` to
+    surface which engine version produced each run on disk.
+
+    Returns an empty dict if:
+      - the parquet doesn't exist
+      - the parquet has no schema metadata (legacy / unstamped)
+      - the parquet has only pandas' own injected metadata (``b"pandas"``
+        keys are filtered out — they're round-trip schema info, not the
+        engine-version stamp we're after)
+
+    Empty-dict semantics on legacy parquets are LOAD-BEARING: the MCP
+    server treats absence as "pre-p7.pricing_arc" and surfaces the
+    matching phantom-fill-bias caveat. A future schema-drift defense
+    could promote this to raise on absence; for now the soft fallback
+    is the right operator-facing call.
+    """
+    path = results_path(run_id, name)
+    if not path.exists():
+        return {}
+    schema = pq.read_schema(path)
+    raw = schema.metadata or {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        try:
+            key = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+        except UnicodeDecodeError:
+            continue
+        if key == "pandas":
+            # pandas' own round-trip schema info; not our stamp.
+            continue
+        try:
+            value = v.decode("utf-8") if isinstance(v, bytes) else str(v)
+        except UnicodeDecodeError:
+            continue
+        out[key] = value
+    return out
