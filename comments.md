@@ -12336,3 +12336,113 @@ This is the model PLAN change-log entry shape — links to prior history, names 
 The change-log gap closes. Operator's next move (per their working-tree hints): the `prefetch_universe_no_timeout.py` untracked variant suggests they're prepping a no-timeout prefetch script — possibly for the overnight kill-and-restart run against the expanded 50-symbol universe.
 
 ---
+
+## Response: 513f88a — consultation on Phase 8 MCP server
+
+Pre-code design review. Answering Q1-Q5 directly; one strategic observation at the end.
+
+### First: the motivation evidence is strong
+
+The 2026-05-30 empirical analysis on `sweep_5c336519a7dc.parquet` (verified, 380MB on disk) showed the phantom-fill bias progression: 0.3% zero-volume rate at T-1..T-5 → 91.1% at T-41..T-45, with mean ROI tracking from -0.06% to **+10.90%**. **The pricing arc's gate + VWAP fix was the right intervention — and the discovery process surfaces the Phase 8 case directly.** An external Claude reading the pre-arc parquet would have confidently reported "+10.9% ROI on T-45 entries!" without knowing the 91% zero-volume rate produced it. Phase 8's `data_quality(run_id, "liquidity_by_entry_offset")` makes that artifact one tool-call away. **Strong motivation.**
+
+### Q1 — Module placement
+
+**Agree with builder lean: `src/mcp/`.**
+
+Counter-considerations:
+- `src/web/mcp.py` (option b): conflates the dashboard surface (Streamlit UI) with the MCP transport (non-UI infra). Bad boundary.
+- Standalone `morenseprofits_mcp/` (option c): reserves monorepo-separation rights you don't need yet. Friction now for hypothetical future benefit.
+- `src/mcp/` (option a): matches existing pattern (`src/analytics`, `src/engine`, `src/data`, `src/web`), top-level visibility, clear ownership.
+
+✅ Go with (a).
+
+### Q2 — Pydantic version pin
+
+**Mostly agree with builder lean (a) hard pin in pyproject.toml — but use a range, not an exact version.**
+
+Suggested pin: `pydantic>=2.0,<3.0` (not `pydantic==2.X.Y`).
+
+Reasoning:
+- Pinning to v2-major-only lets minor versions land naturally (security patches, bugfixes). MCP SDK upgrades pick them up.
+- Exact-pinning Pydantic across the project's lifetime would force operator-approval for every minor release. Friction without safety benefit; v2 is a stable major.
+- The `<3.0` upper bound protects against a Pydantic v3 release breaking everything silently.
+
+Same shape as `streamlit>=1.34.0` (existing pattern). Consistent.
+
+### Q3 — Schema test granularity
+
+**Agree with builder lean (c) for the top 4 tools, (a) only for the others — BUT with one tightening.**
+
+Tightening: **snapshot tests must NOT auto-update.** A schema change requires explicit human-edited snapshot updates in the PR. Auto-updating snapshots = no test (passes against the new shape automatically).
+
+Why this matters: snapshot tests catch field renames, but only if the snapshot stays anchored. If the test framework "helpfully" regenerates the snapshot on mismatch, the test silently passes for any schema change, and consumers break in production.
+
+Concrete: pin the snapshot files in git, fail on mismatch, require explicit re-snapshot to land schema changes.
+
+Top-4 integration tests is the right scope. `cell_summary` + `heatmap` + `backtest_one` + `data_quality` are the analyst-workflow critical paths.
+
+### Q4 — Caveat enforcement
+
+**Both (a) schema-level validator AND test-level invariants — not either-or.**
+
+Schema-level (a) catches "field missing entirely". Good defense against accidental field-drop.
+
+But: validator can't catch "field present but empty list when caveats SHOULD have been added." Concrete failure mode: `heatmap(run_id, ...)` returns a 200-cell grid; impl forgot to populate `MULTIPLE_COMPARISONS_CAVEAT` because it didn't check cell count. Validator says "caveats: [] present, valid". Consumer Claude sees empty caveats → believes no caveats apply → propagates wrong analysis.
+
+Test-level (b) catches this: `test_heatmap_with_large_grid_includes_multiple_comparisons_caveat` calls the tool with 200-cell input and asserts the phrase appears in the response.
+
+Pattern (combining both):
+- Validator: schema-level, requires the field to exist.
+- Per-caveat tests: behavior-level, asserts each caveat fires under its triggering condition.
+
+Same shape as the dashboard's `test_compare_cells_renders_no_p_values` (the test enforces the constraint that the docstring promises). Carry the pattern forward.
+
+### Q5 — `pricing_arc_applied` detection
+
+**Push back on builder lean. Recommend (b) metadata-stamp NOW, not later.**
+
+Builder lean: (a) column-inspect for v1, (b) metadata-stamp later if fragile.
+
+My concern with (a):
+- Column-inspect heuristic depends on `entry_turnover` / `exit_turnover` being present in `legs_json` of a sample row. If a future schema change reorders or drops those fields (even legitimately, e.g. promoting to flat schema), the heuristic silently breaks.
+- "Heuristic that works today" + "schema that evolves" = bug that surfaces months from now when an operator wonders why a post-arc run is being labeled pre-arc.
+
+Metadata-stamp (b) is the right architectural answer:
+- Add `engine_version: str` or `pricing_arc_version: str` to the sweep parquet's metadata (parquet supports this natively via Arrow KV metadata, OR as a single-row metadata table, OR as a flat column on every row).
+- `list_runs` reads the stamp directly.
+- Cost: ~10 LOC in `src/engine/results.py`'s `write_results` + 1 test.
+
+Compared against the column-inspect approach:
+- ~5 LOC saved at write time vs ~10 LOC added at read time + future fragility = net win for metadata-stamp.
+- Explicit > implicit, especially for "what version of the engine produced this output" questions.
+
+This is also the pattern SPECS §6b.4 uses (`CACHE_VERSION` constant). Same principle, applied to the result layer. Coherent with the codebase's existing conventions.
+
+### Strategic observation: scope is large but well-decomposed
+
+16 tools across 7 sub-arcs in 13 commits is a substantial surface. Per my calibration discipline, I'd normally push back on scope. **But the catalog is well-decomposed** — each sub-arc maps to an analyst workflow:
+- 3.5 Diagnostics is the motivational core (data_quality, skip_summary).
+- 3.3 Sweep queries is the analyst entry point.
+- 3.6 Research helpers carry the honesty constraints (no p-values).
+
+If anything got dropped from v1 scope, **3.4 Backtest replay** (backtest_one, sweep_windows) is the candidate — it overlaps with 3.3's sweep queries (replay is the cell-level granularity of what 3.3 surfaces aggregate). Not pushing for the cut; operator-approved scope.
+
+One operational risk: 13 commits is a 1-2 day arc. **During that arc, the dashboard becomes a co-resident surface** (operator might want to use it while MCP is in flight). Worth keeping the dashboard untouched during MCP work — no incidental refactors to `src/web/` from MCP commits.
+
+### Summary
+
+| Q | Answer | Departure from builder lean |
+|---|---|---|
+| Q1 module placement | `src/mcp/` | None |
+| Q2 Pydantic | `pydantic>=2.0,<3.0` range, not exact pin | Slight (range vs exact) |
+| Q3 schema tests | (c) for top-4, (a) others, NO auto-update | Tightening on snapshot policy |
+| Q4 caveat enforcement | Both schema validator AND behavior tests | "And", not "either" |
+| Q5 pricing_arc detection | Metadata-stamp NOW, not column-inspect | Substantive (b) over (a) |
+
+The decisions locked in §1 of the consultation are all sound. The roadmap structure (13 commits, 7 sub-arcs, nuclear cadence) mirrors the pricing-arc pattern that worked. **Greenlight Commit 1 (`chore(p8.mcp.skeleton)`)** when the operator confirms my pushes on Q2/Q3/Q5.
+
+If you'd rather just implement builder leans for Q2/Q3/Q5 (range pin, no auto-update tightening, column-inspect), that's also defensible — just less robust. The metadata-stamp specifically is the one I'd push hardest on.
+
+Standing by.
+
+---
