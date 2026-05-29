@@ -1,261 +1,234 @@
-# Builder consultation — pricing & validity arc
+# Builder consultation — Phase 8 MCP server (research-API)
 
-End-of-arc consultation cycle, per the reviewer-approved cadence (one
-file per arc, deleted/replaced at the next arc). This one is the
-**pricing & validity** arc: how the engine decides which cells are
-real trades, and how it picks a fill price for the ones that are.
+Replaces the now-closed pricing-validity arc consultation. **Pre-code
+design review**: operator explicitly directed "Get it reviewed first!"
+before any commits land.
 
-The operator-builder discussion that led to this plan happened
-2026-05-27 / 2026-05-28; key decisions captured in §3 below.
+The motivation arrived organically. Today (2026-05-30) we confirmed
+via empirical analysis of `sweep_5c336519a7dc.parquet` that the
+analyst's #1 hypothesis (phantom-fill prices on illiquid deep-dated
+contracts) was the dominant source of inflated short-vol ROI:
+
+- T-1..T-5  : 0.3% zero-entry-volume rate → mean ROI -0.06%
+- T-31..T-40: 75.1% zero-entry-volume rate → mean ROI +6.40%
+- T-41..T-45: **91.1%** zero-entry-volume rate → mean ROI **+10.90%**
+
+The IlliquidLegError gate (commit 94d535f, just-shipped pricing-arc)
+will eliminate this artifact on the next sweep — but the analyst who
+diagnosed it is an external Claude, NOT a person looking at this
+codebase. **That's the operator's actual ask**: enable external
+Claudes to do research against this dataset without manual data export.
 
 ---
 
-## 1. State of the codebase
+## 1. Decisions locked (per operator direction in 2026-05-30 chat)
 
-- 563/563 tests pass at HEAD (`f9da84d`).
-- Just-landed UX surfaces: CVaR-5% right pane (`9703c1a`), median/mean
-  toggle (`f9da84d`), regex-decoupled compare-cells caveat (`2175167`).
-- BUILDER's mean-bias-direction grill on the latest review: reviewer
-  flagged mean as "less conservative"; operator/builder math disagreed
-  (short-vol P&L is LEFT-skewed → mean < median → mean is the more
-  honest long-run EV). No caveat caption added; reviewer's grill #1
-  rejected on the math.
-- In-flight prefetch run at ~52% (BHEL universe addition + log-width
-  fix uncommitted in working tree; both lined up to ship before
-  prefetch restart).
-
-## 2. The two problems
-
-### Problem A — Pricing: which field gives a true fill price?
-
-Status quo: every leg fills at the day's `close`. For thinly-traded
-strikes this is a fiction — close is the last trade of the day, which
-on a near-zero-volume day might be a single small print far from where
-the bulk of volume cleared (or where any reasonable bid/ask would have
-been). The 1% slippage haircut partially compensates for ATM blue-chip
-spreads but wildly under-charges for thin strikes.
-
-Operator framing (verbatim, abbreviated):
-
-> "EOD bhavcopy can't give you a real fill price because a fill is
-> min(ask) or max(bid) at the moment you cross, and bhavcopy has
-> neither. So the question reframes to: which proxy is least wrong?"
->
-> Ranking: VWAP > close-with-liquidity-gate > settle_price > ltp.
-
-### Problem B — Validity: was this cell even tradeable?
-
-Status quo: zero validity filter on volume/OI. Engine books a trade
-whenever the loader returns a row with `close` + `lot_size` + `volume`
-populated. NSE often publishes a close even when zero contracts
-traded (theoretical fallback) — these "fills" inflate the result.
-
-Operator framing:
-
-> "A 10k-cell sweep with 7k valid trades is more informative than a
-> 10k-cell sweep with 10k 'trades' of which 3k are model fictions."
-
-## 3. Decisions locked
-
-Discussed and resolved before drafting this plan:
-
-| Decision | Outcome | Reason |
+| Decision | Choice | Rationale |
 |---|---|---|
-| `close == settle_price AND volume == 0` as separate skip reason? | **Drop**. Single `IlliquidLegError` for the whole gate. | Telemetry loss is small; operator wants to avoid over-conservatism in skip-reason labels. The cell skips either way; the label-only subdivision is complexity for marginal data-quality measurement. |
-| DTE cap (e.g. `dte > 60 → skip` for stocks) | **Drop**. | Liquidity gates do the work — past-T-43-stock-options-have-no-volume IS what the gates will surface. Cap is structurally redundant. |
-| Fill price proxy choice | **VWAP** (with `close` fallback) | Operator confirmed: VWAP is the closest EOD-only proxy to a fillable price; midrange/midpoint are NOT tradeable (worked example in chat showed 18% over-promise on a quiet ITC strike). |
-| Volume units verification | **shares (lot_size-multiplied)** — verified against real cached RELIANCE 1500-CE parquet (volume=5000, lot_size=500 → 10 lots) | Threshold formula `volume_shares >= K * lot_size` is correct. |
-| Turnover field availability | **Already in NSE response**, dropped at `_normalize` because `_RENAMES` doesn't carry `"PREMIUM VALUE"` forward. One-line ingest fix. | Verified via `grep FH_TOT_TRADED_VAL` in `src/data/options_loader.py:121`. |
-
-## 4. Commit plan (nuclear, in order)
-
-### Commit 1 — `feat(p7.pricing.liquidity_gate)`
-
-**Goal**: refuse to book a trade whose entry or exit leg had zero
-trading activity.
-
-**Where**: [`src/engine/pnl.py::_price_one_leg`](src/engine/pnl.py),
-inserted AFTER the existing look-ahead + lot-size-continuity checks
-and BEFORE slippage application.
-
-**Logic** (single combined gate, no stale-close subdivision):
-
-```python
-if entry_row.volume == 0 or exit_row.volume == 0 or entry_row.oi == 0:
-    raise IlliquidLegError(
-        f"{context}: leg illiquid — "
-        f"entry_volume={entry_volume}, exit_volume={exit_volume}, "
-        f"entry_oi={entry_oi}. No fill possible."
-    )
-```
-
-**New typed skip reason**: `IlliquidLegError(MissingDataError)` in
-`src/data/errors.py`. Sweeper's `_SKIPPABLE_ERRORS_CACHE_ONLY` already
-catches `MissingDataError`, so no engine-level changes needed.
-
-**Tests** (`tests/test_pnl.py` extension):
-- Cell with `entry_volume=0` → `IlliquidLegError` raised, sweeper
-  catches → row in skip log with correct reason.
-- Cell with `entry_oi=0` → same.
-- Cell with `entry_volume > 0 AND exit_volume > 0 AND entry_oi > 0` →
-  trade prices normally (regression test for the happy path).
-
-**LOC estimate**: ~20 LOC engine + ~50 LOC tests. One commit.
-
-### Commit 2 — `chore(data.options_loader.turnover)`
-
-**Goal**: stop dropping the `"PREMIUM VALUE"` (turnover) column at
-ingest so future re-fetches carry it. Lands BEFORE the in-flight
-prefetch restarts (so the BHEL re-fetch populates turnover into the
-cache).
-
-**Changes** (`src/data/options_loader.py`):
-
-1. Add `"PREMIUM VALUE": "turnover"` to `_RENAMES` (line 283).
-2. The `_SPEC_COLS = list(_RENAMES.values())` derivation auto-picks
-   it up; no separate change needed.
-3. Add `turnover` to the dtype coercion loop in `_normalize()` so it
-   lands as `float64` (rupees, can be in tens of crores per day for
-   active strikes).
-
-**Cache compatibility**: existing parquets don't have the column.
-Loading them post-fix returns NaN for turnover — Commit 3's VWAP
-function falls back to `close` cleanly in that case, so no regression.
-
-**Tests** (`tests/test_options_loader.py`):
-- Normalised frame from a known-good NSE response carries the
-  `turnover` column with positive float values.
-- Empty NSE response still normalises cleanly (no missing-column
-  crash on the new schema).
-
-**LOC estimate**: ~5 LOC code + ~20 LOC tests. One commit.
-
-### Commit 3 — `feat(p7.pricing.vwap_fill)`
-
-**Goal**: switch fill price from `close` to `turnover / volume` (VWAP)
-when both are available; fall back to `close` otherwise.
-
-**Where**: `src/engine/pnl.py::_pick_close_on` (rename to
-`_pick_fill_price` or keep name + change semantics — TBD).
-
-**Logic**:
-
-```python
-def _pick_fill_price(row) -> float:
-    """VWAP when turnover available and volume > 0; else close."""
-    if pd.notna(row.turnover) and row.volume > 0:
-        return float(row.turnover) / float(row.volume)
-    return float(row.close)
-```
-
-**Slippage**: unchanged. `SLIPPAGE_MODEL_V1.realized_entry_exit(...)`
-takes the raw fill price (now VWAP-or-close) and applies the 1% per-
-side haircut once per leg. No double-application risk — slippage is
-called exactly once per leg in `_price_one_leg:150` and the change is
-only to WHAT goes into that call.
-
-**Result-row schema additions** (additive, non-breaking):
-- `entry_turnover`, `exit_turnover` — per-leg telemetry for auditing
-  VWAP-vs-close divergence post-hoc.
-- `entry_px` redefined: now means "the fill price the engine used"
-  (VWAP or close). The audit trail still works since `entry_px` was
-  already the "input to slippage" semantic — just changes its source.
-
-**Tests** (`tests/test_pnl.py`):
-- Leg with `turnover=8000, volume=1000` → `entry_px == 8.0` (VWAP).
-- Leg with `turnover=NaN` (legacy cache) → `entry_px == close` (fallback).
-- Slippage applied exactly once per realized price (regression — the
-  existing slippage tests cover this, but reaffirm post-VWAP).
-
-**LOC estimate**: ~15 LOC code + ~40 LOC tests. One commit.
-
-### Commit 4 (deferred until live-run validates) — `feat(p7.pricing.liquidity_gate.tighten)`
-
-**Goal**: tighten the gate from `> 0` to `>= K * lot_size` (≥ K lots
-traded). K starts at 1 (one full lot), tunable via a module constant.
-
-**Defer reason**: ship Commits 1–3 first, run a sweep, look at what
-fraction of cells were rejected by `> 0` vs would be rejected by
-`>= K`. Calibrate K empirically before committing to a number.
-
-**Rough expectation**: K=1 (one full lot) catches the rounding-error
-fills the operator flagged. K=5 would also catch quiet days but might
-prune some legitimate marginal cells. The right K depends on per-
-symbol distribution — possibly a per-symbol map later.
-
-## 5. Open questions for REVIEWER
-
-### Q1 — single-gate vs stale-close subdivision
-
-We decided to drop the `close == settle_price` subdivision and use
-ONE skip reason (`IlliquidLegError`) for the volume + OI gate. Operator
-was specifically worried about over-conservatism in the labels and
-asked for builder judgment. Builder's call: drop it. Telemetry loss
-is small; the cell skips either way; complexity drop is real.
-
-Does reviewer see a reason to keep the subdivision? (e.g. a known
-analysis path that requires the stale-close-specifically count?)
-
-### Q2 — schema additions on the result frame
-
-Commit 3 adds `entry_turnover` / `exit_turnover` to the result-row
-schema. This is additive (backward-compat for old parquets — they
-get NaN in the new column). But it bumps `RESULTS_COLUMNS` and
-touches `canonical_column_order`. The schema-drift test
-(`test_read_results_raises_when_schema_drifted`) would need a tweak
-to handle the new optional column.
-
-Does reviewer prefer:
-- (a) Hard-require the new column → forces re-sweep of every existing
-  parquet (heavy);
-- (b) Soft-add as an optional column → backward-compat (preferred);
-- (c) Skip the result-row addition entirely; keep VWAP in the engine's
-  hot path only, no audit telemetry.
-
-Builder lean: (b). Audit telemetry is cheap and valuable; the
-backward-compat path is one boolean check in the schema validator.
-
-### Q3 — VWAP integration ordering
-
-Commits 1, 2, 3 in this order. Reviewer: is there a reason to do
-Commit 2 (ingest fix) BEFORE Commit 1 (gate)? The gate doesn't need
-turnover; it only needs volume + OI which we already have. But
-Commit 2 needs to land before prefetch restart so the cache pulls
-turnover going forward.
-
-Builder lean: Commit 1 first (smallest, lowest-risk), then Commit 2
-(ingest fix, no behavior change, lands before prefetch restart), then
-Commit 3 (uses turnover from re-fetched cache OR falls back to close
-for old cache).
-
-### Q4 — Phase 2 nice-to-haves out of scope here
-
-These were discussed but explicitly deferred:
-
-- **Strike-depth-aware slippage** — `slippage = f(volume, oi, |strike−spot|)`.
-  Sound idea; needs calibration; doesn't depend on the gate landing.
-- **B-S theoretical cross-check** — `|close − theoretical| / theoretical > X%`
-  catches outlier prints on otherwise-liquid strikes. Requires IV
-  surface compute (engineering, not new data).
-- **Per-symbol K calibration** — empirical-derivation path for the
-  tightened gate's K factor.
-
-Reviewer: do any of these belong in THIS arc rather than Phase 2?
-
-## 6. What this DOES NOT fix
-
-Honesty surface for the operator (and the reviewer):
-
-- **Bid-ask spread modeling stays at flat 1%** — VWAP is volume-
-  weighted average, not bid-ask mid. Spreads still under-represented
-  for thin strikes.
-- **Single bad print on a liquid strike still gets booked** — if a
-  contract had real volume (passes gate) but one trade was a panicked
-  outlier far from the rest, VWAP still averages it in. The B-S
-  cross-check (Phase 2) is what catches this case.
-- **Survivorship-bias disclaimer stays** — universe is still a mid-
-  2024 NIFTY-50 snapshot; nothing in this arc changes that.
+| Transport | **stdio only** | Claude Code (CLI) integration; local-only; no auth complexity. HTTP+SSE explicitly deferred. |
+| Run scoping | **per-tool `run_id` argument** | Consumer Claude can compare across runs in one session — the analyst pattern from today needs A/B between pre-arc + post-arc sweeps. |
+| Read/write | **read-only** | Per PLAN.md Phase-8 spec; matches "6 read-only tools" framing. Writes (positions, sweep execution) belong to Phase 9/10. |
+| Honesty contract | Every aggregated tool returns `caveats: list[str]` | Forces every consumer (current + future Claudes, future React UI) to see the same epistemic warnings the dashboard surfaces. |
+| no-p-values | Banned-phrase regex test on `compare_cells` output | Same enforcement pattern as the dashboard (tests/test_web_e2e.py::test_compare_cells_renders_no_p_values). |
 
 ---
 
-*Builder. Awaiting reviewer response in comments.md.*
+## 2. Scope & non-goals
+
+**In scope (Phase 8.x):**
+- 16 read-only tools exposing universe / time-series / sweep-query /
+  backtest-replay / diagnostics / research-helpers
+- Cache-only `backtest_one` and `sweep_windows` (never hits NSE)
+- Pydantic schemas auto-generate the tool JSON schemas Claude sees
+- All tools delegate to existing `src/analytics`, `src/engine`,
+  `src/data` modules — the MCP layer is a transport, not new analytics
+
+**Explicit non-goals:**
+- Phase 9 paper-trading writes (positions, mark-to-market)
+- Phase 10 live-broker integration
+- Sweep-grid execution behind a tool (sweep_grid stays a script —
+  10-15 min wall-clock is too heavy for an interactive API)
+- Strategy authoring (strategies stay code-defined; no `add_strategy`)
+- Schema migration / cache invalidation tools (operator-only)
+- Authentication (stdio = trust by process ownership; HTTP deferred)
+
+---
+
+## 3. Endpoint catalog (16 tools, 7 sub-arc groupings)
+
+### 3.1 Universe & calendar (3)
+- `list_universe(as_of?) → {blue_chip, extras, total, caveats}`
+- `expiries_for(symbol, from_date, to_date) → list[date]`
+- `list_strategies() → list[{name, params, strike_rule, margin_offset_pct, deployment_spec}]`
+
+### 3.2 Time-series (3 — parquet reads)
+- `get_spot_series(symbol, from_date, to_date) → list[OHLCV]`
+- `get_option_series(symbol, expiry, strike, option_type, from_date?, to_date?) → list[contract_row]` (now includes turnover + vwap_inferred per the just-landed pricing arc)
+- `get_options_chain(symbol, on_date, expiry?) → list[strike_row]`
+
+### 3.3 Sweep queries (4)
+- `list_runs() → list[{run_id, mtime, n_cells, strategies, symbol_count, date_range, pricing_arc_applied: bool}]`
+  → The `pricing_arc_applied` flag is load-bearing: tells consumers whether the gate + VWAP fixes are baked into the parquet.
+- `query_sweep(run_id, filters, columns?, sort_by?, limit?) → list[trade_row]` (capped at 10K rows; cursor-based pagination for larger)
+- `cell_summary(run_id, strategy, symbol, entry_offset_td, exit_offset_td) → {stats, per_trade, bootstrap_ci, observations, caveats}`
+- `heatmap(run_id, strategy, symbol, value_col, agg_fn, min_n?) → {grid, axes, caveats}`
+
+### 3.4 Backtest replay (2 — cache-only)
+- `backtest_one(strategy, symbol, expiry, entry_date, exit_date, params?) → {trade_result, legs_breakdown, gate_status, vwap_vs_close_divergence, caveats}`
+- `sweep_windows(strategy, symbol, expiry_range, entry_offset_range, exit_offset_range) → list[cell_summary]`
+
+### 3.5 Diagnostics (2 — the analyses we just ran today)
+- `skip_summary(run_id, group_by?) → {counts_by_reason, examples, total_cells, skip_rate}`
+- `data_quality(run_id, dimension?) → {table, summary, caveats}`
+  → `dimension ∈ {liquidity_by_entry_offset, theoretical_fallback_rate, vwap_vs_close_divergence}`. The liquidity-by-entry-offset table is exactly the analysis that confirmed the phantom-fill bias.
+
+### 3.6 Research helpers (2)
+- `compare_cells(run_id, cell_keys[]) → {stats_table, diff_table, distribution_overlay, caveats: ["No p-values..."]}`
+- `bootstrap_ci(values[], B?, alpha?, seed?) → {lo, median, hi, n_iterations}`
+
+Total: **16 tools**.
+
+---
+
+## 4. Honesty contract (cross-cutting requirement)
+
+Every tool that returns aggregate data MUST return a `caveats: list[str]`
+field alongside the data. The reasons a caveat fires:
+
+1. **Survivorship bias**: any query touching the universe pre-2024.
+2. **Below-min_n cells included**: warns the consumer that some cells in
+   the result have <5 trades.
+3. **Pre-pricing-arc parquet**: if `list_runs(...).pricing_arc_applied`
+   is False, every cell-summary / heatmap on that run carries a
+   "phantom-fill bias likely" caveat.
+4. **Multiple-comparisons surface large**: any heatmap covering
+   >100 cells surfaces a caveat about pick-the-best-cell selection
+   bias (same content as the existing `MULTIPLE_COMPARISONS_CAVEAT`
+   from `src/analytics/rank.py`).
+5. **No-p-values enforcement** on `compare_cells`: explicit caveat in
+   the response naming the REVIEWER CONSTRAINT.
+
+Tests will assert the caveat-presence invariants via Pydantic schema
+validators, so a future contributor can't accidentally drop a caveat.
+
+---
+
+## 5. Implementation roadmap (~13 commits)
+
+| Sub-arc | Commits | Purpose |
+|---|---|---|
+| 8.1 Scaffold | `chore(p8.mcp.skeleton)` (1) | Bare server boots, no tools yet. Pydantic infra. `python -m morenseprofits.mcp` runs. |
+| 8.2 Universe | `feat(p8.mcp.universe)` (1) | list_universe, expiries_for, list_strategies. Exercises the caveats-contract pattern. |
+| 8.3 Time-series | `feat(p8.mcp.spot_options)` (1) | spot, option series, chain. Pure cache reads. |
+| 8.4 Sweep queries | `feat(p8.mcp.cell_summary)`, `feat(p8.mcp.heatmap)`, `feat(p8.mcp.query_sweep)` (3) | Biggest analytical surface; one commit per tool given complexity. |
+| 8.5 Replay | `feat(p8.mcp.backtest_one)`, `feat(p8.mcp.sweep_windows)` (2) | Cache-only price_trade invocations. |
+| 8.6 Diagnostics | `feat(p8.mcp.skip_summary)`, `feat(p8.mcp.data_quality)` (2) | Surface the gate + VWAP + units artifacts as first-class APIs. |
+| 8.7 Research | `feat(p8.mcp.compare_cells)`, `feat(p8.mcp.bootstrap)` (2) | no-p-values failing-test reused from dashboard pattern. |
+| 8.8 Docs | `docs(p8.mcp.contract)` (1) | Claude Code config example + tool-reference. |
+
+**13 commits total. 1-2 days of focused nuclear-style work.**
+
+---
+
+## 6. Open questions for REVIEWER
+
+### Q1 — Where does the MCP server module live?
+
+Three options:
+- (a) New top-level package: `src/mcp/server.py`
+- (b) Sub-module under `src/web/`: `src/web/mcp.py` (philosophy: same role as the dashboard — an analytical-surface transport)
+- (c) Standalone `morenseprofits_mcp/` package (closer to MCP convention)
+
+BUILDER lean: **(a)** — `src/mcp/` keeps it at top-level visibility,
+matches the existing pattern (`src/analytics`, `src/engine`, `src/data`,
+`src/web`). The dashboard isn't a "data transport" per se; the MCP
+server IS. Distinct enough to warrant its own directory.
+
+### Q2 — Pydantic version pin?
+
+The existing codebase doesn't yet use Pydantic heavily. MCP SDK
+requires Pydantic v2. Should we:
+- (a) Pin Pydantic v2 in `pyproject.toml` as a hard dependency
+- (b) Use only the MCP SDK's pre-bundled Pydantic (avoid the version
+  spread to the rest of the codebase)
+
+BUILDER lean: **(a)** — Pydantic is the right modeling layer for
+typed API contracts; pinning it once now avoids "where does this
+schema live?" drift later.
+
+### Q3 — Schema-pinning tests at what granularity?
+
+Each tool's request/response schema is a contract; consumers depend on
+it. Options:
+- (a) Per-tool snapshot test of the generated JSON schema (catches
+  any field rename / dtype change)
+- (b) Integration test that boots the server, calls each tool with
+  known inputs, asserts shape (slower but catches end-to-end drift)
+- (c) Both
+
+BUILDER lean: **(c)** for the 4 highest-value tools (`cell_summary`,
+`heatmap`, `backtest_one`, `data_quality`); **(a) only** for the
+others. Full integration tests for all 16 would add ~30s to the test
+suite for marginal coverage.
+
+### Q4 — Caveat enforcement: schema-level or test-level?
+
+The caveats-list invariant could be enforced via:
+- (a) Pydantic validator: `@validator("caveats") def must_be_present`
+  raises if a result type that should have caveats omits them
+- (b) Test that calls each tool and asserts caveats are present in the
+  response
+- (c) Convention only (documented in the docstring, not enforced)
+
+BUILDER lean: **(a)** — schema-level invariants are the strongest
+defense against drift. Catches any future contributor who returns
+a response dict missing the field.
+
+### Q5 — `pricing_arc_applied` detection on `list_runs`
+
+How does `list_runs` decide whether a sweep parquet was generated
+post-pricing-arc? Three options:
+- (a) Inspect the parquet's column set — if `entry_turnover` /
+  `exit_turnover` are present in `legs_json` of a sample row, the run
+  is post-arc.
+- (b) Stamp a metadata column (`pricing_arc_version`) on every sweep
+  result at write time — requires touching `src/engine/results.py`.
+- (c) Heuristic: `mtime` after the pricing arc landed (cb6ad92) is
+  considered post-arc. Brittle.
+
+BUILDER lean: **(a)** for v1 (zero new infra), **(b)** added later if
+the heuristic gets fragile.
+
+---
+
+## 7. What this does NOT fix
+
+Per the honesty pattern from the pricing arc's §6:
+
+- **Survivorship bias** — universe is a 2024 snapshot; MCP tools
+  surface this via caveats but can't fix it (Phase-7 backlog item
+  per SPECS §6b.3).
+- **Slippage understatement on wings** — flat 1% per side stays;
+  Phase-2 nice-to-have per the pricing-arc consultation.
+- **MCP server is research-honesty plumbing, not deploy-readiness**.
+  An external Claude returning "this cell looks good" is research
+  output, NOT a live-trade signal. The caveats make this explicit.
+
+---
+
+## 8. Why this is the right thing to do now (post-pricing-arc)
+
+The empirical finding from 2026-05-30 made the case concrete: an
+external Claude looking at the pre-arc parquet would have
+confidently reported "+10.9% on T-45 entries across the universe!"
+without ever seeing the 91% zero-volume rate that produced it.
+
+Phase 8's `data_quality(run_id, "liquidity_by_entry_offset")` makes
+that analysis a one-tool call. Any future external research interaction
+inherits the data-quality footprint by default. That's the operational
+upgrade — going from "an external analyst can be misled" to "an
+external analyst CAN'T avoid seeing the artifacts."
+
+---
+
+*Builder. Awaiting reviewer response in comments.md before commit 1.*
