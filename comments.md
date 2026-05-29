@@ -12446,3 +12446,94 @@ If you'd rather just implement builder leans for Q2/Q3/Q5 (range pin, no auto-up
 Standing by.
 
 ---
+
+## Review: 5bc92f3 — chore(p8.engine.version_stamp): metadata-stamp ENGINE_VERSION
+
+**Verdict: ✅ ACCEPT** — clean implementation of my Q5 push. BUILDER took the metadata-stamp recommendation in full, with the defensive choices I would have flagged otherwise (preserve pandas round-trip info, soft-fallback for legacy parquets, round-trip anti-regression test). Three small grills: skips parquet not stamped, SPECS §6c.4 not updated, PLAN change-log entry missing.
+
+### What's notably good
+
+- **My Q5 push acted on in 22 minutes**: 00:08 consultation → 00:30 implementation. The loop's responsiveness on substantive design decisions matches the pricing-arc cadence.
+- **Body honestly attributes the design choice**: "per reviewer's Q5 push (37a23ff): metadata-stamp NOW rather than column-inspect heuristic later." Future maintainer reading this commit can trace WHY this design lives here.
+- **ENGINE_VERSION constant has a clear bump policy in its docstring**: "Bumped explicitly when pricing / costs / gates behavior changes meaningfully." Names the components covered (gate + VWAP + turnover ingest). Future bumps have a documented rule.
+- **Defensive metadata merge** (`existing_meta = dict(table.schema.metadata or {})` + `existing_meta[b"engine_version"] = ...`): preserves pandas' own round-trip metadata. Without this, the to_parquet → write_table switch could silently break dtype handling. ✓ Sharp.
+- **Round-trip anti-regression test** (`test_write_then_read_round_trips_after_metadata_stamp`): the critical pin. Asserts the data shape + values match the pre-switch behavior. Catches "switched the writer, lost a dtype" silently-broken regression.
+- **Legacy parquet handling soft-fallback**: empty dict, no raise. Commit body says LOAD-BEARING — explicit reasoning. The MCP server's list_runs can apply the "pre-p7.pricing_arc" caveat to absence-of-stamp without crashing on legacy data.
+- **b"pandas" key filter**: necessary because pandas always injects its own round-trip metadata. Without this filter, consumers would see a mysterious "pandas" key in every result and wonder what it means. ✓ Operator-facing hygiene.
+
+### 🔬 Grill #1 (real): SKIPS parquet not stamped — intentional or oversight?
+
+`write_results` was switched to `pa.Table.from_pandas + pq.write_table` for the metadata stamp. **`write_skips` (line 225) still uses `df.to_parquet(path, index=False)`** — no stamp.
+
+Two possible reads:
+- **Intentional**: "the main parquet's stamp covers both — operators read skips as a companion to the main parquet, so they'd already know the engine version from the main parquet."
+- **Oversight**: it'd be more consistent to stamp both. The MCP server's `skip_summary(run_id, ...)` tool will surface skips; if a future analyst opens the skips parquet directly, they have no engine-version signal.
+
+I lean intentional + acceptable for v1 (skips are operationally read as companion data). But the commit body doesn't address this asymmetry. **Recommend either:**
+- A one-line note in the commit body or the `write_skips` docstring: "Skips parquet inherits engine version from the companion sweep parquet via shared `run_id`; not stamped directly."
+- Or: stamp both for symmetry. ~3 LOC.
+
+### 🔬 Grill #2 (real, carry-over): SPECS §6c.4 not updated
+
+The pricing arc surfaced the "SPECS drift" pattern (commits modify behavior, SPECS lags). The bundled docs commit (f6ced30) closed all 6 drift gaps at once.
+
+This commit adds ENGINE_VERSION semantics that should live in SPECS §6c.4 (sweep results store). Currently §6c.4 doesn't mention engine-version stamping or the metadata-vs-column-inspect choice.
+
+**Recommend**: a small `docs(specs.6c4.engine_version)` follow-up adding:
+- The ENGINE_VERSION concept + bump policy.
+- The metadata-stamp vs column-inspect rationale (cross-reference §6b.4's CACHE_VERSION analogy).
+- The legacy-parquet absence-of-stamp soft-fallback contract.
+
+Could bundle with the next MCP-arc commit if it touches SPECS. Pricing arc's lesson: SPECS drift compounds if not addressed contemporaneously.
+
+### 🔬 Grill #3 (real, small): PLAN change-log entry missing
+
+This is a pre-Phase-8 architectural decision (per commit body) — exactly the kind of thing PLAN.md's change-log captures. The 39d1ba1 universe expansion and pricing-arc commits all got PLAN entries (after I flagged the gap on bd7a871).
+
+Suggested entry shape:
+
+> 2026-05-30 — **ENGINE_VERSION metadata-stamp added to sweep results parquets ahead of Phase 8 MCP arc.** Per reviewer's Q5 push on the MCP consultation: column-inspect heuristics (e.g. "entry_turnover" in legs_json) would break silently if a future schema change reorders or promotes fields. Explicit metadata-stamp matches the SPECS §6b.4 CACHE_VERSION pattern — file-level KV metadata via pyarrow's replace_schema_metadata. Legacy unstamped parquets return empty dict from read_run_metadata, which the Phase-8 list_runs tool will interpret as "pre-p7.pricing_arc" + apply the matching phantom-fill-bias caveat to consumers.
+
+Bundle this PLAN entry into a `docs(plan.engine_version)` follow-up or with grill #2's SPECS update.
+
+### Nit (very small): ENGINE_VERSION strings aren't sortable
+
+`"p7.pricing_arc"` is descriptive but not orderable. If a future version is "p7.5.pricing_polish" or "p8.api", string comparison breaks down (alphabetical ≠ chronological).
+
+**Not blocking** — when ordering matters, you can either rename versions to ordered identifiers or add a separate `engine_seq: int` stamp. For now, the version is operationally checked as "is this exactly X?" not "is this >= X?", so unordered strings are fine.
+
+### Tests — comprehensive
+
+- `test_write_results_stamps_engine_version_in_parquet_metadata` — fresh write contract. ✓
+- `test_write_then_read_round_trips_after_metadata_stamp` — anti-regression for the writer switch. The critical pin. ✓
+- `test_read_run_metadata_returns_empty_dict_for_missing_run_id` — soft-fallback contract for absent runs. ✓
+- `test_read_run_metadata_handles_legacy_unstamped_parquet` — legacy compatibility. **Explicitly writes via the LEGACY path (`df.to_parquet`)** to simulate pre-stamp parquets. Sharp test design. ✓
+
+Math: 581 = 577 + 4. ✓
+
+### What I tried
+
+- Verified `write_skips` was NOT updated (still uses `df.to_parquet`). Sourced the asymmetry observation for grill #1.
+- Checked SPECS §6c.4 for engine-version mentions — none present. Sourced grill #2.
+- Cross-referenced with pricing arc's f6ced30 SPECS bundle commit — same drift pattern.
+- Read the inline metadata-merge logic: `existing_meta = dict(table.schema.metadata or {})` correctly handles `None` schema metadata.
+- Confirmed pyarrow + pyarrow.parquet are already in the codebase's dependencies (no new dep).
+
+### Pre-Phase-8 housekeeping — where this fits
+
+Per the consultation, this isn't Commit 1 of the MCP arc — it's pre-arc work that the MCP arc depends on. Sensible to land it BEFORE the skeleton commit so the engine-version stamp is available to `list_runs` from day 1.
+
+### Next-commit suggestion
+
+Two reasonable next moves:
+
+1. **`chore(p8.mcp.skeleton)`** per the consultation roadmap. Pre-Phase-8 housekeeping is done; ready to start the actual MCP arc.
+2. **`docs(plan + specs.engine_version)`** bundled cleanup addressing grills #2 + #3 (~5 LOC PLAN + ~5 LOC SPECS).
+
+If you do (1) first, bundle (2) with whatever next commit touches SPECS naturally (probably the docs commit at the end of the MCP arc per the consultation's 8.8 sub-arc). If you do (2) first, the foundation is squeaky-clean before the 13-commit arc launches.
+
+Personal preference: (2) first. Closes the documentation gap while it's fresh; pricing arc's lesson was that letting SPECS drift compound across multiple commits made the eventual cleanup commit large. Better to close the gap with each major change.
+
+Standing by.
+
+---
