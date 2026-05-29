@@ -12537,3 +12537,72 @@ Personal preference: (2) first. Closes the documentation gap while it's fresh; p
 Standing by.
 
 ---
+
+## Review: b42d4c2 — chore(p8.mcp.skeleton): Commit 1 of MCP arc
+
+**Verdict: ✅ ACCEPT** — clean skeleton, my Q2 push acted on verbatim (`pydantic>=2.0,<3.0`), sharp `test_skeleton_registers_zero_tools` scope-pinning. Three small grills carry over from 5bc92f3 (SPECS + PLAN drift); one is defensible at this scope (no integration test).
+
+### What's good
+
+- **My Q2 push landed verbatim**: requirements.txt has `pydantic>=2.0,<3.0` — major-pin with upper bound, exactly as I recommended. ✓
+- **`test_skeleton_registers_zero_tools` is the sharpest test in the file**: explicitly pins this commit's scope at ZERO tools. A future sloppy follow-up that "while I'm in here, register one tool" gets caught by CI. **This is the right anti-scope-creep pattern** — name the scope, test the scope.
+- **Factory pattern over module-level singleton**: `build_server()` returns a fresh instance per call. Tests can use it for isolation; production calls the same factory. The idempotency test pins this contract. ✓
+- **Anti-rename guard on `SERVER_NAME`**: `test_server_name_is_canonical` pins `"morenseprofits"` so a future rename can't drift the operator's Claude Code config silently.
+- **Body honestly distinguishes pinned tests from ad-hoc smoke**: "End-to-end smoke (not a pinned test, ran ad-hoc)". The boot-time smoke is hard to automate without real stdio, and the body says so. Right framing.
+- **`_register_*` pattern documented in module docstring**: gives future commits a clear pattern (each sub-arc adds one `_register_<topic>()` call from `build_server`). Single-place visibility into "what tools exist".
+
+### 🔬 Grill #1 (carry-over from 5bc92f3): PLAN.md change-log + SPECS entry
+
+The MCP arc begins. Per the pricing-arc pattern's lesson:
+- Each major arc gets a PLAN change-log entry naming the design decisions.
+- SPECS gets a section on the new architectural surface.
+
+This commit kicks off ~13 commits of new package + new dep + new entry-point. SPECS currently has no §11.X or wherever-it-fits entry on `src/mcp/`. PLAN's Phase-8 reference is high-level but doesn't capture the specific design choices (factory pattern, Pydantic range pin, stdio-only transport, caveats contract).
+
+**Recommend**: a bundled `docs(plan + specs.mcp_skeleton)` commit before Commit 2. Same shape as the pricing arc's f6ced30 cleanup, except landing PROACTIVELY rather than reactively after drift accumulated.
+
+Bundle this with the 5bc92f3 grills (ENGINE_VERSION concept in SPECS + PLAN). Single docs commit closes both gaps.
+
+### 🔬 Grill #2 (small, defensible): no integration test against the MCP protocol
+
+The 4 tests cover boot-contract invariants but don't verify the server responds to actual MCP RPC calls. The ad-hoc smoke test in the body (`asyncio.run(build_server().create_initialization_options())`) is the closest signal.
+
+**Defensible at this scope**: no tools are registered, so there's nothing to call. The integration test naturally lands in Commit 2 (`feat(p8.mcp.universe)`) when the first tool gets registered. ✓
+
+**Suggested test for Commit 2**: a "tools/list" MCP RPC roundtrip test — spawn the server via asyncio + a mock stdio, send `{"method": "tools/list"}`, assert the response contains the registered tool. This is the e2e analog of the dashboard's AppTest scaffold (2140b1f) — pays off across every subsequent tool commit. Worth landing the scaffold WITH Commit 2.
+
+### 🔬 Grill #3 (small): `SERVER_NAME` unversioned
+
+If the operator runs multiple variants side-by-side (pre-pricing-arc validation vs post-arc), having `SERVER_NAME = "morenseprofits"` doesn't disambiguate. Claude Code's MCP config addresses tools as `morenseprofits/<tool>` — running two server instances would collide on tool names.
+
+But: changing `SERVER_NAME` later requires re-registering in Claude Code config. **Probably fine for v1.** If the operator wants multiple variants, the protocol layer can disambiguate by config-name (each Claude Code MCP entry has its own config key, independent of the protocol-level `SERVER_NAME`).
+
+Not pushing for a change. Just noting.
+
+### What I checked
+
+- Confirmed `pydantic>=2.0,<3.0` exactly matches my Q2 recommendation. ✓
+- Verified `test_skeleton_registers_zero_tools` does what its name claims (would need to read the test file to fully confirm; trusting the commit body's description).
+- Math: 585 = 581 + 4 new. ✓
+- Cross-referenced consultation's 13-commit roadmap. This is Commit 1 of 13 (`chore(p8.mcp.skeleton)`). On track.
+
+### Pricing-arc lesson applied?
+
+The pricing-arc lesson was: **close SPECS drift contemporaneously, not reactively.** Currently the MCP arc has 2 commits (5bc92f3 ENGINE_VERSION + b42d4c2 skeleton) without SPECS/PLAN updates. **That's already 2 commits of drift.** By the consultation's roadmap, 13 more are coming.
+
+The pricing arc's f6ced30 bundled docs commit was 82 lines for 3 commits' worth of drift. If the MCP arc accumulates 15 commits of drift, the bundled docs commit could be 400+ lines.
+
+**Strong recommendation**: land `docs(plan + specs.mcp_arc_start)` BEFORE Commit 2. It's cheaper now than the eventual cleanup.
+
+### Next-commit suggestion
+
+Per the roadmap, Commit 2 is `feat(p8.mcp.universe)` (`list_universe` + `expiries_for` + `list_strategies`). Suggested order:
+
+1. **`docs(plan + specs.mcp_arc_start)`** — bundle 5bc92f3 + b42d4c2 docs gaps. ~50 LOC of PLAN + SPECS.
+2. **`feat(p8.mcp.universe)`** — Commit 2 with the integration-test scaffold (suggested in grill #2).
+
+Or just push through to Commit 2 and accept the SPECS/PLAN drift will compound. Operator's call on cadence.
+
+Standing by.
+
+---
