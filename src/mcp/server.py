@@ -1,4 +1,4 @@
-"""MCP server skeleton — zero tools registered at this stage.
+"""MCP server skeleton + cross-sub-arc tool registration.
 
 The actual tool catalog lands across the p8.mcp sub-arc:
   - p8.mcp.universe        : list_universe / expiries_for / list_strategies
@@ -15,32 +15,100 @@ The actual tool catalog lands across the p8.mcp sub-arc:
 
 This file owns the server-construction contract: ``build_server()``
 returns a fully-configured ``mcp.server.Server`` instance with every
-landed tool registered. Each tool sub-arc adds a ``_register_<topic>``
-function called from ``build_server`` — single-place visibility into
-"what tools exist".
+landed tool registered. Each tool sub-arc adds a ``register_*_tools``
+function call below — single-place visibility into "what tools exist".
 
 Why a ``build_server`` factory rather than a module-level singleton:
 tests can call ``build_server()`` to construct an isolated server
 instance, register / inspect tools, and tear down without polluting
 each other's state. Production (the ``__main__`` entry point) calls
 the same factory.
+
+Why a single ``@server.list_tools()`` + ``@server.call_tool()`` pair
+rather than per-sub-arc decorators: the MCP SDK's decorators REPLACE
+the handler on each call. Aggregating into one pair via the
+``ToolEntry`` registry is the canonical pattern for multi-sub-arc
+tool catalogs.
 """
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from mcp.server import Server
+from mcp.types import TextContent, Tool
+
+from src.mcp._models import ToolEntry
+from src.mcp.universe import register_universe_tools
 
 
 SERVER_NAME = "morenseprofits"
 
 
+def _collect_tool_entries() -> dict[str, ToolEntry]:
+    """Aggregate every sub-arc's ToolEntry list into a single
+    name → entry dict. Failure on duplicate names is intentional —
+    catches a copy-paste accident across sub-arcs at server-build
+    time rather than at runtime."""
+    all_entries: list[ToolEntry] = []
+    all_entries.extend(register_universe_tools())
+    # Future sub-arcs append here:
+    # all_entries.extend(register_spot_options_tools())
+    # all_entries.extend(register_cell_summary_tools())
+    # ... etc.
+
+    registry: dict[str, ToolEntry] = {}
+    for entry in all_entries:
+        if entry.name in registry:
+            raise ValueError(
+                f"duplicate MCP tool name {entry.name!r} — two "
+                f"sub-arcs registered the same name"
+            )
+        registry[entry.name] = entry
+    return registry
+
+
 def build_server() -> Server:
     """Construct the MCP Server with every landed tool registered.
 
-    Currently empty — chore(p8.mcp.skeleton) lands the boot contract
-    without any tools. Subsequent commits in the p8.mcp arc each add
-    a ``_register_*`` call below.
+    Tool registration happens here (not at module import time) so
+    each ``build_server()`` call returns a fresh, isolated Server
+    instance. Tests rely on this for non-singleton semantics.
     """
     server: Server = Server(SERVER_NAME)
-    # No tools registered yet. Tool-registration calls land in the
-    # subsequent p8.mcp.* commits.
+    registry = _collect_tool_entries()
+
+    @server.list_tools()
+    async def _list_tools() -> list[Tool]:
+        return [
+            Tool(
+                name=entry.name,
+                description=entry.description,
+                inputSchema=entry.input_model.model_json_schema(),
+            )
+            for entry in registry.values()
+        ]
+
+    @server.call_tool()
+    async def _call_tool(
+        name: str, arguments: dict[str, Any] | None,
+    ) -> list[TextContent]:
+        if name not in registry:
+            raise ValueError(
+                f"unknown tool {name!r}. Available: "
+                f"{sorted(registry.keys())}"
+            )
+        entry = registry[name]
+        # Pydantic does the input-schema validation; an invalid
+        # arguments dict raises ValidationError which the SDK
+        # surfaces to the consumer as a tool-error response.
+        parsed = entry.input_model(**(arguments or {}))
+        result = entry.impl(parsed)
+        # Output is a Pydantic model; serialize to JSON string for
+        # the TextContent payload. ``mode="json"`` ensures date
+        # fields round-trip as ISO strings (the natural form for
+        # consumers reading JSON).
+        payload = json.dumps(result.model_dump(mode="json"), default=str)
+        return [TextContent(type="text", text=payload)]
+
     return server

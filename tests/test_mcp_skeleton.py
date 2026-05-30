@@ -32,21 +32,25 @@ def test_server_name_is_canonical():
     assert getattr(server, "name", None) == SERVER_NAME
 
 
-def test_skeleton_registers_zero_tools():
-    """chore(p8.mcp.skeleton)'s scope is deliberately empty: the boot
-    contract lands first, tools register in subsequent p8.mcp.*
-    commits. Pin zero registered tools so a sloppy follow-up can't
-    sneak undocumented tools into this commit's surface."""
+def test_server_registers_call_tool_dispatcher():
+    """``build_server`` registers a single ``@server.call_tool()``
+    dispatcher that routes by tool name into the per-sub-arc impl
+    via the ToolEntry registry. This test pins the wiring contract:
+    after build, the SDK's request_handlers dict carries a
+    CallToolRequest entry. Anti-regression against a future refactor
+    that accidentally drops the dispatcher decoration.
+
+    Note: the original p8.mcp.skeleton test asserted the OPPOSITE
+    (zero tools registered). Once feat(p8.mcp.universe) landed the
+    first 3 tools, the dispatcher became load-bearing — flipped the
+    assertion to reflect the new contract."""
     server = build_server()
-    # Probe the SDK's internal handler registry. The exact attribute
-    # name has shifted across SDK versions; check the canonical
-    # public-ish accessor first, fall back to the registry dict.
-    if hasattr(server, "request_handlers"):
-        # Tool-registration adds entries to request_handlers for the
-        # CallToolRequest type. Absent any tools registered, this dict
-        # should not contain a CallToolRequest handler.
-        from mcp.types import CallToolRequest
-        assert CallToolRequest not in server.request_handlers
+    from mcp.types import CallToolRequest, ListToolsRequest
+    # Both list_tools and call_tool decorators must have fired in
+    # build_server. The SDK's request_handlers dict carries one entry
+    # per registered request type.
+    assert CallToolRequest in server.request_handlers
+    assert ListToolsRequest in server.request_handlers
 
 
 def test_build_server_is_idempotent_across_calls():
