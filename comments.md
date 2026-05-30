@@ -12849,3 +12849,116 @@ If you bundle (1) + (2) + (3) into a "consolidate" commit before (4), the founda
 Standing by.
 
 ---
+
+## Review: bacf5cf — feat(p8.mcp.list_runs_query_sweep): Commit 4 of MCP arc — sub-arc 3.3 (2 of 4)
+
+**Verdict: ✅ ACCEPT** — my Q5 metadata-stamp push is now operationally validated end-to-end. `list_runs` + `query_sweep` both surface phantom-fill-bias caveats from the ENGINE_VERSION stamp. Sharp Django-style filter syntax with loud-fail on unknowns. One small new grill (filter value type validation); three carry-overs compound.
+
+### The standout: Q5 push pays off end-to-end
+
+My Q5 push (5bc92f3) landed metadata-stamp infrastructure. This commit OPERATIONALLY VALIDATES it:
+
+- `list_runs` reads each parquet's `engine_version` stamp via `read_run_metadata`, sets `pricing_arc_applied` flag, surfaces top-level caveat counting legacy runs.
+- `query_sweep` mirrors the same check PER-CALL: pre-arc query → phantom-fill caveat in every response.
+
+Without the metadata-stamp infrastructure, this tool would have to either column-inspect (the heuristic I argued against in Q5) or skip the bias-flagging entirely. **The stamp is now the canonical pricing-arc-vs-not signal** — exactly the architectural payoff I argued for.
+
+The body's framing: "The pricing_arc_applied flag from chore(p8.engine.version_stamp) becomes load-bearing here" — honest attribution.
+
+### What's notably good
+
+- **Django-style filter syntax** (`__gte`/`__lte`/`__gt`/`__lt`) is idiomatic Python. Consumers used to Django ORM or pandas-pyranges syntax recognize it immediately.
+- **Unknown columns + unknown sort_by + unknown projected columns ALL raise `ValueError`**: typos at consumer side surface loud at the call boundary, not silent (returning whole frame on filter typo would be a footgun).
+- **`limit: int = Field(default=MAX_QUERY_SWEEP_ROWS, ge=1, le=MAX_QUERY_SWEEP_ROWS)`**: Pydantic schema-level cap. Consumer can't pass `limit=100_000` to escape the truncation. ✓ Defensive.
+- **`mtime_utc: datetime` with explicit `tz=timezone.utc`**: no naive datetime ambiguity. Right call.
+- **Defensive corrupted-parquet handling**: per-run `try/except` returns `n_rows=0` for one bad file rather than killing the whole `list_runs` call. Right trade-off (resilience over loud-fail in a discovery tool).
+- **`_to_json_friendly` helper** handles `pd.Timestamp`, `pd.isna`, numpy scalars — defensive serialization layer above what `model_dump(mode="json")` does.
+- **Caveat naming the SPECIFIC bias number** ("T-41..T-45 ROI inflated by ~10pts per the 2026-05-30 analysis"): not generic "data may have biases" — specific, evidence-backed, dated. Consumer Claude sees the concrete artifact, not vague hedging.
+- **Pricing-arc caveat duplicated at both list_runs (summary) and query_sweep (per-call)** — necessary redundancy because each tool is independently callable. Consumer landing on query_sweep directly without going through list_runs still gets the warning.
+- **Test for the load-bearing behavior** (`legacy unstamped parquet → pricing_arc_applied=False + top-level phantom-fill-bias caveat`) is the Q4-pattern behavior pin I asked for. ✓
+- **The `inverse anti-regression test`** ("modern parquet → no phantom-fill caveat") prevents a future refactor from over-firing the caveat on stamped runs. Inverse-test pattern is sharp.
+
+### 🔬 Grill #1 (NEW, small): `_apply_filters` doesn't validate filter value types against column dtype
+
+```python
+filters = {"entry_offset_td__gte": "ten"}  # string, should be int
+```
+
+`_apply_filters` would call `out[entry_offset_td] >= "ten"`, which pandas would compute (string > int comparison in Python 3 is a TypeError). The error would surface, but as a confusing pandas exception rather than a clean MCP tool error.
+
+**Recommendation**: pre-validate filter values against the column's dtype. ~5 LOC:
+
+```python
+expected_dtype = df[column].dtype
+try:
+    coerced_value = expected_dtype.type(value)
+except (TypeError, ValueError):
+    raise ValueError(
+        f"filter {key!r}: value {value!r} not coercible to "
+        f"column {column!r}'s dtype {expected_dtype}"
+    )
+```
+
+This catches the typo cleanly at the schema layer, with a consumer-readable error. Not blocking — pandas errors propagate today — but improves the UX.
+
+### 🔬 Grill #2 (carry-over, now louder): MCP-protocol integration test STILL missing
+
+5 sub-arcs deep (3 tool sub-arcs = 8 tools). The integration test gap I flagged in b42d4c2, 0cc0b2c, and 661b1ff continues to widen.
+
+The argument from b42d4c2 grill #2 — "single scaffold lands once, benefits all 11 remaining sub-arcs" — is now ~40% spent. Each additional sub-arc landed without the scaffold means the scaffold's eventual payoff distribution narrows.
+
+**Concrete test that would have caught the JSON serialization edge cases throughout this arc**:
+
+```python
+@pytest.mark.asyncio
+async def test_query_sweep_via_call_tool_returns_valid_json():
+    server = build_server()
+    result = await server._call_tool(
+        "query_sweep",
+        {"run_id": "test_run", "filters": {"strategy": "short_straddle"}, "limit": 100},
+    )
+    # Pin that result[0].text is valid JSON parseable into the schema
+    payload = json.loads(result[0].text)
+    QuerySweepOutput.model_validate(payload)
+```
+
+### 🔬 Grill #3 (carry-over, now louder): PLAN/SPECS drift now 5 commits deep
+
+5bc92f3 + b42d4c2 + 0cc0b2c + 661b1ff + bacf5cf = 5 MCP-arc commits, zero docs.
+
+Pricing arc's f6ced30 was 82 LOC after 3 commits of drift. Linear extrapolation puts MCP cleanup NOW at ~140 LOC; at 13-commit completion (8 more commits to go), projected ~370+ LOC.
+
+Strong recommendation (fifth time): land `docs(plan + specs.mcp_arc_progress)` before Commit 5.
+
+### 🔬 Grill #4 (carry-over): close-could-be-NaN and chain-no-truncate fixes still pending
+
+661b1ff grills #1 and #2 from my last review haven't landed. Real bugs (one JSON-serialization-fails, one no-cap on output rows). Both ~5 LOC fixes.
+
+### Other observations
+
+- **`MAX_QUERY_SWEEP_ROWS = 10_000`** duplicates spot_options's `MAX_ROWS_PER_RESPONSE`. Body explicitly says "duplicate by design so the two surfaces can diverge later." OK, but the constants could be centralized in a `src/mcp/_limits.py` with a docstring naming the divergence-allowed semantics. Cosmetic.
+- **No NULL filtering support**: can't ask "where exit_spot is null". Out of scope for v1; future enhancement if needed.
+- **`key.endswith(suffix)` could match a column ending in `__gte`** — vanishingly rare in practice; sweep_grid's column set doesn't have any. Acceptable trade-off.
+
+### What I checked
+
+- Verified `pricing_arc_applied = (engine_version == ENGINE_VERSION)` correctly handles None (None ≠ "p7.pricing_arc" → False).
+- Cross-checked the legacy-caveat firing: `n_legacy = sum(1 for r in runs if not r.pricing_arc_applied)`. ✓ Counts both None-stamp and wrong-stamp cases as legacy.
+- Math: 641 = 620 + 21. ✓
+
+### Pricing-arc lesson applied?
+
+Drift continues to grow. The reviewer-builder loop on design + tests is sharp; the documentation-discipline gap remains the soft spot.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.consolidate_grills)`** — bundle 661b1ff grills #1+#2 + this commit's grill #1 + my repeated integration-test ask + PLAN/SPECS docs. ~100 LOC bundle. Single commit closes all open carry-overs. Foundation gets clean before the heavy analytical surfaces (cell_summary, heatmap) land.
+2. **`feat(p8.mcp.cell_summary)`** — sub-arc 3.3 part 3. Per the consultation, this is the heaviest analytical surface (drill-down stats + bootstrap CI + caveats).
+
+If (1) gets pushed past Commit 5, the cleanup commit at arc end will be the largest reactive-cleanup in the project's history. Operator's call.
+
+Standing by.
+
+---
