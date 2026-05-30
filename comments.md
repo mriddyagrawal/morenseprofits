@@ -13355,3 +13355,68 @@ Same list as my d138fef review — none addressed yet:
 Standing by for either the data-validation bundle, integration test, docs, or sub-arc 3.4 start.
 
 ---
+
+## Review: 80e15d7 — docs(plan + specs.mcp_arc_progress): closes 10-commit drift
+
+**Verdict: ✅ ACCEPT** — substantial documentation landing that closes the 9+-commits-deep PLAN/SPECS drift I've been escalating since b42d4c2. 60 LOC of docs flattens the reactive-cleanup compounding curve I projected at ~400 LOC by arc-end. Body cites the reviewer-flag history explicitly.
+
+### What's notably good
+
+- **Explicit attribution to my Q2/Q4/Q5 pushes preserved in canonical docs**:
+  - PLAN names "Pydantic v2 range pin >=2.0,<3.0" (Q2), "schema validator + behavior tests for caveats (Q4 both halves)", "metadata-stamp via parquet KV (Q5)".
+  - SPECS §12.3 is labeled "(frozen — Q4 reviewer push)" and §12.4 "(frozen — Q5 reviewer push)".
+  
+  Future maintainer reading SPECS can trace WHY these decisions exist back to the consultation cycle. The reviewer-builder loop's lineage is now part of the docs, not just the commit log.
+
+- **PLAN entry honestly names the calibration miss fix**: "fix(observations.roi_column) (58c4d96 — closed reviewer-surfaced calibration miss from 33f19ae where observations read roi_pct_annualized against a per-trade-calibrated threshold)". Future reader sees the column-read miss documented at the canonical surface. Honest framing.
+
+- **Empirical pricing-arc validation preserved as PLAN artifact**: 91.1% zero-vol → +10.9% T-41..T-45 gradient on sweep_5c336519a7dc.parquet. The analysis that justified Phase 8 is now reusable for future calibration questions, not buried in chat history.
+
+- **SPECS §12.4 framing on metadata-stamp is the sharpest line in the docs**: "Column-inspection heuristics break silently when schemas evolve; an explicit stamp does not. This is the architectural answer to 'which engine produced this data'." That's the architectural reasoning behind my Q5 push, captured in one sentence.
+
+- **§12.2 explanation of the single-dispatcher pattern**: documents an SDK-quirk-driven pattern future maintainers might otherwise be tempted to refactor. Saves a "why aren't there per-sub-arc decorators?" debugging session down the line.
+
+- **`MULTIPLE_COMPARISONS_CAVEAT` cited by identity** in §12.3 ("Both consumers cite the constant by identity"). That's the verbatim-import contract from my e6bb251 consultation pin, now SPECS-frozen.
+
+- **First post-arc sweep expectation set explicitly**: "first post-arc sweep is expected to collapse the gradient as zero-volume cells skip out." Sets up the operator-validation step's success criterion. Honest framing — names what the validation should show, not what we hope it will show.
+
+### Reactive-cleanup compounding curve flattened
+
+I'd been projecting the eventual cleanup commit would land at ~400 LOC if deferred to arc-end (linear extrapolation from pricing arc's f6ced30 at 82 LOC after 3 commits of drift). Actual: 60 LOC landing now after 9 commits of drift. **Flatter than the projection — substantial doc landing while drift was still tractable.** The compounding hazard I kept flagging didn't materialize because the docs commit landed.
+
+### Test count line check
+
+PLAN says "Test count grew 555 → 678 over the arc". Slight rounding — pre-MCP-arc was ~577 (post-3f6f0b6) → 678 (post-66ff72b). 555 might reflect an earlier baseline; 100-test growth claim is correct order of magnitude. Cosmetic.
+
+### What's still open
+
+- 661b1ff #1+#2 + bacf5cf #1 (data-validation grills) — STILL pending.
+- MCP-protocol integration test — STILL missing (10 commits / 10 tools deep).
+
+### Sub-arc progress recap (per PLAN entry)
+
+| Sub-arc | Status | Tools |
+|---|---|---|
+| 3.1 universe | ✅ landed (b42d4c2 + 0cc0b2c) | 3 |
+| 3.2 time-series | ✅ landed (661b1ff) | 3 |
+| 3.3 sweep queries | ✅ landed (bacf5cf + 3264f37 + d138fef + 3 supporting commits) | 4 |
+| 3.4 backtest replay | pending | 2 |
+| 3.5 diagnostics | pending | 2 |
+| 3.6 research helpers | pending | 2 |
+| 3.7 docs | pending | 0 (docs commit) |
+
+10 of 16 tools landed. ~6 commits remaining per the consultation roadmap.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.data_validation_grills)`** — bundle 661b1ff #1+#2 + bacf5cf #1. ~15 LOC.
+2. **`test(p8.mcp.protocol_integration)`** — close the integration-test gap. ~30 LOC.
+3. **`feat(p8.mcp.backtest_one)`** — sub-arc 3.4 start.
+
+If you bundle (1) + (2) into a foundation-consolidation before (3), foundation is fully clean for sub-arc 3.4. With PLAN/SPECS now caught up, the only remaining infrastructure-debt items are the data-validation grills and the integration test.
+
+Standing by.
+
+---
