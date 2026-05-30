@@ -13645,3 +13645,87 @@ If you go with (1), the MCP arc resumes on its clean foundation. If (2), the ope
 Standing by.
 
 ---
+
+## Review: c3545cc — feat(p8.mcp.backtest_one): sub-arc 3.4 part 1
+
+**Verdict: ✅ ACCEPT** — single-trade replay with VWAP-vs-close classifier and failure-mode-as-gate_status pattern. Three small grills: classifier duplication (dashboard + MCP), tolerance constant duplicated, deep-OTM concern carries from 6ab4866. One sharp design call: NOT emitting pre-pricing-arc caveat — explicitly defended in body.
+
+### Sharp design moves
+
+- **`gate_status: str` mapping failure modes to typed error class names** (`'IlliquidLegError'`, `'NoLiquidStrikeError'`, `'MissingDataError'`, `'OfflineCacheMiss'`, ...) plus `'priced'` for success. Consumer Claude can `if response.gate_status == 'IlliquidLegError'` cleanly — no parsing error messages, no branching on string content. **Excellent consumer-facing API design.** Different shape from the dashboard's caveats — appropriate because backtest_one's audience is programmatic, not analyst-narrative.
+- **NOT emitting pre-pricing-arc caveat is the right call**: body explains "backtest_one runs the CURRENT engine (with the gate + VWAP + units assertion). Whatever cache the contract files have, the engine's behavior is post-arc." Operators wanting the pre-arc baseline use query_sweep/cell_summary instead. Crisp scoping.
+- **Failure modes have dedicated test cases** (3): OfflineCacheMiss, MissingSpot, unknown strategy. The "successful pricing path" test monkeypatches every loader + strategy strike-picking — comprehensive end-to-end coverage of the happy path.
+- **`_resolve_spot` returns None on empty frame**: distinguishes "non-trading day" from "cache miss" cleanly. The empty-frame test pins this with `gate_status='MissingSpot'`.
+- **`params: dict[str, Any] | None`**: untyped dict for strategy-specific overrides. Defensible — strategy params can't have a unified schema across strategies; each strategy's impl validates internally.
+
+### 🔬 Grill #1 (real, small): `_classify_fill_source` duplicated across dashboard + MCP
+
+Two implementations of the same function:
+1. `src/web/heatmap.py::_classify_fill_source` (added in 6ab4866).
+2. `src/mcp/backtest_one.py::_classify_fill_source` (added in this commit).
+
+Body explicitly defends the duplication: "Mirror of the dashboard's _classify_fill_source. Same logic, same tolerance — kept local to the MCP package so the dependency is on engine/data only, not on src/web/."
+
+The reasoning ("MCP shouldn't depend on web") is valid — but the right answer is to put the shared classifier in a layer BOTH src/web/ and src/mcp/ can import. Two candidates:
+- `src/engine/pnl.py` — closest to the engine's VWAP logic. Both files already import from here (TURNOVER_SCALE_FACTOR).
+- `src/analytics/audit.py` (new module) — diagnostic helpers.
+
+**Recommendation**: extract `_classify_fill_source` and `_VWAP_MATCH_TOLERANCE` into `src/engine/pnl.py` (or a new `src/engine/fill_audit.py`). Both call sites import from there. Single source of truth.
+
+For v1 the duplication is defensible — but the moment a third consumer needs the classifier (e.g., a future `data_quality` MCP tool surfaces VWAP-fallback rates), three copies will compound. Better to centralize now.
+
+### 🔬 Grill #2 (real, small): `_VWAP_MATCH_TOLERANCE = 1e-4` is the second copy
+
+Same constant exists in `src/web/heatmap.py`. Drifts independently if updated. Bundle the centralization with grill #1.
+
+### 🔬 Grill #3 (carry-over from 6ab4866 grill #2): deep-OTM tolerance concern carries
+
+The 1e-4 relative tolerance might be too tight for very small option prices (deep OTM, settlement-only rows). For ₹0.05 premium, 1e-4 × 0.05 = 5e-6 rupees absolute — engine and recomputed VWAP would need to match to 6 decimal places.
+
+Tests use entry_px in the substantial range (e.g., the success-path test's "hand-crafted matching telemetry" doesn't test deep-OTM). When the centralization fix from grill #1 lands, add a deep-OTM fixture at the same time.
+
+### Cosmetic: NaN detection via `f != f`
+
+```python
+f = float(entry_px)
+if f != f:  # NaN
+    return "unknown"
+```
+
+Works (NaN is the only value where `x != x`) but `math.isnan(f)` or `pd.isna(f)` is more idiomatic and self-documenting. The inline comment partially compensates. Minor.
+
+### What's good beyond the grills
+
+- **`gate_status` values surface AS-IS to the consumer**: no translation layer between engine error classes and the API contract. If a future engine error class is added (`StaleQuoteError`, say), it shows up in `gate_status` automatically. Future-proof.
+- **The "Pre-pricing-arc caveat NOT emitted here" explanation in module docstring**: head-off the obvious "why doesn't this tool fire the same caveat as cell_summary?" question that future readers would ask. Anti-confusion documentation.
+- **`_extract_legs` defensive try/except on JSON parsing**: malformed `legs_json` returns empty list rather than crashing. Consumer Claude sees `legs=[]` and can reason about it.
+- **Read-only contract**: explicit `offline=True` on every loader call. Same pattern as other MCP tools.
+
+### MCP arc state
+
+10 of 16 tools landed pre-this-commit; 11 of 16 now (backtest_one). Remaining per consultation:
+- sub-arc 3.4 part 2: `sweep_windows` — 1 commit.
+- sub-arc 3.5: `skip_summary` + `data_quality` — 2 commits.
+- sub-arc 3.6: `compare_cells` + `bootstrap_ci` — 2 commits.
+- sub-arc 3.7: docs — 1 commit.
+
+= ~6 commits to go.
+
+### What I checked
+
+- Verified `TURNOVER_SCALE_FACTOR = 100_000.0` is imported from `src.engine.pnl` and matches the engine's value. ✓
+- Confirmed `_VWAP_MATCH_TOLERANCE = 1e-4` in `src/mcp/backtest_one.py` matches the `1e-4` in `src/web/heatmap.py:_classify_fill_source`.
+- Math: 706 = 694 + 12 new. ✓
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`refactor(engine.fill_audit)`** — extract `_classify_fill_source` and `_VWAP_MATCH_TOLERANCE` from BOTH `src/web/heatmap.py` AND `src/mcp/backtest_one.py` into `src/engine/pnl.py` (or a new module). Add a deep-OTM test fixture at the same time. ~30 LOC + 1 test.
+2. **`feat(p8.mcp.sweep_windows)`** — sub-arc 3.4 part 2, the last sweep-replay tool.
+
+If (1) lands before (2), the new tool can import the centralized classifier from day 1. If (2) goes first, the duplication count rises to 3 (sweep_windows is likely to need the same classifier).
+
+Standing by.
+
+---
