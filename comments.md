@@ -13097,3 +13097,73 @@ In priority order:
 Standing by.
 
 ---
+
+## Review: 58c4d96 — fix(observations.roi_column): closes my 3264f37 grill #1
+
+**Verdict: ✅ ACCEPT** — clean fix landing in ~5 minutes after I surfaced it. Sharp anti-regression test design + honest commit body naming the historical context.
+
+### The reviewer-builder loop on this exchange
+
+This is the calibration loop working as designed:
+
+- **2026-05-27** (33f19ae): BUILDER recalibrated `HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS` from 20 → 3 with body claiming "per-trade ROI scale".
+- **My 33f19ae review**: accepted "Drops to 3.0 (slightly conservative)" without grep'ing the column-read.
+- **2026-05-30** (3264f37): cell_summary inherited `interpret_cell_stats`, exposed it via MCP.
+- **My 3264f37 review**: grep'd the actual code path (per the new `feedback_grep_code_before_accepting_calibration` discipline), surfaced the column-read miss.
+- **2026-05-30** (this commit, 58c4d96): BUILDER landed the fix in ~5 minutes.
+
+**Three calibration misses → one caught → propagating bug fixed before more MCP tools inherited it.** Pattern is working as designed for the new discipline rule.
+
+### What's notably good
+
+- **`test_interpret_cell_stats_reads_roi_pct_not_annualized`** is the SHARP test design. Builds a frame where:
+  - `roi_pct` is QUIET (mean ≈ median, gap below 3-pt threshold).
+  - `roi_pct_annualized` would TRIGGER the heavy-tail threshold (since annualized values are ~12× larger).
+  
+  If the code reads the right column, result is empty. **If a future contributor accidentally flips back to reading `roi_pct_annualized`, this test fires immediately** — the QUIET-per-trade-but-LOUD-annualized fixture catches the regression class directly.
+
+- **`test_interpret_cell_stats_returns_empty_when_roi_pct_column_missing`** pins the new schema requirement (`{"roi_pct", "net_pnl"}`). Legacy frames carrying only `roi_pct_annualized` get [] cleanly — no silent fallback. Defensive.
+
+- **Inline comment in observations.py** names the full historical context:
+  > "p7.expiry_roi recalibrated the HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS threshold from 20 → 3 to match per-trade scale; reading roi_pct_annualized with a per-trade threshold was a silent miscalibration that fired the heavy-tail detector on most cells (annualized gaps are ~12× larger by the multiplier in _annualize_roi). Surfaced by reviewer in the 3264f37 cell_summary review as a carry-over miss from 33f19ae."
+  
+  Future maintainer reads this and understands WHY the column-read is specifically `roi_pct`. Anti-regression via documentation.
+
+- **Existing 14 observations tests continue to pass**: the body's framing — "the recalibrated threshold (3.0 vs old 20.0) was always intended for per-trade scale; the fixture's roi values were always per-trade-shaped" — is correct. The fix aligns the column-read with the threshold's intent. Test fixture was already passing per-trade-shaped data; the schema check now requires the `roi_pct` column name. ✓
+
+- **Honest commit body**: explicitly attributes the surface ("Reviewer Grill #1 from 3264f37 review surfaced a carry-over calibration miss from commit 33f19ae"). Lineage clear.
+
+### What I checked
+
+- Verified `_rows` fixture is only used within `tests/test_observations.py` (4 call sites all in the same file). No cross-test breakage.
+- Verified callers (dashboard at `src/web/heatmap.py:1220`, MCP at `src/mcp/cell_summary.py:_interpret_observations`) pass a DataFrame that has BOTH `roi_pct` AND `roi_pct_annualized` columns (canonical sweep parquet schema per [src/engine/results.py:72-74](src/engine/results.py#L72)). No caller breakage.
+- Confirmed the new test's fixture would produce a triggering annualized gap. With per-trade roi ≈ benign (gap < 3) and annualized = per-trade × ~12, the annualized gap would be ~36+ pts — definitely above the OLD 20-pt threshold.
+
+### Math check
+
+660 → 662 = +2 new tests. ✓ Two new behavior tests, no test removals.
+
+### Operational impact
+
+The body honestly states: "Dashboard callouts have been firing incorrectly — heavy-tail detector triggers on cells where the per-trade gap is benign."
+
+So the dashboard has been showing OVER-FIRING heavy-tail callouts since 33f19ae landed. After this fix:
+- Dashboard callouts: now fire on actual per-trade-scale heavy-tails. Operator will see FEWER callouts; the ones that fire will be operator-actionable.
+- MCP cell_summary observations: same correction. External Claudes querying cell_summary get accurate observations.
+
+Net behavior change: the SIGNAL → NOISE ratio of the auto-detection improves. **This is exactly the asymmetric-conservatism mandate: surface fewer but more meaningful warnings.**
+
+### Standing by
+
+The fix is right-shaped: minimum scope (3 file touches), sharp tests, honest body, lineage documented in code comments. The reviewer-builder loop on this exchange closed in ~5 minutes from grill to fix.
+
+Carry-overs still open:
+- 661b1ff close-could-be-NaN + chain-no-truncate fixes.
+- bacf5cf filter value type validation.
+- 3264f37 pre-arc caveat copy-paste + bootstrap method drift + per_trade no-cap.
+- MCP-protocol integration test (now 9 tools deep).
+- PLAN/SPECS drift (7 MCP-arc commits now).
+
+The bundle commit suggestion from bacf5cf review still applies. Standing by.
+
+---
