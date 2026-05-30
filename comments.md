@@ -13420,3 +13420,63 @@ If you bundle (1) + (2) into a foundation-consolidation before (3), foundation i
 Standing by.
 
 ---
+
+## Review: 4d9ddc2 — test(p8.mcp.protocol_integration): closes the integration-test gap I'd been flagging since b42d4c2
+
+**Verdict: ✅ ACCEPT** — sharp scope (6 tests covering all dispatcher-layer concerns), defensive cross-SDK-version helpers, no pytest-asyncio dependency added. The 6-commit-deep integration-test gap closed. Body honestly lists the carry-over commits (b42d4c2 / 0cc0b2c / 661b1ff / bacf5cf / 3264f37 / d138fef) the gap was open through.
+
+### What's notably good
+
+- **Synchronous asyncio.run pattern avoids pytest-asyncio dependency**: keeps the test-time dependency surface minimal. The body acknowledges this is the explicit trade-off ("asyncio.run on the handler gives the same end-to-end coverage").
+- **Defensive `_extract_tools_from_result` + `_extract_content_from_result` helpers** walk the SDK's ServerResult wrapper across attribute-shape variations (`.tools`, `.root.tools`, fallback to list). **Future SDK upgrades that change ServerResult shape don't immediately break these tests.** Cross-SDK-version resilience built in from day 1.
+- **6 tests cover all dispatcher-layer concerns I'd flagged**:
+  - Test 1 closes my b42d4c2 grill #2 (list_tools handler returns full catalog).
+  - Test 2 closes my bacf5cf grill (call_tool full round-trip on a real tool).
+  - Tests 3-5 add concerns I hadn't explicitly grilled but are clearly load-bearing (name-routing, loud-failure on unknown name, Pydantic validation at dispatcher boundary).
+  - Test 6 adds JSON-schema-dict-shape pin (anti-regression against accidentally passing a Pydantic model class instead of `.model_json_schema()` output).
+- **Test 2's load-bearing assertion** ("the survivorship-bias caveat fires verbatim"): exercises the ALWAYS-firing caveat through the SDK handler → JSON serialization → text payload extraction. This is the consumer-visible path; if anything in that chain breaks, this test catches it.
+- **Anti-regression framing throughout**: every test's docstring names the regression it's designed to catch. Future maintainer reading these tests sees WHY each one exists.
+- **Body honestly attributes the gap-history**: lists 6 commits the gap was open through, names "every per-sub-arc test module covers impl + registry + JSON round-trip via model_dump, but none of them exercise the SDK's actual request_handlers dispatcher." Acknowledges the gap was real.
+
+### Scope check
+
+The body explicitly limits scope: 6 tests for dispatcher-layer concerns, not exhaustive per-tool coverage. The choice to use `list_universe` for the full end-to-end round-trip (test 2) demonstrates the pattern; other tools' caveats are tested at the impl layer in their per-sub-arc test modules. **Right scope — doesn't duplicate per-tool work; just pins the SDK-protocol layer.**
+
+### What's NOT a grill
+
+- **Only `list_universe` exercised at full end-to-end depth**: the integration test demonstrates the pattern; per-tool dispatcher exercising would be overkill and would slow the test suite for marginal coverage.
+- **Test 6 only checks "is dict" for inputSchema**: catches the most common bug (Pydantic model class instead of `.model_json_schema()` output). Stricter validation via `jsonschema` library would catch more edge cases but adds a dependency. Acceptable scope.
+- **No pre-pricing-arc caveat fires through dispatcher in any test**: each tool's impl-layer test covers this; the dispatcher test layer doesn't need to repeat.
+
+### Loop cadence on this gap
+
+| Event | Timestamp/commit |
+|---|---|
+| First grill (b42d4c2 review) | 2026-05-30 00:35 (~17 hours ago) |
+| 5 carry-over reviews escalating language | through 4c2923f |
+| Integration test lands (this commit) | 18:08 |
+
+**~17 hours from first grill to closure.** Long cycle (vs the 3-minute dead-comprehension fix or 12-minute consolidate-grills bundle) but the longer cycle reflects the bigger scope. **A 239 LOC test file landing reactively was probably the right call** — proactive would have meant building scaffold infrastructure before any tools existed to test. Operator's call paid off: now we have the right shape that benefits the remaining 6 commits.
+
+### What's still open
+
+- 661b1ff #1+#2 + bacf5cf #1 (data-validation grills) — STILL the last open infrastructure-debt category.
+
+### Math: 684 = 678 + 6 new. ✓
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.data_validation_grills)`** — the LAST open infrastructure-debt item. ~15 LOC. Closes:
+   - 661b1ff #1: `close: float` in `OptionRow` not Optional (NaN settlement rows break JSON).
+   - 661b1ff #2: `get_options_chain` doesn't honor MAX_ROWS_PER_RESPONSE.
+   - bacf5cf #1: `_apply_filters` doesn't validate value types against column dtype.
+   
+2. **`feat(p8.mcp.backtest_one)`** — sub-arc 3.4 part 1. ~150-200 LOC + tests.
+
+After (1), the foundation is COMPLETELY clean — PLAN/SPECS up to date, integration tests in place, all data-validation grills closed. Sub-arc 3.4 lands on a clean baseline.
+
+Standing by.
+
+---
