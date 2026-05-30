@@ -883,3 +883,92 @@ def test_export_rule_stub_renders_info_with_implementation_pending(monkeypatch):
 # plotly_click directly, that fallback isn't needed — a plain single
 # click is the primary interaction. Modebar config is not part of
 # plotly_events' API surface.
+
+
+# ============================================================
+# CSV drill-down export — operator-requested 2026-05-30
+# ============================================================
+
+def test_classify_fill_source_vwap_when_entry_px_matches_implied():
+    """When entry_px equals turnover×100_000/volume, the engine used
+    VWAP. The classifier returns 'vwap'."""
+    from src.web.heatmap import _classify_fill_source
+    # turnover=10 lakhs × 100_000 / volume=50000 = 20.0
+    # entry_px=20.0 → matches → vwap
+    assert _classify_fill_source(20.0, 50000, 10.0) == "vwap"
+
+
+def test_classify_fill_source_close_when_turnover_missing():
+    """No turnover → engine had no VWAP path → must have used close.
+    Returns 'close'."""
+    from src.web.heatmap import _classify_fill_source
+    assert _classify_fill_source(100.0, 1000, None) == "close"
+
+
+def test_classify_fill_source_close_when_volume_zero():
+    """Zero volume → division impossible → engine used close."""
+    from src.web.heatmap import _classify_fill_source
+    assert _classify_fill_source(100.0, 0, 5.0) == "close"
+
+
+def test_classify_fill_source_close_when_entry_px_diverges_from_vwap():
+    """turnover/volume gives VWAP=20 but entry_px=100 → engine rejected
+    VWAP (probably units-sanity band trip) → fell back to close."""
+    from src.web.heatmap import _classify_fill_source
+    assert _classify_fill_source(100.0, 50000, 10.0) == "close"
+
+
+def test_classify_fill_source_unknown_for_nan_entry_px():
+    from src.web.heatmap import _classify_fill_source
+    assert _classify_fill_source(None, 1000, 5.0) == "unknown"
+    assert _classify_fill_source(float("nan"), 1000, 5.0) == "unknown"
+
+
+def test_build_cell_csv_emits_one_row_per_leg_per_trade():
+    """CSV export flattens trades-by-leg. A 2-trade cell with 2 legs
+    per trade → 4 rows."""
+    import json
+    import pandas as pd
+    from src.web.heatmap import _build_cell_csv
+    leg = {
+        "strike": 2600.0, "option_type": "CE", "side": "SELL",
+        "qty_lots": 1, "lot_size": 250,
+        "entry_px": 20.0, "entry_volume": 50000, "entry_oi": 1000,
+        "entry_turnover": 10.0,  # vwap_implied = 20.0 → vwap
+        "exit_px": 5.0, "exit_volume": 50000, "exit_oi": 800,
+        "exit_turnover": 2.5,
+        "entry_px_realized": 19.8, "exit_px_realized": 5.05,
+        "gross_pnl": 3700.0,
+    }
+    rows = pd.DataFrame({
+        "expiry": [pd.Timestamp("2024-01-25"), pd.Timestamp("2024-02-29")],
+        "entry_date": [pd.Timestamp("2024-01-04"), pd.Timestamp("2024-02-04")],
+        "exit_date": [pd.Timestamp("2024-01-24"), pd.Timestamp("2024-02-28")],
+        "net_pnl": [100.0, 200.0],
+        "roi_pct": [1.0, 2.0],
+        "hold_trading_days": [14, 14],
+        "legs_json": [json.dumps([leg, leg]), json.dumps([leg, leg])],
+    })
+    csv_bytes = _build_cell_csv(rows)
+    decoded = csv_bytes.decode("utf-8")
+    # Header + 4 data rows (2 trades × 2 legs each)
+    lines = [line for line in decoded.split("\n") if line.strip()]
+    assert len(lines) == 5  # 1 header + 4 data rows
+    # entry_fill_source for this fixture should be 'vwap' (matches)
+    assert "vwap" in decoded
+
+
+def test_build_cell_csv_empty_cell_returns_header_only():
+    """A cell with zero priced trades must still return a valid CSV
+    (header only) so the download button doesn't yield a blank file."""
+    import pandas as pd
+    from src.web.heatmap import _build_cell_csv
+    empty = pd.DataFrame(columns=[
+        "expiry", "entry_date", "exit_date", "net_pnl", "roi_pct",
+        "hold_trading_days", "legs_json",
+    ])
+    csv_bytes = _build_cell_csv(empty)
+    decoded = csv_bytes.decode("utf-8")
+    lines = [line for line in decoded.split("\n") if line.strip()]
+    assert len(lines) == 1  # header only
+    assert "expiry" in lines[0]

@@ -986,6 +986,135 @@ def render_export_rule(
 # Cell drill-down — Phase 7 (analyst exploration tool)
 # ============================================================
 
+# Tolerance for "entry_px matches computed VWAP" in the CSV export's
+# fill-source inference. The engine's units-sanity assertion already
+# bounds VWAP/close ratios to [0.5, 2.0]; this much tighter band is
+# for the equality check of "did the engine use VWAP?".
+_VWAP_MATCH_TOLERANCE = 1e-4
+
+
+def _classify_fill_source(
+    entry_px: float | None,
+    volume: int | None,
+    turnover: float | None,
+) -> str:
+    """Derive whether the engine used VWAP or fell back to close based
+    on the per-leg telemetry. ``entry_px`` is the engine's recorded
+    fill (pre-slippage). Returns one of:
+      - 'vwap' — turnover + volume present AND entry_px ≈ VWAP-implied
+      - 'close' — turnover unavailable OR volume zero (forced fallback)
+      - 'unknown' — entry_px is missing / NaN / can't classify
+
+    The ``vwap_implied = turnover × 100_000 / volume`` formula uses the
+    project's TURNOVER_SCALE_FACTOR (NSE convention: lakhs of rupees).
+    """
+    if entry_px is None or (
+        isinstance(entry_px, float) and entry_px != entry_px  # NaN
+    ):
+        return "unknown"
+    has_turnover = turnover is not None and not (
+        isinstance(turnover, float) and turnover != turnover
+    )
+    has_volume = volume is not None and volume > 0
+    if not has_turnover or not has_volume:
+        return "close"  # no VWAP path possible
+    vwap_implied = float(turnover) * 100_000.0 / float(volume)
+    if abs(vwap_implied - entry_px) / max(abs(entry_px), 1e-9) < _VWAP_MATCH_TOLERANCE:
+        return "vwap"
+    return "close"  # engine had VWAP available but didn't use it (band reject)
+
+
+def _build_cell_csv(rows: pd.DataFrame) -> bytes:
+    """Flatten the cell's per-trade rows into a one-leg-per-row CSV
+    so the operator can audit close-vs-VWAP fill sourcing per leg.
+
+    Returns bytes (the format ``st.download_button`` expects).
+
+    The CSV includes:
+      - Trade-level identity (expiry, entry/exit dates, net_pnl, roi)
+      - Per-leg key (strike, option_type, side, qty_lots, lot_size)
+      - Per-leg cache telemetry on BOTH sides (volume, oi, turnover)
+      - The engine's recorded fill (``entry_px`` / ``exit_px``) so the
+        operator can compare against ``turnover × 100_000 / volume``
+      - Derived ``entry_fill_source`` / ``exit_fill_source`` per
+        ``_classify_fill_source``
+      - ``gross_pnl`` per leg from the engine's leg-result dict
+    """
+    import io
+    import json
+    out_rows: list[dict] = []
+    for _, trade in rows.iterrows():
+        try:
+            legs = json.loads(trade["legs_json"])
+        except (KeyError, json.JSONDecodeError, TypeError):
+            legs = []
+        for leg_idx, leg in enumerate(legs):
+            entry_vol = leg.get("entry_volume")
+            exit_vol = leg.get("exit_volume")
+            entry_turn = leg.get("entry_turnover")
+            exit_turn = leg.get("exit_turnover")
+            entry_px = leg.get("entry_px")
+            exit_px = leg.get("exit_px")
+            entry_vwap_implied = (
+                float(entry_turn) * 100_000.0 / float(entry_vol)
+                if (entry_turn is not None and entry_vol)
+                else None
+            )
+            exit_vwap_implied = (
+                float(exit_turn) * 100_000.0 / float(exit_vol)
+                if (exit_turn is not None and exit_vol)
+                else None
+            )
+            out_rows.append({
+                "expiry": trade["expiry"].strftime("%Y-%m-%d"),
+                "entry_date": trade["entry_date"].strftime("%Y-%m-%d"),
+                "exit_date": trade["exit_date"].strftime("%Y-%m-%d"),
+                "net_pnl": float(trade["net_pnl"]),
+                "roi_pct": float(trade["roi_pct"]),
+                "hold_trading_days": int(trade["hold_trading_days"]),
+                "leg_idx": leg_idx,
+                "strike": leg.get("strike"),
+                "option_type": leg.get("option_type"),
+                "side": leg.get("side"),
+                "qty_lots": leg.get("qty_lots"),
+                "lot_size": leg.get("lot_size"),
+                "entry_px": entry_px,
+                "entry_volume": entry_vol,
+                "entry_oi": leg.get("entry_oi"),
+                "entry_turnover_lakhs": entry_turn,
+                "entry_vwap_implied": entry_vwap_implied,
+                "entry_fill_source": _classify_fill_source(
+                    entry_px, entry_vol, entry_turn,
+                ),
+                "exit_px": exit_px,
+                "exit_volume": exit_vol,
+                "exit_oi": leg.get("exit_oi"),
+                "exit_turnover_lakhs": exit_turn,
+                "exit_vwap_implied": exit_vwap_implied,
+                "exit_fill_source": _classify_fill_source(
+                    exit_px, exit_vol, exit_turn,
+                ),
+                "entry_px_realized": leg.get("entry_px_realized"),
+                "exit_px_realized": leg.get("exit_px_realized"),
+                "gross_pnl_leg": leg.get("gross_pnl"),
+            })
+    if not out_rows:
+        # Empty cell — still return a valid CSV with header so the
+        # download button doesn't yield a blank file.
+        empty = pd.DataFrame(columns=[
+            "expiry", "entry_date", "exit_date", "net_pnl", "roi_pct",
+            "leg_idx", "strike", "option_type", "side", "entry_px",
+            "entry_fill_source",
+        ])
+        buf = io.StringIO()
+        empty.to_csv(buf, index=False)
+        return buf.getvalue().encode("utf-8")
+    csv_df = pd.DataFrame(out_rows)
+    buf = io.StringIO()
+    csv_df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
 def render_cell_drilldown(
     df: pd.DataFrame,
     *,
@@ -1257,6 +1386,31 @@ def render_cell_drilldown(
         dist_fig,
         use_container_width=True,
         key="mp_heatmap_drilldown_roi_dist",
+    )
+
+    # ---- CSV export ----------------------------------------------
+    # Operator diagnostic per 2026-05-30 chat: download per-leg data
+    # so close (raw cache) can be compared against entry_px (engine-
+    # recorded fill). If turnover is present AND entry_px ≈
+    # turnover×100_000/volume, the engine used VWAP. If entry_px
+    # matches close directly, the engine fell back. Surfacing both
+    # makes the fill-source choice auditable per trade.
+    csv_bytes = _build_cell_csv(rows)
+    st.download_button(
+        label="⬇ Download cell trades (CSV)",
+        data=csv_bytes,
+        file_name=(
+            f"trades_{strategy}_{symbol}_T-{entry_td}_T-{exit_td}.csv"
+        ),
+        mime="text/csv",
+        key="mp_heatmap_drilldown_csv",
+        help=(
+            "One row per leg per trade. Compare ``entry_px`` (engine "
+            "fill) against ``entry_vwap_implied`` (computed from "
+            "turnover/volume). Equal → engine used VWAP; close-equal "
+            "→ engine fell back. ``entry_fill_source`` is the derived "
+            "verdict."
+        ),
     )
 
     # ---- Per-trade table — All / Winners / Losers tabs -------
