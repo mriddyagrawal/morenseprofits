@@ -12606,3 +12606,121 @@ Or just push through to Commit 2 and accept the SPECS/PLAN drift will compound. 
 Standing by.
 
 ---
+
+## Review: 0cc0b2c — feat(p8.mcp.universe): Commit 2 of MCP arc + cross-arc plumbing
+
+**Verdict: ✅ ACCEPT** — my Q4 push (both schema validator AND behavior tests) landed exactly as recommended. Sharp design moves throughout: duplicate-name guard, `offline=True` enforcement on `expiries_for`, ALWAYS-firing caveats on `list_universe` + `list_strategies`. Four grills: two carry-overs (PLAN/SPECS drift, integration test missing), one re-surfacing (WATCHLIST_EXTRAS now 3 places), one new (output_model unused).
+
+### What's notably good
+
+- **My Q4 push acted on in BOTH halves**: schema validator (`CaveatedResponse` Pydantic base with required `caveats: list[str]` + str-element validator) AND behavior tests (test_list_universe_includes_survivorship_caveat, test_list_strategies_includes_tier_b_caveat). The body explicitly attributes the design to "reviewer Q4 first half" — honest framing. ✓
+- **Duplicate-name guard in `_collect_tool_entries`**: catches copy-paste accidents at SERVER-BUILD time rather than at runtime when a consumer calls a phantom tool. Sharp defensive programming.
+- **`offline=True` enforcement on `expiries_for`**: read-only contract is implemented at the data-layer call, not just documented. Cache miss → `OfflineCacheMiss` raises → SDK surfaces error to consumer. The MCP server can't accidentally hit NSE. ✓
+- **ALWAYS-firing caveats on universe/strategies**: not conditional, not "if applicable" — every response carries the survivorship-bias + as_of-ignored caveats. The Pydantic field-required contract makes the caveats unmissable for consumers. **Exactly the asymmetric-conservatism mandate applied to API design.**
+- **The skeleton test rename is honest**: `test_skeleton_registers_zero_tools` → `test_server_registers_call_tool_dispatcher` and INVERTED. The original test's role is gone (tools have landed), the new test pins the new contract. Tests stay aligned with current behavior; old tests aren't left as zombie xfails.
+- **`json.dumps(..., default=str)`** belt-and-suspenders fallback for any non-JSON-serializable field that `model_dump(mode="json")` doesn't handle. Defensive.
+- **Single `@server.list_tools()` + `@server.call_tool()` pair** with the documented reasoning ("SDK's decorators REPLACE the handler on each call"). Anti-footgun pattern explanation that future contributors will thank you for.
+
+### 🔬 Grill #1 (real, carry-over from b42d4c2): no MCP-protocol integration test
+
+I flagged this in b42d4c2 grill #2: "the integration test scaffold should land WITH Commit 2 when the first tool gets registered." It didn't land in this commit.
+
+The unit tests cover:
+- The impl functions (correct data, correct caveats).
+- The registry assembly (right count, right names, models compatible).
+- The JSON round-trip path (model_dump → json.dumps → consumer-readable).
+
+What's NOT tested:
+- The actual MCP protocol (stdio_server() spinning up, JSON-RPC framing).
+- The SDK's `mcp.types.Tool` shape (could change in a future SDK version; unit tests wouldn't catch).
+- The dispatcher's behavior on truly malformed input (Pydantic validation tested, but what about MCP-protocol-level errors?).
+
+**Suggested integration test** (~30 LOC, lands once, gives confidence for all 11 remaining sub-arcs):
+
+```python
+@pytest.mark.asyncio
+async def test_mcp_protocol_list_tools_roundtrip():
+    """End-to-end: list_tools RPC returns the registered tools."""
+    from mcp.server.stdio import stdio_server
+    # ... mock stdio streams, send {"method": "tools/list"} ...
+    # ... assert response contains list_universe, expiries_for, list_strategies
+```
+
+This is the e2e analog of the dashboard's AppTest scaffold (2140b1f) which paid for itself in <24h by catching the 30s perf timeout. Same value proposition here. **Should land before Commit 3 (`feat(p8.mcp.spot_options)`).**
+
+### 🔬 Grill #2 (real, carry-over from b42d4c2): PLAN/SPECS still missing
+
+MCP arc is now 3 commits deep (5bc92f3 + b42d4c2 + 0cc0b2c) without PLAN/SPECS updates. By the consultation's 13-commit roadmap, ~10 more commits are coming.
+
+**The pricing arc's lesson was f6ced30's 82-line bundled cleanup commit after 3 prior commits of drift.** Linear extrapolation: a Phase-8 cleanup commit at the end could be ~400 lines. Better to close the gap now.
+
+Strong recommendation (third time): land `docs(plan + specs.mcp_arc_progress)` before Commit 3. ~30-50 LOC. Closes the drift while it's small.
+
+If you're choosing not to land docs incrementally, the trade-off is explicit: shipping a chunk of drift to clean up later vs. keeping every commit self-contained. Operator's call. But "we'll catch up on docs at the end" rarely delivers in practice.
+
+### 🔬 Grill #3 (real, re-surfacing from 39d1ba1): `["PNB", "BHEL"]` now hardcoded in 3 places
+
+After this commit, the operator-extras list is hardcoded in:
+1. `scripts/prefetch_universe.py::_build_default_symbols`
+2. `scripts/p7_wide_sweep.py::_build_symbols`
+3. `src/mcp/universe.py::list_universe_impl`
+
+The WATCHLIST_EXTRAS centralization I flagged in 39d1ba1 grill #1 is now genuinely overdue. Three copies + two strings = 6 places to update if a 3rd extra is added.
+
+Recommend: `src/universe/watchlist.py` with `WATCHLIST_EXTRAS: list[str] = ["PNB", "BHEL"]`, imported by all 3 sites. ~15 LOC fix.
+
+Not blocking this commit but actively compounding.
+
+### 🔬 Grill #4 (small, new): `output_model` field in `ToolEntry` is documentation, not enforced
+
+```python
+class ToolEntry(BaseModel):
+    name: str
+    description: str
+    input_model: type[BaseModel]
+    output_model: type[BaseModel]  # ← declared, but...
+    impl: Callable
+```
+
+The dispatcher calls `entry.impl(parsed)` then `result.model_dump(...)`. **It doesn't check that `result` is an instance of `entry.output_model`.** A tool implementation could return any Pydantic model; the dispatcher would happily serialize it.
+
+For now, the tests catch type drift (each tool's behavior tests check output structure). But a runtime assertion would catch regressions earlier:
+
+```python
+if not isinstance(result, entry.output_model):
+    raise TypeError(
+        f"tool {name!r} impl returned {type(result).__name__}, "
+        f"expected {entry.output_model.__name__}"
+    )
+```
+
+~3 LOC defensive guard. Catches the failure mode "tool impl was refactored, output shape drifted, tests on the tool itself pass but the documented contract lies."
+
+### Nit (cosmetic): unused `from typing import Any` in universe.py
+
+[src/mcp/universe.py:22](src/mcp/universe.py#L22) imports `Any` but I don't see it used in the file. Linter would flag this. Tiny cleanup.
+
+### What's well-tested
+
+- 20 new tests in `test_mcp_universe.py`, broken down by category in the commit body — comprehensive coverage of schema invariants, behavior, registry assembly, and JSON round-trip.
+- The "caveat fires under triggering condition" pattern (e.g. `test_list_universe_includes_survivorship_caveat`) is exactly the Q4-behavior-test pattern I recommended.
+
+### Pricing-arc lesson applied?
+
+Still drifting (grill #2). 3 commits without docs. The MCP arc is now bigger than the pricing arc's pre-bundled-cleanup state was. Recommendation grows louder.
+
+### Next-commit suggestion
+
+Three options, in priority order:
+
+1. **`test(p8.mcp.protocol_integration)`** — close grill #1 with the e2e MCP-protocol scaffold. ~30 LOC, single file, lands once, benefits every subsequent sub-arc.
+2. **`docs(plan + specs.mcp_arc_progress)`** — close grill #2 (and grills from 5bc92f3 + b42d4c2). ~30-50 LOC.
+3. **`feat(p8.mcp.spot_options)`** — Commit 3 of MCP arc per the roadmap.
+
+If you bundle (1) + (2), they're both arc-level infrastructure landing in a "consolidate before next sub-arc" commit. Then (3) lands knowing the docs + integration tests are clean.
+
+If you push through to (3), grills #1 and #2 compound. Operator's call.
+
+Standing by.
+
+---
