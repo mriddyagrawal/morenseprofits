@@ -284,17 +284,18 @@ def test_register_spot_options_tools_names_unique():
 
 
 def test_server_assembles_universe_and_spot_options_without_collision():
-    """Cross-sub-arc assembly: build_server() concats universe + spot_options
-    tool lists; no name collisions allowed. Anti-regression for
-    _collect_tool_entries' duplicate-detection."""
+    """Cross-sub-arc assembly: build_server() concats this sub-arc's
+    tools into the registry alongside the universe sub-arc; no name
+    collisions allowed. Superset check (rather than exact-set) so this
+    test stays green as future sub-arcs add tools."""
     from src.mcp.server import _collect_tool_entries
     registry = _collect_tool_entries()
-    # Should include all 6 tools (3 from universe + 3 from spot_options).
-    expected = {
-        "list_universe", "expiries_for", "list_strategies",
+    spot_tools = {
         "get_spot_series", "get_option_series", "get_options_chain",
     }
-    assert set(registry.keys()) == expected
+    universe_tools = {"list_universe", "expiries_for", "list_strategies"}
+    assert spot_tools.issubset(registry.keys())
+    assert universe_tools.issubset(registry.keys())
 
 
 # ============================================================
