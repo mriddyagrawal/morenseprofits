@@ -11,12 +11,37 @@ reviewer's Q4 push, behavior tests in each sub-arc's test module
 assert the right caveat strings fire under their triggering
 conditions (e.g. survivorship bias for universe queries, multiple-
 comparisons warning when a heatmap grid exceeds 100 cells).
+
+Reusable caveat constants live here too — see the
+PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT below. Single source of truth so
+wording updates are one-edit changes, not the 3+-site copy-paste
+that reviewer Grill #2 on 3264f37 flagged.
 """
 from __future__ import annotations
 
 from typing import Callable
 
 from pydantic import BaseModel, Field, field_validator
+
+
+# ============================================================
+# Reusable caveat constants
+# ============================================================
+#
+# Pulled into a constant per reviewer Grill #2 on 3264f37: the
+# phantom-fill-bias caveat string was being copy-pasted across
+# list_runs / query_sweep / cell_summary, with each new tool that
+# touches a pre-arc parquet adding a fourth+ duplication site.
+# Single source of truth here means a future wording update (e.g.
+# referencing a newer analysis) is one edit, not N.
+
+PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT = (
+    "Run was generated BEFORE the p7.pricing_arc landed; results may "
+    "be inflated by phantom-fill artifact (zero-volume legs priced "
+    "at stale close → +10pts T-41..T-45 per the 2026-05-30 analysis). "
+    "Treat as pre-arc data; re-sweep against the post-arc engine for "
+    "correctness."
+)
 
 
 class CaveatedResponse(BaseModel):

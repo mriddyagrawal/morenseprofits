@@ -35,12 +35,37 @@ from src.analytics.aggregate import MIN_N_FOR_RANKING
 from src.analytics.bootstrap import bootstrap_ci
 from src.analytics.observations import interpret_cell_stats
 from src.engine.results import ENGINE_VERSION, read_results, read_run_metadata
-from src.mcp._models import CaveatedResponse, ToolEntry
+from src.mcp._models import (
+    PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT,
+    CaveatedResponse,
+    ToolEntry,
+)
 
 
 # CVaR tail fraction. 5% matches the dashboard's right-pane CVaR
 # rendering — keep one source of truth across surfaces.
 CVAR_ALPHA = 0.05
+
+# Bootstrap parameters for the median-ROI CI. Hoisted to constants
+# (rather than hardcoded inside _compute_bootstrap_ci + the method
+# string) per reviewer Grill #3 on 3264f37: the method string was a
+# silent-lie risk if the actual ``bootstrap_ci(...)`` call ever
+# diverged from the hardcoded "B=1000, seed=0" string. Now there's
+# one source of truth and the method string is constructed from it.
+BOOTSTRAP_B = 1000
+BOOTSTRAP_SEED = 0
+BOOTSTRAP_ALPHA = 0.05
+BOOTSTRAP_METHOD = (
+    f"percentile bootstrap, B={BOOTSTRAP_B}, seed={BOOTSTRAP_SEED}, "
+    f"alpha={BOOTSTRAP_ALPHA}"
+)
+
+# Per-trade list cap. Typical cells have ~24 trades; worst-case wide-
+# grid runs land ~50 expiries. The cap is bigger than the empirical
+# ceiling but bounded — keeps consistency with get_spot_series /
+# query_sweep which both cap at MAX_ROWS_PER_RESPONSE. Per reviewer
+# Grill #4 on 3264f37.
+MAX_PER_TRADE_ROWS = 1_000
 
 
 # ============================================================
@@ -106,8 +131,12 @@ class BootstrapCIResult(BaseModel):
         ..., description="Upper bound of the 95% bootstrap CI."
     )
     method: str = Field(
-        default="percentile bootstrap, B=1000, seed=0, alpha=0.05",
-        description="Frozen so consumer Claudes can cite the method exactly.",
+        ...,
+        description=(
+            "Method description constructed from BOOTSTRAP_B / SEED / "
+            "ALPHA module constants — single source of truth so the "
+            "string can't drift from the actual call."
+        ),
     )
 
 
@@ -207,14 +236,17 @@ def _compute_stats(cell: pd.DataFrame) -> CellStats:
 def _compute_bootstrap_ci(cell: pd.DataFrame) -> BootstrapCIResult:
     if len(cell) < 2:
         return BootstrapCIResult(
-            point_estimate=None, ci_lo=None, ci_hi=None,
+            point_estimate=None, ci_lo=None, ci_hi=None, method=BOOTSTRAP_METHOD,
         )
     roi = cell["roi_pct"].to_numpy(dtype=float)
-    point, lo, hi = bootstrap_ci(roi, B=1000, seed=0, alpha=0.05)
+    point, lo, hi = bootstrap_ci(
+        roi, B=BOOTSTRAP_B, seed=BOOTSTRAP_SEED, alpha=BOOTSTRAP_ALPHA,
+    )
     return BootstrapCIResult(
         point_estimate=None if np.isnan(point) else float(point),
         ci_lo=None if np.isnan(lo) else float(lo),
         ci_hi=None if np.isnan(hi) else float(hi),
+        method=BOOTSTRAP_METHOD,
     )
 
 
@@ -274,6 +306,17 @@ def cell_summary_impl(inp: CellSummaryInput) -> CellSummaryOutput:
 
     caveats: list[str] = []
 
+    # Per-trade list cap. Typical cells are ~24 trades; this only
+    # fires if a future sweep grid materially expands expiry coverage.
+    if per_trade is not None and len(per_trade) > MAX_PER_TRADE_ROWS:
+        n_dropped = len(per_trade) - MAX_PER_TRADE_ROWS
+        per_trade = per_trade[:MAX_PER_TRADE_ROWS]
+        caveats.append(
+            f"per_trade truncated to {MAX_PER_TRADE_ROWS} rows; "
+            f"{n_dropped} additional trades dropped. Use query_sweep "
+            f"with the same cell-key filter for full coverage."
+        )
+
     # Min-N caveat — empty cell is the strongest case but it's
     # informative even for n=1..min_n-1.
     if stats.n == 0:
@@ -294,14 +337,7 @@ def cell_summary_impl(inp: CellSummaryInput) -> CellSummaryOutput:
     # the queried run lacks the current engine_version stamp.
     stamp = read_run_metadata(inp.run_id)
     if stamp.get("engine_version") != ENGINE_VERSION:
-        caveats.append(
-            "Run was generated BEFORE the p7.pricing_arc landed; the "
-            "cell's median / mean ROI may be inflated by phantom-fill "
-            "artifact (zero-volume legs priced at stale close → "
-            "+10pts T-41..T-45 per the 2026-05-30 analysis). Treat as "
-            "pre-arc data; re-sweep against the post-arc engine for "
-            "correctness."
-        )
+        caveats.append(PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT)
 
     return CellSummaryOutput(
         run_id=inp.run_id,

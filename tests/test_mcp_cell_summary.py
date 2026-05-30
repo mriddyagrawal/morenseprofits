@@ -18,12 +18,18 @@ import pytest
 from src.analytics.aggregate import MIN_N_FOR_RANKING
 from src.engine import results as r
 from src.mcp.cell_summary import (
+    BOOTSTRAP_ALPHA,
+    BOOTSTRAP_B,
+    BOOTSTRAP_METHOD,
+    BOOTSTRAP_SEED,
+    MAX_PER_TRADE_ROWS,
     CellSummaryInput,
     CellSummaryOutput,
     _bottom_alpha_mean,
     cell_summary_impl,
     register_cell_summary_tools,
 )
+from src.mcp._models import PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
 
 
 # ============================================================
@@ -368,6 +374,68 @@ def test_server_registry_now_exposes_cell_summary():
 # ============================================================
 # JSON round-trip
 # ============================================================
+
+def test_bootstrap_method_string_is_derived_from_constants():
+    """Per reviewer Grill #3 on 3264f37: the method string must be
+    constructed from the actual BOOTSTRAP_* constants used in the
+    bootstrap_ci call — anti-regression against a future commit
+    changing the constants but forgetting to update the string."""
+    rows = _cell_with_n_trades(10, roi_pcts=list(range(1, 11)))
+    r.write_results(pd.DataFrame(rows), run_id="method_str")
+    out = cell_summary_impl(CellSummaryInput(
+        run_id="method_str",
+        strategy="short_straddle", symbol="RELIANCE",
+        entry_offset_td=15, exit_offset_td=1,
+    ))
+    method = out.bootstrap_ci_median_roi.method
+    # Method string must literally contain the constant values.
+    assert f"B={BOOTSTRAP_B}" in method
+    assert f"seed={BOOTSTRAP_SEED}" in method
+    assert f"alpha={BOOTSTRAP_ALPHA}" in method
+    # And match the module's pre-computed BOOTSTRAP_METHOD string.
+    assert method == BOOTSTRAP_METHOD
+
+
+def test_pre_arc_caveat_uses_shared_constant():
+    """Per reviewer Grill #2 on 3264f37: the phantom-fill caveat
+    string is sourced from src.mcp._models.PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
+    so a wording update is a single-site edit. This test pins the
+    sourcing — if the impl gets re-inlined with copy-paste text, the
+    test fires."""
+    rows = _cell_with_n_trades(10, roi_pcts=list(range(1, 11)))
+    df = pd.DataFrame(rows)
+    path = r.results_path("shared_caveat")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    r.canonical_column_order(df).to_parquet(path, index=False)
+
+    out = cell_summary_impl(CellSummaryInput(
+        run_id="shared_caveat",
+        strategy="short_straddle", symbol="RELIANCE",
+        entry_offset_td=15, exit_offset_td=1,
+    ))
+    # The shared constant must appear verbatim in the caveats list.
+    assert PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT in out.caveats
+
+
+def test_per_trade_truncates_at_max_with_caveat(monkeypatch):
+    """Per reviewer Grill #4 on 3264f37: per_trade list now caps at
+    MAX_PER_TRADE_ROWS with explicit truncation caveat. Anti-regression
+    in case a future sweep grid materially expands expiry coverage."""
+    # Force a tiny cap so the test can exercise it without building
+    # 1000+ fake trades.
+    monkeypatch.setattr("src.mcp.cell_summary.MAX_PER_TRADE_ROWS", 5)
+    rows = _cell_with_n_trades(10, roi_pcts=list(range(1, 11)))
+    r.write_results(pd.DataFrame(rows), run_id="cap_test")
+    out = cell_summary_impl(CellSummaryInput(
+        run_id="cap_test",
+        strategy="short_straddle", symbol="RELIANCE",
+        entry_offset_td=15, exit_offset_td=1,
+    ))
+    assert out.per_trade is not None
+    assert len(out.per_trade) == 5
+    assert any("per_trade truncated" in c for c in out.caveats)
+    assert any("query_sweep" in c for c in out.caveats)
+
 
 def test_cell_summary_output_round_trips_through_json():
     rows = _cell_with_n_trades(5)

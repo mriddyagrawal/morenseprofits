@@ -43,7 +43,11 @@ from src.engine.results import (
     read_run_metadata,
     results_path,
 )
-from src.mcp._models import CaveatedResponse, ToolEntry
+from src.mcp._models import (
+    PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT,
+    CaveatedResponse,
+    ToolEntry,
+)
 
 
 # Hard cap on returned rows — reuse the spot_options constant indirectly
@@ -139,11 +143,7 @@ def list_runs_impl(inp: ListRunsInput) -> ListRunsOutput:
     if n_legacy > 0:
         caveats.append(
             f"{n_legacy} of {len(runs)} run(s) lack the p7.pricing_arc "
-            f"engine_version stamp. Those parquets were generated before "
-            f"the IlliquidLegError gate + VWAP fill landed and have the "
-            f"phantom-fill-bias artifact (T-41..T-45 ROI inflated by ~10pts "
-            f"per the 2026-05-30 analysis). Query results from those runs "
-            f"carry the same caveat at the per-call level."
+            f"engine_version stamp. " + PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
         )
     return ListRunsOutput(runs=runs, n_runs=len(runs), caveats=caveats)
 
@@ -304,13 +304,7 @@ def query_sweep_impl(inp: QuerySweepInput) -> QuerySweepOutput:
     # query against a pre-arc run flags the phantom-fill bias.
     stamp = read_run_metadata(inp.run_id)
     if stamp.get("engine_version") != ENGINE_VERSION:
-        caveats.append(
-            "Run was generated BEFORE the p7.pricing_arc landed; results "
-            "have the phantom-fill bias (zero-volume legs priced at "
-            "stale close → +10pts inflated ROI at T-41..T-45 per the "
-            "2026-05-30 analysis). Treat as pre-arc data; re-run sweep "
-            "against the post-arc engine for correctness."
-        )
+        caveats.append(PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT)
 
     rows = _to_json_friendly(df.to_dict(orient="records"))
     return QuerySweepOutput(
