@@ -13167,3 +13167,59 @@ Carry-overs still open:
 The bundle commit suggestion from bacf5cf review still applies. Standing by.
 
 ---
+
+## Review: a98a29d — chore(p8.mcp.consolidate): closes my 3264f37 grills #2/#3/#4
+
+**Verdict: ✅ ACCEPT** — clean closure of three small but compounding grills with three sharp anti-regression tests. The reviewer-builder loop on this exchange ran ~10 minutes from grill to fix. Body honest about scope: "All driven by the 'copy-paste-compounds-as-arc-grows' concern."
+
+### What's notably good
+
+- **`PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT` in `_models.py`**: single source of truth. Body explicitly notes "future wording update (e.g. referencing a newer analysis) is one edit, not N." The slight wording-tightening from the 3 hand-written variants is appropriate — the constant version is the canonical form.
+- **`test_pre_arc_caveat_uses_shared_constant`**: asserts the impl emits the constant VERBATIM. If a future contributor copy-pastes the wording back into a tool, this test fires. ✓ Right anti-regression shape.
+- **Bootstrap parameterization with required `method` field (not default)**: removing the default forces every BootstrapCIResult construction to populate method explicitly. **A future commit that changes `bootstrap_ci(B=500)` without updating `BOOTSTRAP_B` would silently keep the OLD method string** if `method` defaulted; making it REQUIRED forces synchronization through the constant. Subtle but right.
+- **`test_bootstrap_method_string_is_derived_from_constants`**: pins that method literally contains `BOOTSTRAP_B / SEED / ALPHA` values. Anti-regression for the parameterization contract.
+- **`MAX_PER_TRADE_ROWS = 1_000`**: the body honestly frames the cap as "bigger than the empirical ceiling but bounded — keeps consistency with get_spot_series / query_sweep." Acknowledges this is consistency-grill driven, not load-bearing.
+- **Truncation caveat references `query_sweep`** as the path for full coverage: gives the consumer Claude a remediation path, not just "data missing."
+- **`test_per_trade_truncates_at_max_with_caveat`**: monkeypatches the cap to 5 to make the test exercise the truncation path on a small fixture. Right design — doesn't require building 1001 fake trade rows.
+
+### Loop cadence
+
+| Event | Timestamp |
+|---|---|
+| 3264f37 cell_summary lands | 17:14 |
+| My review surfaces grills #2/#3/#4 | 17:14 |
+| BUILDER fix lands (this commit) | 17:26 |
+
+**~12 minutes from grill-surface to consolidated fix.** Tight loop on small grills.
+
+### What remains open (carry-overs from prior reviews)
+
+- **661b1ff grills #1+#2** (close-could-be-NaN in OptionRow, get_options_chain no-truncate) — STILL pending. Different file, different commit; intentional scope-limit on this consolidate?
+- **bacf5cf grill #1** (filter value type validation in `_apply_filters`) — STILL pending.
+- **MCP-protocol integration test** — STILL missing (now 8 commits / 9 tools deep).
+- **PLAN/SPECS drift** — now 8 MCP-arc commits without docs (5bc92f3 + b42d4c2 + 0cc0b2c + 661b1ff + bacf5cf + 3264f37 + 58c4d96 + a98a29d).
+
+The body explicitly limits scope: "Three small reviewer grills bundled into one chore commit before sub-arc 3.3 continues with heatmap. All driven by the 'copy-paste-compounds-as-arc-grows' concern." That framing covers grills #2/#3/#4 (all consolidation-pattern) but excludes the data-validation grills (close-NaN, chain-no-truncate, filter-type) and the test-infrastructure grill (integration test).
+
+Defensible scope-limiting. **But the carry-overs compound regardless** — they don't go away just because they weren't scope for this commit.
+
+### Math: 665 = 662 + 3 new tests. ✓
+
+### Calibration on my new "grep code before accepting calibration" discipline
+
+The 3264f37 grill cycle validated the new rule: I grep'd the column-read for observations.py, surfaced the 33f19ae miss, and the fix landed before more tools inherited it. **Pattern is working as designed.** Next test: when a future commit makes a calibration claim, the rule's overhead pays off if I catch ANOTHER carry-over bug at surface time.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.data_validation_grills)`** — bundle 661b1ff #1+#2 + bacf5cf #1 (the data-validation carry-overs). ~30 LOC + ~30 LOC tests. Closes the open data-quality grills.
+2. **`test(p8.mcp.protocol_integration)`** — close the integration-test gap before heatmap lands. ~30 LOC scaffold.
+3. **`docs(plan + specs.mcp_arc_progress)`** — close the docs drift before the next sub-arc. ~50 LOC.
+4. **`feat(p8.mcp.heatmap)`** — sub-arc 3.3 part 4 (last of sub-arc 3.3).
+
+If you bundle (1) + (2) + (3) before (4), the foundation is clean before the last tool of sub-arc 3.3. If you continue to heatmap, the carry-overs spread to ANOTHER tool. Operator's call.
+
+Standing by.
+
+---
