@@ -13223,3 +13223,104 @@ If you bundle (1) + (2) + (3) before (4), the foundation is clean before the las
 Standing by.
 
 ---
+
+## Review: d138fef — feat(p8.mcp.heatmap): Commit 6 of MCP arc — sub-arc 3.3 (4 of 4)
+
+**Verdict: ✅ ACCEPT** — closes sub-arc 3.3. LOAD-BEARING MULTIPLE_COMPARISONS_CAVEAT verbatim from src.analytics.rank with boundary anti-regression test. **One real new grill: dead-code comprehension at impl line ~308 that wastes O(n×m) per cell. Should delete.** Two carry-overs continue to compound.
+
+### What's notably good
+
+- **MULTIPLE_COMPARISONS_CAVEAT verbatim from `src.analytics.rank`**: not paraphrased, not re-written — direct import + emit. This honors my consultation response's caveat enforcement contract: "Re-export the constant; don't paraphrase." Same Q4 pattern as the dashboard's Export-rule constraint, now operationalized in MCP.
+- **BOUNDARY anti-regression test**: "Silent below threshold (boundary anti-regression)" + "MULTIPLE_COMPARISONS_CAVEAT fires above 100 cells (LOAD-BEARING)". The 101-cell case fires; the 100-cell case is silent. Sharp pin on the threshold.
+- **`HeatmapCell.masked` field explicit**: Consumer can distinguish "cell has no trades" (value=None, n=0, masked=False) vs "cell was masked at min_n" (value=None, n>0, masked=True). Same failure-mode disambiguation pattern from get_option_series. ✓
+- **`cvar_5` routes to `pivot_cvar`, agg_fn ignored** — test proves the dispatch is REAL (median=10 vs CVaR=-100 on a hand-crafted outlier cell). Not a label-swap; actual analytical dispatch.
+- **Consolidated constants used correctly**: PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT (from a98a29d) + MULTIPLE_COMPARISONS_CAVEAT (from rank.py). No re-inlining.
+- **f9da84d skew-direction lesson encoded in schema**: agg_fn description says "'mean' (sensitive to tail; pairs well with cvar_5 for the head-vs-tail story)". The schema-doc-surfaces the corrected interpretation, same as cell_summary.
+- **All-masked caveat suggests remediation**: "Lower min_n to surface noisier estimates, or pick a different (strategy, symbol) with more coverage." Operator-readable path forward.
+- **`SupportedValueCol` + `SupportedAggFn` Literals**: schema-layer guard; consumer can't pass `value_col="vix"` or `agg_fn="mode"`.
+
+### 🚨 Grill #1 (NEW, real, code-quality bug): dead-code comprehension wasting O(n×m) per cell
+
+[src/mcp/heatmap.py:~304-313](src/mcp/heatmap.py):
+
+```python
+for entry in entry_offsets:
+    for exit_ in exit_offsets:
+        raw_value = grid.at[entry, exit_]
+        n = int(counts.at[entry, exit_]) if (entry, exit_) in [
+            (i, c) for i in counts.index for c in counts.columns
+        ] else 0
+        # counts pivot has explicit shape match to grid; the
+        # comprehension above is a defensive lookup. Simpler form
+        # below.
+        try:
+            n = int(counts.at[entry, exit_])
+        except KeyError:
+            n = 0
+        ...
+```
+
+**Two assignments to `n` for the same cell.** The first is via list comprehension; the second via try/except OVERWRITES it. Both compute the same value.
+
+Effect:
+- The list comprehension builds a `[(i, c) for i in counts.index for c in counts.columns]` list of length `len(counts.index) * len(counts.columns)` for EVERY cell iteration.
+- For a 720-cell grid (45×16): each cell builds a 720-element list → **518k unused list-construction operations per `heatmap()` call**.
+- Then immediately overwritten by the try/except form.
+
+The inline comment ("the comprehension above is a defensive lookup. Simpler form below") suggests the author refactored to the simpler form but didn't delete the original.
+
+**Recommendation**: delete the first `n = ...` line and its accompanying comment. The try/except is the load-bearing logic. ~3 LOC removal.
+
+This is a code-review-catchable bug that the tests don't surface (they pass because BOTH expressions compute the same value). Pure perf regression + reader confusion.
+
+### 🔬 Grill #2 (carry-over, still louder): MCP-protocol integration test STILL missing
+
+9 commits / 10 tools deep. Sub-arc 3.3 closes; sub-arc 3.4 (backtest_one + sweep_windows) is next per the roadmap. The integration test gap I've flagged in b42d4c2 / 0cc0b2c / 661b1ff / bacf5cf / 3264f37 / bacf5cf is now ~50% spent.
+
+### 🔬 Grill #3 (carry-over, still louder): PLAN/SPECS drift now 9 MCP-arc commits deep
+
+Pricing arc had 82 LOC bundled cleanup after 3 commits. Linear extrapolation puts MCP cleanup NOW at ~250 LOC; at full 13-commit completion, projected ~370+ LOC.
+
+### 🔬 Grill #4 (carry-over): data-validation grills (661b1ff #1+#2 + bacf5cf #1) STILL pending
+
+close-could-be-NaN, chain-no-truncate, filter-value-type-validation. All ~5-15 LOC each. None landed in a98a29d's consolidate (that was scoped to consolidation-pattern grills only).
+
+### What I checked
+
+- Traced the dead-code path: comprehension result assigned to `n`, then immediately OVERWRITTEN by try/except. Verified via diff: both forms reference `counts.at[entry, exit_]` with the same fallback to 0.
+- Verified `MULTIPLE_COMPARISONS_CAVEAT` is imported from `src.analytics.rank` and used VERBATIM (no paraphrase): `caveats.append(MULTIPLE_COMPARISONS_CAVEAT)`. ✓
+- Verified `cvar_5` routes to `pivot_cvar(df, ..., alpha=0.05)` not `pivot_window`. ✓ Dispatch is real.
+- Math: 678 = 665 + 13. ✓
+
+### Sub-arc 3.3 closes — milestone
+
+| Tool | Commit |
+|---|---|
+| list_runs | bacf5cf |
+| query_sweep | bacf5cf |
+| cell_summary | 3264f37 |
+| heatmap | d138fef (this) |
+
+**4 of 4 sub-arc 3.3 tools landed.** Per the consultation's 13-commit roadmap, MCP arc is now 9 commits in (skeleton + 3 sub-arcs of 1+3+3+2 tools + 2 fixes/consolidate). Remaining per roadmap:
+- Sub-arc 3.4 (backtest_one + sweep_windows) — 2 commits.
+- Sub-arc 3.5 (skip_summary + data_quality) — 2 commits.
+- Sub-arc 3.6 (compare_cells + bootstrap_ci) — 2 commits.
+- Sub-arc 3.7 (docs) — 1 commit.
+
+= ~7 commits to go.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.heatmap.dead_comprehension)`** — close grill #1 (~3 LOC removal). Quick win; eliminates the O(n×m) per-cell waste.
+2. **`fix(p8.mcp.data_validation_grills)`** — bundle 661b1ff #1+#2 + bacf5cf #1.
+3. **`test(p8.mcp.protocol_integration)`** — close the integration-test gap before sub-arc 3.4.
+4. **`docs(plan + specs.mcp_arc_progress)`** — close the 9-commits-deep PLAN/SPECS drift.
+5. **`feat(p8.mcp.backtest_one)`** — sub-arc 3.4 part 1.
+
+If (1)+(2)+(3)+(4) all land as a "foundation consolidation" before sub-arc 3.4, foundation is clean. If pushed past, carry-overs spread to more tools.
+
+Standing by.
+
+---
