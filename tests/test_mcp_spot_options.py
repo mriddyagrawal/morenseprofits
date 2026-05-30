@@ -173,6 +173,28 @@ def test_get_option_series_input_rejects_bad_option_type():
         )
 
 
+def test_get_option_series_handles_settlement_only_row_with_nan_close(monkeypatch):
+    """Per reviewer Grill #1 on 661b1ff: NSE publishes some settlement-
+    only rows where ``close`` is NaN (zero-volume contracts near expiry).
+    Pre-fix the impl raised on ``float(NaN)`` → JSON-mode model_dump
+    crash. Post-fix close is Optional[float] and routes to None."""
+    import math
+    frame = _option_frame([
+        {"date": date(2024, 1, 5), "close": float("nan"), "settle_price": 95.0},
+        {"date": date(2024, 1, 6), "close": 100.0, "settle_price": 100.0},
+    ], with_turnover=True)
+    monkeypatch.setattr(spot_options, "load_option", lambda *a, **kw: frame)
+    out = get_option_series_impl(GetOptionSeriesInput(
+        symbol="X", expiry=date(2024, 1, 25), strike=100.0, option_type="CE",
+    ))
+    # First row has NaN close → None in the response, not a crash.
+    assert out.rows[0].close is None
+    assert out.rows[1].close == 100.0
+    # Serialization through model_dump(mode="json") must not raise on NaN.
+    import json
+    json.dumps(out.model_dump(mode="json"))
+
+
 def test_get_option_series_default_window_is_expiry_minus_120_days(monkeypatch):
     """When from_date / to_date are omitted, the impl defaults to the
     contract's typical full lifetime (expiry - 120d → expiry)."""

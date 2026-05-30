@@ -113,7 +113,16 @@ class OptionRow(BaseModel):
     open: float | None = None
     high: float | None = None
     low: float | None = None
-    close: float
+    close: float | None = Field(
+        default=None,
+        description=(
+            "Day's closing trade price. None on settlement-only rows "
+            "where NSE publishes settle_price but no close trade "
+            "happened (rare; typically zero-volume contracts near "
+            "expiry). Pre-fix(661b1ff #1) this was required and "
+            "raised on NaN."
+        ),
+    )
     ltp: float | None = None
     settle_price: float | None = None
     lot_size: int
@@ -182,7 +191,7 @@ def get_option_series_impl(inp: GetOptionSeriesInput) -> GetOptionSeriesOutput:
             "open": float(r["open"]) if pd.notna(r.get("open")) else None,
             "high": float(r["high"]) if pd.notna(r.get("high")) else None,
             "low": float(r["low"]) if pd.notna(r.get("low")) else None,
-            "close": float(r["close"]),
+            "close": float(r["close"]) if pd.notna(r.get("close")) else None,
             "ltp": float(r["ltp"]) if pd.notna(r.get("ltp")) else None,
             "settle_price": float(r["settle_price"]) if pd.notna(r.get("settle_price")) else None,
             "lot_size": int(r["lot_size"]),
@@ -219,7 +228,14 @@ class ChainRow(BaseModel):
     open: float | None = None
     high: float | None = None
     low: float | None = None
-    close: float
+    close: float | None = Field(
+        default=None,
+        description=(
+            "Day's closing trade price for this strike. None when the "
+            "bhavcopy row has no close (rare; zero-volume strikes that "
+            "NSE publishes for completeness)."
+        ),
+    )
     settle_price: float | None = None
     contracts: int | None = Field(
         default=None,
@@ -267,11 +283,15 @@ def get_options_chain_impl(inp: GetOptionsChainInput) -> GetOptionsChainOutput:
             "open": float(r["open"]) if pd.notna(r.get("open")) else None,
             "high": float(r["high"]) if pd.notna(r.get("high")) else None,
             "low": float(r["low"]) if pd.notna(r.get("low")) else None,
-            "close": float(r["close"]),
+            "close": float(r["close"]) if pd.notna(r.get("close")) else None,
             "settle_price": float(r["settle_price"]) if pd.notna(r.get("settle_price")) else None,
             "contracts": int(r["contracts"]) if pd.notna(r.get("contracts")) else None,
             "oi": int(r["oi"]) if pd.notna(r.get("oi")) else None,
         })
+    # Truncate to MAX_ROWS_PER_RESPONSE for consistency with the two
+    # other tools in this sub-arc (fix(661b1ff #2): chain previously
+    # had no cap — a heavy symbol's full multi-expiry chain could
+    # blow past the consumer Claude's context budget).
     capped, caveats = _truncate_rows(rows)
     return GetOptionsChainOutput(
         symbol=inp.symbol.upper(),

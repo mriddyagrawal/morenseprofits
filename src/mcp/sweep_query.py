@@ -217,11 +217,50 @@ _COMPARISON_OPS = {
 }
 
 
+def _coerce_to_column_dtype(value: Any, column: str, dtype: Any) -> Any:
+    """Pre-validate a filter value against the target column's dtype.
+    Per reviewer Grill #1 on bacf5cf — without this, a typo like
+    ``{"entry_offset_td__gte": "ten"}`` would raise an opaque pandas
+    TypeError inside ``__ge__`` rather than a clean consumer-readable
+    MCP tool error.
+
+    Coerce-and-test is sufficient for the typical cases (str → int,
+    str → float, str → date). When coercion fails, raise ValueError
+    with the column name + dtype so the consumer Claude sees exactly
+    what's wrong.
+    """
+    if value is None:
+        return value
+    # numeric types — handles int / float / Int64 / nullable
+    if pd.api.types.is_numeric_dtype(dtype):
+        try:
+            return type(dtype.type(value))(value) if hasattr(dtype, 'type') else float(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"filter value {value!r} (type {type(value).__name__}) "
+                f"not coercible to column {column!r}'s dtype {dtype}: {e}"
+            )
+    # datetime — accept ISO string or date / datetime instance
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        try:
+            return pd.Timestamp(value)
+        except Exception as e:
+            raise ValueError(
+                f"filter value {value!r} not coercible to datetime "
+                f"for column {column!r}: {e}"
+            )
+    # string / object — let through unchanged
+    return value
+
+
 def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
     """Apply the flat filter dict to df, returning the filtered frame.
     Unknown columns or invalid suffixes raise ValueError so a typo at
     the consumer side surfaces immediately rather than silently
-    returning the unfiltered frame."""
+    returning the unfiltered frame. Per fix(bacf5cf #1), filter
+    values are also pre-validated against the target column's dtype
+    so a string-vs-int typo surfaces as a clean MCP tool error
+    rather than an opaque pandas exception."""
     out = df
     for key, value in filters.items():
         matched_op = None
@@ -236,12 +275,19 @@ def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
                 f"filter key {key!r} references unknown column {column!r}. "
                 f"Available: {sorted(df.columns)}"
             )
-        if matched_op is not None:
-            out = out[matched_op(out[column], value)]
-        elif isinstance(value, list):
-            out = out[out[column].isin(value)]
+        dtype = df[column].dtype
+        if isinstance(value, list):
+            # IN-list: coerce each element separately.
+            coerced_values = [
+                _coerce_to_column_dtype(v, column, dtype) for v in value
+            ]
+            out = out[out[column].isin(coerced_values)]
         else:
-            out = out[out[column] == value]
+            coerced = _coerce_to_column_dtype(value, column, dtype)
+            if matched_op is not None:
+                out = out[matched_op(out[column], coerced)]
+            else:
+                out = out[out[column] == coerced]
     return out
 
 

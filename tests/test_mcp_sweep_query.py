@@ -210,6 +210,38 @@ def test_query_sweep_filters_by_range_gte():
     assert out.n_rows == 2
 
 
+def test_query_sweep_filter_value_dtype_mismatch_raises_clean_error():
+    """Per reviewer Grill #1 on bacf5cf: filter values are pre-validated
+    against the target column's dtype. A typo like int_column__gte='ten'
+    surfaces a clean MCP tool error (ValueError with column name +
+    dtype + the offending value), NOT an opaque pandas TypeError from
+    inside __ge__ comparisons."""
+    rows = [_minimal_row(net_pnl=100.0)]
+    r.write_results(pd.DataFrame(rows), run_id="bad_value")
+    with pytest.raises(ValueError, match="not coercible"):
+        query_sweep_impl(QuerySweepInput(
+            run_id="bad_value",
+            # entry_offset_td is int; "ten" can't coerce.
+            filters={"entry_offset_td__gte": "ten"},
+        ))
+
+
+def test_query_sweep_filter_value_string_to_int_coerces_cleanly():
+    """When a string IS coercible to the column's int dtype (e.g.
+    '15' → 15), the filter succeeds rather than over-strictly
+    rejecting. Anti-regression for over-zealous validation."""
+    rows = [
+        _minimal_row(),  # entry_offset_td=15 default
+        # Different cell to ensure filter selects.
+    ]
+    rows[0]["entry_offset_td"] = 15
+    r.write_results(pd.DataFrame(rows), run_id="coerce")
+    out = query_sweep_impl(QuerySweepInput(
+        run_id="coerce", filters={"entry_offset_td": "15"},  # str → int
+    ))
+    assert out.n_rows == 1
+
+
 def test_query_sweep_unknown_filter_column_raises():
     """Typo at the consumer side surfaces immediately as ValueError;
     silent acceptance would let a bad filter return the whole frame
