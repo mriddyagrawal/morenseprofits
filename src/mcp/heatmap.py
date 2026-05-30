@@ -204,12 +204,10 @@ def heatmap_impl(inp: HeatmapInput) -> HeatmapOutput:
     for entry in entry_offsets:
         for exit_ in exit_offsets:
             raw_value = grid.at[entry, exit_]
-            n = int(counts.at[entry, exit_]) if (entry, exit_) in [
-                (i, c) for i in counts.index for c in counts.columns
-            ] else 0
-            # counts pivot has explicit shape match to grid; the
-            # comprehension above is a defensive lookup. Simpler form
-            # below.
+            # counts pivot has the same (entry, exit) shape as the
+            # value grid (both come from the same _filter slice), so
+            # the KeyError branch is defensive — fires only on a
+            # degenerate case where the two pivots disagree.
             try:
                 n = int(counts.at[entry, exit_])
             except KeyError:
