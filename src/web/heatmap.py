@@ -986,42 +986,13 @@ def render_export_rule(
 # Cell drill-down — Phase 7 (analyst exploration tool)
 # ============================================================
 
-# Tolerance for "entry_px matches computed VWAP" in the CSV export's
-# fill-source inference. The engine's units-sanity assertion already
-# bounds VWAP/close ratios to [0.5, 2.0]; this much tighter band is
-# for the equality check of "did the engine use VWAP?".
-_VWAP_MATCH_TOLERANCE = 1e-4
-
-
-def _classify_fill_source(
-    entry_px: float | None,
-    volume: int | None,
-    turnover: float | None,
-) -> str:
-    """Derive whether the engine used VWAP or fell back to close based
-    on the per-leg telemetry. ``entry_px`` is the engine's recorded
-    fill (pre-slippage). Returns one of:
-      - 'vwap' — turnover + volume present AND entry_px ≈ VWAP-implied
-      - 'close' — turnover unavailable OR volume zero (forced fallback)
-      - 'unknown' — entry_px is missing / NaN / can't classify
-
-    The ``vwap_implied = turnover × 100_000 / volume`` formula uses the
-    project's TURNOVER_SCALE_FACTOR (NSE convention: lakhs of rupees).
-    """
-    if entry_px is None or (
-        isinstance(entry_px, float) and entry_px != entry_px  # NaN
-    ):
-        return "unknown"
-    has_turnover = turnover is not None and not (
-        isinstance(turnover, float) and turnover != turnover
-    )
-    has_volume = volume is not None and volume > 0
-    if not has_turnover or not has_volume:
-        return "close"  # no VWAP path possible
-    vwap_implied = float(turnover) * 100_000.0 / float(volume)
-    if abs(vwap_implied - entry_px) / max(abs(entry_px), 1e-9) < _VWAP_MATCH_TOLERANCE:
-        return "vwap"
-    return "close"  # engine had VWAP available but didn't use it (band reject)
+# Re-export the centralized fill-source classifier so the existing
+# test surface (tests/test_web_heatmap.py imports _classify_fill_source
+# directly) keeps working. The implementation moved to
+# src.engine.pnl.classify_fill_source per c3545cc reviewer grills #1+#2;
+# this shim keeps the underscored dashboard-local name + signature
+# stable while the real logic lives in one place.
+from src.engine.pnl import classify_fill_source as _classify_fill_source  # noqa: E402
 
 
 def _build_cell_csv(rows: pd.DataFrame) -> bytes:

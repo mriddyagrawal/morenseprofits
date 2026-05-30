@@ -178,6 +178,75 @@ def _pick_fill_price(
     return fill_px, int(r["lot_size"]), volume, oi, turnover
 
 
+# ============================================================
+# Fill-source audit helpers (shared with src/web + src/mcp)
+# ============================================================
+#
+# Used by the dashboard's drill-down CSV export and the MCP
+# backtest_one tool to classify each leg's fill as VWAP-derived,
+# close-derived, or indeterminate. Centralized here per reviewer
+# grills on c3545cc + 6ab4866: two duplicates had drifted independently;
+# any future third consumer (e.g. a data_quality MCP tool) would
+# compound the drift risk.
+#
+# Tolerance choice: relative 0.1% OR absolute 0.001 rupees, whichever
+# is larger. The absolute floor is load-bearing for deep-OTM contracts
+# (₹0.05 premium) where a tight relative tolerance would require
+# byte-perfect agreement that turnover precision can't deliver.
+
+VWAP_MATCH_TOLERANCE_REL = 1e-3
+VWAP_MATCH_TOLERANCE_ABS = 1e-3
+
+
+def classify_fill_source(
+    entry_px: float | int | None,
+    volume: int | None,
+    turnover: float | None,
+) -> str:
+    """Derive whether the engine used VWAP or close based on per-leg
+    telemetry. Mirrors the ``_pick_fill_price`` decision logic from
+    the perspective of a post-hoc auditor reading legs_json fields.
+
+    Returns one of:
+      ``'vwap'``     — turnover + volume present AND entry_px matches
+                       ``turnover × TURNOVER_SCALE_FACTOR / volume``
+                       within tolerance.
+      ``'close'``    — turnover unavailable OR volume = 0 (no VWAP
+                       path possible), OR engine had VWAP available
+                       but the result fell outside the units-sanity
+                       band [_VWAP_CLOSE_RATIO_MIN, MAX] and got
+                       rejected. The recorded entry_px is the close.
+      ``'unknown'``  — entry_px is missing / NaN; can't classify.
+
+    Tolerance is ``max(VWAP_MATCH_TOLERANCE_REL × |entry_px|,
+    VWAP_MATCH_TOLERANCE_ABS)`` — relative-OR-absolute so deep-OTM
+    contracts (₹0.05 premium) don't fail-match on turnover quantisation
+    while liquid ATM contracts (₹100+ premium) still get a meaningful
+    relative check.
+    """
+    import math
+    if entry_px is None:
+        return "unknown"
+    try:
+        f = float(entry_px)
+    except (TypeError, ValueError):
+        return "unknown"
+    if math.isnan(f):
+        return "unknown"
+    has_turnover = (
+        turnover is not None
+        and not (isinstance(turnover, float) and math.isnan(turnover))
+    )
+    has_volume = volume is not None and volume > 0
+    if not has_turnover or not has_volume:
+        return "close"
+    vwap_implied = float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
+    tol = max(VWAP_MATCH_TOLERANCE_REL * abs(f), VWAP_MATCH_TOLERANCE_ABS)
+    if abs(vwap_implied - f) <= tol:
+        return "vwap"
+    return "close"  # engine had VWAP available but used close (band reject)
+
+
 # Backward-compat shim: existing callers (and the public price_trade
 # entry point) call ``_pick_close_on`` and expect the 4-tuple. Keep
 # the old name as an alias that drops the turnover field, while the

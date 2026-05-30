@@ -33,15 +33,9 @@ from pydantic import BaseModel, Field
 
 from src.data.errors import MissingDataError, OfflineCacheMiss
 from src.data.spot_loader import load_spot
-from src.engine.pnl import TURNOVER_SCALE_FACTOR, price_trade
+from src.engine.pnl import classify_fill_source, price_trade
 from src.mcp._models import CaveatedResponse, ToolEntry
 from src.strategies.registry import STRATEGIES
-
-
-# Tolerance for "entry_px matches computed VWAP" in the per-leg
-# fill-source classification. Mirrors the dashboard's CSV-export
-# helper in src/web/heatmap.py:_classify_fill_source.
-_VWAP_MATCH_TOLERANCE = 1e-4
 
 
 # ============================================================
@@ -151,27 +145,12 @@ def _classify_fill_source(
     volume: int | None,
     turnover: float | None,
 ) -> str:
-    """Mirror of the dashboard's _classify_fill_source. Same logic,
-    same tolerance — kept local to the MCP package so the dependency
-    is on engine/data only, not on src/web/."""
-    if entry_px is None:
-        return "unknown"
-    try:
-        f = float(entry_px)
-        if f != f:  # NaN
-            return "unknown"
-    except (TypeError, ValueError):
-        return "unknown"
-    has_turnover = turnover is not None and not (
-        isinstance(turnover, float) and turnover != turnover
-    )
-    has_volume = volume is not None and volume > 0
-    if not has_turnover or not has_volume:
-        return "close"
-    vwap_implied = float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
-    if abs(vwap_implied - entry_px) / max(abs(entry_px), 1e-9) < _VWAP_MATCH_TOLERANCE:
-        return "vwap"
-    return "close"
+    """Backward-compat shim around the centralized
+    ``src.engine.pnl.classify_fill_source``. Kept under the
+    underscored name + same signature so the test module can import
+    it as before. New callers should import the public name from
+    src.engine.pnl directly."""
+    return classify_fill_source(entry_px, volume, turnover)
 
 
 def _resolve_spot(symbol: str, entry_date: date) -> float | None:

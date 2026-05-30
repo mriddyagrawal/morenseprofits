@@ -934,3 +934,65 @@ def test_offline_flag_propagates_to_load_option():
         "price_trade must propagate offline=True to load_option_fn — "
         "without this, cache_only=True sweeps still let workers hit NSE"
     )
+
+
+# ============================================================
+# classify_fill_source — centralized fill-source audit helper
+# (chore(p8.fill_audit.centralize): pulled out of dashboard +
+# backtest_one duplicates per c3545cc reviewer grills #1+#2)
+# ============================================================
+
+def test_classify_fill_source_vwap_match_atm_price():
+    """₹100 ATM-ish premium, exact VWAP match → 'vwap'."""
+    from src.engine.pnl import classify_fill_source
+    # turnover 10 lakhs × 100_000 / 10_000 volume = 100.0
+    assert classify_fill_source(100.0, 10_000, 10.0) == "vwap"
+
+
+def test_classify_fill_source_vwap_match_with_turnover_precision_noise():
+    """Real turnover values are quantised at 2 decimal places (lakhs).
+    A computed VWAP of 100.005 vs entry_px=100.00 should still
+    classify as 'vwap' — the centralized tolerance is generous enough
+    to absorb the quantisation noise."""
+    from src.engine.pnl import classify_fill_source
+    # vwap_implied = 10.0005 × 100_000 / 10_000 = 100.005
+    assert classify_fill_source(100.0, 10_000, 10.0005) == "vwap"
+
+
+def test_classify_fill_source_vwap_match_deep_otm():
+    """LOAD-BEARING per c3545cc reviewer grill #3 (carry-over from
+    6ab4866 grill #2): deep-OTM contracts (₹0.05 premium) shouldn't
+    fail-match on turnover quantisation. Relative-OR-absolute tolerance
+    means ₹0.05 entry_px matches a VWAP-implied of ₹0.0505 (1% off)
+    or even ₹0.051 (2% off) — generous enough for real-world turnover
+    rounding."""
+    from src.engine.pnl import classify_fill_source
+    # turnover 0.05 lakhs (5_000 rs) / volume 100_000 → vwap = 0.05
+    # Try slight perturbation:
+    assert classify_fill_source(0.05, 100_000, 0.0501) == "vwap"
+
+
+def test_classify_fill_source_close_when_turnover_absent():
+    from src.engine.pnl import classify_fill_source
+    assert classify_fill_source(100.0, 1000, None) == "close"
+    assert classify_fill_source(100.0, 1000, float("nan")) == "close"
+
+
+def test_classify_fill_source_close_when_volume_zero():
+    from src.engine.pnl import classify_fill_source
+    assert classify_fill_source(100.0, 0, 10.0) == "close"
+
+
+def test_classify_fill_source_close_when_diverges_outside_tolerance():
+    """Engine had VWAP available (turnover + volume present) but the
+    recorded entry_px diverges from the implied — engine fell back
+    to close, probably via the units-sanity band reject. ``close``."""
+    from src.engine.pnl import classify_fill_source
+    # vwap_implied = 100; entry_px = 50 → 50% off → way outside band
+    assert classify_fill_source(50.0, 10_000, 10.0) == "close"
+
+
+def test_classify_fill_source_unknown_on_nan_or_none():
+    from src.engine.pnl import classify_fill_source
+    assert classify_fill_source(None, 1000, 5.0) == "unknown"
+    assert classify_fill_source(float("nan"), 1000, 5.0) == "unknown"
