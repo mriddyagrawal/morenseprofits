@@ -73,10 +73,17 @@ def interpret_cell_stats(rows: pd.DataFrame) -> list[str]:
     """
     if len(rows) == 0:
         return []
-    if not {"roi_pct_annualized", "net_pnl"}.issubset(rows.columns):
+    if not {"roi_pct", "net_pnl"}.issubset(rows.columns):
         return []
 
-    roi = rows["roi_pct_annualized"].dropna()
+    # Per-trade ROI (NOT annualized). p7.expiry_roi recalibrated the
+    # HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS threshold from 20 → 3 to match
+    # per-trade scale; reading roi_pct_annualized with a per-trade
+    # threshold was a silent miscalibration that fired the heavy-tail
+    # detector on most cells (annualized gaps are ~12× larger by the
+    # multiplier in _annualize_roi). Surfaced by reviewer in the
+    # 3264f37 cell_summary review as a carry-over miss from 33f19ae.
+    roi = rows["roi_pct"].dropna()
     pnl = rows["net_pnl"].dropna()
     out: list[str] = []
 

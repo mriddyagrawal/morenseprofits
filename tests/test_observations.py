@@ -19,10 +19,17 @@ from src.analytics.observations import (
 
 
 def _rows(roi: list[float], pnl: list[float] | None = None) -> pd.DataFrame:
-    """Build a minimal cell-rows frame."""
+    """Build a minimal cell-rows frame.
+
+    Uses ``roi_pct`` (per-trade) since the observations module's
+    thresholds are calibrated for per-trade scale per p7.expiry_roi.
+    Pre-fix(observations.roi_column) the fixture (and the module) used
+    ``roi_pct_annualized`` — the column read mismatched the calibrated
+    threshold by the annualization factor (~12×), silently over-firing
+    the heavy-tail detector on most cells."""
     if pnl is None:
         pnl = [0.0] * len(roi)
-    return pd.DataFrame({"roi_pct_annualized": roi, "net_pnl": pnl})
+    return pd.DataFrame({"roi_pct": roi, "net_pnl": pnl})
 
 
 def test_empty_frame_returns_empty():
@@ -157,3 +164,51 @@ def test_all_three_can_coexist():
     assert any("heavy upside tail" in s for s in out)
     assert any("one trade carries" in s for s in out)
     assert any("dispersion wildly exceeds" in s for s in out)
+
+
+# ============================================================
+# Column-read contract — fix(observations.roi_column) anti-regression
+# ============================================================
+
+def test_interpret_cell_stats_reads_roi_pct_not_annualized():
+    """LOAD-BEARING per the reviewer's 3264f37 grill #1: the
+    observations module's thresholds are per-trade-calibrated
+    (HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS = 3.0 from 33f19ae). It must
+    read ``roi_pct``, NOT ``roi_pct_annualized``. Reading the
+    annualized column with a per-trade threshold over-fires the
+    heavy-tail detector by the annualization factor (~12×).
+
+    Test design: build a frame where the per-trade column is QUIET
+    (mean ≈ median) but the annualized column would TRIGGER the
+    heavy-tail threshold. If observations reads roi_pct, the result
+    is empty. If it accidentally falls back to roi_pct_annualized,
+    the heavy-tail detector fires."""
+    # Per-trade ROI: tight distribution, mean ≈ median, no heavy tail.
+    roi_pct = [5.0, 5.5, 5.2, 5.1, 5.3, 5.4, 5.0, 5.6]
+    # Annualized version (12× scaled): mean-median gap would CROSS
+    # the 3.0 threshold if observations were reading this column.
+    roi_pct_annualized = [r * 12.0 for r in roi_pct]
+    # Add a small skew on the annualized column that wouldn't matter
+    # at per-trade scale but would trigger heavy-tail at annualized:
+    roi_pct_annualized[-1] += 40.0  # tiny per-trade bump → huge annualized
+    df = pd.DataFrame({
+        "roi_pct": roi_pct,
+        "roi_pct_annualized": roi_pct_annualized,
+        "net_pnl": [100.0] * len(roi_pct),
+    })
+    out = interpret_cell_stats(df)
+    # Per-trade column is quiet → no heavy-tail callout.
+    assert not any("heavy upside tail" in s for s in out)
+    assert not any("heavy downside tail" in s for s in out)
+
+
+def test_interpret_cell_stats_returns_empty_when_roi_pct_column_missing():
+    """Schema-contract update: the column requirement is now
+    ``{"roi_pct", "net_pnl"}``. A frame carrying only the legacy
+    ``roi_pct_annualized`` column (without roi_pct) returns []
+    rather than reading the wrong column silently."""
+    df = pd.DataFrame({
+        "roi_pct_annualized": [10, 20, 30],
+        "net_pnl": [100, 200, 300],
+    })
+    assert interpret_cell_stats(df) == []

@@ -246,10 +246,10 @@ def _as_date(v: Any) -> date:
 
 def _interpret_observations(cell: pd.DataFrame) -> list[str]:
     """Call into ``interpret_cell_stats``. Requires the per-trade
-    frame to carry ``roi_pct_annualized`` (the column observations
-    actually reads even though semantics-wise it surfaces per-trade-
-    scale conclusions — see src/analytics/observations.py module
-    docstring). Returns [] for an empty cell."""
+    frame to carry ``roi_pct`` (the column observations reads after
+    fix(observations.roi_column) — the recalibrated thresholds are
+    per-trade-scale, so the column read matches). Returns [] for an
+    empty cell."""
     if len(cell) == 0:
         return []
     return interpret_cell_stats(cell)
