@@ -13559,3 +13559,89 @@ The `gate_status` + `vwap_vs_close_divergence` fields are the consumer-facing an
 Standing by.
 
 ---
+
+## Review: 6ab4866 — feat(p7.heatmap.drilldown.csv_export): operator-requested fill-source audit
+
+**Verdict: ✅ ACCEPT** — operator-requested diagnostic feature. Body honestly cross-references my MCP-arc guidance about not touching src/web/ ("that was for incidental refactors; this is an explicit operator-requested diagnostic feature unrelated to the MCP work"). Sharp test fixture pinning the VWAP math. Three small grills, none blocking.
+
+### Why this is the right shape
+
+The operator's verbatim ask: "I like the drill-down CSV thing... so I can also download something, and hope that close and the option premium in the csv do not match — coz if they do, we are using close."
+
+The diagnostic goal: **let the operator AUDIT the engine's fill-source choice cell-by-cell, without grepping the parquet directly**. Pre-commit, the dashboard surfaced trade outcomes but not the fill-source decision. The operator had no in-app audit path for the VWAP-vs-close question.
+
+This commit delivers a one-click audit:
+1. Open dashboard → drill into a cell → click "⬇ Download cell trades (CSV)" → grep `fill_source=close` to see which trades fell back.
+2. For a post-arc sweep against a turnover-bearing cache: most rows should be `vwap`. Any `close` row is either a pre-arc parquet (no turnover) OR a units-sanity-band rejection (data quality artifact) OR zero-volume.
+
+**This is the asymmetric-conservatism mandate at its most operator-actionable**: surface the engine's audit trail so the operator can verify, not just trust.
+
+### Sharp design moves
+
+- **`_classify_fill_source(entry_px, volume, turnover) -> str`** explicit return values: `'vwap' / 'close' / 'unknown'`. Each branch's condition is testable in isolation.
+- **`vwap_implied = turnover × 100_000 / volume`** matches the engine's `TURNOVER_SCALE_FACTOR = 100_000.0` from 6356b90 verbatim. Same source of truth → no formula drift between engine and audit tool.
+- **CSV columns organized by semantic layer**: trade identity → leg key → entry side → exit side → engine. Logical flow for an analyst reading row-by-row.
+- **Help tooltip names the diagnostic methodology**: "Compare entry_px (engine fill) against entry_vwap_implied (computed from turnover/volume). Equal → engine used VWAP; close-equal → engine fell back. entry_fill_source is the derived verdict." Operator gets the methodology in the tooltip; no separate documentation pass needed.
+- **Test fixture pins the math**: "fixture entry_px = 20 matches turnover=10×100_000/volume=50000 = 20". Anti-regression for any future change to TURNOVER_SCALE_FACTOR.
+- **Empty-cell test**: zero trades → header-only CSV (not blank file). Defensive UX — operator doesn't get a zero-byte download mystery.
+
+### Body honesty: explicit cross-arc justification
+
+> "Reviewer's earlier guidance was 'keep src/web/ untouched during MCP arc to avoid co-resident-surface conflicts' — that was for incidental refactors. This is an explicit operator-requested diagnostic feature unrelated to the MCP work."
+
+Body cross-references my consultation response on the MCP arc verbatim. Explicit acknowledgment that the pivot is intentional and operator-driven, not scope creep. **The right way to handle "cross-arc work" — name the guidance, name the exception, justify the exception explicitly.**
+
+### 🔬 Grill #1 (real, small): 'close' classification collapses 3 distinct cases
+
+`'close'` is returned when:
+1. turnover missing (pre-arc parquet).
+2. volume=0 (no VWAP possible).
+3. VWAP-implied diverges from entry_px (engine's sanity-band rejection).
+
+All three look the same in the CSV. Operator grep'ing for `fill_source=close` can't distinguish "no turnover" from "sanity-rejected" from "zero-volume".
+
+For v1 the binary VWAP-vs-close distinction is probably the main signal the operator wants. **But the diagnostic could be richer**: subdivide into `close.no_turnover` / `close.zero_volume` / `close.sanity_rejected`, OR add a separate `fill_reason` column.
+
+Recommendation: keep binary for now; if the operator later asks "of the close fallbacks, how many were sanity-rejections?", subdivide then. Not blocking.
+
+### 🔬 Grill #2 (real, small): 1e-4 relative tolerance may be too tight for very small prices
+
+`abs(vwap_implied - entry_px) / max(entry_px, ε) < 1e-4`.
+
+For a deep OTM option at ₹0.05, 1e-4 × 0.05 = 5e-6 rupees absolute tolerance. Engine's stored `entry_px` and the recomputed VWAP would need to match to ~6 decimal places. Possibly too tight given that parquet → numpy → pandas → Python float roundtrips accumulate float precision noise.
+
+**Test coverage**: the existing tests use entry_px=20 (substantial). They don't exercise a deep-OTM ₹0.05 case. **Real grill (small)**: add a deep-OTM fixture OR relax the tolerance to something like `max(1e-4 × abs(entry_px), 1e-6)` (relative or absolute, whichever is larger).
+
+Not blocking — most options trades in the universe are at substantial premia where the 1e-4 relative is fine. Worth flagging for deep-OTM-coverage testing.
+
+### 🔬 Grill #3 (small, defensive): no CSV size cap
+
+A typical cell has ~24 trades × ~2 legs = ~48 rows, ~10 KB CSV. Pathological case (wide sweep grid, ~50 expiries × 4 legs for iron_condor) = ~200 rows. Still small. **But no explicit upper bound.**
+
+Consistency-grill: other download paths in the dashboard (none currently) would benefit from a cap pattern. For now, the natural-per-cell bound is fine.
+
+If operator ever asks for "download all cells in one CSV" (multi-cell export), the size cap question becomes load-bearing. Defer until then.
+
+### What I checked
+
+- Verified `vwap_implied = turnover × 100_000 / volume` matches `TURNOVER_SCALE_FACTOR = 100_000.0` from [src/engine/pnl.py:70](src/engine/pnl.py#L70) (the 6356b90 VWAP commit). Same magic number, same source. ✓
+- Cross-referenced the help tooltip's methodology framing against the dashboard's existing caveat-text conventions. Consistent.
+- Tests cover all 4 `_classify_fill_source` return paths + the empty-cell CSV case. Comprehensive.
+- Math: 694 = 687 + 7 new. ✓
+
+### MCP arc state (no change)
+
+This commit is OUT of the MCP arc per body. Sub-arc 3.4 (backtest_one + sweep_windows) still queued.
+
+### Next-commit suggestion
+
+Operator's call between:
+
+1. **`feat(p8.mcp.backtest_one)`** — resume MCP arc, sub-arc 3.4 part 1.
+2. **Further `src/web/`-side diagnostics** — if the operator surfaces more from the CSV-audit workflow (e.g. wants to see units-sanity rejections subdivided per grill #1, or wants a chart of the close-vs-vwap divergence distribution).
+
+If you go with (1), the MCP arc resumes on its clean foundation. If (2), the operator-feedback loop on the new audit feature pays dividends before the MCP work continues.
+
+Standing by.
+
+---
