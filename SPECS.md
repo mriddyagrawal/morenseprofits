@@ -897,3 +897,60 @@ consistently per DESIGN_SPEC §8 wiring constraint.
 The symbol filter passes `list[str]` everywhere. No tab module calls
 `blue_chip(as_of)` directly — Phase-7 user-curated-universe support becomes
 a sidebar text-area → `list[str]` conversion, not a refactor.
+
+## 12. MCP server contract (Phase 8)
+
+The MCP server in `src/mcp/` exposes the project's analytical surface as
+typed read-only tools for Claude Code consumers. Phase 8 implementation
+launched 2026-05-30 per `BUILDER_CONSULTATION.md` (commit 513f88a);
+reviewer-greenlit architecture is documented inline in the consultation
+file and PLAN.md change-log entries dated 2026-05-30.
+
+### 12.1 Transport (frozen for v1)
+
+stdio only. The `__main__` entry point boots `mcp.server.stdio.stdio_server()`
+and binds it to `build_server()`. HTTP+SSE is explicitly deferred.
+
+### 12.2 Sub-arc structure
+
+Each sub-arc owns one file in `src/mcp/` plus a `register_*_tools()`
+factory returning a `list[ToolEntry]`. `build_server()` aggregates them
+into one registry with a single `@server.list_tools()` and
+`@server.call_tool()` pair (the SDK's decorators REPLACE the handler
+on each call, so multi-sub-arc cataloging requires one dispatcher).
+
+### 12.3 Caveats contract (frozen — Q4 reviewer push)
+
+Every aggregated-data response inherits from `CaveatedResponse`
+(`src/mcp/_models.py`) which requires a `caveats: list[str]` field at
+the schema layer. A Pydantic field validator pins `str`-element
+typing. The shared `PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT` constant is
+the single source of truth for the load-bearing phantom-fill-bias
+warning that fires whenever a queried run lacks the `engine_version`
+stamp (`p7.pricing_arc` is the current value, set by 5bc92f3).
+
+`MULTIPLE_COMPARISONS_CAVEAT` is imported verbatim from
+`src.analytics.rank` — same string the dashboard's Export-rule will
+eventually re-export. Both consumers cite the constant by identity.
+
+### 12.4 Engine version stamp (frozen — Q5 reviewer push)
+
+`write_results()` in `src/engine/results.py` stamps the
+`ENGINE_VERSION` string into every sweep parquet's file-level KV
+metadata. `read_run_metadata()` reads it back. MCP's `list_runs` uses
+this stamp to flag pre-arc vs post-arc parquets in its
+`pricing_arc_applied: bool` field; downstream tools (`query_sweep`,
+`cell_summary`, `heatmap`) surface `PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT`
+whenever the queried run's stamp ≠ current `ENGINE_VERSION`. This is
+the architectural answer to "which engine produced this data" — column-
+inspection heuristics break silently when schemas evolve; an explicit
+stamp does not.
+
+### 12.5 Read-only contract (frozen for v1)
+
+Every loader called from an MCP tool runs with `offline=True`. A
+cache miss raises `OfflineCacheMiss` which the SDK surfaces to the
+consumer as a tool-error response. **MCP tools NEVER hit NSE**, and
+NEVER write to disk. Phase 9 (paper-trading writes) and Phase 10
+(broker integration) are the writeable surfaces; Phase 8 is purely
+research.
