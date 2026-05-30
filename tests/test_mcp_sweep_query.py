@@ -325,16 +325,20 @@ def test_register_sweep_query_tools_names_match_expected():
 
 
 def test_server_assembles_all_three_subarcs_without_collision():
-    """Cross-sub-arc assembly across the now-three sub-arcs (universe +
-    spot_options + sweep_query entry points). 6 + 2 = 8 tools."""
+    """Cross-sub-arc assembly across the universe + spot_options +
+    sweep_query entry-point sub-arcs. Superset check (rather than
+    exact-set) so the test stays green as future sub-arcs land more
+    tools (cell_summary, heatmap, backtest_one, etc.)."""
     from src.mcp.server import _collect_tool_entries
     registry = _collect_tool_entries()
-    expected = {
-        "list_universe", "expiries_for", "list_strategies",
+    sweep_query_tools = {"list_runs", "query_sweep"}
+    universe_tools = {"list_universe", "expiries_for", "list_strategies"}
+    spot_options_tools = {
         "get_spot_series", "get_option_series", "get_options_chain",
-        "list_runs", "query_sweep",
     }
-    assert set(registry.keys()) == expected
+    assert sweep_query_tools.issubset(registry.keys())
+    assert universe_tools.issubset(registry.keys())
+    assert spot_options_tools.issubset(registry.keys())
 
 
 # ============================================================

@@ -39,6 +39,7 @@ from mcp.server import Server
 from mcp.types import TextContent, Tool
 
 from src.mcp._models import ToolEntry
+from src.mcp.cell_summary import register_cell_summary_tools
 from src.mcp.spot_options import register_spot_options_tools
 from src.mcp.sweep_query import register_sweep_query_tools
 from src.mcp.universe import register_universe_tools
@@ -56,8 +57,9 @@ def _collect_tool_entries() -> dict[str, ToolEntry]:
     all_entries.extend(register_universe_tools())
     all_entries.extend(register_spot_options_tools())
     all_entries.extend(register_sweep_query_tools())
+    all_entries.extend(register_cell_summary_tools())
     # Future sub-arcs append here:
-    # all_entries.extend(register_cell_summary_tools())
+    # all_entries.extend(register_heatmap_tools())
     # ... etc.
 
     registry: dict[str, ToolEntry] = {}
