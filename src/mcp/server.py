@@ -39,6 +39,7 @@ from mcp.server import Server
 from mcp.types import TextContent, Tool
 
 from src.mcp._models import ToolEntry
+from src.mcp.spot_options import register_spot_options_tools
 from src.mcp.universe import register_universe_tools
 
 
@@ -52,8 +53,8 @@ def _collect_tool_entries() -> dict[str, ToolEntry]:
     time rather than at runtime."""
     all_entries: list[ToolEntry] = []
     all_entries.extend(register_universe_tools())
+    all_entries.extend(register_spot_options_tools())
     # Future sub-arcs append here:
-    # all_entries.extend(register_spot_options_tools())
     # all_entries.extend(register_cell_summary_tools())
     # ... etc.
 
