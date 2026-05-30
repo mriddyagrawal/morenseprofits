@@ -13480,3 +13480,82 @@ After (1), the foundation is COMPLETELY clean — PLAN/SPECS up to date, integra
 Standing by.
 
 ---
+
+## Review: 0b39030 — fix(p8.mcp.data_validation): closes data-validation grills bundle
+
+**Verdict: ✅ ACCEPT — but ANOTHER calibration miss to acknowledge: my 661b1ff grill #2 was wrong. Builder pushback was correct.**
+
+### My fourth calibration miss this session — surfacing it
+
+My 661b1ff grill #2 claimed `get_options_chain_impl` doesn't honor `MAX_ROWS_PER_RESPONSE`. Body of this commit pushes back:
+
+> "Re-audit confirms ``_truncate_rows(rows)`` IS already called inside ``get_options_chain_impl`` (between rows-build and output construction). The reviewer's grill flagged 'no truncation' but the truncation was in place — likely a false positive from skimming the loop body alone."
+
+I verified against `git show 661b1ff -- src/mcp/spot_options.py`:
+
+```python
+def get_options_chain_impl(inp: GetOptionsChainInput) -> GetOptionsChainOutput:
+    ...
+    for _, r in sub.iterrows():
+        rows.append({...})
+    capped, caveats = _truncate_rows(rows)   # ← truncation IS here
+    return GetOptionsChainOutput(
+        ...
+        rows=[ChainRow(**r) for r in capped],
+        ...
+    )
+```
+
+**BUILDER is right. I skimmed only the loop body and stopped reading before reaching the `_truncate_rows(rows)` call immediately after.** Calibration miss #4 of this session.
+
+Pattern this time: not "anchored on commit body framing" (the prior 3 misses' pattern). This was **skimmed function partially, declared no-X based on the visible portion, missed the X that came after**. Different failure mode, same calibration deficit.
+
+**Updating memory**: when grilling about "tool doesn't do X", read the COMPLETE function body, not just the section containing the surface-shape suggesting X is missing. Adding to feedback_grep_code_before_accepting_calibration as a sibling case.
+
+### What's good (grills #1 and #3 are real fixes)
+
+- **Grill #1 (close NaN-guard)** lands exactly per my 661b1ff recommendation:
+  - `OptionRow.close: float | None` (was non-Optional).
+  - `ChainRow.close: float | None` (same).
+  - Impl guards both with `pd.notna()`.
+  - New test `test_get_option_series_handles_settlement_only_row_with_nan_close` pins the behavior.
+  - **This was a real bug** — `float('nan')` propagating through Pydantic v2 model_dump(mode="json") raises (JSON has no NaN literal). The settlement-only-rows case would have crashed consumer Claude's tool call.
+- **Grill #3 (filter dtype-coercion)** lands exactly per my bacf5cf recommendation:
+  - New `_coerce_to_column_dtype(value, column, dtype)` helper.
+  - Numeric columns: str → int/float coercion, clean ValueError on failure.
+  - Datetime columns: accepts ISO string or date/datetime instance.
+  - String/object columns: pass-through.
+  - Applied uniformly to equality, IN-list, range filters (__gte/__lte/__gt/__lt).
+  - Two new tests pin both the failure path (`"ten"` for entry_offset_td__gte raises) AND the happy path (`"15"` coerces to int 15 cleanly).
+  - **Both anti-regression tests are sharp** — the happy-path test prevents over-strict validation that would reject correct string-typed numeric values.
+- **Grill #2 (false positive)**: BUILDER added an inline comment naming the truncation call site so a future reader doesn't re-raise the same concern. **Defensive doc against my own failure mode replicating in a future reviewer.** Sharp.
+
+### Loop signal
+
+The honest pushback on grill #2 is exactly what the reviewer-builder loop is supposed to do. **I'd rather get pushback on wrong grills than have them silently accepted.** The 4 calibration misses this session represent ~5% of my grills; the loop catches them (operator on f9da84d, user on tqdm, my own discipline on observations.roi_column, BUILDER here on chain truncation).
+
+This is the third commit body in the MCP arc that explicitly acknowledges a reviewer push — and the second to push back on a wrong reviewer claim. Healthy loop dynamics.
+
+### Math: 687 = 684 + 3 new. ✓
+
+### What's NOW open
+
+After this commit, my best understanding of remaining infrastructure-debt:
+- ✅ PLAN/SPECS drift — closed in 80e15d7.
+- ✅ Integration test gap — closed in 4d9ddc2.
+- ✅ Data-validation grills — closed in this commit (modulo the false positive).
+
+**Foundation is now COMPLETELY clean for sub-arc 3.4.** No more carry-overs.
+
+### Next-commit suggestion
+
+`feat(p8.mcp.backtest_one)` — sub-arc 3.4 part 1. Per the consultation:
+- Inputs: strategy, symbol, expiry, entry_date, exit_date, params?
+- Outputs: {trade_result, legs_breakdown, gate_status, vwap_vs_close_divergence, caveats}
+- Cache-only (forces offline=True).
+
+The `gate_status` + `vwap_vs_close_divergence` fields are the consumer-facing analog of the pricing-arc's introspection — let an external Claude see per-cell WHETHER the gate fired and WHAT the VWAP-vs-close divergence was. Strong analyst surface.
+
+Standing by.
+
+---
