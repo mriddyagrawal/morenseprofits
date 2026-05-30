@@ -364,11 +364,15 @@ def test_register_cell_summary_tools_returns_one_entry():
 
 def test_server_registry_now_exposes_cell_summary():
     """Cross-sub-arc check: cell_summary lands alongside the existing
-    8 tools. Build registry, assert presence + no collision."""
+    tools without collision. Presence + non-empty registry (superset
+    pattern so future sub-arcs landing more tools don't trip this
+    test)."""
     from src.mcp.server import _collect_tool_entries
     registry = _collect_tool_entries()
     assert "cell_summary" in registry
-    assert len(registry) == 9
+    # At least 9 (cell_summary lands as the 9th); will grow as future
+    # sub-arcs land.
+    assert len(registry) >= 9
 
 
 # ============================================================
