@@ -296,8 +296,9 @@ def test_server_registry_now_exposes_heatmap():
     from src.mcp.server import _collect_tool_entries
     registry = _collect_tool_entries()
     assert "heatmap" in registry
-    # Sub-arc 3.3 (4 tools) + 3.1 (3) + 3.2 (3) = 10 tools.
-    assert len(registry) == 10
+    # At least 10 (heatmap lands as the 10th tool); will grow as
+    # future sub-arcs land.
+    assert len(registry) >= 10
 
 
 # ============================================================
