@@ -12724,3 +12724,128 @@ If you push through to (3), grills #1 and #2 compound. Operator's call.
 Standing by.
 
 ---
+
+## Review: 661b1ff — feat(p8.mcp.spot_options): Commit 3 of MCP arc — sub-arc 3.2
+
+**Verdict: ✅ ACCEPT** — operator chose to push through (per my "either way" framing). Quality stays high; the LOAD-BEARING pre-pricing-arc caveat on `get_option_series` is the standout move. Two NEW real grills (close-could-be-NaN, `get_options_chain` doesn't truncate); 2 carry-overs compound.
+
+### What's notably good
+
+- **LOAD-BEARING pre-pricing-arc caveat on `get_option_series`** is the sharpest move in this commit. When `turnover` is ABSENT (column missing) OR universally NaN with rows present, the response carries: "Contract was cached before the p7.pricing_arc turnover ingest landed; turnover is unavailable so VWAP cannot be reconstructed. Engine fill-price for any cell touching this contract falls back to close." **This is the consumer-facing analog of the ENGINE_VERSION metadata stamp** — propagates the engine-version semantics into per-contract data the consumer is reading. ✓ Exactly the Q4-style honesty surface I want.
+- **`turnover_all_nan` detection checks BOTH cases** (column missing OR all-values-NaN-with-rows). Defensive against the two distinct legacy-parquet failure modes.
+- **`Literal["CE", "PE"]` input validation**: Pydantic rejects bad option_type at the schema layer. Consumer can't pass "C" or "Call" by accident.
+- **Default window resolution for `get_option_series`**: `from_date = expiry - 120 days`, `to_date = expiry`. Matches the contract's typical full lifetime — operator doesn't need to specify the obvious.
+- **`MAX_ROWS_PER_RESPONSE = 10_000`** with explicit truncation caveat fired by `_truncate_rows()`. Consumer can't silently get a partial frame and treat it as complete.
+- **`offline=True` on every loader call**: consistent with sub-arc 3.1. Read-only contract enforcement at the data-layer call, not just docs.
+
+### 🔬 Grill #1 (NEW, real): `close` is non-Optional but could be NaN in settlement-only rows
+
+```python
+class OptionRow(BaseModel):
+    ...
+    close: float          # ← NOT Optional
+    ...
+```
+
+In `get_option_series_impl`:
+```python
+"close": float(r["close"]),  # no pd.notna guard
+```
+
+For most options rows, `close` is non-NaN. But:
+- Settlement-only rows (NSE publishes `settle_price` with `close` missing for some expiry days).
+- Truly zero-trading-volume contracts where bhavcopy gives `settle_price` but no `close`.
+
+If `pd.notna(r["close"])` is False, `float(r["close"])` → `float('nan')`. Pydantic v2's `model_dump(mode="json")` raises on NaN in JSON mode (or produces invalid JSON like `NaN`). Consumer Claude sees a tool-error or malformed response.
+
+**Recommendation**: either (a) make `close` Optional and route to None on NaN, OR (b) filter the row entirely (skip settlement-only rows), OR (c) add explicit NaN → settlement-only-row caveat. (a) is the simplest:
+
+```python
+class OptionRow(BaseModel):
+    close: float | None = None  # ← Optional
+```
+
+with the impl:
+```python
+"close": float(r["close"]) if pd.notna(r.get("close")) else None,
+```
+
+Same pattern already used for `open`/`high`/`low`/`ltp`/`settle_price`. **3 LOC fix.**
+
+### 🔬 Grill #2 (NEW, real): `get_options_chain` doesn't honor MAX_ROWS_PER_RESPONSE
+
+The other two tools use `_truncate_rows()`. `get_options_chain_impl` iterates `sub.iterrows()` and appends directly:
+
+```python
+for _, r in sub.iterrows():
+    rows.append({...})  # no truncation
+```
+
+A single bhavcopy day for a large symbol (say RELIANCE with many monthly expiries) could yield 100+ strikes × 2 (CE/PE) × multiple expiries = potentially 1000+ rows. **Not currently capped.**
+
+For one day with expiry-filter, this is fine. Without expiry-filter, a heavy symbol could blow past 10K rows.
+
+**Recommendation**: apply `_truncate_rows()` consistently. ~2 LOC at the bottom of the impl:
+```python
+rows_capped, caveats = _truncate_rows(rows)
+return GetOptionsChainOutput(..., rows=[ChainRow(**r) for r in rows_capped], caveats=caveats)
+```
+
+### 🔬 Grill #3 (carry-over, now louder): MCP-protocol integration test STILL missing
+
+Now 2 sub-arcs of tools registered (6 total: 3 universe + 3 spot_options). The integration test gap I flagged in b42d4c2 and 0cc0b2c grows by every sub-arc.
+
+The unit tests cover impl + registry assembly + JSON round-trip via `model_dump`. **None test the actual MCP protocol** (stdio_server() spinning up, JSON-RPC framing, the SDK's `mcp.types.Tool` shape matching consumer expectations).
+
+The "single integration scaffold lands once, benefits all 11 remaining sub-arcs" argument from b42d4c2 grill #2 is now ~30% spent. Suggested test:
+
+```python
+@pytest.mark.asyncio
+async def test_mcp_protocol_call_get_spot_series_via_dispatcher():
+    """End-to-end through the SDK's call_tool dispatcher with a real
+    Pydantic-validated arguments dict + real serialization."""
+    server = build_server()
+    result = await server._call_tool(
+        "get_spot_series",
+        {"symbol": "RELIANCE", "from_date": "2024-01-01", "to_date": "2024-01-31"},
+    )
+    assert result[0].type == "text"
+    payload = json.loads(result[0].text)
+    assert "rows" in payload and "caveats" in payload
+```
+
+This isn't full stdio_server() boot but it IS through the actual `_call_tool` dispatcher. Pins the JSON arguments → Pydantic input → impl → output → JSON serialization roundtrip without spinning up a real subprocess.
+
+### 🔬 Grill #4 (carry-over, now louder): PLAN/SPECS drift now 4 commits deep
+
+5bc92f3 + b42d4c2 + 0cc0b2c + 661b1ff = 4 MCP-arc commits, zero PLAN/SPECS updates.
+
+Pricing arc's f6ced30 was 82 LOC after 3 commits of drift. Linear extrapolation puts the eventual MCP cleanup at ~100+ LOC NOW; at 13-commit completion, projected ~400 LOC.
+
+Strong recommendation (fourth time): land `docs(plan + specs.mcp_arc_progress)` before Commit 4. Each commit you delay makes the eventual cleanup larger.
+
+### What I checked
+
+- Verified `_truncate_rows` is called in `get_spot_series` ✓ and `get_option_series` ✓ but NOT in `get_options_chain` ✗. Sourced grill #2.
+- Confirmed `close: float` in `OptionRow` is NOT Optional; checked impl for `pd.notna` guard on close — NONE present. Sourced grill #1.
+- Cross-checked `turnover_all_nan` detection logic: `not turnover_present or (turnover_all_nan and len(rows) > 0)`. ✓ Correct handling of empty-rows case (won't fire caveat on empty data).
+- Math: 620 = 605 + 15 new. ✓
+
+### Pricing-arc lesson applied?
+
+Still drifting on PLAN/SPECS. The reviewer-builder loop's discipline on tests + design is excellent; the documentation-discipline part is the gap.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.spot_options.close_nan + chain_truncation)`** — bundle grills #1 + #2 as a small follow-up. ~5 LOC change. Closes both real bugs before they're spread across more tools.
+2. **`test(p8.mcp.protocol_integration)`** — close grill #3 with the e2e scaffold. ~30 LOC.
+3. **`docs(plan + specs.mcp_arc_progress)`** — close grill #4. ~50 LOC.
+4. **`feat(p8.mcp.cell_summary)`** — Commit 4 of MCP arc per the roadmap (sub-arc 3.3 part 1).
+
+If you bundle (1) + (2) + (3) into a "consolidate" commit before (4), the foundation is clean. Otherwise grills compound.
+
+Standing by.
+
+---
