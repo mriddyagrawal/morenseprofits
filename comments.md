@@ -13803,3 +13803,81 @@ Alternative placement: `src/engine/fill_audit.py` (new module). Cleaner separati
 Standing by.
 
 ---
+
+## Review: 96a506c — feat(p8.mcp.sweep_windows): sub-arc 3.4 closes (12/16 tools)
+
+**Verdict: ✅ ACCEPT** — sub-arc 3.4 closes. Reuses `backtest_one_impl` for single-source-of-truth pricing. Sharp `skip_summary: dict[str, int]` keyed by gate_status. Two small grills (stat-aggregation duplication, pre-arc-caveat-omission undocumented), neither blocking.
+
+### Sharp design moves
+
+- **Reuses `backtest_one_impl` directly**: single source of truth for the trade-pricing path. No re-implementation of strategy lookup, spot resolution, or VWAP/close fallback. **Consistent semantics across single-trade and grid replays.** ✓
+- **`skip_summary: dict[str, int]` keyed by gate_status**: consumer sees "22 priced + 2 IlliquidLegError + 1 OfflineCacheMiss" in one structured field. Same shape as backtest_one's gate_status string but aggregated per cell. Sharp programmatic-audience API.
+- **`MAX_GRID_TRADES = 500` cap** explicitly framed: "we explicitly don't want this tool to BE the wide sweep." Right boundary — interactive Claude-driven research, not batch.
+- **Cap caveat names the alternative path**: "use the wide-sweep script (scripts/p7_wide_sweep.py) + query via cell_summary / heatmap for full-grid analysis." Operator gets remediation route.
+- **Defensive `entry_date >= exit_date` post-resolution check**: belt-and-suspenders for the "last trading day" edge case where offset_trading_days can collapse to entry == exit. Named in inline comment.
+- **LOAD-BEARING `MAX_GRID_TRADES` cap test pinned**: future contributor can't quietly bump the cap without explicit test update.
+- **Honest inline justification for `_bottom_alpha_mean` duplication**: "Mirror of cell_summary's CVaR helper. Inline to avoid an extra cross-module import for one function." Acknowledges the trade-off without pretending it's not a duplication.
+
+### 🔬 Grill #1 (real, small): stat aggregation duplicates cell_summary's `_compute_stats`
+
+`_aggregate_priced_trades` (this commit) and `_compute_stats` (cell_summary) compute the same stat block (n, win_rate, median/mean/std ROI, CVaR-5%, total_net_pnl). Different INPUT shapes:
+- `_aggregate_priced_trades(priced: list[tuple[float, float]])` — list of (roi, pnl) tuples.
+- `_compute_stats(cell: pd.DataFrame)` — DataFrame with roi_pct / net_pnl columns.
+
+Shared logic: the math. Different: the data-extraction layer.
+
+**Recommendation**: extract a `compute_cell_stats(rois: np.ndarray, pnls: np.ndarray) -> CellStats` helper into either:
+- `src/analytics/aggregate.py` (where MIN_N_FOR_RANKING lives).
+- `src/mcp/_stats.py` (new module).
+
+Both call sites adapt their input to (rois, pnls) and call the helper. The CellStats schema becomes the single source of truth for "the per-cell stat block".
+
+Same compounding hazard as the classifier duplication from c3545cc grill #1 — defensible at 2 copies, fragile at 3. The next MCP commit (sub-arc 3.5 `skip_summary` / `data_quality`) MIGHT need similar stats; if so, this becomes the third copy.
+
+### 🔬 Grill #2 (real, small): pre-pricing-arc-caveat-omission not documented in this module
+
+backtest_one's module docstring has an explicit section:
+
+> "Pre-pricing-arc caveat NOT emitted here. backtest_one runs the CURRENT engine (with the gate + VWAP + units assertion). Whatever cache the contract files have, the engine's behavior is post-arc."
+
+sweep_windows ALSO doesn't emit the pre-arc caveat (because it routes through backtest_one). **But this commit's docstring doesn't mention it.** A future reader checking why sweep_windows doesn't surface the caveat (that they see in query_sweep / cell_summary / heatmap) would have to trace through backtest_one to figure out why.
+
+**Recommendation**: add the same explicit "Pre-pricing-arc caveat NOT emitted here" section to the sweep_windows module docstring, or even a 1-liner: "Same as backtest_one — runs current engine; if pre-arc baseline needed, use cell_summary against a pre-arc sweep parquet." Anti-confusion documentation.
+
+### Minor observations (non-grills)
+
+- **`_bottom_alpha_mean` + `CVAR_ALPHA = 0.05`** are duplicated with cell_summary. Body's inline justification is acceptable for v1. If a third consumer needs them, time to centralize (same pattern as the classifier centralization in b29d55e).
+- **"Cap by taking the densest cells first"** comment doesn't match the impl — actual cap takes the first N pairs (which after sorting are the highest-entry/lowest-exit, which IS the densest, but the comment phrasing is slightly off). Cosmetic.
+
+### What I checked
+
+- Verified `backtest_one_impl` is called per-trade with offline=True propagation. ✓
+- Confirmed the `entry > exit` filter at grid-construction PLUS the `entry_date >= exit_date` post-resolution check both fire. Belt-and-suspenders correct.
+- Math: 723 = 713 + 10 new. ✓
+
+### Sub-arc 3.4 closes — 12 of 16 tools landed
+
+| Sub-arc | Status | Tools |
+|---|---|---|
+| 3.1 universe | ✅ | 3 (list_universe, expiries_for, list_strategies) |
+| 3.2 time-series | ✅ | 3 (get_spot_series, get_option_series, get_options_chain) |
+| 3.3 sweep queries | ✅ | 4 (list_runs, query_sweep, cell_summary, heatmap) |
+| 3.4 backtest replay | ✅ | 2 (backtest_one, sweep_windows) |
+| 3.5 diagnostics | pending | skip_summary + data_quality |
+| 3.6 research helpers | pending | compare_cells + bootstrap_ci |
+| 3.7 docs | pending | — |
+
+4 more tools + the docs commit per the consultation roadmap.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`feat(p8.mcp.skip_summary)`** — sub-arc 3.5 part 1. The motivational tool from 513f88a consultation ("data_quality(run_id, 'liquidity_by_entry_offset') makes the analysis a one-tool call"). High operator value.
+2. **`feat(p8.mcp.data_quality)`** — sub-arc 3.5 part 2. The other motivational tool.
+
+If grill #1 compounds when (1) needs the same stat aggregation: bundle the `compute_cell_stats` extraction with sub-arc 3.5's first commit.
+
+Standing by.
+
+---
