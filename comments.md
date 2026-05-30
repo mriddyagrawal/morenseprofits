@@ -12962,3 +12962,138 @@ If (1) gets pushed past Commit 5, the cleanup commit at arc end will be the larg
 Standing by.
 
 ---
+
+## Review: 3264f37 — feat(p8.mcp.cell_summary): Commit 5 of MCP arc — sub-arc 3.3 (3 of 4)
+
+**Verdict: ✅ ACCEPT with one significant calibration miss to surface from 33f19ae** — the analyst's heaviest single-cell tool. Q3 + both Q4 halves acted on. One real grill that's a CARRY-OVER bug from the p7.expiry_roi arc (which I missed during 33f19ae review — see below). Three small grills + carry-overs.
+
+### What's notably good
+
+- **Frozen `method` string on BootstrapCIResult**: `"percentile bootstrap, B=1000, seed=0, alpha=0.05"`. Consumer Claude can cite the method EXACTLY. The first MCP tool that explicitly frames its own methodology in the response — operationalizes the asymmetric-conservatism mandate on a per-tool basis.
+- **`std_roi_pct` description explicitly names the bias %**: "~11% at n=5, ~5% at n=10, ~2.5% at n=20." Self-documenting honesty surface — consumer doesn't need to dig SPECS for the bias.
+- **`mean_roi_pct` description encodes the f9da84d skew-direction lesson**: "For left-skewed short-vol P&L, mean < median is structural — the gap measures the drag from rare large losses." **THIS is exactly the framing I had backwards in f9da84d.** The schema doc-surfaces the correct interpretation. ✓
+- **Threshold-boundary test** (`min-N caveat silent at threshold`) is the inverse-anti-regression pattern. Pins the boundary explicitly.
+- **No-trades caveat names BOTH failure modes** ("outside the sweep grid OR every candidate trade was skipped (check skip_summary)"). Consumer gets a remediation path.
+- **`include_per_trade` toggle**: stat-only queries can omit the heavy list. Saves consumer Claude's context. ✓
+- **Q3 schema invariants tests** (test_output_schema_pins_required_field_set, test_input_schema_pins_cell_key_required) are exactly what I asked for in Q3.
+
+### 🚨 Grill #1 (real, calibration miss from 33f19ae): observations.py reads `roi_pct_annualized` but threshold is per-trade-calibrated
+
+This is a CARRY-OVER bug I should have caught in my 33f19ae review. cell_summary.py inheriting `interpret_cell_stats` semantics surfaces it again.
+
+**The bug**:
+- `src/analytics/observations.py:79`: `roi = rows["roi_pct_annualized"].dropna()` (reads ANNUALIZED column).
+- `HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS = 3.0` per 33f19ae's recalibration (claimed "per-trade scale").
+- Results parquet has BOTH `roi_pct` (per-trade) AND `roi_pct_annualized` (annualized) columns.
+- The observations module's threshold (3.0) is too sensitive when applied to annualized data (where typical mean-median gaps are 5-30+ pts).
+
+**What 33f19ae's commit body claimed**: "Post p7.expiry_roi, the observations module is fed PER-TRADE ROI distributions" → recalibrated threshold 20.0 → 3.0.
+
+**What actually happened**: 33f19ae only updated the threshold. It DID NOT update the column read. observations.py still reads `roi_pct_annualized`.
+
+**My miss**: my 33f19ae review accepted "Drops to 3.0 (slightly conservative)" without checking that the observations module's column-read was switched from `roi_pct_annualized` to `roi_pct`. Same pattern as f9da84d (skew direction) and 6ccc820 (tqdm fake-precision) — anchored on commit body framing, didn't grep the actual code.
+
+**Operational impact**:
+- Dashboard callouts have been over-firing since 33f19ae landed (heavy-tail and instability detectors fire on annualized data with per-trade-calibrated threshold).
+- cell_summary.py now propagates the same bug to MCP consumers.
+- External Claudes querying cell_summary will see observations that fire incorrectly on most cells, making them noise rather than signal.
+
+**Two ways to fix**:
+- (a) Update observations.py to read `roi_pct` instead of `roi_pct_annualized`. Aligns with 33f19ae's stated intent.
+- (b) Revert HEAVY_TAIL_MEAN_MINUS_MEDIAN_PTS back to 20.0. Reflects what's actually happening (threshold matches annualized scale).
+
+(a) is the right answer per 33f19ae's commit body — the calibration intent was per-trade. The column-read miss was a 33f19ae mistake.
+
+**Recommendation**: `fix(observations.roi_column)` — switch column read to `roi_pct`, add a behavior test pinning that the threshold values actually fire on the right magnitudes. Land BEFORE the MCP arc continues so cell_summary's behavior in production matches what consumers expect.
+
+**Calibration logging**: this is my third "anchored on commit body, didn't check code" miss. Pattern is clear. Adding to memory.
+
+### 🔬 Grill #2 (real, small): pre-arc caveat copy-paste compounds
+
+The same pre-arc phantom-fill caveat string now appears in 3 places:
+- `bacf5cf::list_runs_impl` (top-level summary)
+- `bacf5cf::query_sweep_impl` (per-call)
+- `3264f37::cell_summary_impl` (per-call)
+
+When `feat(p8.mcp.heatmap)` lands, that'll be 4. Future-proof now via a module-level constant in `src/mcp/_models.py` or `src/mcp/_caveats.py`:
+
+```python
+PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT = (
+    "Run was generated BEFORE the p7.pricing_arc landed; ..."
+)
+```
+
+If the wording ever needs updating (operator decides the message is too long, or wants to reference a newer analysis), one place to change. ~5 LOC fix.
+
+### 🔬 Grill #3 (real, small): bootstrap method string can drift from actual call
+
+```python
+class BootstrapCIResult(BaseModel):
+    method: str = Field(
+        default="percentile bootstrap, B=1000, seed=0, alpha=0.05",
+        ...
+    )
+
+def _compute_bootstrap_ci(cell):
+    ...
+    point, lo, hi = bootstrap_ci(roi, B=1000, seed=0, alpha=0.05)
+```
+
+The default `method` string is hardcoded. If a future commit changes `_compute_bootstrap_ci` to use `B=500` or `seed=42`, the method string in the response still says "B=1000, seed=0" — **silent lie**.
+
+**Recommendation**: parameterize. Use f-string in the constructor:
+
+```python
+B = 1000
+SEED = 0
+ALPHA = 0.05
+
+return BootstrapCIResult(
+    ...,
+    method=f"percentile bootstrap, B={B}, seed={SEED}, alpha={ALPHA}",
+)
+```
+
+Single source of truth; the string can't lie because it's constructed from the actual params.
+
+### 🔬 Grill #4 (real, small): no size cap on `per_trade` list
+
+`get_spot_series` and `get_option_series` cap at `MAX_ROWS_PER_RESPONSE = 10_000`. `query_sweep` caps at `MAX_QUERY_SWEEP_ROWS = 10_000`. `cell_summary` doesn't cap `per_trade`.
+
+Typical cell has ~24 trades. Worst-case (wide sweep grid, ~50 expiries) ~50 trades. Well within reason. **But consistency matters**: future heavy-cell case could push past expectation.
+
+~3 LOC fix: truncate at the same cap with explicit caveat. Or — since this list is naturally bounded by sweep-grid size — document the bound explicitly.
+
+### 🔬 Grill #5 (carry-over, even louder): MCP-protocol integration test still missing
+
+6 sub-arcs deep, 9 tools registered. Now ~50% of the consultation's roadmap landed without the integration scaffold.
+
+### 🔬 Grill #6 (carry-over, even louder): PLAN/SPECS drift now 6 commits deep
+
+5bc92f3 + b42d4c2 + 0cc0b2c + 661b1ff + bacf5cf + 3264f37 = 6 MCP-arc commits, zero docs updates.
+
+Linear extrapolation: ~170 LOC of reactive cleanup NOW, ~370+ at arc end.
+
+### Calibration memory update
+
+This is my third "anchored on commit body, didn't grep code" miss. f9da84d skew direction → operator+BUILDER corrected. 6ccc820 fake-precision tqdm → user pushed back. 33f19ae column-read miss → surfaced here via cell_summary inheriting the bug.
+
+Pattern: when a commit body claims "X is calibrated for Y", I accept the framing without verifying the data flow. Need a discipline rule: when a calibration claim involves a column name or a data shape, grep the actual code path before accepting.
+
+Adding to memory.
+
+### Math: 660 = 641 + 19. ✓
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(observations.roi_column)`** — switch column read to `roi_pct`. **Blocks cell_summary from propagating wrong observations to MCP consumers.** ~5 LOC + 1 test. Time-critical because the dashboard ALSO has this bug; both surfaces (dashboard + MCP) inherit the fix.
+2. **`fix(p8.mcp.consolidate_grills)`** — bundle 661b1ff grills + bacf5cf grill #1 + this commit's grills #2-#4 + integration test scaffold + PLAN/SPECS docs. ~100-150 LOC.
+3. **`feat(p8.mcp.heatmap)`** — sub-arc 3.3 part 4. The cross-axis analytical surface.
+
+(1) is the only NEW grill that ships a behavior bug. Closing it before more tools inherit the broken observations is the right call.
+
+Standing by.
+
+---
