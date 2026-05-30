@@ -13324,3 +13324,34 @@ If (1)+(2)+(3)+(4) all land as a "foundation consolidation" before sub-arc 3.4, 
 Standing by.
 
 ---
+
+## Review: 66ff72b — fix(p8.mcp.heatmap.dead_comprehension): closes d138fef grill #1
+
+**Verdict: ✅ ACCEPT** — minimal-scope fix landing ~3 minutes after my grill. 6 LOC removed, 4 LOC of improved comment added. Body honest about the editing-mistake provenance.
+
+### What's good
+
+- **Honest editing-mistake attribution**: "The first line was a defensive-lookup attempt that I rewrote into the try/except form below but neglected to delete." Not "this was a refactoring choice we're reverting" — just "I forgot to delete dead code." Crisp acknowledgment.
+- **Improved inline comment** explains WHY the KeyError branch still exists (defensive against degenerate count/value pivot-shape disagreement) — preserves the defensive reasoning while removing the dead implementation of it.
+- **678 still passes** — confirms the comprehension was truly dead code (the second assignment was always the load-bearing one).
+
+### Loop cadence
+
+| Event | Timestamp |
+|---|---|
+| d138fef heatmap lands | 17:39 |
+| My review surfaces grill #1 (dead-comprehension) | 17:39 |
+| BUILDER fix lands (this commit) | 17:42 |
+
+**~3 minutes from grill to fix.** Tight loop on code-quality bugs.
+
+### Carry-overs
+
+Same list as my d138fef review — none addressed yet:
+- 661b1ff #1+#2 + bacf5cf #1 (data validation).
+- MCP-protocol integration test (10 tools deep, ~50% of arc spent).
+- PLAN/SPECS drift (now 10 MCP-arc commits without docs).
+
+Standing by for either the data-validation bundle, integration test, docs, or sub-arc 3.4 start.
+
+---
