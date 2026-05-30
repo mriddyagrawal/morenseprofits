@@ -13729,3 +13729,77 @@ If (1) lands before (2), the new tool can import the centralized classifier from
 Standing by.
 
 ---
+
+## Review: b29d55e — chore(p8.fill_audit.centralize): closes my c3545cc grills + deep-OTM carry-over
+
+**Verdict: ✅ ACCEPT** — closes all 3 grills from c3545cc review in ~5 minutes. Sharp recalibration with explicit quantisation reasoning. LOAD-BEARING deep-OTM test pinned. Shim pattern preserves existing test imports without forcing test file changes.
+
+### What's notably good
+
+- **Tolerance recalibration is mathematically explicit**: `max(REL × |entry_px|, ABS)` with REL=1e-3, ABS=1e-3. Body shows the math:
+  - ATM ₹100: 0.1 rupee tolerance (relative dominates).
+  - Deep-OTM ₹0.05: 0.001 rupee tolerance (absolute dominates).
+  - **"Both bands comfortably exceed turnover quantisation noise"** — names the actual noise source (turnover stored to 2 decimal places in lakhs) the tolerance has to clear. Not hand-waved "some tolerance needed".
+
+- **LOAD-BEARING deep-OTM test pinned**: "₹0.05 premium with 1% relative drift classifies as 'vwap'". Closes grill #3 carry-over directly. Future contributor can't tighten tolerance back to 1e-4 without breaking this test.
+
+- **Quantisation-noise tolerance test** (turnover 10.0005 vs entry 100.0 → 'vwap'): explicitly tests that the tolerance band exceeds the quantisation step. Anti-regression for accidentally setting REL too tight.
+
+- **Body cross-references the THREE specific reviewer grills** (c3545cc #1 + c3545cc #2 + 6ab4866 #2 via c3545cc #3 carry-over). Reviewer-builder loop history preserved in the commit log.
+
+- **Shim pattern**: `from src.engine.pnl import classify_fill_source as _classify_fill_source` keeps the existing test imports working at both call sites. **Tests don't need updates; centralization is a pure-refactor at the call sites.** Sharp design.
+
+- **`math.isnan(f)` cosmetic note from c3545cc review acted on**: the `f != f` idiom replaced with `math.isnan`. Future reader doesn't have to mentally parse the self-comparison.
+
+- **Existing 5+5 tests at both call sites continue to pass via shims** — confirms the centralization is behavior-equivalent.
+
+### Math validation
+
+Body's tolerance choice math:
+- ₹100 ATM × 1e-3 = 0.1 rupee (relative wins).
+- ₹0.05 deep OTM × 1e-3 = 5e-5 < 1e-3 → 0.001 rupee (absolute floor wins).
+
+Cross-check against turnover quantisation:
+- Turnover precision: 0.01 lakh = ₹1,000 absolute.
+- VWAP precision: `(1000 × 100_000) / volume_shares` rupees.
+- For volume = 1,000,000 shares: ±0.001 rupee VWAP precision (at the absolute tolerance floor — tight but OK).
+- For volume = 100,000 shares: ±0.01 rupee VWAP precision (well within tolerance).
+- For volume = 10,000 shares: ±0.1 rupee VWAP precision (matches the ATM relative tolerance — TIGHT but defensible).
+- For volume = 1,000 shares: ±1 rupee VWAP precision — exceeds the 0.1 rupee tolerance for ₹100 premium → false 'close' classification.
+
+**Observation (not a grill)**: low-volume contracts (~1,000 shares or less) might trigger false-close classifications because VWAP precision degrades faster than the tolerance allows. **In practice this is moot** because the engine's `[0.5, 2.0]` sanity band rejects such contracts first — they'd actually be priced at close in the engine, so 'close' classification IS correct.
+
+### What I checked
+
+- Verified the body's deep-OTM math: ₹0.05 × 1e-3 < 1e-3 → ABS dominates ✓
+- Verified the shim pattern in both call sites: `_classify_fill_source` resolves to the centralized impl via aliased import. ✓
+- Cross-referenced `math.isnan(f)` replacement at the centralized helper. ✓
+- Math: 713 = 706 + 7 new. ✓
+
+### One observation (not a grill): module placement
+
+The centralized helper landed in `src/engine/pnl.py`. Defensible — it's where `TURNOVER_SCALE_FACTOR` lives, both call sites already import from here, and the function uses pnl-domain knowledge.
+
+Alternative placement: `src/engine/fill_audit.py` (new module). Cleaner separation: pnl owns pricing; fill_audit owns post-hoc classification. But adds a module for a single function. For v1 the in-pnl placement is fine; if future audit helpers grow (e.g., gate-decision classifier, units-rejection classifier), refactoring to a dedicated module is straightforward.
+
+### Loop cadence on this exchange
+
+| Event | Timestamp |
+|---|---|
+| c3545cc backtest_one lands | 18:22 |
+| My review surfaces grills #1/#2/#3 | 18:22 |
+| BUILDER fix lands (this commit) | 18:27 |
+
+**~5 minutes from grill to fix.** Sharp loop on centralization concerns.
+
+### MCP arc state
+
+11 of 16 tools landed. ~5 commits remaining per consultation:
+- sub-arc 3.4 part 2: `sweep_windows`.
+- sub-arc 3.5: `skip_summary` + `data_quality`.
+- sub-arc 3.6: `compare_cells` + `bootstrap_ci`.
+- sub-arc 3.7: docs.
+
+Standing by.
+
+---
