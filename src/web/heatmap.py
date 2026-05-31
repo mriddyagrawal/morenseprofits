@@ -30,7 +30,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.analytics.aggregate import MIN_N_FOR_RANKING
+from src.analytics.cell_stats import compute_cell_stats
 from src.analytics.heatmap import pivot_counts, pivot_cvar, pivot_window
+from src.analytics.rank import MULTIPLE_COMPARISONS_CAVEAT
+from src.engine.results import ENGINE_VERSION, read_run_metadata
+from src.mcp._models import PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
 from src.web._filter import filter_pair
 from src.web._format import format_pct
 from src.web.empty_state import render_empty
@@ -958,28 +962,209 @@ def render_compare_cells(
     )
 
 
+def _build_rule_md(
+    *,
+    strategy: str,
+    symbol: str,
+    entry_offset_td: int,
+    exit_offset_td: int,
+    rows: pd.DataFrame,
+    run_id: str | None,
+    engine_version: str | None,
+) -> bytes:
+    """Build the deployment-ready Markdown rule for one cell.
+
+    LOAD-BEARING CONTRACT (anti-regression test pin):
+    ``MULTIPLE_COMPARISONS_CAVEAT`` MUST appear verbatim under a
+    ``## Selection bias warning`` H2 — operator picking one cell from
+    a ~2.25M-cell wide-sweep grid has introduced selection bias the
+    per-rule backtest can't capture. Re-export the constant; don't
+    paraphrase.
+
+    PRE-ARC CAVEAT: when ``engine_version`` differs from
+    ``ENGINE_VERSION``, the .md also re-emits
+    ``PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT`` verbatim — same trigger
+    the MCP tools use.
+    """
+    stats = compute_cell_stats(
+        rois=rows["roi_pct"].to_numpy(dtype=float),
+        pnls=rows["net_pnl"].to_numpy(dtype=float),
+    )
+
+    def _fmt_pct(v: float | None) -> str:
+        return f"{v:.2f}%" if v is not None else "—"
+
+    def _fmt_inr(v: float) -> str:
+        return f"₹{v:,.0f}"
+
+    hold_days = int(entry_offset_td) - int(exit_offset_td)
+    pre_arc_block = ""
+    if engine_version is not None and engine_version != ENGINE_VERSION:
+        pre_arc_block = (
+            "\n## Pre-pricing-arc warning\n\n"
+            f"{PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT}\n"
+        )
+
+    provenance_lines = [
+        f"- **run_id**: `{run_id}`" if run_id else "- **run_id**: _(unknown)_",
+        f"- **engine_version**: `{engine_version}`" if engine_version
+            else "- **engine_version**: _(unstamped — pre-arc parquet likely)_",
+    ]
+
+    md = (
+        f"# Trading rule — {strategy} × {symbol}\n"
+        f"\n"
+        f"## Selection bias warning\n"
+        f"\n"
+        f"{MULTIPLE_COMPARISONS_CAVEAT}\n"
+        f"\n"
+        f"## Rule specification\n"
+        f"\n"
+        f"- **Strategy**: `{strategy}`\n"
+        f"- **Symbol**: `{symbol}`\n"
+        f"- **Entry**: T-{entry_offset_td} (entry_offset_td={entry_offset_td})\n"
+        f"- **Exit**: T-{exit_offset_td} (exit_offset_td={exit_offset_td})\n"
+        f"- **Hold**: {hold_days} trading days\n"
+        f"\n"
+        f"## Historical performance ({stats.n} expiries)\n"
+        f"\n"
+        f"- **Trades**: n={stats.n}\n"
+        f"- **Win rate**: {_fmt_pct(stats.win_rate_pct)}\n"
+        f"- **Median ROI per trade**: {_fmt_pct(stats.median_roi_pct)}\n"
+        f"- **Mean ROI per trade**: {_fmt_pct(stats.mean_roi_pct)}\n"
+        f"- **Std ROI per trade (ddof=0)**: {_fmt_pct(stats.std_roi_pct)}\n"
+        f"- **CVaR-5% (tail mean ROI)**: {_fmt_pct(stats.cvar_5_roi_pct)}\n"
+        f"- **Total net P&L**: {_fmt_inr(stats.total_net_pnl)}\n"
+        f"\n"
+        f"## Provenance\n"
+        f"\n"
+        + "\n".join(provenance_lines) + "\n"
+        + pre_arc_block
+    )
+    return md.encode("utf-8")
+
+
 def render_export_rule(
     df: pd.DataFrame,
     *,
     strategy: str | None,
     symbol: str | None,
 ) -> None:
-    """Export-rule mode (STUB). Implementation lands in
-    feat(p7.heatmap.export).
+    """Export-rule mode — per-cell .md trading rule + per-cell CSV
+    trade list. Reads the selected cell from
+    ``st.session_state['mp_heatmap_selected_cell']`` (same selection
+    mechanism as the drill-down mode).
 
-    REVIEWER CONSTRAINT (do not relax in the follow-up commit):
-    the exported .md MUST include MULTIPLE_COMPARISONS_CAVEAT from
-    src.analytics.rank as a top-level "## Selection bias warning"
-    section. Operator selecting one cell from ~3,600 candidate
-    (strategy × symbol × entry × exit) rules has introduced selection
-    bias the per-rule backtest doesn't capture. Re-export the constant;
-    don't paraphrase or duplicate. No download path without it.
+    Two downloads side-by-side:
+    - **rule_{strategy}_{symbol}_T-{e}_T-{x}.md** — deployment-ready
+      trading rule with MULTIPLE_COMPARISONS_CAVEAT (LOAD-BEARING),
+      rule spec, per-cell historical performance from the centralized
+      ``CellStatsBlock``, and provenance (run_id + engine_version).
+      Pre-pricing-arc caveat fires when the run's engine_version
+      stamp differs from ``ENGINE_VERSION``.
+    - **trades_{strategy}_{symbol}_T-{e}_T-{x}.csv** — re-uses
+      ``_build_cell_csv``; same per-leg detail as the drill-down's
+      CSV, scoped to the picked cell only.
+
+    Empty paths:
+    - No cell selected → prompt the operator to click a cell.
+    - Cell selected but no trades match (after current filters) →
+      "no trades" message; nothing to export.
     """
-    st.info(
-        "**Export rule** — pick a single cell to download a "
-        "deployment-ready trading rule (.md). "
-        "_(Implementation pending — see feat(p7.heatmap.export).)_"
+    if strategy is None or symbol is None:
+        st.info(
+            "**Export rule** — pick a strategy + symbol first, then "
+            "click a cell on the heatmap above to pick the rule."
+        )
+        return
+
+    sel = st.session_state.get("mp_heatmap_selected_cell")
+    if sel is None:
+        st.info(
+            "**Export rule** — click any cell on the **Median ROI** "
+            "heatmap above to pick the rule, then download the .md "
+            "trading rule + per-trade CSV scoped to that single cell."
+        )
+        return
+
+    entry_td, exit_td = sel
+    rows = df[
+        (df["strategy"] == strategy)
+        & (df["symbol"] == symbol)
+        & (df["entry_offset_td"] == entry_td)
+        & (df["exit_offset_td"] == exit_td)
+    ].copy().sort_values("expiry").reset_index(drop=True)
+
+    if len(rows) == 0:
+        st.info(
+            f"**Export rule** — no trades for ({strategy}, {symbol}, "
+            f"T-{entry_td}, T-{exit_td}) under current filters. Pick "
+            f"another cell."
+        )
+        return
+
+    # Read run_id + engine_version from the rows so the .md's
+    # provenance + pre-arc-caveat fire-condition match the underlying
+    # sweep. The dashboard's sidebar already treats the active frame
+    # as one run (results_df['run_id'].iloc[0] pattern, see app.py:202);
+    # follow that here.
+    run_id: str | None = None
+    engine_version: str | None = None
+    if "run_id" in rows.columns and len(rows):
+        run_id = str(rows["run_id"].iloc[0])
+        try:
+            stamp = read_run_metadata(run_id)
+            engine_version = stamp.get("engine_version")
+        except Exception:
+            # Parquet missing from disk (e.g. mid-test, mid-rename).
+            # Provenance just degrades; not a hard failure.
+            pass
+
+    md_bytes = _build_rule_md(
+        strategy=strategy, symbol=symbol,
+        entry_offset_td=int(entry_td), exit_offset_td=int(exit_td),
+        rows=rows, run_id=run_id, engine_version=engine_version,
     )
+    csv_bytes = _build_cell_csv(rows)
+
+    file_suffix = f"{strategy}_{symbol}_T-{entry_td}_T-{exit_td}"
+
+    st.markdown(
+        f"### Export rule — {strategy} × {symbol}: "
+        f"entry T-{entry_td} → exit T-{exit_td}"
+    )
+    st.caption(
+        f"Picked rule based on n={len(rows)} historical expiries. "
+        f"Both files re-emit MULTIPLE_COMPARISONS_CAVEAT — treat as "
+        f"a CANDIDATE for forward validation, not a guaranteed winner."
+    )
+    dl_left, dl_right = st.columns(2)
+    with dl_left:
+        st.download_button(
+            label="⬇ Download rule (.md)",
+            data=md_bytes,
+            file_name=f"rule_{file_suffix}.md",
+            mime="text/markdown",
+            key="mp_heatmap_export_md",
+            help=(
+                "Deployment-ready trading rule with selection-bias "
+                "warning + per-cell historical stats + provenance. "
+                "Pre-arc parquets surface the phantom-fill caveat."
+            ),
+        )
+    with dl_right:
+        st.download_button(
+            label="⬇ Download trades (CSV)",
+            data=csv_bytes,
+            file_name=f"trades_{file_suffix}.csv",
+            mime="text/csv",
+            key="mp_heatmap_export_csv",
+            help=(
+                "Per-leg detail for the picked cell — same shape as "
+                "the drill-down's CSV. Auditable fill-source "
+                "classification per leg."
+            ),
+        )
 
 
 # ============================================================

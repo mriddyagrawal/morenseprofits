@@ -862,19 +862,253 @@ def test_cell_action_mode_returns_session_state_value(monkeypatch):
     assert hm.cell_action_mode() == "Export rule"
 
 
-def test_export_rule_stub_renders_info_with_implementation_pending(monkeypatch):
-    """Same shape as compare-cells stub; full behavior lands in
-    feat(p7.heatmap.export). The future commit MUST surface the
-    MULTIPLE_COMPARISONS_CAVEAT per the constraint in the stub
-    docstring — not yet enforceable here since there's no download path."""
-    import src.web.heatmap as hm
-    infos: list[str] = []
-    monkeypatch.setattr(hm.st, "info", lambda msg, **_: infos.append(msg))
+# ============================================================
+# Export-rule mode — feat(p7.heatmap.export)
+# ============================================================
+#
+# Per-cell .md trading rule + per-cell trade-list CSV bundle. The .md
+# is operator-facing — what they'd paste into a trade journal or
+# screenshot to remember "what's this rule that backtested well?".
+# The CSV is the audit trail — the same per-leg dump the drill-down's
+# CSV produces, scoped to the same cell.
+#
+# LOAD-BEARING reviewer constraint (from the original stub docstring):
+# the .md MUST re-emit MULTIPLE_COMPARISONS_CAVEAT verbatim from
+# src.analytics.rank as a top-level "## Selection bias warning"
+# section. The operator picking one cell from a ~2.25M-cell wide-
+# sweep grid has introduced massive selection bias the per-rule
+# backtest can't capture. Re-export the constant; don't paraphrase.
 
-    hm.render_export_rule(pd.DataFrame(), strategy="S", symbol="X")
-    assert len(infos) == 1
-    assert "Export rule" in infos[0]
-    assert "Implementation pending" in infos[0]
+
+def _export_trade(
+    *,
+    strategy="short_straddle", symbol="RELIANCE",
+    entry_offset=15, exit_offset=1, roi_pct=1.0, net_pnl=100.0,
+    expiry="2024-01-25", run_id="run_export",
+) -> dict:
+    """Trade-row fixture for the export tests. Carries enough fields
+    that _build_cell_csv can flatten legs_json without crashing AND
+    that the .md rule's stats block has its expected inputs."""
+    import json
+    return {
+        "run_id": run_id,
+        "strategy": strategy,
+        "symbol": symbol,
+        "expiry": pd.Timestamp(expiry),
+        "entry_date": pd.Timestamp("2024-01-04"),
+        "exit_date": pd.Timestamp("2024-01-24"),
+        "entry_offset_td": entry_offset,
+        "exit_offset_td": exit_offset,
+        "net_pnl": net_pnl,
+        "gross_pnl": net_pnl + 40.0,
+        "costs": 40.0,
+        "roi_pct": roi_pct,
+        "hold_trading_days": 14,
+        "legs_json": json.dumps([
+            {
+                "strike": 2600, "option_type": "CE", "side": "short",
+                "qty_lots": 1, "lot_size": 250,
+                "entry_px": 50.0, "exit_px": 25.0,
+                "entry_volume": 1000, "exit_volume": 800,
+                "entry_oi": 5000, "exit_oi": 5500,
+                "entry_turnover": 5.0, "exit_turnover": 2.5,
+                "gross_pnl": 6250.0,
+            },
+        ]),
+    }
+
+
+def _patch_streamlit_for_export(monkeypatch):
+    """Replace every Streamlit primitive render_export_rule calls with
+    a no-op or recorder. Returns the captured downloads list."""
+    import src.web.heatmap as hm
+
+    class _NullCtx:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_columns(n_or_spec):
+        n = n_or_spec if isinstance(n_or_spec, int) else len(n_or_spec)
+        return [_NullCtx() for _ in range(n)]
+
+    downloads: list[dict] = []
+    infos: list[str] = []
+    monkeypatch.setattr(hm.st, "columns", fake_columns)
+    monkeypatch.setattr(hm.st, "markdown", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "caption", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "warning", lambda *a, **k: None)
+    monkeypatch.setattr(hm.st, "info", lambda m, **k: infos.append(m))
+    monkeypatch.setattr(
+        hm.st, "download_button",
+        lambda label, data, file_name, **k: downloads.append({
+            "label": label, "data": data, "file_name": file_name,
+        }),
+    )
+    return downloads, infos
+
+
+def test_export_rule_no_selection_shows_picker_prompt(monkeypatch):
+    """No cell selected → the export panel prompts the operator to
+    click a cell. No download buttons rendered (the rule needs an
+    anchor cell). Same shape as the drill-down's empty path."""
+    import src.web.heatmap as hm
+    monkeypatch.setattr(hm.st, "session_state", {})
+    downloads, infos = _patch_streamlit_for_export(monkeypatch)
+    hm.render_export_rule(
+        pd.DataFrame([_export_trade()]),
+        strategy="short_straddle", symbol="RELIANCE",
+    )
+    assert len(downloads) == 0
+    assert any("pick a cell" in m.lower() or "click" in m.lower()
+               for m in infos)
+
+
+def test_export_rule_md_includes_multiple_comparisons_caveat_verbatim(monkeypatch):
+    """LOAD-BEARING constraint per the original stub docstring + the
+    2026-05-28 PLAN entry: the .md MUST include
+    MULTIPLE_COMPARISONS_CAVEAT verbatim from src.analytics.rank as a
+    "## Selection bias warning" section. Re-emit (don't paraphrase)
+    so consumer-facing language matches the constant in one source of
+    truth. Anti-regression against a future contributor weakening the
+    framing."""
+    import src.web.heatmap as hm
+    from src.analytics.rank import MULTIPLE_COMPARISONS_CAVEAT
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (15, 1)},
+    )
+    # Engine-version stamp irrelevant for this test; treat as matched.
+    monkeypatch.setattr(
+        hm, "read_run_metadata",
+        lambda run_id: {"engine_version": "p7.pricing_arc"},
+    )
+    downloads, _ = _patch_streamlit_for_export(monkeypatch)
+    df = pd.DataFrame([_export_trade(roi_pct=2.0, net_pnl=150.0)])
+    hm.render_export_rule(df, strategy="short_straddle", symbol="RELIANCE")
+
+    md = next(d for d in downloads if d["file_name"].endswith(".md"))
+    md_text = md["data"].decode("utf-8")
+    assert MULTIPLE_COMPARISONS_CAVEAT in md_text, (
+        "MULTIPLE_COMPARISONS_CAVEAT MUST appear verbatim in the "
+        "exported .md (re-export from src.analytics.rank, do not "
+        "paraphrase). Reviewer constraint pinned on the original stub."
+    )
+    assert "## Selection bias warning" in md_text
+
+
+def test_export_rule_md_includes_rule_spec_and_stats(monkeypatch):
+    """The .md is a deployment-ready trading rule: it must carry the
+    rule spec (strategy, symbol, entry/exit offsets) AND the historical
+    performance block (n, win rate, median ROI) so the operator can
+    screenshot or paste it into a journal. Hand-verifiable stats: 3
+    trades with ROIs [-1.0, 2.0, 5.0] → median 2.0, n=3."""
+    import src.web.heatmap as hm
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (15, 1)},
+    )
+    monkeypatch.setattr(
+        hm, "read_run_metadata",
+        lambda run_id: {"engine_version": "p7.pricing_arc"},
+    )
+    downloads, _ = _patch_streamlit_for_export(monkeypatch)
+    rows = [
+        _export_trade(roi_pct=-1.0, net_pnl=-100.0, expiry="2024-01-25"),
+        _export_trade(roi_pct=2.0, net_pnl=200.0, expiry="2024-02-29"),
+        _export_trade(roi_pct=5.0, net_pnl=500.0, expiry="2024-03-28"),
+    ]
+    hm.render_export_rule(
+        pd.DataFrame(rows),
+        strategy="short_straddle", symbol="RELIANCE",
+    )
+    md = next(d for d in downloads if d["file_name"].endswith(".md"))
+    md_text = md["data"].decode("utf-8")
+    # Rule spec
+    assert "short_straddle" in md_text
+    assert "RELIANCE" in md_text
+    assert "T-15" in md_text
+    assert "T-1" in md_text
+    # Stats — hand-computable: n=3, median ROI=2.0
+    assert "n=3" in md_text or "**Trades**: 3" in md_text or "3 trades" in md_text.lower()
+    assert "2.0" in md_text  # median
+
+
+def test_export_rule_pre_arc_caveat_fires_when_engine_version_mismatch(monkeypatch):
+    """Pre-pricing-arc caveat — same trigger as the MCP tools'
+    PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT. If the underlying sweep
+    parquet's engine_version stamp differs from ENGINE_VERSION, the
+    exported .md MUST carry the verbatim caveat string. An operator
+    who exports a rule from a pre-arc parquet and acts on it would
+    be deploying against potentially-inflated numbers; the caveat is
+    load-bearing honesty."""
+    import src.web.heatmap as hm
+    from src.mcp._models import PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (15, 1)},
+    )
+    monkeypatch.setattr(
+        hm, "read_run_metadata",
+        lambda run_id: {"engine_version": "p6.legacy"},  # pre-arc stamp
+    )
+    downloads, _ = _patch_streamlit_for_export(monkeypatch)
+    hm.render_export_rule(
+        pd.DataFrame([_export_trade()]),
+        strategy="short_straddle", symbol="RELIANCE",
+    )
+    md = next(d for d in downloads if d["file_name"].endswith(".md"))
+    md_text = md["data"].decode("utf-8")
+    assert PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT in md_text
+
+
+def test_export_rule_offers_csv_download_alongside_md(monkeypatch):
+    """The CSV bundle: same per-leg detail as the drill-down's CSV
+    (re-uses _build_cell_csv), scoped to the selected cell only. The
+    operator gets BOTH the human-readable .md rule AND the
+    machine-readable trade-list CSV from one export action — no need
+    to switch modes to the drill-down to grab the trades."""
+    import src.web.heatmap as hm
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (15, 1)},
+    )
+    monkeypatch.setattr(
+        hm, "read_run_metadata",
+        lambda run_id: {"engine_version": "p7.pricing_arc"},
+    )
+    downloads, _ = _patch_streamlit_for_export(monkeypatch)
+    hm.render_export_rule(
+        pd.DataFrame([_export_trade()]),
+        strategy="short_straddle", symbol="RELIANCE",
+    )
+    file_names = {d["file_name"] for d in downloads}
+    assert any(n.endswith(".md") for n in file_names)
+    assert any(n.endswith(".csv") for n in file_names)
+    # CSV file name matches the drill-down's convention so an operator
+    # comparing the two surfaces sees the same file naming scheme.
+    csv = next(d for d in downloads if d["file_name"].endswith(".csv"))
+    assert "short_straddle" in csv["file_name"]
+    assert "RELIANCE" in csv["file_name"]
+    assert "T-15" in csv["file_name"]
+    assert "T-1" in csv["file_name"]
+
+
+def test_export_rule_empty_cell_after_selection_shows_no_data_message(monkeypatch):
+    """Cell selected but no trades match the (strategy, symbol,
+    entry, exit) intersection (e.g. operator picked a cell that was
+    just masked by the min_n slider). Surface a no-data message; no
+    downloads — there's nothing to export."""
+    import src.web.heatmap as hm
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (40, 10)},
+    )
+    monkeypatch.setattr(
+        hm, "read_run_metadata",
+        lambda run_id: {"engine_version": "p7.pricing_arc"},
+    )
+    downloads, infos = _patch_streamlit_for_export(monkeypatch)
+    df = pd.DataFrame([_export_trade(entry_offset=15, exit_offset=1)])
+    hm.render_export_rule(
+        df, strategy="short_straddle", symbol="RELIANCE",
+    )
+    assert len(downloads) == 0
+    assert any("no" in m.lower() for m in infos)
 
 
 # test_value_pane_config_exposes_select_tools deleted:
