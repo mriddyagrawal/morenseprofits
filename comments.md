@@ -15253,3 +15253,85 @@ Operator-driven from here. The new flag unblocks the smoke-test path against the
 Standing by.
 
 ---
+
+## Review of 8c2c517 — `fix(p7.pricing.vwap_strike_correction)`
+
+**Verdict: ✅ ACCEPT.** Substantive pricing-engine correctness fix surfaced via the smoke-sweep methodology my prior review suggested. Empirical methodology rigorous; user-suggested structural test is exactly the right falsifying shape; all 3 callers updated; SPECS + docstrings + options_loader comment all corrected. Five e2e tests failing pending operator sweep re-run (honestly disclosed). No grills.
+
+### What I checked
+
+- `src/engine/pnl.py` — `_compute_vwap(turnover, volume, strike)` + `_pick_fill_price` strike extraction + `classify_fill_source(..., strike=None)` + semantic shift docs.
+- `src/mcp/backtest_one.py:144-154` + `:195-201` — shim signature update + `_extract_legs` strike pass-through for both entry and exit.
+- `src/mcp/data_quality.py:170-178` + `:270-330` — `_flatten_legs` carries `leg_strike`; both dimensions thread strike to `classify_fill_source`; `_vwap_vs_close_divergence` subtracts strike from `vwap_implied`.
+- `src/web/heatmap.py:1247-1260` — `_build_cell_csv` passes strike to both classifier calls.
+- `SPECS.md` §2.2 + `src/data/options_loader.py:281-303` — UNITS NOTE rewritten with empirical insight + recovery formula + all 3 column variants named (FH_TOT_TRADED_VAL / VAL_INLAKH / TtlTrfVal).
+- `grep '"strike"' src/engine/pnl.py` → line 405 confirms engine has always emitted `leg.strike` in legs_json.
+- All test math hand-verified (see below).
+
+### Empirical methodology — strong
+
+The diagnosis chain is rigorous:
+
+1. **Symptom**: smoke sweep `5f199d6984f2` → 180k cells planned, 0 priced, 100% skip rate, 91.6% MissingDataError from `_pick_fill_price`'s band check. SECOND time the smoke-sweep methodology paid off — prior analysis (2026-05-30) caught the OUTPUT symptom of phantom-fill bias; this catches the INPUT symptom of the broken formula.
+2. **BHEL 2024-05-30 strike-grid** (26 strikes): ITM strikes 220-285 → `notional/share` clusters at 290-298 (≈ BHEL spot ~292) — the "moneyness coincidence" that fooled the prior diagnosis. OTM strikes 290-350 → converge to **strike** (295 → 295.82; 310 → 310.08; 350 → 350.05). Falsifies the "notional = spot" theory.
+3. **RELIANCE 2025-02-27 across DTE**: structural confirmation. OTM `notional/share` locks to strike as premium decays.
+4. **Three hand-verified production rows** from the skip log (RELIANCE 1260-CE / BHEL 285-CE / PNB 106-CE) — recovered premium within ~₹1.5 of close.
+
+The **moneyness-coincidence insight** is the load-bearing observation: ITM `notional/share ≈ spot` because `strike + intrinsic = spot` algebraically, not because the field is reporting spot. That's the kind of first-principles check `feedback-grep-code-before-accepting-calibration` says I should do — BUILDER did it instead.
+
+### Math verification (hand-checked every new test)
+
+- `test_compute_vwap_recovers_premium_via_strike_subtraction`: `12 × 10⁵ / 10⁴ = 120; 120 - 100 = 20` ✓; `10 × 10⁵ / 50_000 = 20; 20 - 0 = 20` ✓
+- `test_compute_vwap_recovered_premium_negative_returns_none`: `9.9 × 10⁵ / 10⁴ = 99; 99 - 100 = -1 ≤ 0 → None` ✓
+- **`test_compute_vwap_time_decay_structural`** (the user-suggested load-bearing test): for premium ∈ {10, 5, 1, 0.05} at strike=1300, `turnover = (1300+premium) × 10_000 / 10⁵`; recovery: `turnover × 10⁵ / 10_000 - 1300 = premium`. Algebraically exact (`pytest.approx(premium, abs=1e-9)`). **The right falsifying test** — any future "fix" dropping the strike subtraction would predict `recovered → strike` across DTEs, while real data demands `recovered → 0`. Time-decay-toward-zero is a fundamental options invariant.
+- `test_vwap_falls_back_to_close_when_out_of_band`: `vwap=300, close=100 → ratio 3.0 > 2.0 → close=100`. SELL@100 / BUY@20 → 20,000 ✓
+- `test_vwap_falls_back_to_close_when_recovered_premium_negative`: `notional=999, recovered=-1 → None → close=0.05` ✓ both legs close → gross=0 ✓
+- `test_classify_fill_source_vwap_match_atm_price`: `260×10⁵/10⁴ = 2600; 2600-2500=100` matches entry_px=100 → "vwap" ✓
+- `test_classify_fill_source_close_when_strike_absent`: strike=None → "close" (honest degradation) ✓
+
+All consistent.
+
+### Praises
+
+- **Two-source empirical confirmation** (strike grid + DTE structural) — either alone could be a coincidence; together they rule out the "notional = spot" alternative.
+- **User-suggested `test_compute_vwap_time_decay_structural`** specifies the INVARIANT (premium → 0 as DTE → 0), not just an example. The right anti-regression shape for a structural property.
+- **Semantic shift documented in TWO places**: `_pick_fill_price` inline comments AND the `_VWAP_CLOSE_RATIO_*` constant docstring. Band-check is now "arithmetic-quality safety valve" rather than "units-sanity assertion". A future maintainer reading either gets the right mental model.
+- **Out-of-band falls THROUGH to close** (was: raised MissingDataError). Correct under the sound formula — out-of-band is no longer evidence of a data bug. The prior gate was correct GIVEN the broken formula (don't book against suspect prices); the new fall-through is correct GIVEN the sound formula.
+- **Deep-OTM ill-conditioning guard** (recovered ≤ 0 → None). At premium ≪ strike, `notional - strike` subtracts two nearly-equal numbers; lakh-rounding noise can dominate. Guarding rather than papering over it.
+- **Backward compat preserved**: `classify_fill_source(..., strike=None)` default keeps existing telemetry working but degrades to "close" — false 'vwap' would be worse than honest 'close'.
+- **All 3 callers updated** (verified): backtest_one + data_quality + heatmap. No stragglers.
+- **Fixture refactoring is operator-friendly**: test authors specify the INTENT (target VWAP premium); fixture computes synthetic turnover under the corrected formula. Much harder to accidentally test the wrong thing.
+- **SPECS §2.2 thorough**: names all 3 NSE column variants, explains the moneyness-coincidence, gives the recovery formula. Single source of truth.
+- **3 hand-verified production rows in commit body** — checkable by anyone reading the commit, not internal-test-only.
+- **Honest disclosure of 5 failing e2e tests** at the end of the commit body — names the cause (broken on-disk parquet) and the resolution path (operator re-runs sweep).
+
+### Minor observation (not a grill, doesn't fire in practice)
+
+`data_quality._vwap_vs_close_divergence` candidate filter doesn't include `& legs_df["leg_strike"].notna()`. With `classify_fill_source(strike=None) → "close"`, a hand-constructed legs_json without `strike` could enter the candidate set; `candidates["leg_strike"].astype(float)` would then propagate NaN through `vwap_implied`, polluting per-symbol stats with NaN rows (counted in `n_legs_with_band_reject` but skipped by median/mean/p95).
+
+Verified via `grep '"strike"' src/engine/pnl.py:405`: the engine has always emitted `leg.strike` in legs_json, so real parquets never trip this. Defensive fix if it ever bites: add the `.notna()` clause to the filter. Mild; not blocking.
+
+### State-of-tree note (operator-actionable, NOT a grill)
+
+The commit body discloses **5 failing e2e tests** in `tests/test_web_e2e.py` — those depend on the on-disk sweep parquet (`5f199d6984f2`) which has 0 priced rows because the broken formula skipped every cell. The fix unblocks the engine; the tests will pass once the operator re-runs the sweep on the corrected engine. Honest disclosure + clear resolution path.
+
+**Implication for the next operator step**: the dashboard's heatmap tab will continue rendering empty until a fresh sweep parquet replaces the broken one. The 4e5099d `--symbols` flag + this 8c2c517 fix together make the smoke-sweep loop usable end-to-end.
+
+### MCP arc state
+
+Unchanged at 16/16 tools. This is a Phase-7 pricing-engine fix, not a Phase-8 commit. But the fix ripples through 3 MCP tools (backtest_one's fill-source classifier, data_quality's two VWAP dimensions) — the cross-surface contract holds because the centralized `classify_fill_source` was the single point of update. Pays off the b29d55e centralization once more.
+
+### Open grills
+
+**Empty.** No grills.
+
+### Next-commit suggestion
+
+Operator-driven from here. In priority order:
+
+1. **Smoke sweep on corrected engine**: `python scripts/p7_wide_sweep.py --symbols RELIANCE INFY TCS BHEL --workers 4`. Verify skip rate drops from 100% to a healthy figure (≤5% per the prior PLAN target). Spot-check the recovered premium VWAPs against close for sanity. The 5 e2e tests should pass once this lands.
+2. **Full universe sweep** to land a fresh production parquet that dashboard + MCP tools can drive against. After that, the +10.9% T-41..T-45 gradient observed in the pre-arc analysis should be confirmed/refuted under the corrected engine — that's the load-bearing comparison the whole pricing arc was set up to enable.
+
+Standing by.
+
+---
