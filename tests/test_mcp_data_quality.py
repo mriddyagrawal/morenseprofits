@@ -114,6 +114,37 @@ def test_data_quality_liquidity_by_entry_offset_bands_match_expected():
     assert "phantom-fill" in out.summary.lower() or "10.9" in out.summary or "T-41" in out.summary
 
 
+def test_data_quality_liquidity_counts_all_expiries_per_cell():
+    """LOAD-BEARING regression test per reviewer Grill #1 on 22104df.
+    Pre-fix the impl deduplicated by (eot, xot, symbol, strategy)
+    WITHOUT expiry, collapsing all expiries into ONE row. n_trades
+    under-counted by a factor of len(expiries) and mean_roi was the
+    FIRST expiry's roi only.
+
+    Test construction: 2 trades with IDENTICAL (eot=15, xot=1,
+    symbol=RELIANCE, strategy=short_straddle) but DIFFERENT expiries.
+    n_trades MUST be 2; mean_roi MUST be the mean of both ROIs."""
+    rows = [
+        _trade_row(entry_offset=3, roi_pct=10.0),
+        _trade_row(entry_offset=3, roi_pct=30.0),
+    ]
+    # Force different expiries so the trades are distinct at the
+    # parquet level. (Two identical rows wouldn't actually appear in
+    # a real sweep; sweep_grid produces one row per cell-expiry.)
+    rows[1]["expiry"] = pd.Timestamp("2024-02-29")
+    rows[1]["entry_date"] = pd.Timestamp("2024-02-04")
+    rows[1]["exit_date"] = pd.Timestamp("2024-02-28")
+    r.write_results(pd.DataFrame(rows), run_id="dedup_test")
+    out = data_quality_impl(DataQualityInput(
+        run_id="dedup_test", dimension="liquidity_by_entry_offset",
+    ))
+    bands_by_label = {row["entry_offset_band"]: row for row in out.table}
+    # Both trades land in T-01..T-05; n_trades MUST be 2 (not 1).
+    assert bands_by_label["T-01..T-05"]["n_trades"] == 2
+    # Mean ROI MUST be mean(10, 30) = 20.0 (not just the first row's 10.0)
+    assert bands_by_label["T-01..T-05"]["mean_roi_pct"] == pytest.approx(20.0)
+
+
 def test_data_quality_summary_references_pre_post_arc_comparison():
     rows = [_trade_row(entry_offset=15)]
     r.write_results(pd.DataFrame(rows), run_id="summary")

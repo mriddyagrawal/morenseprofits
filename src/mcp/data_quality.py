@@ -187,36 +187,43 @@ def _liquidity_by_entry_offset(df: pd.DataFrame) -> tuple[list[dict], str]:
     if legs_df.empty:
         return [], "No legs parsed; data may be missing legs_json."
 
-    # Per-trade min entry_volume (worst leg).
-    per_trade_min_vol = (
-        legs_df.groupby(["entry_offset_td"])["entry_volume"]
-        .agg(lambda s: s.dropna().min() if s.notna().any() else None)
-        .rename("worst_leg_min_volume")
-    )
-
+    # Trade-level stats (n_trades, mean_roi, median_roi) come from
+    # ``df`` directly per fix(data_quality.liquidity_dedup): the
+    # original impl flattened legs first and deduplicated by
+    # (eot, xot, symbol, strategy), which collapsed all expiries of
+    # a cell into one row — n_trades under-counted by a factor of
+    # ``len(expiries)`` and mean_roi was the FIRST expiry's roi only.
+    # Computing trade-level stats from ``df`` filtered to the band
+    # removes the leaky leg-multiplication round-trip entirely;
+    # legs_df is now used ONLY for leg-level metrics (zero-volume
+    # fraction + mean entry volume).
     table: list[dict] = []
     for lo, hi in ENTRY_OFFSET_BANDS:
+        band_trades = df[
+            (df["entry_offset_td"] >= lo)
+            & (df["entry_offset_td"] <= hi)
+        ]
         band_legs = legs_df[
             (legs_df["entry_offset_td"] >= lo)
             & (legs_df["entry_offset_td"] <= hi)
         ]
-        if band_legs.empty:
+        if band_trades.empty:
             continue
-        # n at trade level (a trade may have multiple legs; dedup)
-        trades_in_band = band_legs.drop_duplicates(
-            subset=["entry_offset_td", "exit_offset_td", "symbol",
-                    "strategy"],
-        )
-        n_trades = len(trades_in_band)
-        # Fraction of LEGS with entry_volume == 0
-        zero_vol_legs = (band_legs["entry_volume"] == 0).sum()
-        total_legs = band_legs["entry_volume"].notna().sum()
-        frac_zero = (
-            float(zero_vol_legs / total_legs) if total_legs > 0 else None
-        )
-        mean_entry_vol = float(band_legs["entry_volume"].mean())
-        mean_roi = float(trades_in_band["roi_pct"].mean())
-        median_roi = float(trades_in_band["roi_pct"].median())
+        n_trades = int(len(band_trades))
+        mean_roi = float(band_trades["roi_pct"].mean())
+        median_roi = float(band_trades["roi_pct"].median())
+        # Leg-level liquidity: fraction of LEGS with entry_volume==0
+        # + mean entry volume across the band's legs.
+        if band_legs.empty:
+            frac_zero = None
+            mean_entry_vol = None
+        else:
+            zero_vol_legs = (band_legs["entry_volume"] == 0).sum()
+            total_legs = band_legs["entry_volume"].notna().sum()
+            frac_zero = (
+                float(zero_vol_legs / total_legs) if total_legs > 0 else None
+            )
+            mean_entry_vol = float(band_legs["entry_volume"].mean())
         table.append({
             "entry_offset_band": f"T-{lo:02d}..T-{hi:02d}",
             "entry_offset_min": lo,
@@ -277,14 +284,17 @@ def _theoretical_fallback_rate(df: pd.DataFrame) -> tuple[list[dict], str]:
     rows.sort(key=lambda r: r["close_fill_rate_pct"] or 0.0, reverse=True)
 
     summary = (
-        "Per-symbol fraction of entry-leg fills that used VWAP vs fell "
-        "back to close. Symbols with close_fill_rate_pct near 100% "
-        "were cached BEFORE the p7.pricing_arc turnover ingest landed "
-        "— their fills are the pre-VWAP behavior (still gate-corrected, "
-        "still post-arc engine, but VWAP refinement absent). Symbols "
-        "near 0% close fallback have full VWAP coverage. Mixed "
-        "coverage across the universe is the expected state after "
-        "the 2026-05-31 prefetch run; force-refresh those symbols if "
+        "Per-symbol fraction of ENTRY-leg fills that used VWAP vs fell "
+        "back to close. NOTE: classification is ENTRY-side only — "
+        "exit legs may have different fill paths (different date, "
+        "different turnover availability) and are not counted here. "
+        "Symbols with close_fill_rate_pct near 100% were cached "
+        "BEFORE the p7.pricing_arc turnover ingest landed — their "
+        "fills are the pre-VWAP behavior (still gate-corrected, still "
+        "post-arc engine, but VWAP refinement absent). Symbols near 0% "
+        "close fallback have full VWAP coverage. Mixed coverage "
+        "across the universe is the expected state after the "
+        "2026-05-31 prefetch run; force-refresh those symbols if "
         "uniform VWAP coverage matters for your comparison."
     )
     return rows, summary
@@ -350,13 +360,14 @@ def _vwap_vs_close_divergence(df: pd.DataFrame) -> tuple[list[dict], str]:
     rows.sort(key=lambda r: r["mean_divergence_pct"], reverse=True)
 
     summary = (
-        "Per-symbol VWAP-vs-close divergence for legs where the engine "
-        "had turnover data BUT used close anyway (band-reject of the "
-        "units-sanity assertion). Large divergence values flag "
-        "symbols where NSE turnover and close drift apart routinely — "
-        "operator-side: investigate the contracts to see whether "
-        "settlement-price noise or genuine bid-ask asymmetry is the "
-        "driver."
+        "Per-symbol VWAP-vs-close divergence for ENTRY legs where the "
+        "engine had turnover data BUT used close anyway (band-reject "
+        "of the units-sanity assertion). NOTE: classification is "
+        "ENTRY-side only — exit-leg divergence not measured here. "
+        "Large divergence values flag symbols where NSE turnover and "
+        "close drift apart routinely — operator-side: investigate the "
+        "contracts to see whether settlement-price noise or genuine "
+        "bid-ask asymmetry is the driver."
     )
     return rows, summary
 
