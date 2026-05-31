@@ -129,8 +129,25 @@ def compute_cell_stats(
     NaNs if they need NaN-aware behavior (mirrors numpy's policy on
     the underlying functions: ``np.median`` propagates NaN).
 
+    The ``cvar_alpha`` kwarg is LOCKED to ``DEFAULT_CVAR_ALPHA`` (5%).
+    The field name on the returned block — ``cvar_5_roi_pct`` —
+    encodes the 5% commitment, so allowing the caller to pass a
+    different alpha would silently produce a stat block whose field
+    name disagrees with its value. Raise loud rather than drift.
+    Reviewer's latent grill on ebe7228: the previous signature
+    accepted any alpha, which made the field-name contract leaky.
+
     Returns ``empty_cell_stats_block()`` when n == 0.
     """
+    if cvar_alpha != DEFAULT_CVAR_ALPHA:
+        raise ValueError(
+            f"cvar_alpha={cvar_alpha} differs from DEFAULT_CVAR_ALPHA"
+            f"={DEFAULT_CVAR_ALPHA}. The returned block's "
+            f"``cvar_5_roi_pct`` field name encodes 5% by contract; "
+            f"a non-default alpha would produce a misleadingly-named "
+            f"field. If you need a different tail fraction, call "
+            f"``bottom_alpha_mean`` directly (alpha-agnostic helper)."
+        )
     rois = np.asarray(rois, dtype=float)
     pnls = np.asarray(pnls, dtype=float)
     if rois.shape != pnls.shape:

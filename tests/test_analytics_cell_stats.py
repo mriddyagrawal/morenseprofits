@@ -123,13 +123,32 @@ def test_compute_cell_stats_mixed_winners_losers():
     assert out.total_net_pnl == pytest.approx(230.0)
 
 
-def test_compute_cell_stats_custom_alpha_changes_cvar():
-    """Sanity: passing a different cvar_alpha changes the result."""
+def test_compute_cell_stats_locks_cvar_alpha_to_default():
+    """LOAD-BEARING: cvar_alpha is LOCKED to DEFAULT_CVAR_ALPHA (5%).
+    The returned block's ``cvar_5_roi_pct`` field name encodes the
+    5% commitment, so a non-default alpha would silently produce a
+    stat block whose field name disagrees with its value. Raise loud
+    rather than drift. If a caller needs a different tail fraction,
+    they call ``bottom_alpha_mean`` directly (alpha-agnostic helper).
+    Reviewer's latent grill on ebe7228 closes here."""
+    from src.analytics.cell_stats import DEFAULT_CVAR_ALPHA
     rois = np.arange(1, 101, dtype=float)
     pnls = np.full_like(rois, 100.0)
-    out_05 = compute_cell_stats(rois, pnls, cvar_alpha=0.05)
-    out_20 = compute_cell_stats(rois, pnls, cvar_alpha=0.20)
-    # α=0.05: bottom 5 of 100 → mean(1..5) = 3
-    # α=0.20: bottom 20 of 100 → mean(1..20) = 10.5
-    assert out_05.cvar_5_roi_pct == pytest.approx(3.0)
-    assert out_20.cvar_5_roi_pct == pytest.approx(10.5)
+    # Default alpha succeeds.
+    out_05 = compute_cell_stats(rois, pnls, cvar_alpha=DEFAULT_CVAR_ALPHA)
+    assert out_05.cvar_5_roi_pct == pytest.approx(3.0)  # mean(1..5)
+    # Non-default alpha is rejected with a message naming both the
+    # rejected value and the locked default.
+    with pytest.raises(ValueError, match="DEFAULT_CVAR_ALPHA"):
+        compute_cell_stats(rois, pnls, cvar_alpha=0.20)
+
+
+def test_bottom_alpha_mean_remains_alpha_configurable():
+    """Companion to the lock test above: the alpha-agnostic helper
+    ``bottom_alpha_mean`` still accepts arbitrary alpha. This is
+    where callers go if they need a non-5% tail fraction. Pinning
+    the split so a future refactor doesn't accidentally lock both."""
+    from src.analytics.cell_stats import bottom_alpha_mean
+    arr = np.arange(1, 101, dtype=float)
+    assert bottom_alpha_mean(arr, 0.05) == pytest.approx(3.0)   # mean(1..5)
+    assert bottom_alpha_mean(arr, 0.20) == pytest.approx(10.5)  # mean(1..20)
