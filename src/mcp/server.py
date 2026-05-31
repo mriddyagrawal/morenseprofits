@@ -40,6 +40,7 @@ from mcp.types import TextContent, Tool
 
 from src.mcp._models import ToolEntry
 from src.mcp.backtest_one import register_backtest_one_tools
+from src.mcp.bootstrap_ci import register_bootstrap_ci_tools
 from src.mcp.cell_summary import register_cell_summary_tools
 from src.mcp.compare_cells import register_compare_cells_tools
 from src.mcp.data_quality import register_data_quality_tools
@@ -70,9 +71,8 @@ def _collect_tool_entries() -> dict[str, ToolEntry]:
     all_entries.extend(register_skip_summary_tools())
     all_entries.extend(register_data_quality_tools())
     all_entries.extend(register_compare_cells_tools())
-    # Future sub-arcs append here:
-    # all_entries.extend(register_bootstrap_ci_tools())
-    # ... etc.
+    all_entries.extend(register_bootstrap_ci_tools())
+    # Sub-arc 3.7 (docs) is the final commit; no more tools land here.
 
     registry: dict[str, ToolEntry] = {}
     for entry in all_entries:
