@@ -999,7 +999,13 @@ def _build_rule_md(
 
     hold_days = int(entry_offset_td) - int(exit_offset_td)
     pre_arc_block = ""
-    if engine_version is not None and engine_version != ENGINE_VERSION:
+    # Fire on ANY non-match — including None (legacy / pre-arc parquet
+    # with no engine_version stamp). The 4 MCP sweep-touching tools
+    # use exactly this trigger (``stamp.get("engine_version") !=
+    # ENGINE_VERSION``); diverging here would SUPPRESS the caveat in
+    # the exact scenario it was designed for. Single source of truth
+    # across the dashboard + MCP surfaces.
+    if engine_version != ENGINE_VERSION:
         pre_arc_block = (
             "\n## Pre-pricing-arc warning\n\n"
             f"{PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT}\n"

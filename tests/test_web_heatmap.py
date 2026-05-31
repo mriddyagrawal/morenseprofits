@@ -1108,7 +1108,61 @@ def test_export_rule_empty_cell_after_selection_shows_no_data_message(monkeypatc
         df, strategy="short_straddle", symbol="RELIANCE",
     )
     assert len(downloads) == 0
-    assert any("no" in m.lower() for m in infos)
+    # Tightened from a bare "no" substring to "no trades" — the bare
+    # form passed on accidental matches like "no longer needed".
+    assert any("no trades" in m.lower() for m in infos)
+
+
+def test_export_rule_pre_arc_caveat_fires_when_stamp_missing(monkeypatch):
+    """LOAD-BEARING (closes 6b3a9eb Grill #1+#2): unstamped parquets
+    (legacy / pre-arc) trigger the same caveat as mismatched stamps.
+    ``read_run_metadata`` returns ``{}`` for legacy parquets so
+    ``stamp.get("engine_version")`` is None; the export MUST treat
+    that as 'pre-arc' and emit the phantom-fill caveat verbatim. Same
+    trigger as the 4 MCP sweep-touching tools — single source of
+    truth across the dashboard + MCP surfaces. Without this test
+    the ``engine_version is not None`` guard could silently regress
+    and suppress the caveat in the exact scenario it was designed
+    for."""
+    import src.web.heatmap as hm
+    from src.mcp._models import PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (15, 1)},
+    )
+    monkeypatch.setattr(hm, "read_run_metadata", lambda run_id: {})
+    downloads, _ = _patch_streamlit_for_export(monkeypatch)
+    hm.render_export_rule(
+        pd.DataFrame([_export_trade()]),
+        strategy="short_straddle", symbol="RELIANCE",
+    )
+    md = next(d for d in downloads if d["file_name"].endswith(".md"))
+    assert PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT in md["data"].decode("utf-8")
+
+
+def test_export_rule_pre_arc_caveat_fires_when_read_run_metadata_raises(monkeypatch):
+    """Companion to the missing-stamp case: when ``read_run_metadata``
+    raises (parquet missing from disk mid-rename, etc.), the impl
+    catches the exception and leaves engine_version as None. That
+    must still trigger the pre-arc caveat — same rationale as the
+    stamp-missing case (operator must NEVER export an
+    untraceable-engine rule without the warning)."""
+    import src.web.heatmap as hm
+    from src.mcp._models import PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
+
+    def _raises(run_id):
+        raise FileNotFoundError(f"parquet for {run_id} missing")
+
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (15, 1)},
+    )
+    monkeypatch.setattr(hm, "read_run_metadata", _raises)
+    downloads, _ = _patch_streamlit_for_export(monkeypatch)
+    hm.render_export_rule(
+        pd.DataFrame([_export_trade()]),
+        strategy="short_straddle", symbol="RELIANCE",
+    )
+    md = next(d for d in downloads if d["file_name"].endswith(".md"))
+    assert PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT in md["data"].decode("utf-8")
 
 
 # test_value_pane_config_exposes_select_tools deleted:
