@@ -15136,3 +15136,62 @@ Both close in one tiny chore commit.
 Standing by.
 
 ---
+
+## Review of 1fd73a6 — `fix(p7.heatmap.export.pre_arc_unstamped)`
+
+**Verdict: ✅ ACCEPT.** Tiny clean fix closing both my 6b3a9eb grills exactly as recommended + picking up my minor #1 observation as a bonus. Open grill list is empty again.
+
+### What landed
+
+- **Grill #1 fix (1-line impl change)** at `src/web/heatmap.py:1002-1007`:
+  - Old: `if engine_version is not None and engine_version != ENGINE_VERSION:`
+  - New: `if engine_version != ENGINE_VERSION:`
+  - 6-line explanatory comment ABOVE the check naming the cross-surface contract ("single source of truth across the dashboard + MCP surfaces") + warning a future contributor not to re-add the None guard.
+- **Grill #2 fix (TWO new LOAD-BEARING tests)** — exceeding what I asked for:
+  - `test_export_rule_pre_arc_caveat_fires_when_stamp_missing` — `read_run_metadata` returns `{}` → caveat fires verbatim. The case I explicitly asked for.
+  - `test_export_rule_pre_arc_caveat_fires_when_read_run_metadata_raises` — `read_run_metadata` raises `FileNotFoundError` → caveat still fires. BUILDER caught this from my Grill #1 description and added independent coverage. Nice catch.
+- **Bonus: minor #1 picked up** — `test_export_rule_empty_cell_after_selection_shows_no_data_message`'s loose `any("no" in m.lower())` assertion tightened to `"no trades"`. Hadn't required this; nice to have.
+
+### Trigger-logic verification (case-by-case)
+
+The new check `if engine_version != ENGINE_VERSION:` handles all 3 cases correctly:
+
+| engine_version | Result | Fires? | Desired? |
+|---|---|---|---|
+| `None` (missing stamp / read raised) | `None != "p7.pricing_arc"` → True | ✓ fires | ✓ |
+| `"p7.pricing_arc"` (current) | `equal != equal` → False | skipped | ✓ |
+| `"p6.legacy"` (older) | `"p6.legacy" != "p7.pricing_arc"` → True | ✓ fires | ✓ |
+
+All 6 original tests still pass under the new check (verified by walking through each mocked engine_version). The cross-surface contract now holds: dashboard export and MCP tools (cell_summary, heatmap, skip_summary, data_quality) all use the same trigger pattern.
+
+### Praises
+
+- **Anti-regression inline comment** is exactly the right anti-confusion docs. A future "this looks fragile, let me add a None guard" instinct gets caught at the comment.
+- **Two tests for two independent code paths** (missing stamp vs raising). Either path could regress independently; pinning both means the trigger contract stays solid no matter which path a future refactor touches.
+- **`test_export_rule_pre_arc_caveat_fires_when_read_run_metadata_raises`** is the one I didn't explicitly ask for but should have. The exception path is a real production scenario (mid-rename, mid-rebuild, file-system permission flip). BUILDER read the grill body carefully and surfaced both cases.
+- **Bonus minor pickup** (the loose-substring tightening) is the kind of small follow-through that compounds. Doesn't matter for this commit; matters for the next person who copies the pattern.
+
+### Behavior delta
+
+For valid post-arc parquets: NONE. The caveat still skips when `engine_version == ENGINE_VERSION`.
+
+For legacy / pre-arc / missing-stamp / read-error parquets: caveat now fires (correctly) where it previously suppressed (incorrectly). Operators exporting from those parquets now see the LOUD warning, not just the quiet "(unstamped — pre-arc parquet likely)" footer in Provenance.
+
+### Math check
+
+`786 → 788 (+2 net)`: 2 new tests, 0 deletions, 1 modified assertion. ✓
+
+### Open grills
+
+**Empty.** Both 6b3a9eb grills closed; both minor observations addressed (the formatter-fragility one on "2.0" substring is the only remaining minor and is YAGNI for v1).
+
+### Next-commit suggestion
+
+There are NO open grills. Next moves are operator-driven:
+
+1. **Operator validation** of the export surface end-to-end: pick a cell on the heatmap, download the .md, verify the rule renders in their notes app, verify the CSV opens in their analysis tool. Edge-case: try exporting from a pre-arc parquet to confirm the caveat surfaces correctly.
+2. **Phase 9 (paper trading)** consultation/planning when ready.
+
+Standing by.
+
+---
