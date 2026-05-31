@@ -33,6 +33,13 @@ from pydantic import BaseModel, Field
 
 from src.analytics.aggregate import MIN_N_FOR_RANKING
 from src.analytics.bootstrap import bootstrap_ci
+from src.analytics.cell_stats import (
+    DEFAULT_CVAR_ALPHA,
+    CellStatsBlock,
+    bottom_alpha_mean,
+    compute_cell_stats,
+    empty_cell_stats_block,
+)
 from src.analytics.observations import interpret_cell_stats
 from src.engine.results import ENGINE_VERSION, read_results, read_run_metadata
 from src.mcp._models import (
@@ -42,9 +49,10 @@ from src.mcp._models import (
 )
 
 
-# CVaR tail fraction. 5% matches the dashboard's right-pane CVaR
-# rendering — keep one source of truth across surfaces.
-CVAR_ALPHA = 0.05
+# Re-exported alias for backward compatibility with the test module's
+# import of CVAR_ALPHA. Single source of truth lives in
+# src.analytics.cell_stats.
+CVAR_ALPHA = DEFAULT_CVAR_ALPHA
 
 # Bootstrap parameters for the median-ROI CI. Hoisted to constants
 # (rather than hardcoded inside _compute_bootstrap_ci + the method
@@ -72,51 +80,12 @@ MAX_PER_TRADE_ROWS = 1_000
 # Models
 # ============================================================
 
-class CellStats(BaseModel):
-    n: int = Field(..., description="Trade count in the cell.")
-    win_rate_pct: float | None = Field(
-        ...,
-        description=(
-            "Fraction of trades with positive net_pnl, in percent. "
-            "None when n == 0."
-        ),
-    )
-    median_roi_pct: float | None = Field(
-        ...,
-        description=(
-            "Median per-trade ROI (the rank metric the dashboard "
-            "defaults to)."
-        ),
-    )
-    mean_roi_pct: float | None = Field(
-        ...,
-        description=(
-            "Mean per-trade ROI. For left-skewed short-vol P&L, "
-            "mean < median is structural — the gap measures the "
-            "drag from rare large losses."
-        ),
-    )
-    std_roi_pct: float | None = Field(
-        ...,
-        description=(
-            "Observed-sample standard deviation of per-trade ROI "
-            "(ddof=0). Treated as a LOWER bound on the true population "
-            "spread; bias vs ddof=1 is ~11% at n=5, ~5% at n=10, "
-            "~2.5% at n=20."
-        ),
-    )
-    cvar_5_roi_pct: float | None = Field(
-        ...,
-        description=(
-            f"CVaR-{int(CVAR_ALPHA*100)}%: mean of the worst-α fraction "
-            "of per-trade ROI in the cell. Floor-at-1 so thin cells "
-            "still surface the single-worst-trade as their tail "
-            "estimate. None when n == 0."
-        ),
-    )
-    total_net_pnl: float = Field(
-        ..., description="Sum of net_pnl across all trades in the cell."
-    )
+# Backward-compat alias: the per-cell stat block centralized in
+# src.analytics.cell_stats.CellStatsBlock per the
+# chore(p8.cell_stats.centralize) refactor. CellStats stays as the
+# name surfaced by this module's API so external tests / imports
+# (``from src.mcp.cell_summary import CellStats``) keep working.
+CellStats = CellStatsBlock
 
 
 class BootstrapCIResult(BaseModel):
@@ -192,44 +161,26 @@ class CellSummaryOutput(CaveatedResponse):
 # Pure helpers
 # ============================================================
 
+# Backward-compat shims around the centralized helpers in
+# src.analytics.cell_stats. External tests / consumers import these
+# under the underscored names; the shims keep them resolvable while
+# the real logic lives in one place.
+
 def _bottom_alpha_mean(values: np.ndarray, alpha: float) -> float:
-    """Mean of the worst-α fraction of values (CVaR-α tail mean).
-    Floor-at-1 — for tiny n the single-worst value IS the honest tail
-    estimate. NaN-aware: drops NaNs before sorting."""
-    arr = np.asarray(values, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if len(arr) == 0:
-        return float("nan")
-    k = max(1, int(np.ceil(alpha * len(arr))))
-    return float(np.mean(np.sort(arr)[:k]))
+    return bottom_alpha_mean(values, alpha)
 
 
 def _empty_stats() -> CellStats:
-    return CellStats(
-        n=0,
-        win_rate_pct=None,
-        median_roi_pct=None,
-        mean_roi_pct=None,
-        std_roi_pct=None,
-        cvar_5_roi_pct=None,
-        total_net_pnl=0.0,
-    )
+    return empty_cell_stats_block()
 
 
 def _compute_stats(cell: pd.DataFrame) -> CellStats:
-    n = len(cell)
-    if n == 0:
-        return _empty_stats()
-    roi = cell["roi_pct"].to_numpy(dtype=float)
-    pnl = cell["net_pnl"].to_numpy(dtype=float)
-    return CellStats(
-        n=n,
-        win_rate_pct=float(100.0 * (pnl > 0).sum() / n),
-        median_roi_pct=float(np.median(roi)),
-        mean_roi_pct=float(np.mean(roi)),
-        std_roi_pct=float(np.std(roi, ddof=0)) if n >= 2 else None,
-        cvar_5_roi_pct=_bottom_alpha_mean(roi, CVAR_ALPHA),
-        total_net_pnl=float(pnl.sum()),
+    if len(cell) == 0:
+        return empty_cell_stats_block()
+    return compute_cell_stats(
+        rois=cell["roi_pct"].to_numpy(dtype=float),
+        pnls=cell["net_pnl"].to_numpy(dtype=float),
+        cvar_alpha=CVAR_ALPHA,
     )
 
 

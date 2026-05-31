@@ -34,6 +34,12 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from src.analytics.cell_stats import (
+    DEFAULT_CVAR_ALPHA,
+    CellStatsBlock,
+    compute_cell_stats,
+    empty_cell_stats_block,
+)
 from src.data.errors import MissingDataError, OfflineCacheMiss
 from src.data.expiry_calendar import monthly_expiries
 from src.data.trading_calendar import offset_trading_days
@@ -48,22 +54,19 @@ from src.mcp.backtest_one import BacktestOneInput, backtest_one_impl
 # upper bound for an interactive Claude-driven research session.
 MAX_GRID_TRADES = 500
 
-# CVaR alpha — matches cell_summary + the dashboard.
-CVAR_ALPHA = 0.05
+# Backward-compat alias for the test module's CVAR_ALPHA import.
+CVAR_ALPHA = DEFAULT_CVAR_ALPHA
 
 
 # ============================================================
 # Models
 # ============================================================
 
-class CellWindowStats(BaseModel):
-    n: int = Field(..., description="Priced trade count for this cell.")
-    win_rate_pct: float | None
-    median_roi_pct: float | None
-    mean_roi_pct: float | None
-    std_roi_pct: float | None
-    cvar_5_roi_pct: float | None
-    total_net_pnl: float
+# Backward-compat alias: shared per-cell stat block centralized in
+# src.analytics.cell_stats.CellStatsBlock. CellWindowStats stays as
+# the name surfaced by this module's API so test imports + downstream
+# consumers keep resolving.
+CellWindowStats = CellStatsBlock
 
 
 class CellWindowResult(BaseModel):
@@ -119,42 +122,27 @@ class SweepWindowsOutput(CaveatedResponse):
 # ============================================================
 # Helpers
 # ============================================================
-
-def _bottom_alpha_mean(values: np.ndarray, alpha: float) -> float:
-    """Mirror of cell_summary's CVaR helper. Inline to avoid an extra
-    cross-module import for one function."""
-    arr = np.asarray(values, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if len(arr) == 0:
-        return float("nan")
-    k = max(1, int(np.ceil(alpha * len(arr))))
-    return float(np.mean(np.sort(arr)[:k]))
+#
+# All three local helpers below (_bottom_alpha_mean, _empty_stats,
+# _aggregate_priced_trades) now delegate to the centralized
+# src.analytics.cell_stats. The shims keep the underscored names so
+# the test module's existing imports keep resolving, while the real
+# logic lives in one place per the chore(p8.cell_stats.centralize)
+# refactor.
 
 
 def _empty_stats() -> CellWindowStats:
-    return CellWindowStats(
-        n=0, win_rate_pct=None, median_roi_pct=None, mean_roi_pct=None,
-        std_roi_pct=None, cvar_5_roi_pct=None, total_net_pnl=0.0,
-    )
+    return empty_cell_stats_block()
 
 
 def _aggregate_priced_trades(priced: list[tuple[float, float]]) -> CellWindowStats:
     """Compute the per-cell stat block from a list of (roi_pct, net_pnl)
     tuples. Empty input → empty stats."""
     if not priced:
-        return _empty_stats()
+        return empty_cell_stats_block()
     rois = np.array([p[0] for p in priced], dtype=float)
     pnls = np.array([p[1] for p in priced], dtype=float)
-    n = len(priced)
-    return CellWindowStats(
-        n=n,
-        win_rate_pct=float(100.0 * (pnls > 0).sum() / n),
-        median_roi_pct=float(np.median(rois)),
-        mean_roi_pct=float(np.mean(rois)),
-        std_roi_pct=float(np.std(rois, ddof=0)) if n >= 2 else None,
-        cvar_5_roi_pct=_bottom_alpha_mean(rois, CVAR_ALPHA),
-        total_net_pnl=float(pnls.sum()),
-    )
+    return compute_cell_stats(rois=rois, pnls=pnls, cvar_alpha=CVAR_ALPHA)
 
 
 # ============================================================
