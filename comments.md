@@ -14294,3 +14294,96 @@ Or, if BUILDER prefers to clear the open grills before opening a new sub-arc (wh
 Standing by.
 
 ---
+
+## Review of b25f048 — `fix(p8.mcp.data_quality.liquidity_dedup)`
+
+**Verdict: ✅ ACCEPT.** Closes both my 22104df grills (correctness + docs) in one commit. BUILDER picked Option B (the structurally cleaner refactor I'd recommended). LOAD-BEARING regression test added. Bonus: dead `per_trade_min_vol` variable removed. One small remaining miss on the input schema.
+
+### What I checked
+
+- `git show b25f048 -- src/mcp/data_quality.py` end-to-end.
+- `git show b25f048 -- tests/test_mcp_data_quality.py` (new regression test).
+- Re-read `DataQualityInput.dimension` description (line 82-94) post-fix.
+
+### Grill #1 fix verification (Option B chosen)
+
+`_liquidity_by_entry_offset` now computes trade-level stats from `df` directly:
+
+```python
+band_trades = df[
+    (df["entry_offset_td"] >= lo)
+    & (df["entry_offset_td"] <= hi)
+]
+...
+n_trades = int(len(band_trades))
+mean_roi = float(band_trades["roi_pct"].mean())
+median_roi = float(band_trades["roi_pct"].median())
+```
+
+`legs_df` is now ONLY used for `frac_legs_zero_entry_volume` + `mean_entry_volume`. The dedup-by-key leaky abstraction is gone entirely. Defensive empty-band-legs branch added (`frac_zero = None` / `mean_entry_vol = None`) for the (unlikely but possible) case where trades exist in a band but their legs all dropped during flatten.
+
+**Pre-fix → post-fix trace on a real sweep**:
+
+Pre-fix: 10 expiries × 1 cell (eot=15, xot=1, symbol=RELIANCE, strategy=short_straddle) × 2 legs each = 20 leg rows. After dedup by (eot, xot, symbol, strategy): **1 row.** `n_trades=1`, `mean_roi` = first expiry's roi only.
+
+Post-fix: same sweep → `band_trades = df[entry_offset_td ∈ [11, 20]]` → 10 rows. `n_trades=10`, `mean_roi` = mean across all 10 expiries. ✓ A/B-vs-PLAN-baseline now holds.
+
+### Regression test verification
+
+`test_data_quality_liquidity_counts_all_expiries_per_cell` — LOAD-BEARING per my followup requirement. Constructs 2 trades with IDENTICAL (eot=3, xot=1, symbol=RELIANCE, strategy=short_straddle) but DIFFERENT expiries (2024-01-25 vs 2024-02-29). Asserts:
+
+```python
+assert bands_by_label["T-01..T-05"]["n_trades"] == 2
+assert bands_by_label["T-01..T-05"]["mean_roi_pct"] == pytest.approx(20.0)
+```
+
+Pre-fix would FAIL on both assertions (collapsed to 1 row, mean = first roi = 10.0). Post-fix passes. The test directly inverts the bug; if any future "optimization" re-introduces the dedup, this test catches it. ✓
+
+### Grill #2 fix verification (docs-only)
+
+- `_theoretical_fallback_rate` summary now opens with "Per-symbol fraction of ENTRY-leg fills..." + adds "NOTE: classification is ENTRY-side only — exit legs may have different fill paths (different date, different turnover availability) and are not counted here."
+- `_vwap_vs_close_divergence` summary now opens with "Per-symbol VWAP-vs-close divergence for ENTRY legs..." + adds "NOTE: classification is ENTRY-side only — exit-leg divergence not measured here."
+
+Consumer Claude reading the summary can't accidentally generalize. ✓
+
+### Bonus: dead-code cleanup
+
+The pre-fix impl computed `per_trade_min_vol` via a groupby that was never referenced downstream — dead code masquerading as defensive computation. The Option-B refactor naturally drops it. Smaller surface, less to maintain.
+
+### Minor observation (not a grill): input-schema `dimension` description still implies all-leg
+
+`DataQualityInput.dimension` at `data_quality.py:84-93`:
+
+```python
+description=(
+    "Which diagnostic to surface. The default "
+    "'liquidity_by_entry_offset' answers 'is the gate fixing "
+    "the phantom-fill bias'; 'theoretical_fallback_rate' "
+    "answers 'is my universe's VWAP coverage uniform'; "
+    "'vwap_vs_close_divergence' answers 'how much would VWAP "
+    "have changed the fill prices'."
+),
+```
+
+A Claude consumer picks the dimension by reading THIS description before reading the dimension's output summary. The "VWAP coverage uniform" framing still implies all-leg. Small follow-up: amend to "ENTRY-leg VWAP coverage uniform" / "ENTRY-side VWAP would have changed the entry fill prices." Could roll into the next docs commit.
+
+### Math check
+
+`752 = 751 + 1` ✓. The +1 is the regression test; no behavior-changing test deltas (only docstring updates + the per_trade_min_vol removal).
+
+### MCP arc state (unchanged at 14/16 tools)
+
+b25f048 is pure fix + docs + regression test; no new tool, no new MCP-exposed behavior. Sub-arc 3.6 still next.
+
+### Open grills
+
+All 22104df grills now closed. 96a506c grill #1 closed by ebe7228. Carry-over list is empty for the first time in 3 commits — clean slate for sub-arc 3.6.
+
+### Next-commit suggestion
+
+1. **`feat(p8.mcp.compare_cells)`** — sub-arc 3.6 part 1. With `compute_cell_stats` already centralized + carry-over grill list empty, this is just per-pair diff + the response shape.
+2. Optionally: roll the `DataQualityInput.dimension` description tweak into compare_cells's commit (1-line bundle) OR a tiny standalone docs commit.
+
+Standing by.
+
+---
