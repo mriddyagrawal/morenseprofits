@@ -15195,3 +15195,61 @@ There are NO open grills. Next moves are operator-driven:
 Standing by.
 
 ---
+
+## Review of 4e5099d — `chore(p7_wide_sweep.symbols_flag)`
+
+**Verdict: ✅ ACCEPT.** Tiny operator-quality chore. No grills.
+
+### What landed
+
+`scripts/p7_wide_sweep.py` gains `_parse_args()` exposing two CLI flags:
+- `--symbols A B C` — nargs="+", default = full 50-symbol universe.
+- `--workers N` — default = `N_WORKERS = 8`.
+
+`main()` reads `args.symbols` / `args.workers` into locals (`symbols`, `n_workers`) and threads them through 5 call sites that previously used the module-level constants:
+- Expiry-build loop (`for sym in symbols:`)
+- Cell-count math (`len(STRATEGIES) * len(symbols) * ...`)
+- `_compute_run_id` hash input
+- `sweep_grid(symbols=symbols, ...)` call
+- `sweep_grid(n_workers=n_workers, ...)` parameter + the log line above it
+
+### Praises
+
+- **Symmetric with `scripts/prefetch_universe.py`**. Verified via grep: prefetch_universe uses the same `--symbols nargs="+" default=DEFAULT_SYMBOLS` pattern at line 217. Operator memorizes one flag idiom across both scripts.
+- **Help text names the LOCKSTEP CONVENTION** — "pass the same list to prefetch + sweep so sweep doesn't run against non-prefetched stocks (which would yield OfflineCacheMiss skips)". That's the right anti-confusion docs at the right place. Without this hint, a smoke-test operator running `--symbols RELIANCE` on the sweep against a 50-symbol cache would either get confused by the skips or worse, assume the universe was small without realizing they were exercising the cache_only=True policy edge case.
+- **Defaults preserve backward compat**: no-args invocation runs the full 50-symbol universe with 8 workers. Existing operator habits + cron jobs (if any) unchanged.
+- **Module-level `SYMBOLS` / `N_WORKERS` stay as the source-of-truth for defaults**. Single place to bump when the universe grows.
+- **Operator confirmation in the run header**: `print(f"  symbols     = {symbols}  (n={len(symbols)})")` echoes the resolved list + count back, so a fat-finger like `--symbols RELIANC` is visible at startup rather than 30 minutes into the run.
+- **All 5 call sites consistently swapped**. No stragglers using the module-level constant after the local was introduced — verified the full diff.
+
+### Minor observations (not grills)
+
+- **No upper bound on `--workers`** — `--workers 1000` would be accepted and the process pool would try to spawn 1000 workers. Operator-pitfall; not a correctness bug. Could add `choices=range(1, 33)` or `type=lambda n: max(1, min(int(n), 32))` if it ever bites. Mild.
+- **No `--strategies` / `--entry-offsets` flag** — STRATEGIES, ENTRY_OFFSETS_TD, EXIT_OFFSETS_TD all stay hardcoded. Defensible: those are the EXPERIMENT DESIGN, while symbols + workers are EXECUTION SCOPE. The abstraction line is reasonable.
+- **No symbol-validity check at parse time**. A typo like `--symbols RELIANC` flows through to `sweep_grid` and surfaces as `OfflineCacheMiss` skips per expiry. The startup echo (`n=49`) gives a visible signal if the expected count diverges; explicit validation would be nice but is YAGNI.
+
+### Behavior delta
+
+For valid no-args invocation: **none**. Full 50-symbol universe, 8 workers, identical run_id (the hash inputs are the same).
+
+For new invocations: smoke-tests can target a subset without editing the script and risking a bad commit.
+
+### Math
+
+Test count unchanged (788 stays 788). Commit body says "Test count unchanged" — accurate.
+
+### MCP arc / Phase 7 state
+
+`p7_wide_sweep` is a Phase-7 production script (not Phase-8 MCP). This chore is operator-quality, not arc-closing work. No state change to the MCP arc (still closed at 16/16); no state change to the Phase-7 pricing arc (still complete).
+
+### Open grills
+
+**Empty.**
+
+### Next-commit suggestion
+
+Operator-driven from here. The new flag unblocks the smoke-test path against the post-arc engine; running a smoke sweep on a 2-3 symbol subset, then sanity-checking the cell_summary / data_quality output against expected post-arc behavior, would be a natural next operator action. Otherwise, Phase 9 planning.
+
+Standing by.
+
+---
