@@ -15555,3 +15555,54 @@ Unchanged at 16/16. Docs-only.
 Standing by.
 
 ---
+
+## Review of 4665611 — `fix(docs.mcp_catalog.identifier_drift)`
+
+**Verdict: ✅ ACCEPT.** Both ab6ed6d grills closed cleanly + the pattern-prevention feedback loop is closed (memory rule applied at write time, not just at review time). No grills.
+
+### What landed
+
+- **Grill A fix**: `phantom_fill_band` → `liquidity_by_entry_offset` in the ENTRY-side scope bullet. Single identifier swap. Commit body diagnoses the root cause cleanly: "The `phantom_fill_band` string is the THING the first dimension reports on ('is the gate fixing the phantom-fill bias?'), not the dimension's identifier." That's exactly the conceptual confusion that produced the original typo — conflating the topic with the identifier.
+- **Grill B fix**: Replaced the named-caveat claim with the actual quoted prose + explicit pointer: "(substring-match for `\"ROI distribution was truncated\"` — there is no named caveat key)". Operators now know precisely what to grep for.
+
+### Verification (grep-the-code discipline, applied to docs)
+
+Applied my updated `feedback-grep-code-before-accepting-calibration` rule on every backtick'd identifier in the new prose:
+
+- `liquidity_by_entry_offset` ✓ verified at `src/mcp/data_quality.py:71-75` (DataQualityDimension Literal).
+- `theoretical_fallback_rate` ✓ same Literal.
+- `vwap_vs_close_divergence` ✓ same Literal.
+- `"ROI distribution was truncated"` ✓ verified at `src/mcp/compare_cells.py:248` (start of the free-form caveat string).
+
+All identifiers grep-hit the cited files.
+
+### Praises
+
+- **Root-cause naming**: the commit body's "THING vs identifier" distinction is the right post-mortem framing. A future contributor reading this commit body learns the failure mode, not just the surface fix.
+- **Pattern-prevention loop closed at WRITE time**: commit body explicitly says "Reviewer's memory updated with a dedicated rule: every backtick'd identifier in the prose must grep-hit the cited file. Applied that rule on this fix before commit (verified all 3 dimension names verbatim in data_quality.py and the caveat substring in compare_cells.py)." That's the kind of cross-side feedback loop that compounds — BUILDER read my memory update, applied it preemptively, verified before commit. Pattern caught at write time, not just at review.
+- **No code changes**, no test changes — minimum-surface fix.
+- **Commit body acknowledges the third-in-a-stretch pattern** (793494b → 9102620 → cfc0f88) without trying to obscure it. Honest about the recurring failure mode + names the new prevention rule.
+
+### Behavior delta
+
+None. Pure docs. 801/801 still pass per commit body.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Open grills
+
+**Empty.** Both ab6ed6d grills closed. The docs-identifier pattern now has a memory rule AND a documented prevention practice on the BUILDER side.
+
+### Next-commit suggestion
+
+Operator-driven from here. Three standing operator actions remain:
+
+1. **(operator-driven)** Bring the bare-library1-recipe diagnostic to a conclusion (manual click-test outcome) or pivot per click_failures.md decision tree.
+2. **(operator-driven)** Smoke sweep on corrected engine (carry-over from 8c2c517) — verifies the pricing fix end-to-end + unblocks the 5 failing e2e tests.
+3. **(operator-driven)** Once click + pricing fixes are validated end-to-end, Phase 9 (paper trading) consultation/planning per the SPECS roadmap.
+
+Standing by.
+
+---
