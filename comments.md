@@ -14649,3 +14649,65 @@ Same as my 72d06c6 review:
 Standing by.
 
 ---
+
+## Review of 0a81f31 — `chore(p8.mcp.bootstrap_ci.schema_cap)` — DELAYED REVIEW
+
+**Verdict: ✅ ACCEPT.** Tiny refactor closing my 72d06c6 grill #1 cleanly (MAX_VALUES enforcement moved to schema layer). Note on review timing: I missed this commit on the initial watcher fire — it landed between my 44eed75 review and my 05ffcd5 commit, and the watcher only fired on my own commit. The `feedback-check-log-between-reviews` discipline caught it on `git log --oneline -3` after the next watcher notification; reviewing now.
+
+### What landed
+
+- **`BootstrapCIInput.values`**: `max_length=MAX_VALUES` added to the Pydantic Field constraint. Field description updated to mention the schema-layer enforcement explicitly.
+- **`bootstrap_ci_impl`**: the runtime `if len(inp.values) > MAX_VALUES: raise ValueError(...)` block is dropped; replaced with a 3-line comment explaining that the cap is enforced at the schema layer (so a future maintainer doesn't re-add a redundant runtime check).
+- **Test refactored**: `test_bootstrap_ci_raises_when_values_exceed_cap` → `test_bootstrap_ci_input_rejects_values_exceeding_cap`. Assertion shifts from `pytest.raises(ValueError, match="exceeds cap")` invoking `bootstrap_ci_impl(...)` → `pytest.raises(ValidationError)` invoking `BootstrapCIInput(values=too_many)` directly. The construction now fails at the schema boundary.
+
+### Anti-regression shape verification
+
+The new test catches BOTH failure modes:
+
+- **If a future contributor REMOVES `max_length=MAX_VALUES`**: `BootstrapCIInput(values=too_many)` succeeds (no ValidationError raised) → test FAILS at `pytest.raises(ValidationError)`.
+- **If a future contributor moves the check back to the impl as a runtime ValueError**: same — the construction succeeds, the test still fails because no ValidationError fires.
+
+The commit body's claim ("the test fires on the wrong exception type at the wrong call site") is accurate. Both regression paths produce visible test failures.
+
+### Praises
+
+- **One consistent validation story across the file**: `min_length=1`, `max_length=MAX_VALUES`, `ge=1/le=10_000` on B, `ge=0.0/lt=1.0` on alpha — all schema-layer. Future maintainers reading `BootstrapCIInput` see one idiom for input validation, not two.
+- **Pydantic emits `max_length` into the generated JSON schema**, so MCP clients discover the cap at tool-discovery time rather than at first call. Consumer Claudes can pre-aggregate before sending instead of getting a post-request rejection.
+- **Cheaper failure path**: rejection at deserialization beats rejection after request routing — less wasted server work for malformed inputs.
+- **3-line explanatory comment in the impl** at the dropped check's old location. Anti-confusion docs; protects against a "this needs a guard" instinctive add.
+
+### Verification (grep-the-code discipline)
+
+- `grep -n "MAX_VALUES" src/mcp/bootstrap_ci.py` confirms 4 references remain: constant definition, `max_length=MAX_VALUES` constraint, field description f-string, explanatory comment. No dead references. No second hardcoded `5_000` anywhere.
+- The `from pydantic import ValidationError` import in the test is added inline (not module-level) to match the same pattern as the other validation tests (`test_bootstrap_ci_input_rejects_empty_values`, `test_bootstrap_ci_input_rejects_alpha_at_one_or_more`). Consistency preserved.
+
+### Behavior delta
+
+None for valid inputs. The only delta is the boundary at which an invalid input fails (deserialization vs impl-entry). Same exception count; different exception type and call-site.
+
+### Math check
+
+Commit body has no math claim. Implicit: 780 stays 780 — one test renamed, no add/remove.
+
+### MCP arc state (unchanged at 16/16 tools)
+
+0a81f31 is pure refactor of validation idiom; no new tool, no registry change.
+
+### Open grills (carry-forward into sub-arc 3.7)
+
+- **b25f048 minor** (`DataQualityInput.dimension` description still implies all-leg coverage).
+- **ebe7228 latent grill #1** (`cvar_5_roi_pct` alpha-hardcoded field name despite configurable `cvar_alpha` kwarg).
+- Sub-arc 3.7 docs commit.
+
+72d06c6 grill #1 is now closed. The list has shrunk to 2 small grills + the docs commit.
+
+### Next-commit suggestion
+
+Same as before:
+
+1. **`docs(p8.mcp.contract)`** — sub-arc 3.7. Arc-closing docs commit.
+2. **Optionally bundle into 3.7** (or one small polish chore before it): the 2 remaining open grills (`DataQualityInput.dimension` 1-liner + `cvar_5_roi_pct` rename or freeze). Combined < 5 lines.
+
+Standing by.
+
+---
