@@ -13923,3 +13923,98 @@ In priority order:
 Standing by.
 
 ---
+
+## Review of fc6356e — `feat(p8.mcp.skip_summary)` — sub-arc 3.5 (1 of 2)
+
+**Verdict: ✅ ACCEPT.** Sub-arc 3.5 opens. 13/16 tools landed. Two small grills.
+
+### What I checked
+
+Re-read `src/mcp/skip_summary.py` (272 LOC) end-to-end + `tests/test_mcp_skip_summary.py` (274 LOC, 13 new tests) + the `_collect_tool_entries` diff in `server.py`. Cross-referenced against the SKIPS_COLUMNS schema in `src/engine/results.py` and the peer error-handling pattern in `sweep_query.py` / `cell_summary.py`.
+
+### Praises
+
+- **Two-tier caveat structure.** Shared `PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT` + the additional "skip distribution reflects pre-arc engine behavior — mostly OfflineCacheMiss + corporate-action skips; post-arc adds IlliquidLegError as a dominant new skip class; NOT directly comparable" framing. Closes the failure mode where a consumer Claude pulls a pre-arc skip log + a post-arc one and treats the new IlliquidLegError concentration as "things got worse" instead of "the gate is doing its job." Anti-cargo-cult docs.
+- **Sort by count DESC.** `groups.sort(key=lambda g: g.count, reverse=True)` after the groupby. Consumer Claude reads the dominant failure mode at index 0. Matches the same "biggest bucket first" UX as heatmap's top-cells.
+- **`_column_for_group_by` translation.** Cleanly maps the input enum `"reason"` → the parquet column `"skip_reason"`, with the other 4 group_by values passing through unchanged. The choice to NOT expose `"skip_detail"` as a group_by dimension is right — `skip_detail` is the exception message (high-cardinality, often unique per row); grouping by it would explode the groups list.
+- **Missing-data defensiveness.** `pd.isna(key)` → `"<missing>"` so a NaN-keyed group doesn't crash the str-coercion; `pd.Timestamp` keys → `.date().isoformat()` so the JSON output stays date-string-canonical.
+- **Test coverage matches the surface.** 4 group_by columns × explicit tests (including the ADANIENT-cluster test referencing a real past audit finding); examples capping at 3 + max_examples=0 counts-only path + schema-layer rejection of out-of-range max_examples; pre-arc caveat marked LOAD-BEARING in the docstring; JSON round-trip via `model_dump(mode="json")`; registry grows to ≥13.
+- **`total_cells_attempted = n_priced + n_skipped`.** Verified the sweeper contract: every attempted cell lands in EITHER `sweep_*.parquet` OR `sweep_*_skipped.parquet`, never both — so the sum is the true attempted count. This is the right denominator for `skip_rate_pct`.
+- **Empty-skip case.** When `read_skips` returns the canonical-shape empty frame (no companion file), the tool returns `groups=[]` + `skip_rate_pct=0.0` cleanly rather than raising. That's the common case for a healthy sweep.
+
+### Grill #1 (small): hardcoded path in the missing-run_id error message lies under monkey-patched `RESULTS_DIR`
+
+`src/mcp/skip_summary.py:171-174`:
+
+```python
+except FileNotFoundError as e:
+    raise ValueError(
+        f"run_id {inp.run_id!r} has no sweep parquet at "
+        f"data/results/sweep_{inp.run_id}.parquet"
+    ) from e
+```
+
+The string `data/results/sweep_{inp.run_id}.parquet` is a hardcoded restatement of what `results_path()` would return under default `RESULTS_DIR`. Under any deployment with a non-default `RESULTS_DIR` (env override, test monkey-patch, or future MCP-server config), the error message says it looked in `data/results/` when it actually looked in `RESULTS_DIR`. Two clean fixes:
+
+- **Option A (matches peers)**: drop the wrap, let `FileNotFoundError` propagate. `sweep_query` and `cell_summary` both do this with `df = read_results(inp.run_id)` and the underlying `read_results` error message is already "no results parquet at {path}" — accurate under any `RESULTS_DIR`.
+- **Option B (keeps friendlier wrap)**: build the path correctly: `raise ValueError(f"run_id {inp.run_id!r} has no sweep parquet at {results_path(inp.run_id)}")`.
+
+I'd take Option A for symmetry with the rest of the MCP arc, but B is fine if the friendlier "no sweep parquet" phrasing has consumer-Claude value.
+
+### Grill #2 (small): examples are first-N from skip-log row order, not balanced — consumer Claude might over-generalize
+
+`src/mcp/skip_summary.py:222-225`:
+
+```python
+if inp.max_examples > 0:
+    head = group_df.head(inp.max_examples)
+    for _, row in head.iterrows():
+        examples.append(_row_to_example(row))
+```
+
+For `group_by='reason'` over a few thousand `IlliquidLegError` skips, `head(3)` returns the FIRST 3 rows of that reason in skip-log insertion order. If the sweeper happened to write all ADANIENT skips first (it iterates symbol-by-symbol), the consumer Claude sees 3 ADANIENT examples and might conclude "IlliquidLegError concentrates on ADANIENT" — when actually the group covers many symbols and ADANIENT is just first in insertion order.
+
+The `SkipExample` docstring says "One representative row from the skip log" — but the impl picks the FIRST N rows, not representative ones. Two clean ways to close:
+
+- **Docs-only fix**: amend the `SkipExample` and `SkipGroupSummary.examples` field docstrings to say "first N rows from the skip-log insertion order (not balanced across symbols/expiries)". Lets the consumer Claude know not to over-generalize from the sample.
+- **Behavior fix**: pull examples balanced across unique sub-keys (e.g., one per unique symbol up to N). More work; only worth doing if you've seen the over-generalization fail in practice.
+
+Docs-only is the right call for v1 unless you have a specific consumer-Claude misread to point to.
+
+### Minor observations (not grills)
+
+- **`n_priced = len(read_results(inp.run_id))` loads the full results parquet for a row count.** At 7500-trade sweeps it's pulled overhead for the row count alone. Future optimization: `pq.read_metadata(results_path(inp.run_id)).num_rows` reads only the parquet footer. Not blocking; just on the optimization-when-needed list.
+- **`test_skip_summary_max_examples_clamped_at_max`** asserts `pytest.raises(ValidationError)` — schema layer REJECTS rather than CLAMPS. Mild naming nit (test name says "clamped" but the behavior tested is rejection); doesn't matter.
+- **Group ordering with ties.** `groups.sort(key=lambda g: g.count, reverse=True)` is stable in Python; ties resolve by the groupby insertion order. Fine, but worth a 1-liner in the `SkipSummaryOutput.groups` docstring if anyone ever depends on tie-break ordering.
+
+### Math check
+
+Commit body claims `736 passed (was 723, +13 from this commit)`. 723 + 13 = 736 ✓. Sub-arc 3.4 count (713 → 723 was +10 from sweep_windows) was the prior baseline; 723 → 736 is +13 from skip_summary. Numbers consistent.
+
+### MCP arc state
+
+| Sub-arc | Status | Tools |
+|---|---|---|
+| 3.1 spot_options | ✅ | 2 (get_options_chain, get_spot_history) |
+| 3.2 server scaffolding | ✅ | server.py + _models.py infrastructure |
+| 3.3 sweep queries | ✅ | 4 (list_runs, query_sweep, cell_summary, heatmap) |
+| 3.4 backtest replay | ✅ | 2 (backtest_one, sweep_windows) |
+| 3.5 diagnostics part 1 | ✅ | 1 (skip_summary) |
+| 3.5 diagnostics part 2 | pending | data_quality |
+| 3.6 research helpers | pending | compare_cells + bootstrap_ci |
+| 3.7 docs | pending | — |
+
+13/16 tools landed. 3 tools + the docs commit remaining.
+
+### Carry-over: 96a506c grill #1 still open
+
+`compute_cell_stats(rois, pnls) -> CellStats` extraction is still on the to-do list. `data_quality` likely aggregates per-cell or per-symbol stats too — if the math overlaps, bundle the extraction into the data_quality commit. Otherwise standalone refactor before sub-arc 3.6 closes.
+
+### Next-commit suggestion
+
+1. **`feat(p8.mcp.data_quality)`** — sub-arc 3.5 part 2. Closes the diagnostics tier. The other motivational tool from the consultation ("liquidity_by_entry_offset" as a one-tool call). If its aggregation math overlaps cell_summary/sweep_windows, fold in the `compute_cell_stats` extraction (closes 96a506c grill #1).
+2. After 3.5 closes: sub-arc 3.6 (compare_cells + bootstrap_ci) — the research-helper tier.
+
+Standing by.
+
+---
