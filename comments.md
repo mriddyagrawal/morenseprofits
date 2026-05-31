@@ -14711,3 +14711,48 @@ Same as before:
 Standing by.
 
 ---
+
+## Review of f4707e3 — `chore(p8.mcp.data_quality.entry_side_docs)`
+
+**Verdict: ✅ ACCEPT.** 9-line docs commit closing the b25f048 minor (input-schema description now names ENTRY-side scope inline).
+
+### What landed
+
+`DataQualityInput.dimension` description (`src/mcp/data_quality.py:86-100`) now reads:
+
+> Which diagnostic to surface. The default 'liquidity_by_entry_offset' answers 'is the gate fixing the phantom-fill bias' (ENTRY-side leg only); 'theoretical_fallback_rate' answers 'is my universe's VWAP coverage uniform' (ENTRY-side fill classification only — the exit-side fallback rate is not surfaced here); 'vwap_vs_close_divergence' answers 'how much would VWAP have changed the fill prices' (ENTRY-side legs only). All three dimensions analyze the ENTRY leg; the exit-side counterparts can be derived from cell_summary or backtest_one if needed.
+
+Three dimension descriptions name ENTRY-side scope inline + a trailing cross-cutting sentence + a pointer to the right tools for exit-side analysis. Anti-confusion docs at the right surface (consumer Claudes pick dimension by reading this BEFORE calling the tool, so the scope is now visible upstream).
+
+### Verification
+
+- Output-side summary strings (set in b25f048) already say "ENTRY-side only" — they're unchanged. The input-side description now matches. No drift between input and output framings.
+- "All three dimensions analyze the ENTRY leg; the exit-side counterparts can be derived from cell_summary or backtest_one if needed." — accurate. cell_summary aggregates per-cell stats (which include exit ROI implicitly); backtest_one replays a single trade end-to-end (exposing both legs). Both are reasonable pointers.
+
+### Behavior delta
+
+None. Pure docs change. No tests touched.
+
+### Math
+
+780 stays 780.
+
+### MCP arc state (unchanged at 16/16 tools)
+
+Pure docs.
+
+### Open grills (carry-forward)
+
+- **ebe7228 latent grill #1** (`cvar_5_roi_pct` alpha-hardcoded field name) — still open.
+- Sub-arc 3.7 docs commit.
+
+b25f048 minor is now closed. Open list is down to 1 small grill + the docs commit. BUILDER has working-tree changes on `src/analytics/cell_stats.py` — likely starting the `cvar_5_roi_pct` rename.
+
+### Next-commit suggestion
+
+1. **(in-progress)** `chore(p8.cell_stats.cvar_alpha_field)` — rename `cvar_5_roi_pct` → `cvar_tail_mean_roi_pct` (or freeze the kwarg). Closes the last small grill.
+2. **`docs(p8.mcp.contract)`** — sub-arc 3.7. Arc-closing docs commit.
+
+Standing by.
+
+---
