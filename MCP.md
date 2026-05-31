@@ -17,8 +17,10 @@ than fetching.
 ```
 
 Speaks JSON-RPC over stdio (the MCP SDK default transport). Claude Code
-registers it through `~/.claude.json` MCP config; for one-off testing
-the same `python -m src.mcp` command works.
+registers it through `~/.claude/mcp.json` (global) or `.mcp.json`
+(project-local) — see `DESIGN/PHASE_8_MCP.md` §2 for the canonical
+config block. For one-off testing the same `python -m src.mcp` command
+works.
 
 Tools live in `src/mcp/`, one module per sub-arc, registered into one
 catalog by `build_server()` in `src/mcp/server.py`. Each tool has a
@@ -196,9 +198,11 @@ No parameters.
 
 ### `sweep_windows`
 
-> Generate a list of candidate (entry_date, exit_date) windows for a
-> (strategy, symbol, expiry range, offset range) tuple. The "what
-> would I sweep" preview tool.
+> Replay a small (entry × exit) grid across N expiries against the
+> local cache. Returns one stat block per (entry, exit) pair + per-cell
+> skip breakdown. **Hard-capped at 500 total trades** — for wider
+> grids, run `scripts/p7_wide_sweep.py` then query via `cell_summary` /
+> `heatmap`.
 
 | Param | Type | Required | Default | Notes |
 |---|---|---|---|---|
@@ -261,6 +265,19 @@ No parameters.
   `p7.pricing_arc` engine version (no `engine_version` metadata stamp)
   raise a caveat on `cell_summary`, `heatmap`, etc. — the operator
   needs to know the result might be carrying phantom-fill bias.
+- **`data_quality` is ENTRY-side only.** All three diagnostics
+  (`phantom_fill_band`, `theoretical_fallback_rate`,
+  `vwap_vs_close_divergence`) classify and measure ENTRY-leg fills
+  only — exit-leg fill quality is NOT covered. Operator interpreting
+  any of these dimensions must treat them as entry-fill diagnostics,
+  not whole-trade diagnostics.
+- **`compare_cells.roi_distribution` keeps the LOWEST N by ROI.**
+  When a cell's distribution exceeds the per-cell row cap, the right
+  tail is dropped (not a random sample) — consistent with the tool's
+  tail-risk emphasis (CVaR-5%). A `roi_distribution_truncated` caveat
+  fires on truncation. Operators charting these distributions should
+  treat the right edge as a lower bound on the best trades, not a
+  full picture.
 - **Every tool's output has a `caveats` field** — a free-form list of
   strings surfacing data-quality issues, truncations, and known-bug
   exceptions. Treat empty caveats as the explicit "no concerns"
