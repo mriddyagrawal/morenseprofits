@@ -14193,3 +14193,104 @@ In priority order:
 Standing by.
 
 ---
+
+## Review of ebe7228 — `chore(p8.cell_stats.centralize)`
+
+**Verdict: ✅ ACCEPT.** Clean extraction, closes my 96a506c grill #1 in advance of sub-arc 3.6. One small docs grill on the alpha-hardcoded field name; some minor observations. Math verified end-to-end across all 12 new tests.
+
+### What I checked
+
+- `src/analytics/cell_stats.py` (151 LOC, new) end-to-end.
+- `tests/test_analytics_cell_stats.py` (135 LOC, 12 new tests) — hand-derived every assertion.
+- `cell_summary.py` diff: the original `CellStats` model + `_bottom_alpha_mean` / `_empty_stats` / `_compute_stats` impls were dropped and replaced with backward-compat shims pointing at the centralized helpers.
+- `sweep_windows.py` diff: same pattern — `CellWindowStats` aliased to `CellStatsBlock`, `_bottom_alpha_mean` deleted entirely, `_empty_stats` + `_aggregate_priced_trades` shimmed.
+
+### Behavior parity verification (the load-bearing question for a refactor)
+
+- `bottom_alpha_mean(values, alpha)`: original (in cell_summary + sweep_windows) used `arr[np.isfinite(arr)]` + `max(1, int(np.ceil(alpha * len(arr))))` + `float(np.mean(np.sort(arr)[:k]))` + NaN-on-empty. Centralized version is line-for-line identical. ✓
+- `_empty_stats()`: original returned `CellStats(n=0, win_rate_pct=None, ..., total_net_pnl=0.0)`. New `empty_cell_stats_block()` returns the same field values. ✓
+- `compute_cell_stats`: replicates `n / 100×(pnls>0).sum()/n / median / mean / std-with-ddof=0-and-None-when-n<2 / bottom_alpha_mean / pnls.sum()`. Identical to both prior copies. ✓
+- The `n=1 → std_roi_pct=None` "honesty surface" semantic preserved (caller would otherwise read 0.0 as "tight distribution").
+
+### Test-math verification (hand-checked every assertion)
+
+- `bottom_alpha_mean_strict_count_for_large_n`: arr 1..100, α=0.05, k=ceil(5)=5, sorted bottom 5 = [1..5], mean = 3.0 ✓
+- `bottom_alpha_mean_floors_to_one_for_tiny_n`: arr [10,20,-5,15], α=0.05, k=ceil(0.2)=max(1,0)=1, bottom 1 = -5 ✓
+- `bottom_alpha_mean_drops_nans`: arr [10,nan,20,-5] → [10,20,-5], α=0.50, k=ceil(1.5)=2, bottom 2 sorted = mean(-5, 10) = 2.5 ✓
+- `compute_cell_stats_hand_derived_for_ten_trades`: ROIs 1..10, PnLs 100..1000. median=5.5, mean=5.5, std(ddof=0)=√8.25≈2.872, CVaR-5% with n=10 → k=ceil(0.5)=1 → bottom = 1.0, total = sum(100..1000) = 5500 ✓
+- `compute_cell_stats_mixed_winners_losers`: ROIs [10,-5,15,-2,8,-3] sorted = [-5,-3,-2,8,10,15], median = mean(-2,8) = 3.0 ✓; PnLs [100,-50,150,-20,80,-30] sum = 230 ✓; 3 positive PnLs of 6 = 50% win rate ✓
+- `compute_cell_stats_custom_alpha_changes_cvar`: α=0.05, n=100, k=5, mean(1..5)=3.0 ✓; α=0.20, k=20, mean(1..20)=10.5 ✓
+
+All math holds.
+
+### Praises
+
+- **Hoists `DEFAULT_CVAR_ALPHA = 0.05` to a single canonical constant.** Both consumer modules now alias it (`CVAR_ALPHA = DEFAULT_CVAR_ALPHA`) for backward-compat with the existing test imports. Beats having two parallel `CVAR_ALPHA = 0.05` definitions silently drift.
+- **Backward-compat aliases preserve external imports.** `CellStats = CellStatsBlock` + `CellWindowStats = CellStatsBlock` keep the per-tool test imports (`from src.mcp.cell_summary import CellStats`, `from src.mcp.sweep_windows import CellWindowStats`) resolving. No test churn for the rename — disciplined refactor hygiene.
+- **`n=1 → std_roi_pct=None` honesty surface preserved.** The original cell_summary's semantic ("don't claim a meaningful zero") is now codified in the centralized helper + tested explicitly. This was load-bearing prior behavior; it could have been lost in the move. Wasn't.
+- **`empty_cell_stats_block()` is its own exposed helper** rather than buried inside `compute_cell_stats`. Lets callers handle their "no data" branch explicitly when the empty case isn't reached via `n == 0` (e.g., a caller that filtered out cells before passing the arrays).
+- **`compute_cell_stats` raises on shape mismatch** with an explicit message (`"rois and pnls shape mismatch: (2,) vs (1,)"`). Defensive; ascending callers can't silently mis-align ROI ↔ PnL.
+- **Lands BEFORE `compare_cells`** so commit 11 imports the centralized helper directly rather than becoming the third copy. Matches my 96a506c-grill-#1 framing ("defensible at 2, fragile at 3").
+
+### Grill #1 (small, docs/API): `cvar_5_roi_pct` field name is alpha-hardcoded but `compute_cell_stats(cvar_alpha=...)` is configurable
+
+`src/analytics/cell_stats.py:72-79`:
+
+```python
+cvar_5_roi_pct: float | None = Field(
+    ...,
+    description=(
+        "CVaR-5%: mean of the worst-α fraction of per-trade ROI "
+        "in the cell. Floor-at-1 so thin cells still surface the "
+        "single-worst-trade as their tail estimate. None when n == 0."
+    ),
+)
+```
+
+The field NAME bakes in `5%` but `compute_cell_stats` accepts a `cvar_alpha` parameter (and `test_compute_cell_stats_custom_alpha_changes_cvar` validates a 20% alpha). If a future caller passes `cvar_alpha=0.20`, the returned `CellStatsBlock` will have `cvar_5_roi_pct = <20%-tail-mean>` — a field labelled "CVaR-5%" carrying the CVaR-20%. The description says "5%" too.
+
+Two clean fixes:
+
+- **Option A (rename field)**: `cvar_tail_mean_roi_pct` + amend description to "Mean of the worst-α fraction (α = DEFAULT_CVAR_ALPHA = 5% unless overridden via compute_cell_stats's cvar_alpha kwarg)." Forward-flexible. Mild test/consumer rewiring.
+- **Option B (freeze α)**: drop the `cvar_alpha` parameter, pin to `DEFAULT_CVAR_ALPHA`. Backward-cleanest. Lose the future flexibility (and the matching test).
+
+Today's 3 consumers (cell_summary, sweep_windows, compare_cells) all use the default 0.05, so the latent inconsistency hasn't fired yet. Worth closing before a 4th consumer introduces it.
+
+### Minor observations (not grills)
+
+- **Redundant n==0 short-circuit in `cell_summary._compute_stats`**: the shim now does `if len(cell) == 0: return empty_cell_stats_block()` ABOVE the `compute_cell_stats` call — but `compute_cell_stats` already returns `empty_cell_stats_block()` for `n == 0`. Dead defensive code; harmless. Drop the shim's branch to reduce surface.
+- **`CellStatsBlock.std_roi_pct` description dropped precision detail**: original cell_summary.CellStats had "bias vs ddof=1 is ~11% at n=5, ~5% at n=10, ~2.5% at n=20" — the centralized version kept only "~11% at n=5". Mild operator-facing info loss for schema readers. Restore the full table.
+- **Module docstring at `cell_stats.py:16` mentions `compare_cells.py::_compute_stats (about to be 3rd copy)`** — once compare_cells lands and uses the centralized helper, this line should be amended to "(now uses compute_cell_stats too)". Lifecycle housekeeping, not blocking.
+- **All-NaN ROI input not explicitly documented**: for `n > 0` with all-NaN rois, `bottom_alpha_mean` returns NaN; median/mean/std stay NaN per numpy. The `cvar_5_roi_pct` field description says "None when n == 0" but doesn't address the all-NaN case. Caller-side, this is the standard numpy contract — but worth a 1-liner if a Claude consumer might trip on it.
+
+### Math check
+
+Commit body claims `751 passed (was 747, +4 net from the consumer-test wash + 12 new centralized helper tests minus the 8 e2e tests skipped because the sweep parquet is currently deleted during operator's fresh prefetch)`. Math: 747 + 12 − 8 = 751 ✓.
+
+The 8 skipped e2e tests are PRE-EXISTING skips from the operator's fresh-prefetch state (no live sweep parquet to drive them) — not a regression introduced by this refactor. Once a fresh sweep lands, those tests come back online and should pass under the centralized helpers (the consumer behavior is preserved). Worth a brief verification after the next sweep completes; not blocking the commit.
+
+### Open grills NOT closed by this commit
+
+**22104df Grill #1 (correctness, data_quality liquidity dedup)** — still open. The centralization here doesn't touch `_liquidity_by_entry_offset`'s dedup keys. The fix commit is still owed.
+
+**22104df Grill #2 (docs, data_quality entry-only)** — still open. Same reason.
+
+These are independent of the cell_stats refactor; flagging so they don't fall off the radar.
+
+### MCP arc state (unchanged at 14/16 tools)
+
+ebe7228 is pure refactor — no new tool, no new MCP-exposed behavior. 14/16 tools landed. Sub-arc 3.6 (compare_cells + bootstrap_ci) still next.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.data_quality.liquidity_dedup)`** — close 22104df Grill #1 (correctness). LOAD-BEARING for the A/B-vs-PLAN-baseline purpose.
+2. **`docs(p8.mcp.data_quality.entry_only)`** — close 22104df Grill #2 (docs); could bundle with #1.
+3. **`feat(p8.mcp.compare_cells)`** — sub-arc 3.6 part 1. With `compute_cell_stats` already centralized, this is just per-pair diff + the response shape. Should be clean.
+
+Or, if BUILDER prefers to clear the open grills before opening a new sub-arc (which is the discipline I'd recommend): bundle #1 + #2 into one `fix(...)` commit, then start sub-arc 3.6 with a clean slate.
+
+Standing by.
+
+---
