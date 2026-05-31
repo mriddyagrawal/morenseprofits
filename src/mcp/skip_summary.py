@@ -29,6 +29,7 @@ from src.engine.results import (
     read_results,
     read_run_metadata,
     read_skips,
+    results_path,
 )
 from src.mcp._models import (
     PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT,
@@ -54,7 +55,12 @@ SkipGroupBy = Literal[
 # ============================================================
 
 class SkipExample(BaseModel):
-    """One representative row from the skip log."""
+    """One example row from the skip log. NOT randomly sampled — these
+    are the first-N rows of the group in skip-log insertion order. The
+    sweeper writes skips symbol-by-symbol, so a single group's
+    examples can be clustered on the first few symbols even when the
+    underlying group spans many. Treat as illustrative, not
+    statistical."""
     strategy: str
     symbol: str
     expiry: str = Field(..., description="ISO date string of the expiry.")
@@ -77,8 +83,12 @@ class SkipGroupSummary(BaseModel):
     examples: list[SkipExample] = Field(
         ...,
         description=(
-            "First N rows of this group's skips. Capped per the "
-            "request's ``max_examples`` argument."
+            "First N rows of this group's skips in skip-log insertion "
+            "order. Capped per the request's ``max_examples`` argument. "
+            "NOT balanced across sub-keys (symbols / expiries / "
+            "offsets) — for a large IlliquidLegError bucket the "
+            "examples may all share the first symbol the sweeper "
+            "processed. Treat as illustrative, not representative."
         ),
     )
 
@@ -125,7 +135,9 @@ class SkipSummaryOutput(CaveatedResponse):
         description=(
             "Sorted by count DESC — biggest bucket first so the "
             "consumer Claude reads the dominant failure mode at the "
-            "top of the list."
+            "top of the list. Ties break by groupby insertion order "
+            "(Python's sort is stable) — don't depend on tie ordering "
+            "for analytical conclusions."
         ),
     )
 
@@ -164,13 +176,16 @@ def _row_to_example(row: pd.Series) -> SkipExample:
 
 def skip_summary_impl(inp: SkipSummaryInput) -> SkipSummaryOutput:
     # 1. Read the main results parquet for the priced count + side-
-    # effect of validating that the run_id exists at all.
+    # effect of validating that the run_id exists at all. Use
+    # results_path() rather than a hardcoded "data/results/" string so
+    # the error message stays accurate under non-default RESULTS_DIR
+    # (env overrides, test monkey-patches, future MCP-config layers).
     try:
         priced_df = read_results(inp.run_id)
     except FileNotFoundError as e:
         raise ValueError(
             f"run_id {inp.run_id!r} has no sweep parquet at "
-            f"data/results/sweep_{inp.run_id}.parquet"
+            f"{results_path(inp.run_id)}"
         ) from e
     n_priced = len(priced_df)
 
