@@ -14387,3 +14387,98 @@ All 22104df grills now closed. 96a506c grill #1 closed by ebe7228. Carry-over li
 Standing by.
 
 ---
+
+## Review of 67c6d3f — `feat(p8.mcp.compare_cells)` — sub-arc 3.6 (1 of 2)
+
+**Verdict: ✅ ACCEPT.** Sub-arc 3.6 opens. 15/16 tools landed. Strong no-p-values enforcement (3 LOAD-BEARING tests + cross-pin to the dashboard's E2E banned-pattern set). One small grill on distribution-truncation semantics. Math hand-verified.
+
+### What I checked
+
+- `src/mcp/compare_cells.py` (295 LOC) end-to-end.
+- `tests/test_mcp_compare_cells.py` (363 LOC, 14 new tests).
+- `src/analytics/rank.py:40` — verified `MULTIPLE_COMPARISONS_CAVEAT` exists and is re-exported verbatim.
+- `tests/test_web_e2e.py:174` (dashboard's `_BANNED_STAT_PATTERNS`) — confirmed **line-for-line identical** to the MCP test's banned set. Same 8 regex patterns, same order. Cross-pin claim accurate.
+- `tests/test_web_e2e.py:223` (`test_compare_cells_renders_no_p_values`) — exists, same constraint pattern.
+
+### Praises
+
+- **Three LOAD-BEARING enforcement tests for the no-p-values constraint**:
+  - `test_no_p_values_in_serialized_output` scans `json.dumps(model_dump(mode="json")).lower()` against all 8 banned regex patterns. A future contributor wiring `scipy.stats` in or adding a `p_value` field gets caught here.
+  - `test_no_p_values_caveat_present_verbatim` pins the exact `NO_P_VALUES_CAVEAT` string identity.
+  - `test_multiple_comparisons_caveat_re_exported_verbatim` pins `MULTIPLE_COMPARISONS_CAVEAT` via Python identity equality to `src.analytics.rank` — same constant the dashboard cites. The MCP and dashboard surfaces emit the IDENTICAL string, which is what makes the cross-surface contract real.
+- **Identical banned-pattern set as the dashboard's E2E test**. Both `_BANNED_STAT_PATTERNS` at `test_mcp_compare_cells.py:33` and `test_web_e2e.py:174` define the same 8 patterns in the same order. If either drifts, the other will surface the divergence.
+- **3rd consumer of the centralized `compute_cell_stats`** — exactly the use case ebe7228 was set up for. The `cvar_alpha=DEFAULT_CVAR_ALPHA` call site at `compare_cells.py:185` is correct.
+- **Diff math is hand-derivable**: `_sub` returns None when either side is None (because empty cells have `median_roi=None`); `delta_n_trades` returns `int(other.n - baseline.n)`. Test at line 201 hand-derives baseline median=1.0 / other median=5.0 → +4.0 ✓.
+- **Pydantic min/max length constraints at the schema layer**: `cell_keys: list[CompareCellKey] = Field(..., min_length=2, max_length=4)`. Two tests pin both ends (length=1 and length=5+ rejected). The "comparison needs at least 2, no more than 4" UX rule is enforced before the impl sees the input.
+- **Defensive empty-cell branch** in `_build_comparison`: returns `empty_cell_stats_block()` + `roi_distribution=[]` rather than letting `compute_cell_stats` see an empty frame. Slight code-path duplication with `compute_cell_stats`'s own empty handling but harmless.
+- **All-empty caveat surfaces "verify the cell_keys exist via query_sweep or cell_summary"** — anti-confusion. The consumer Claude gets a literal redirect to the right diagnostic tool.
+- **Hardcoded `NO_P_VALUES_CAVEAT` string with the explicit comment** explaining why it's not in a shared constants module ("the exact phrasing here is part of the contract"). Defensible. If a future no-p-values consumer (compare_strategies, compare_runs) lands, the extraction can happen then; YAGNI for now.
+
+### Grill #1 (small, semantics): distribution truncation silently keeps the LOWEST N values
+
+`src/mcp/compare_cells.py:187-190`:
+
+```python
+sorted_rois = sorted(float(v) for v in cell_df["roi_pct"].tolist())
+truncated = len(sorted_rois) > MAX_DISTRIBUTION_ROWS
+if truncated:
+    sorted_rois = sorted_rois[:MAX_DISTRIBUTION_ROWS]
+```
+
+The list is sorted ASCENDING then truncated by `[:MAX_DISTRIBUTION_ROWS]` — which keeps the FIRST 200 of an ascending sort, i.e. the LOWEST 200 ROIs. The right tail (best trades) gets dropped entirely.
+
+For a "consumer Claude builds its own distribution overlay" use case, this is biased in a non-obvious way. The truncation caveat says:
+
+> At least one cell's ROI distribution was truncated to {MAX_DISTRIBUTION_ROWS} rows. Use cell_summary against the specific cell_key for the full per-trade list.
+
+But it doesn't say WHICH 200 are kept. A consumer plotting this as a histogram would see a left-shifted distribution and might conclude the cell is worse than it is.
+
+Two clean fixes (lowest-cost first):
+
+- **Document the policy**: amend the truncation caveat to "At least one cell's ROI distribution was truncated to {MAX_DISTRIBUTION_ROWS} rows (LOWEST {MAX_DISTRIBUTION_ROWS} by ROI; right tail dropped — use cell_summary for full coverage)." The lowest-N policy is defensible for tail-risk emphasis (consistent with the CVaR-5% focus), but it needs to be NAMED so consumers don't generalize from the visible distribution.
+- **Switch to stratified sampling**: keep min, max, and a uniform deterministic sample of the middle. Preserves shape; more work. Only worth doing if the consumer-side use case demands it.
+
+I'd take the docs fix — the lowest-N policy probably IS right for this tool given the no-p-values + tail-risk framing, but the silent bias is the problem, not the policy.
+
+### Minor observations (not grills)
+
+- **`_extract_cell` rescans `df` per cell**. For a 4-cell comparison on a 100K-row sweep, that's 4 full-frame boolean scans. Future optimization: pre-build a `groupby([strategy, symbol, entry_offset_td, exit_offset_td])` index. Not blocking at v1 scale.
+- **`delta_total_net_pnl` is computed unconditionally** (treats empty cells as `total = 0.0`) while `delta_median_roi` / `delta_mean_roi` return None on either side empty. Mild semantic inconsistency — a consumer reading `delta_total_net_pnl = 0.0` for a both-empty pair might interpret it as "the cells have the same total" when really both are empty. The empty-cells caveat catches the all-empty case, and `delta_n_trades` carries the signal for partial-empty. Defensible; just an observation.
+- **`cvar_5_roi_pct` alpha-hardcoded field name issue** (from my ebe7228 review) carries over because compare_cells uses `cvar_alpha=DEFAULT_CVAR_ALPHA`. Consistent with the other 2 consumers; latent inconsistency not new here.
+- **No tests for length=3 or length=4** — Pydantic's `[2, 4]` constraint is well-defined so this is fine, but if the constraint ever changes (e.g., to a Literal-style union), boundary tests would surface drift. Not blocking.
+- **Test `test_compare_cells_pre_arc_caveat_on_legacy_parquet` writes `r.canonical_column_order(df).to_parquet(...)` directly** instead of `r.write_results(...)`. That bypasses the engine_version metadata stamp on purpose to simulate a legacy parquet. Same pattern as the prior tools' legacy tests. Sound technique; just noting.
+
+### Math check
+
+`766 = 752 + 14` ✓. All 14 new tests hand-checked against the impl.
+
+### MCP arc state
+
+| Sub-arc | Status | Tools |
+|---|---|---|
+| 3.1 spot_options | ✅ | 2 |
+| 3.2 server scaffolding | ✅ | — |
+| 3.3 sweep queries | ✅ | 4 |
+| 3.4 backtest replay | ✅ | 2 |
+| 3.5 diagnostics | ✅ | 2 |
+| 3.6 research helpers part 1 | ✅ | 1 (compare_cells) |
+| 3.6 research helpers part 2 | pending | bootstrap_ci |
+| 3.7 docs | pending | — |
+
+**15 of 16 tools landed.** 1 tool + the docs commit remaining.
+
+### Open grills
+
+- This commit's grill #1 (distribution truncation policy docs).
+- The unfixed minor from b25f048 (DataQualityInput.dimension description still implies all-leg).
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`feat(p8.mcp.bootstrap_ci)`** — sub-arc 3.6 part 2. Closes the research-helper tier and brings the registry to 16/16. With the no-p-values constraint already established in compare_cells, bootstrap_ci has the right precedent: the dashboard uses bootstrap CI (not parametric stats) as the right tool for the N≈24 regime, so the MCP can carry the same shape (`src.analytics.bootstrap.bootstrap_ci` is already imported by `cell_summary` — that helper is ready).
+2. Optionally bundle: the distribution-truncation-policy docs fix (grill #1 above, 2 lines) + the `DataQualityInput.dimension` 1-line tweak from b25f048. Both are <5 lines combined.
+
+Standing by.
+
+---
