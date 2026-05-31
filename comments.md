@@ -15335,3 +15335,116 @@ Operator-driven from here. In priority order:
 Standing by.
 
 ---
+
+## Reviews of ab1257f + 09bfb48 + 5ba1262 — batched docs/tooling on main
+
+**Branch context**: HEAD is back on `main`. The `bare-library1-recipe` branch (2128e10 + b921423 + my reviews df9113e + 3deb29a) stayed sandboxed per the "DO NOT MERGE TO MAIN" gate. Verified via `git branch --contains` — both click commits live only on the diagnostic branch. Main-side comments.md doesn't carry those reviews; they live with their commits on the branch.
+
+Three commits landed on main as a batch (watcher batched ab1257f + 09bfb48; 5ba1262 followed). All three are docs/tooling-quality. Reviewing each below.
+
+### ab1257f — `docs(p8.mcp.catalog): add MCP.md — 16-tool operator-facing catalog`
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** 301-LOC operator-facing catalog. One REAL factual error on `sweep_windows`; one minor cross-doc config-path inconsistency; one minor omission on cross-cutting policies.
+
+**What I checked**: read MCP.md end-to-end; cross-referenced 4 tool descriptions against the live registry via `_collect_tool_entries()`; verified `SweepWindowsInput.model_json_schema()` against MCP.md's params table; cross-checked the 16-tool count + grouping against the formal contract + registry-pin test.
+
+**Praises**
+
+- **Tool count matches the registry-pin test exactly** (16). Grouping by purpose (Discovery / Raw market-data / Sweep result querying / Compute helpers) is the right operator-facing categorization — distinct from the formal sub-arc grouping.
+- **Relationship to the formal contract named explicitly** at the top: "Complements the machine-readable contract in docs/mcp/*". Clear division of labor.
+- **Self-regeneration recipe** (lines 293-301) lets a future maintainer dump the live registry to diff against MCP.md. Anti-staleness mechanism.
+- **No-p-values constraint surfaced as a LOAD-BEARING bullet** in `compare_cells` description (lines 173-176). Cross-doc single-source-of-truth framing.
+- **Cross-cutting contracts section** names cache-only + caveats-field-always-present + Pydantic-input-validation — operator can rely on these without re-checking each tool.
+
+**Grill #1 (REAL, correctness): `sweep_windows` description is materially wrong**
+
+MCP.md lines 197-202:
+
+> Generate a list of candidate (entry_date, exit_date) windows for a (strategy, symbol, expiry range, offset range) tuple. The "what would I sweep" preview tool.
+
+Live registry:
+
+> Replay a small (entry × exit) grid across N expiries against the local cache. Returns one CellWindowResult per (entry, exit) pair with stats + per-cell skip breakdown. Hard-capped at 500 total trades — wider grids should use the wide-sweep script + query via cell_summary / heatmap.
+
+These are materially different tools. `sweep_windows` is a **grid backtest replay** with stats + skip breakdown + 500-trade hard cap — NOT a planning/preview tool. An operator reading MCP.md would call it expecting cheap planning output, get backtest-grid results, and miss the hard cap until they hit it.
+
+`DESIGN/PHASE_8_MCP.md`'s catalog row gets it right: "Stat block across all entry/exit windows for one cell." MCP.md gets it wrong.
+
+**Fix**: rewrite the prose to match the registry. Suggested:
+
+> Replay a small (entry × exit) grid across N expiries against the local cache. Returns one stat block per (entry, exit) pair + per-cell skip breakdown. Hard-capped at 500 total trades — for wider grids, run `scripts/p7_wide_sweep.py` then query via `cell_summary` / `heatmap`.
+
+Params table (lines 203-213) IS correct — verified against the schema. Only the prose is wrong.
+
+**Grill #2 (small, cross-doc inconsistency): config-path divergence**
+
+MCP.md line 21 says "Claude Code registers it through `~/.claude.json` MCP config" — the legacy single-file location. `DESIGN/PHASE_8_MCP.md` §2 uses `~/.claude/mcp.json` (subdirectory) as canonical, with `.mcp.json` as the project-local alternative. Both work on current Claude Code, but cross-doc divergence confuses operators.
+
+**Fix**: either align MCP.md to `~/.claude/mcp.json` + `.mcp.json` OR reference `DESIGN/PHASE_8_MCP.md` §2 for the canonical config block. Latter avoids docs-stale risk if the convention shifts again.
+
+**Minor observation (not a grill): three cross-cutting policies missing from MCP.md**
+
+DESIGN/PHASE_8_MCP.md §4 lists 7 cross-cutting policies. MCP.md covers 5; missing:
+
+- **ENTRY-side scope on `data_quality`** (§4.4) — operator-visible. An operator interpreting `theoretical_fallback_rate` / `vwap_vs_close_divergence` needs to know the classification is entry-leg only (per f4707e3 fix).
+- **Lowest-N truncation on `compare_cells`** (§4.5) — operator-visible. An operator plotting `roi_distribution` needs to know the right tail might be dropped (per 44eed75 fix).
+- **cvar-α field-name lock** (§4.6) — less operator-visible; YAGNI for this doc.
+
+Adding the first two closes the most material operator-facing gaps. Could fold into the sweep_windows fix commit.
+
+### 09bfb48 — `docs(design): archive completed DESIGN_SPEC visual prototype under DESIGN/Complete/`
+
+**Verdict: ✅ ACCEPT.** Pure file-relocation commit (5042 insertions across 26 files — verbatim prototype content) with clear archival rationale.
+
+**Praises**
+
+- **Three concrete use cases in the commit body**: (1) reference for what each surface ORIGINALLY targeted before iteration; (2) source-of-truth for the headline-strip + dual-pane mockup that Phase-6.3 commits cite (§2.5, §2.3); (3) lookup for color/spacing decisions in the live UI. Each is a real future-lookup scenario, not "keep around just in case."
+- **"FROZEN baseline, not the working spec"** framing is the right operator-facing distinction. DESIGN_SPEC.md + DESIGN_HONESTY.md continue to live at DESIGN/ root.
+- **Path `DESIGN/Complete/`** signals "completed and frozen" without disturbing the working-spec layout.
+
+**Minor observation (not a grill)**: `Complete` could read as "completed-as-in-100%-done" rather than "completed-implementation-reference." A 2-line `DESIGN/Complete/README.md` would close the ambiguity for future conventions. Optional.
+
+**Math**: no tests touched, no behavior change.
+
+### 5ba1262 — `chore(scripts): add prefetch_universe_no_timeout.py — A/B variant`
+
+**Verdict: ✅ ACCEPT.** A/B measurement script for the politeness-sleep question. Loud USE WITH CAUTION block + accurate monkey-patch + verified macOS-spawn re-import design. No grills.
+
+**Praises**
+
+- **USE WITH CAUTION block is loud and quantified**: WAF rate-limit risk named (401 / 403 / HTML-challenge / IP soft-ban); upside upper-bounded ("4 workers × 0.5s sleep gives back at most ~2s/contract — IF WAF doesn't trip"); explicit "NOT for production use."
+- **Monkey-patch at module top level** is load-bearing. Inline comment (lines 72-76) explains the macOS spawn re-import semantics: "On macOS, mp.spawn re-executes the script from scratch in each worker process. Module-level monkey-patch runs in BOTH the parent AND every worker on first import. If this lived inside main(), workers would still hit the upstream 0.5s sleep." Real correctness consideration that would silently break a naive port.
+- **Honest side-effect disclosure**: `options_loader.time.sleep = ...` no-ops `time.sleep` for the WHOLE process (modules share the `time` module object). Affects jugaad-data retry backoff, requests pool retries, tqdm throttle. Comment explicitly: "DO NOT use this pattern in production code where some sleeps are legitimately load-bearing."
+- **Resumable behavior preserved** — cache-first `load_option` means re-runs skip cached contracts.
+
+**Minor observation (not a grill)**: side-effect scope isn't quite universal — modules using `from time import sleep` bind a local reference at import time and aren't affected by the reassignment; only `import time; time.sleep(...)` callers are. Comment generalizes; mild inaccuracy; not blocking the measurement purpose.
+
+**Math**: no tests touched. Standalone script.
+
+### Combined math + state
+
+No tests changed across all 3 commits on main. Test count unchanged from 218af6b baseline.
+
+**Open grills (after these 3)**:
+
+1. **ab1257f Grill #1** (correctness): MCP.md `sweep_windows` prose wrong; describe as grid replay with 500-trade cap.
+2. **ab1257f Grill #2** (cross-doc): config-path divergence.
+3. **ab1257f minor** (omitted policies): add ENTRY-side scope + lowest-N truncation to MCP.md cross-cutting contracts.
+
+All three are in one file (MCP.md). Single tiny `fix(docs.mcp_catalog)` commit closes all three.
+
+### MCP arc state
+
+Unchanged at 16/16. All three commits are docs/tooling; no MCP-tool registry touched.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(docs.mcp_catalog)`** — close the 3 MCP.md grills above (1 correctness + 1 cross-doc + 1 minor omission). Tiny edits in one file.
+2. **(operator-driven)** Bring the bare-library1-recipe diagnostic to a conclusion (manual click-test outcome) or pivot per click_failures.md decision tree.
+3. **(operator-driven)** Smoke sweep on corrected engine (carry-over from 8c2c517).
+
+Standing by.
+
+---
