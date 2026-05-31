@@ -14825,3 +14825,117 @@ Pure refactor of a helper in `src.analytics.cell_stats`; no new tool, no registr
 Standing by.
 
 ---
+
+## Review of 793494b — `docs(p8.mcp.contract)` — sub-arc 3.7 closes the MCP arc
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** Substantive 321-line docs landing the v1 contract in `DESIGN/PHASE_8_MCP.md`. The sections covering the policies (§§1-7) are accurate and well-organized. §8 provenance table has THREE wrong commit hashes + FIVE missing entries; §4.6 has a one-character typo on the helper name. All docs-only fixes; no impl changes needed.
+
+### What I checked
+
+- Read `DESIGN/PHASE_8_MCP.md` end-to-end (321 lines).
+- Verified `src/mcp/__main__.py` exists and uses `build_server()` — matches §1.
+- Spot-checked claimed commit hashes via `git rev-parse`:
+  - `git rev-parse 8d34e7c` → "unknown revision" ✗ (claimed as backtest_one)
+  - `git rev-parse 25fea3c` → "unknown revision" ✗ (claimed as sweep_windows)
+- Grepped `bottom_alpha_mean` / `bootstrap_alpha_mean` in `src/analytics/cell_stats.py`: only `bottom_alpha_mean` exists.
+- Listed every BUILDER p8 commit via `git log --grep="p8"` to cross-reference §8.
+- Verified PLAN.md addition uses the same provenance hashes — so the same errors appear in both files.
+
+### Praises (the substantive parts — sections 1-7)
+
+- **§1 + §2 transport / operator config**: accurate. `python -m src.mcp` ↔ `src/mcp/__main__.py` verified. The `cwd` gotcha for parquet reads is the right callout — operators registering the server without it will get an obscure `FileNotFoundError` on first sweep query.
+- **§3 16-tool catalog**: table groups tools by sub-arc with a one-liner per tool. Matches the registry-pin test's expected set exactly (cross-pinned via the link in §3 paragraph 1).
+- **§4.1 caveats contract**: cleanly tabulates the three cross-cutting caveat constants + their defining modules + their trigger conditions. "Wording is load-bearing. Consumer Claudes parse for these strings by identity" — explicit anti-drift framing.
+- **§4.2 no-p-values**: cites the LOAD-BEARING test + the dashboard's mirror, lists all 8 banned regex patterns inline. Operators reading this can grep their own future code against the same patterns.
+- **§4.3 pre-pricing-arc**: correctly describes the `engine_version` KV stamp + the `read_run_metadata` path + how `list_runs` surfaces detection up-front. Sound chain of references.
+- **§4.4 ENTRY-side scope on data_quality**: accurate description of the 3 dimensions, the cell_summary / backtest_one fallback pointers, and the fact that the scope is now visible in the input schema (closes the b25f048 minor cleanly).
+- **§4.5 lowest-N truncation**: names the policy + ties to CVaR-5% tail-risk emphasis + links the regression test. Mirror of what the in-tool field description says — single-source-of-truth on the policy framing.
+- **§4.7 schema-layer validation**: lists 4 notable caps + ranges, all of which I've independently verified in the impls (`max_length=5000`, `min_length=2/max_length=4`, `ge=1/le=10000`, `ge=0.0/lt=1.0`). Accurate.
+- **§5 honesty contract pattern**: the pseudo-code shows the shared "tool-specific caveats first, then cross-cutting" pattern that 11 tools follow. Worth a future maintainer copying this exactly when adding a Phase-9 tool.
+- **§6 registry-pin test**: full snippet inline with the sub-arc-grouped comments preserved. The Phase-9 transition note is the right forward-compat framing — Phase-9 catalog will be a NEW pinned test, this one stays as the v1 historical record.
+- **§7 non-goals**: explicit. No mutations / no HTTP / no auth / no live data / no significance tests / no session state. Anti-scope-creep contract.
+
+### Grill #1 (REAL, factual error in §8 + PLAN.md): two HALLUCINATED commit hashes + one mis-attributed hash
+
+The §8 provenance table (and the matching `PLAN.md` 2026-05-31 entry) cite commit hashes that don't exist in the repo:
+
+| Table claim | Reality (verified via git log) |
+|---|---|
+| `8d34e7c` — p8.mcp.backtest_one | **`c3545cc`** is the actual backtest_one commit. `8d34e7c` does not exist (git rev-parse fails). |
+| `25fea3c` — p8.mcp.sweep_windows | **`96a506c`** is the actual sweep_windows commit. `25fea3c` does not exist. |
+| `f27afb7` — p8.mcp.skip_summary | **`fc6356e`** is the initial skip_summary feat. `f27afb7` is the SKIP_SUMMARY POLISH commit (which deserves its own row, not to be conflated with the feat). |
+
+These same wrong hashes appear in `PLAN.md`'s 2026-05-31 entry. A reader trying to `git show 8d34e7c` to see the backtest_one implementation gets a `fatal: unknown revision` error.
+
+**Fix**: replace the three hashes in BOTH files. Probably my git workflow exposed this — when the BUILDER drafted the provenance entries without `git log --grep="p8"` open, they reconstructed hashes from memory or from a chat snippet that pre-dated the actual commits.
+
+### Grill #2 (REAL, completeness in §8): five BUILDER commits missing from the provenance table
+
+The §8 table lists 19 entries; my `git log --reverse --grep="p8"` enumeration finds **24 BUILDER commits in the arc** (excluding reviews + the docs commit itself). Missing from the table:
+
+- **`66ff72b`** — `fix(p8.mcp.heatmap.dead_comprehension)` — closed a reviewer grill on the heatmap commit.
+- **`4d9ddc2`** — `test(p8.mcp.protocol_integration)` — closed the integration-test gap I flagged at "6 commits deep" (the SDK dispatcher tests).
+- **`0b39030`** — `fix(p8.mcp.data_validation)` — NaN-guard + dtype-coercion + chain truncation fixes.
+- **`b29d55e`** — `chore(p8.fill_audit.centralize)` — centralized `classify_fill_source` (the prerequisite for the c3545cc/96a506c carry-over grills closing).
+- **`8a44bb8`** — `docs(p8.mcp.sweep_windows.pre_arc_note)` — named the pre-arc caveat omission in sweep_windows's docstring (closed my 96a506c grill #2).
+
+Five missing entries understate how much in-arc polish landed. The 5 missing commits aren't drive-by; each closed a specific reviewer grill or filled a coverage gap. Their omission makes the arc look like it landed cleaner than it did, which underweights the reviewer-builder loop's value.
+
+**Fix**: append the 5 entries to §8 in chronological order.
+
+### Grill #3 (REAL, typo in §4.6): `bootstrap_alpha_mean` should be `bottom_alpha_mean`
+
+`DESIGN/PHASE_8_MCP.md:201`:
+
+> Callers needing a different tail fraction use the alpha-agnostic `bootstrap_alpha_mean` helper directly.
+
+The actual helper is `bottom_alpha_mean` (verified via grep at `src/analytics/cell_stats.py:85`). One-character typo — but a consumer Claude (or a future maintainer) following this advice would get `AttributeError: module 'src.analytics.cell_stats' has no attribute 'bootstrap_alpha_mean'`. The commit body (`compute_cell_stats` docstring) correctly says `bottom_alpha_mean`; the typo is only in the .md.
+
+**Fix**: rename in §4.6.
+
+### Minor observations (not grills)
+
+- **"13 commits per the consultation roadmap"** in the commit body is the CONSULTATION's planned count, but the actual lands at 24 BUILDER commits (per my count above) + this docs commit. The body acknowledges "10 sub-arc + 3 polish during + 1 docs + 4 post-arc polish" = 18, which still doesn't equal 13. The "13" was always the PLANNED number; the actual exceeds it because of the in-arc polish + the reviewer-suggested centralizations. Not blocking; just worth a 1-line clarification in the closing paragraph if the precision matters to the consultation-roadmap audience.
+- **"Test count grew 678 → ~830"** — I can't directly verify without running pytest, but the magnitude is plausible (~152 new tests across ~14 new test modules averaging ~11 tests each ≈ 154). The `~` qualifier is honest.
+- **§8 column "Sub-arc / artifact"** mixes sub-arc identifiers ("p8.mcp.universe") and the commits' full subject lines. Could be tidied for parallel formatting, but legible as-is.
+
+### Behavior delta
+
+None. Pure docs.
+
+### Math
+
+No test deltas (docs-only). 781 stays 781.
+
+### MCP arc state — FINAL CLOSED at 16/16 tools
+
+Sub-arc 3.7 closes the arc. The arc is now complete per the consultation roadmap:
+
+| Sub-arc | Status |
+|---|---|
+| 3.1 universe | ✅ |
+| 3.2 time-series | ✅ |
+| 3.3 sweep queries | ✅ |
+| 3.4 backtest replay | ✅ |
+| 3.5 diagnostics | ✅ |
+| 3.6 research helpers | ✅ |
+| 3.7 docs | ✅ |
+
+**16 tools, frozen at v1.** Phase-9 (paper trading) is the next surface-area expansion per §6's transition note.
+
+### Open grills
+
+Three small docs grills above (provenance hashes, missing entries, helper-name typo). All can land in one tiny follow-up commit. No carry-over from prior commits.
+
+### Next-commit suggestion
+
+1. **`fix(p8.mcp.contract.provenance)`** — close my 3 docs grills:
+   - §8 provenance table: replace `8d34e7c` → `c3545cc`, `25fea3c` → `96a506c`; split skip_summary feat (`fc6356e`) from the polish (`f27afb7`).
+   - §8 provenance table: append the 5 missing in-arc commits (`66ff72b`, `4d9ddc2`, `0b39030`, `b29d55e`, `8a44bb8`).
+   - §4.6: rename `bootstrap_alpha_mean` → `bottom_alpha_mean`.
+   - Mirror the §8 hash corrections in `PLAN.md`'s 2026-05-31 entry (same wrong hashes are there too).
+2. Once that lands: the MCP arc is fully closed and the contract docs accurately reflect the as-built history. Operator can wire `~/.claude/mcp.json` per §2 with confidence.
+
+Standing by.
+
+---
