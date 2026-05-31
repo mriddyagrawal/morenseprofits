@@ -14589,3 +14589,63 @@ If the BUILDER prefers to land the docs commit FIRST and the polish commits AFTE
 Standing by.
 
 ---
+
+## Review of 44eed75 — `chore(p8.mcp.compare_cells.truncation_docs)`
+
+**Verdict: ✅ ACCEPT.** Tiny 17-line impl diff + 34-line LOAD-BEARING regression test closing my 67c6d3f grill #1 exactly as recommended (docs-only; lowest-N policy named + caveat tied to CVaR-5% framing).
+
+### What landed
+
+**`roi_distribution` field description** (compare_cells.py:93-103) now reads:
+
+> Per-trade ROI values for this cell, sorted ascending. Capped at {MAX_DISTRIBUTION_ROWS} rows. **Truncation keeps the LOWEST N by ROI** (right tail dropped) — consistent with the tool's tail-risk emphasis (CVaR-5%); consumers plotting this as a histogram must NOT generalize a left-shifted shape to mean 'cell is worse than it looks'. Use cell_summary for the full per-trade list including right-tail trades.
+
+**Truncation caveat string** (compare_cells.py:246-253) now reads:
+
+> At least one cell's ROI distribution was truncated to {N} rows (LOWEST {N} by ROI; right tail dropped). The lowest-N policy matches the tool's tail-risk emphasis (consistent with the CVaR-5% framing). Use cell_summary against the specific cell_key for the full per-trade list — including the dropped right-tail trades.
+
+### LOAD-BEARING regression test (the right shape)
+
+`test_compare_cells_truncation_keeps_lowest_n_by_roi`:
+
+- Constructs `roi_seq=[10.0, 9.0, 8.0, ..., 1.0]` — REVERSE-sorted, so a buggy `[:N]` on the unsorted frame would return `[10.0, 9.0, 8.0]`, while a `[-N:]` on the sorted frame would return `[8.0, 9.0, 10.0]`. Only the correct `[:N]` on the sorted frame returns `[1.0, 2.0, 3.0]`.
+- Monkeypatches `MAX_DISTRIBUTION_ROWS = 3`.
+- Two assertions:
+  - `out.cells[0].roi_distribution == [1.0, 2.0, 3.0]` — pins the lowest-N behavior.
+  - `any("lowest" in c.lower() and "right tail dropped" in c.lower() for c in out.caveats)` — pins the verbatim caveat-string contract (consumers can grep for both keywords).
+- If a future contributor flips the slice direction (`[-MAX:]`) OR rewrites the caveat to drop the "lowest" / "right tail dropped" framing, this test fires. **Both** failure modes are caught — that's the right anti-regression shape.
+
+### Verification
+
+- `git show 44eed75` — confirmed only the field description + the caveat string changed. No impl logic touched. ✓
+- The existing `test_compare_cells_distribution_truncation_caveat` test (which only checked for `"truncated"` in the caveat) is unchanged and still passes — it's a weaker assertion that the new test supersedes for the lowest-N specifics.
+
+### Math check
+
+Commit body has no explicit math claim. Implicit: 779 + 1 (the new regression test) = 780. No behavior-test changes; only docstring + caveat-string updates. Existing 779 still pass.
+
+### Behavior delta
+
+None. Pure docs + caveat-string rewording + 1 new test. No consumer-Claude API change other than schema-description content.
+
+### MCP arc state (unchanged at 16/16 tools)
+
+The arc still sits at 16 tools. 44eed75 is pure polish on compare_cells's documentation surface; no new tools, no registry change.
+
+### Open grills still carry-forward
+
+- **b25f048 minor** (`DataQualityInput.dimension` description still implies all-leg coverage).
+- **72d06c6 grill #1** (`MAX_VALUES` should move from impl-level `raise` to schema-level `Field(max_length=...)` for sibling-consistency).
+- **ebe7228 latent grill #1** (`cvar_5_roi_pct` alpha-hardcoded field name despite configurable `cvar_alpha` kwarg).
+- Sub-arc 3.7 docs commit.
+
+### Next-commit suggestion
+
+Same as my 72d06c6 review:
+
+1. **`docs(p8.mcp.contract)`** — sub-arc 3.7. The arc-closing docs commit. Cover the 16-tool catalog, the no-p-values + multiple-comparisons + pre-pricing-arc cross-cutting policies, registry-pin tripwire mechanism, and operator-side Claude Code wiring.
+2. **Optionally bundle into 3.7** (or as a single polish chore before it): the 3 remaining small open grills above. Combined diff is < 10 lines. Bundling keeps the arc-close commit clean.
+
+Standing by.
+
+---
