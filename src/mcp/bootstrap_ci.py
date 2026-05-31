@@ -57,10 +57,14 @@ class BootstrapCIInput(BaseModel):
     values: list[float] = Field(
         ...,
         min_length=1,
+        max_length=MAX_VALUES,
         description=(
             "1-D numeric values to bootstrap (e.g. per-trade ROI for "
-            f"one cell). Capped at {MAX_VALUES} entries. NaN values "
-            "are dropped before the resample."
+            f"one cell). Capped at {MAX_VALUES} entries (enforced at "
+            "the Pydantic schema layer, so consumers see the cap in "
+            "the tool-discovery JSON schema and the rejection fires "
+            "at deserialization). NaN values are dropped before the "
+            "resample."
         ),
     )
     statistic: SupportedStatistic = Field(
@@ -134,11 +138,9 @@ def bootstrap_ci_impl(inp: BootstrapCIInput) -> BootstrapCIOutput:
 
     caveats: list[str] = []
 
-    if len(inp.values) > MAX_VALUES:
-        raise ValueError(
-            f"values length {len(inp.values)} exceeds cap "
-            f"{MAX_VALUES}. Pre-aggregate or sample before passing."
-        )
+    # MAX_VALUES cap enforced at the schema layer (max_length on the
+    # values Field). Reaching the impl means the input already passed
+    # the cap check — no runtime guard needed here.
 
     arr = np.asarray(inp.values, dtype=float)
     finite = arr[np.isfinite(arr)]

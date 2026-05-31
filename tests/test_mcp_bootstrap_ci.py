@@ -124,12 +124,19 @@ def test_bootstrap_ci_input_rejects_alpha_at_one_or_more():
         BootstrapCIInput(values=[1.0, 2.0], alpha=1.0)
 
 
-def test_bootstrap_ci_raises_when_values_exceed_cap():
-    """Inputs > MAX_VALUES raise ValueError naming the cap so the
-    consumer Claude can pre-aggregate."""
+def test_bootstrap_ci_input_rejects_values_exceeding_cap():
+    """LOAD-BEARING: MAX_VALUES is enforced at the SCHEMA layer
+    (max_length on the values Field), not the impl layer. Inputs >
+    MAX_VALUES fail at BootstrapCIInput construction with
+    ValidationError — same idiom as alpha < 1.0 and min_length=1
+    checks. This means MCP clients see the cap in the tool-discovery
+    JSON schema, and the rejection fires before any impl code runs.
+    Anti-regression against a future contributor moving the check
+    back into the impl as a runtime ValueError."""
+    from pydantic import ValidationError
     too_many = [float(i) for i in range(MAX_VALUES + 1)]
-    with pytest.raises(ValueError, match="exceeds cap"):
-        bootstrap_ci_impl(BootstrapCIInput(values=too_many))
+    with pytest.raises(ValidationError):
+        BootstrapCIInput(values=too_many)
 
 
 # ============================================================
