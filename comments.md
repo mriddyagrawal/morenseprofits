@@ -14058,3 +14058,138 @@ f27afb7 is pure polish — no new tool, no new tests. 736 passing. Sub-arc 3.5 r
 Standing by.
 
 ---
+
+## Review of 22104df — `feat(p8.mcp.data_quality)` — sub-arc 3.5 (2 of 2)
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** Sub-arc 3.5 closes. 14/16 tools landed. One CORRECTNESS grill (under-counts in multi-expiry sweeps — the very case this tool was built to diagnose), one DOCS grill (entry-only fallback rate is mis-implied as "all-legs"), one open carry-over.
+
+### What I checked
+
+Re-read `src/mcp/data_quality.py` (427 LOC) end-to-end + `tests/test_mcp_data_quality.py` (281 LOC, 11 new tests) + the `_collect_tool_entries` diff in `server.py`. Cross-referenced against:
+
+- `classify_fill_source` signature in `src/engine/pnl.py:201` — confirmed `(entry_px, volume, turnover)` matches the call site at `data_quality.py:255-257`.
+- `TURNOVER_SCALE_FACTOR = 100_000.0` at `pnl.py:70` — confirmed the units conversion: turnover (in lakhs) × 100_000 / volume (shares) → vwap_implied (rupees per share).
+- `read_results` schema validation — confirmed `legs_json` is in `RESULTS_COLUMNS`, so the `if "legs_json" not in df.columns` guard at `data_quality.py:183/247/298` is defensive/dead.
+- Grepped `expiry`, `entry_date`, `exit_date` in `data_quality.py` — **zero matches**. This is load-bearing for the grill below.
+
+### Praises
+
+- **Deterministic sampling.** `df.sample(n=MAX_TRADES_SAMPLED, random_state=0)` + caveat with the explicit sample size. Repeat calls return identical numbers, and the caveat names exactly what consumer Claudes need to know.
+- **Three dimensions named after the three real failure modes** the pricing arc was designed to fix. The summary strings in each impl are the right anti-cargo-cult docs — they tell the consumer Claude what comparison to make, not just dump a table.
+- **`vwap_vs_close_divergence` band-reject filter is LOAD-BEARING and correct.** The filter `entry_source == "close" AND entry_turnover.notna() AND entry_volume > 0 AND entry_px.notna()` exactly isolates the "engine had VWAP available but rejected the band" subset. The test asserts this LOAD-BEARING explicitly. Math verified: `vwap_implied = turnover (lakhs) × 100_000 / volume = 10.0 × 100_000 / 50_000 = 20.0`; entry_px = 100.0; divergence = `|20 − 100| / 100 = 80%` ✓.
+- **Per-symbol dispatch + DESC sort** matches the same UX as skip_summary's groups-sorted-DESC. Dominant problem at index 0.
+- **Pre-arc caveat fires for legacy parquets** via the shared `PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT`. Same plumbing as the other sweep tools.
+- **Sampling caveat fires AFTER schema-validation reads but BEFORE dispatch** so a sampled run that hits a dimension-impl error still surfaces both caveats.
+- **`classify_fill_source` reuse closes the c3545cc compounding hazard.** This tool would have been the THIRD copy of the VWAP-vs-close classifier without the b29d55e centralization. Win for that earlier refactor.
+
+### Grill #1 (REAL, correctness): `_liquidity_by_entry_offset` under-counts and biases `mean_roi` in multi-expiry sweeps
+
+`src/mcp/data_quality.py:206-219`:
+
+```python
+trades_in_band = band_legs.drop_duplicates(
+    subset=["entry_offset_td", "exit_offset_td", "symbol",
+            "strategy"],
+)
+n_trades = len(trades_in_band)
+...
+mean_roi = float(trades_in_band["roi_pct"].mean())
+median_roi = float(trades_in_band["roi_pct"].median())
+```
+
+The dedup subset is missing `expiry` (and `entry_date` — neither is even copied to leg rows by `_flatten_legs.keep_trade_cols` at line 151-152). For a typical dashboard sweep with N expiries per `(entry_offset_td, exit_offset_td, symbol, strategy)` cell, ALL N expiries collapse into ONE row after dedup.
+
+Consequence in real-world use:
+
+- `n_trades` = `count of unique (eot, xot, symbol, strategy) tuples` rather than `count of trades`. Under-counts by a factor of N (number of expiries per cell).
+- `mean_roi_pct` / `median_roi_pct` = roi of the FIRST trade encountered per tuple (by pandas insertion order). For a sweep with 10 expiries per cell, mean is computed over 10% of the data and skews to whichever expiry the sweeper wrote first.
+
+**Why the test misses it**: `test_data_quality_liquidity_by_entry_offset_bands_match_expected` has 3 trades in 3 DIFFERENT bands (entry_offset=3 / 25 / 42), so dedup has nothing to collapse. The test passes; the bug ships unobserved.
+
+**Why this matters specifically**: this dimension was built to compare post-arc `mean_roi_pct` against the **2026-05-30 PLAN.md baseline numbers** (the +10.9% T-41..T-45 spike). The baseline was computed across ALL trades (every expiry); the post-arc value computed here is "first-expiry-per-cell only." The A/B comparison the tool's docstring promises won't hold.
+
+**Two clean fixes**:
+
+- **Option A (smallest diff)**: add `expiry` to `keep_trade_cols` AND to the dedup `subset`. Restores trade-granularity.
+
+  ```python
+  keep_trade_cols = ["entry_offset_td", "exit_offset_td", "symbol",
+                     "strategy", "expiry", "roi_pct", "net_pnl"]
+  ...
+  trades_in_band = band_legs.drop_duplicates(
+      subset=["entry_offset_td", "exit_offset_td", "symbol",
+              "strategy", "expiry"],
+  )
+  ```
+
+- **Option B (structurally cleaner)**: don't leg-flatten for trade-level stats. Compute `mean_roi`, `median_roi`, `n_trades` from `df` (per-trade) filtered to the band directly, and only use the flattened `legs_df` for leg-level stats (`frac_legs_zero_entry_volume`, `mean_entry_volume`). Removes the dedup leaky-abstraction entirely.
+
+I'd take Option B — `df` already has `entry_offset_td`, `roi_pct`, `expiry`, etc., and using it directly avoids the leg-multiplication round-trip. But Option A unblocks the tool immediately.
+
+**Required followup**: a regression test that constructs 2 trades with the SAME (entry_offset_td, exit_offset_td, symbol, strategy) but DIFFERENT expiries, then asserts `n_trades == 2` and `mean_roi == mean of both ROIs`. That test would fail today.
+
+### Grill #2 (REAL, docs/scope): `theoretical_fallback_rate` and `vwap_vs_close_divergence` classify ENTRY side only
+
+`src/mcp/data_quality.py:254-259` (and the same pattern at `:304-309`):
+
+```python
+legs_df["entry_source"] = legs_df.apply(
+    lambda r: classify_fill_source(
+        r["entry_px"], r["entry_volume"], r["entry_turnover"],
+    ),
+    axis=1,
+)
+```
+
+Only `entry_source` is computed. The module docstring at line 14-19 says "what fraction of priced legs used close" and the impl docstring at line 244-246 says "Returns per-symbol fallback rates" — both imply ALL legs, but the impl is entry-only. Exit legs may have different fill paths (exit on a different date with different turnover availability), so per-symbol rates that conflate entry and exit could differ.
+
+This isn't a correctness bug — it's a docs/scope mismatch. Three clean fixes (in increasing scope):
+
+- **Docs-only**: amend `_theoretical_fallback_rate` summary string + `DataQualityInput.dimension` description to say "entry-leg fill source only" / "entry-side". Lowest cost; lets the consumer Claude know not to over-generalize.
+- **Behavior expansion (both sides separately)**: add columns `vwap_fill_rate_pct_entry`, `vwap_fill_rate_pct_exit`. Lets the consumer see if exit legs have a different fallback pattern.
+- **Behavior expansion (combined)**: classify both entry + exit per leg, sum the counters. Treats "fraction of FILL EVENTS that used close" as the metric — probably the right shape for the "is my universe's VWAP coverage uniform" use case.
+
+I'd take docs-only for v1 and revisit if the data shows entry/exit divergence. The same grill applies to `vwap_vs_close_divergence` — also entry-only.
+
+### Carry-over: 96a506c grill #1 not closed by this commit (genuinely doesn't compound here)
+
+`compute_cell_stats(rois, pnls) -> CellStats` extraction: data_quality's stat math is per-band (`frac_legs_zero_entry_volume`, `mean_entry_volume`) or per-symbol (`vwap_fill_rate_pct`, `close_fill_rate_pct`), not per-cell. Different aggregation shape; no overlap with `cell_summary._compute_stats` / `sweep_windows._aggregate_priced_trades`. Standalone refactor before sub-arc 3.6's `compare_cells` is the right time — that tool DOES aggregate per-cell stats.
+
+### Minor observations (not grills)
+
+- **`_flatten_legs` uses `iterrows()` + `apply(axis=1)` for classification** at 200K-trade scale. Performance only; not blocking. If wall-clock budget becomes an issue, vectorize: `legs_df.apply(classify_fill_source_vec, ...)` or move to `numpy.where` on a pre-computed `vwap_implied` column.
+- **`n_trades_sampled` field name** says "sampled" but returns the post-sampling row count regardless of whether sampling fired. Either rename to `n_trades_scanned` or add a field description clarifying "equal to len(sweep) when no sampling fired".
+- **`if "legs_json" not in df.columns:` guards at lines 183/247/298** are dead — `read_results` validates the column is present. Belt-and-suspenders is fine; just an observation.
+- **`vwap_vs_close_divergence` filter is asymmetric vs `theoretical_fallback_rate`**: divergence requires `entry_volume > 0` AND `entry_turnover.notna()` AND `entry_px.notna()`, but fallback_rate just delegates to `classify_fill_source` which already handles None / NaN / zero. The filter here is correct but more explicit — worth a 1-liner saying "filter mirrors `classify_fill_source`'s VWAP-path preconditions explicitly so the divide-by-volume below is safe".
+
+### Math check
+
+Commit body claims `747 passed (was 736, +11 from this commit)`. 736 + 11 = 747 ✓.
+
+### MCP arc state
+
+| Sub-arc | Status | Tools |
+|---|---|---|
+| 3.1 spot_options | ✅ | 2 (get_options_chain, get_spot_history) |
+| 3.2 server scaffolding | ✅ | — (infrastructure) |
+| 3.3 sweep queries | ✅ | 4 (list_runs, query_sweep, cell_summary, heatmap) |
+| 3.4 backtest replay | ✅ | 2 (backtest_one, sweep_windows) |
+| 3.5 diagnostics | ✅ | 2 (skip_summary, data_quality) |
+| 3.6 research helpers | pending | compare_cells + bootstrap_ci |
+| 3.7 docs | pending | — |
+
+**14 of 16 tools landed.** 2 tools + the docs commit remaining. Sub-arc 3.5 CLOSES even with the grill since fix is local.
+
+The commit body claims `3 universe + 3 spot_options + 4 sweep_query + 2 backtest_replay + 2 diagnostics`. By my count that's 14 = 3+3+4+2+2. The first "3 universe" probably refers to `list_runs` + 2 others I'd want to verify, but tool count is consistent with the registry assertion (`>= 14`). Not blocking.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(p8.mcp.data_quality.liquidity_dedup)`** — close Grill #1. Tiny commit: add `expiry` to `keep_trade_cols` + dedup subset (Option A) OR refactor to use `df` directly for trade-level stats (Option B). Add the regression test (2 trades, same offsets/symbol/strategy, different expiries → `n_trades == 2`). LOAD-BEARING for the tool's stated A/B-vs-PLAN-baseline purpose.
+2. **`docs(p8.mcp.data_quality.entry_only)`** — close Grill #2 with the docs-only fix (rename "fallback rate" → "entry-leg fallback rate" in summaries + descriptions). Could bundle with #1.
+3. **`feat(p8.mcp.compare_cells)`** — sub-arc 3.6 part 1. Pull the `compute_cell_stats` extraction (closes 96a506c grill #1) into this commit since the math overlaps directly.
+
+Standing by.
+
+---
