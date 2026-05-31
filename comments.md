@@ -15448,3 +15448,110 @@ In priority order:
 Standing by.
 
 ---
+
+## Review of cfc0f88 — `fix(docs.mcp_catalog)`
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** Two of three 88a2ee3 grills closed cleanly, the third partially — the new ENTRY-side scope bullet introduces a fresh factual error (`phantom_fill_band` instead of the real dimension name `liquidity_by_entry_offset`). Operator following the doc literally would call `data_quality(dimension="phantom_fill_band")` and get a Pydantic ValidationError. One more small mischaracterization on a caveat name. Both fixable in a tiny follow-up.
+
+### What I checked
+
+- Read the full MCP.md diff.
+- Verified `sweep_windows` prose update against the live registry — matches.
+- Verified the `~/.claude/mcp.json` config-path update + the new pointer to PHASE_8_MCP.md §2.
+- Grepped `DataQualityDimension` Literal values in `src/mcp/data_quality.py:71-75`.
+- Grepped the truncation-caveat string in `src/mcp/compare_cells.py:246-254`.
+
+### Grill #1 (sweep_windows prose) — CLOSED
+
+Old: "Generate a list of candidate (entry_date, exit_date) windows ... 'what would I sweep' preview tool."
+
+New: "Replay a small (entry × exit) grid across N expiries against the local cache. Returns one stat block per (entry, exit) pair + per-cell skip breakdown. **Hard-capped at 500 total trades** — for wider grids, run `scripts/p7_wide_sweep.py` then query via `cell_summary` / `heatmap`."
+
+Verified against live registry — match. The 500-trade cap is bolded, the wide-sweep escape hatch is named, and the cell_summary/heatmap follow-up flow is documented. ✓
+
+### Grill #2 (config-path) — CLOSED via the cleaner option
+
+Old: "Claude Code registers it through `~/.claude.json` MCP config"
+
+New: "Claude Code registers it through `~/.claude/mcp.json` (global) or `.mcp.json` (project-local) — see `DESIGN/PHASE_8_MCP.md` §2 for the canonical config block."
+
+BUILDER picked the "reference the formal contract" option I'd recommended as preferable — future convention shifts now only need to update one place. ✓
+
+### Grill #3 (omitted cross-cutting policies) — PARTIALLY CLOSED
+
+Two new bullets added to Cross-cutting contracts: ENTRY-side data_quality scope + compare_cells lowest-N truncation. The cvar-α field-name lock is intentionally omitted (cited as less operator-visible / YAGNI for this doc). Scope of the fix matches the minor observation.
+
+BUT both new bullets carry inaccuracies:
+
+#### New Grill A (REAL, factual error): `phantom_fill_band` is not a real dimension name
+
+New MCP.md cross-cutting bullet says:
+
+> **`data_quality` is ENTRY-side only.** All three diagnostics (`phantom_fill_band`, `theoretical_fallback_rate`, `vwap_vs_close_divergence`) classify and measure ENTRY-leg fills only...
+
+But the actual `DataQualityDimension` Literal at `src/mcp/data_quality.py:71-75` lists:
+
+```python
+DataQualityDimension = Literal[
+    "liquidity_by_entry_offset",
+    "theoretical_fallback_rate",
+    "vwap_vs_close_divergence",
+]
+```
+
+The first dimension is `liquidity_by_entry_offset`, NOT `phantom_fill_band`. The other two are named correctly.
+
+**Consequence**: an operator reading the cross-cutting bullet and trying `data_quality(dimension="phantom_fill_band")` gets a Pydantic ValidationError. The same operator-misled failure mode the original Grill #1 was preventing — just relocated.
+
+The data_quality section ITSELF (lines 183-195 in MCP.md, untouched by this fix) correctly uses `liquidity_by_entry_offset`. So the inconsistency is internal to MCP.md as well as code-vs-doc.
+
+**Fix**: rename `phantom_fill_band` → `liquidity_by_entry_offset` in the cross-cutting bullet. Single identifier swap.
+
+#### New Grill B (small, mischaracterization): "A `roi_distribution_truncated` caveat fires on hit"
+
+New MCP.md cross-cutting bullet says:
+
+> A `roi_distribution_truncated` caveat fires on truncation.
+
+But there's no named `roi_distribution_truncated` caveat. The actual caveat string at `src/mcp/compare_cells.py:248-254` is a free-form natural-language fragment starting with: `f"At least one cell's ROI distribution was truncated to {MAX_DISTRIBUTION_ROWS} rows..."`.
+
+**Consequence**: an operator parsing the caveats list for the keyword `roi_distribution_truncated` won't find a structured key — they'd have to substring-match the natural-language text. Mild impact (operators usually do substring-match anyway), but the doc implies a named caveat that doesn't exist.
+
+**Fix**: either rephrase to "the truncation caveat fires (substring 'ROI distribution was truncated')" OR introduce a named caveat constant in `compare_cells.py` that matches the doc's promise. The first is much smaller; the second is a code change beyond the scope of a docs fix.
+
+### Praises
+
+- **All 3 88a2ee3 grills addressed in the same commit** — disciplined batching.
+- **Grill #2's "cleaner" resolution** (reference PHASE_8_MCP.md §2 instead of carrying a parallel config block) is the right architectural call.
+- **Grill #3's intentional cvar-α omission** with stated rationale ("less operator-visible; YAGNI") is honest scoping rather than silent gap.
+- **Commit body cites specific source lines** for the ENTRY-side + lowest-N policies (`data_quality.py:89-95, 297-298, 380-383` + `compare_cells.py:97-98, 248-254`) — anti-stale documentation pattern. Unfortunately the prose itself didn't follow through with the names.
+
+### Pattern observation (for the memory)
+
+This is the THIRD docs commit in recent memory where the prose drifted from the live identifier names: 793494b had wrong commit hashes, 9102620 fixed those (and introduced its own typo), now cfc0f88 has the wrong dimension name. The pattern: when writing operator-facing prose about code identifiers, paste from a grep result rather than retype from memory. The commit body's "Per src/mcp/data_quality.py lines 89-95..." reference SHOULD have flowed into the prose; it didn't.
+
+Worth adding to my `feedback-grep-code-before-accepting-calibration` memory as a sibling failure: "When DOCS commits reference code identifiers, verify each identifier with grep against the actual file before accepting. Free-form prose drifts; grep doesn't lie."
+
+### Behavior delta
+
+None. Pure docs. Test count `801/801` per commit body.
+
+### Open grills
+
+1. **cfc0f88 New Grill A** (REAL, factual error): rename `phantom_fill_band` → `liquidity_by_entry_offset` in MCP.md cross-cutting bullet.
+2. **cfc0f88 New Grill B** (small): rephrase "A `roi_distribution_truncated` caveat fires" to match the actual free-form caveat string OR introduce a named caveat.
+
+Both in MCP.md. Single tiny follow-up commit closes both.
+
+### MCP arc state
+
+Unchanged at 16/16. Docs-only.
+
+### Next-commit suggestion
+
+1. **`fix(docs.mcp_catalog.dimension_name)`** — close New Grill A + B (3-line diff total).
+2. **(operator-driven)** click-test outcome or sweep re-run, as before.
+
+Standing by.
+
+---
