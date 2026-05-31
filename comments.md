@@ -13881,3 +13881,45 @@ If grill #1 compounds when (1) needs the same stat aggregation: bundle the `comp
 Standing by.
 
 ---
+
+## Review of 8a44bb8 — `docs(p8.mcp.sweep_windows.pre_arc_note)`
+
+**Verdict: ✅ ACCEPT.** Tiny 9-line docs commit closing my 96a506c grill #2 in ~3 minutes. Nothing to grill.
+
+### What landed
+
+A new docstring section in `src/mcp/sweep_windows.py` (lines 19-26) names the pre-pricing-arc-caveat omission explicitly:
+
+> Pre-pricing-arc caveat NOT emitted here. Same as `backtest_one`: this tool runs the CURRENT engine against the contract cache, so the gate + VWAP + units assertion are always in force regardless of when the option parquets themselves were cached. Operators who need a pre-arc baseline (the phantom-fill-bias era of pre-94d535f data) should query a pre-arc `sweep_*.parquet` via `cell_summary` / `heatmap`; THOSE tools emit the phantom-fill caveat when the queried parquet lacks the engine_version stamp.
+
+### Verification (per grep-the-code discipline)
+
+- **The commit body claims `backtest_one`'s docstring has the parallel section.** Verified: `grep -n "Pre-pricing-arc caveat" src/mcp/backtest_one.py` → line 14 ("Pre-pricing-arc caveat is NOT emitted here because backtest_one..."). Wording differs by an "is" but the substance + role is identical. Parallel exists; the new sweep_windows section is a proper twin.
+- **The new section delivers what my grill asked for.** My grill #2 said: "sweep_windows lacks an explicit `Pre-pricing-arc caveat NOT emitted here` section; a future maintainer might add the caveat mistakenly." The new docstring states it's not emitted, says WHY (current-engine-against-cache), and routes operators wanting a pre-arc baseline to `cell_summary` / `heatmap` against a pre-arc parquet. That's the anti-confusion documentation grill #2 asked for.
+
+### Behavior delta
+
+None. Docs-only. No tests touched, no impl touched. Pure anti-confusion comment.
+
+### Grills
+
+None.
+
+### Carry-over: grill #1 still open
+
+My 96a506c grill #1 (extract `compute_cell_stats(rois, pnls) -> CellStats` from cell_summary's `_compute_stats` + sweep_windows's `_aggregate_priced_trades` math) is still open. It compounds with each new tool that aggregates the same stats. The bundling option I called out in the prior next-commit suggestion is still on the table — if sub-arc 3.5's first tool (`skip_summary` or `data_quality`) needs the same aggregation, fold the extraction into that commit.
+
+### MCP arc state (unchanged at 12/16 tools)
+
+The arc landing-state didn't change — 8a44bb8 is pure docs, no new tools or behavior. Sub-arc 3.5 remains the next slice (skip_summary + data_quality).
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`feat(p8.mcp.skip_summary)`** — sub-arc 3.5 part 1. Highest operator value: surfaces which gates are firing most across a run. If `_aggregate_priced_trades`-style math comes up while building it, fold in the `compute_cell_stats` extraction (closes my open grill #1 at the same time, no separate commit needed).
+2. **`feat(p8.mcp.data_quality)`** — sub-arc 3.5 part 2. The second motivational tool from the consultation.
+
+Standing by.
+
+---
