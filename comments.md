@@ -14756,3 +14756,72 @@ b25f048 minor is now closed. Open list is down to 1 small grill + the docs commi
 Standing by.
 
 ---
+
+## Review of 69ab7e3 — `chore(p8.cell_stats.cvar_alpha_lock)`
+
+**Verdict: ✅ ACCEPT.** Closes my ebe7228 latent grill #1 with Option B (freeze α + raise loud) — the simpler of my two suggested fixes. Production behavior unchanged across all 4 call sites; clean test rewire pinning the lock + the helper split. **The open-grill list is now EMPTY except for sub-arc 3.7 docs.**
+
+### What landed
+
+- **`compute_cell_stats` now raises** `ValueError` when `cvar_alpha != DEFAULT_CVAR_ALPHA`. Error message names both the rejected value and the locked default, and points to `bottom_alpha_mean` as the alpha-agnostic escape hatch.
+- **Updated docstring** explicitly calls out the lock + the reasoning ("the field name on the returned block — `cvar_5_roi_pct` — encodes the 5% commitment, so allowing the caller to pass a different alpha would silently produce a stat block whose field name disagrees with its value"). Anti-confusion docs for future maintainers.
+- **Test rewire**:
+  - `test_compute_cell_stats_custom_alpha_changes_cvar` (which previously ASSERTED the leaky behavior) is replaced by `test_compute_cell_stats_locks_cvar_alpha_to_default`. New test pins: default succeeds (with the hand-derived `cvar_5_roi_pct == 3.0` from bottom 5 of 1..100), non-default raises with `"DEFAULT_CVAR_ALPHA"` in the message.
+  - NEW test: `test_bottom_alpha_mean_remains_alpha_configurable`. Asserts the alpha-agnostic helper still accepts arbitrary alpha (verified at α=0.05 and α=0.20). **Pins the split** so a future refactor that accidentally locks both gets caught.
+
+### Why this is the right call
+
+Option B vs Option A tradeoff (from my ebe7228 grill):
+
+- **Option A (rename field)**: forward-flexible. Lets future callers customize alpha. Cost: 4 call-site renames + downstream test rewires + JSON-schema contract change for the 3 MCP tools that surface `cvar_5_roi_pct` in their output models.
+- **Option B (freeze α, this commit)**: simpler. Locks the field-name-contract. Production behavior unchanged. The escape hatch (`bottom_alpha_mean`) is named in the error message so a future use case has a clear path. Cost: 17 LOC + 1 net new test.
+
+For a tool surface where 4/4 production callers pass `DEFAULT_CVAR_ALPHA`, Option B is the right tradeoff. The "configurable" feature was theoretical, never used in production, and silently broke the field-name contract. BUILDER chose simpler over flexible — defensible.
+
+### Verification (grep-the-code discipline)
+
+Checked all 4 call sites of `compute_cell_stats` confirm they pass `DEFAULT_CVAR_ALPHA` or its alias `CVAR_ALPHA`:
+
+- `cell_summary.py:185-189` — `compute_cell_stats(..., cvar_alpha=CVAR_ALPHA)` where `CVAR_ALPHA = DEFAULT_CVAR_ALPHA` (alias from the centralized constant).
+- `sweep_windows.py:_aggregate_priced_trades` — `compute_cell_stats(..., cvar_alpha=CVAR_ALPHA)` same pattern.
+- `compare_cells.py:185` — `compute_cell_stats(..., cvar_alpha=DEFAULT_CVAR_ALPHA)` direct.
+- `data_quality.py` doesn't call `compute_cell_stats` (different aggregation).
+
+No production caller affected. ✓
+
+### Math verification
+
+- `out_05 = compute_cell_stats(rois=1..100, pnls=100×100, cvar_alpha=0.05)`. `cvar_5_roi_pct = mean(bottom 5 of 1..100) = mean(1..5) = 3.0` ✓.
+- `bottom_alpha_mean(1..100, 0.20) = mean(1..20) = (1+20)×20/2/20 = 210/20 = 10.5` ✓.
+
+### Behavior delta
+
+- For production callers (cvar_alpha=DEFAULT): NONE.
+- For non-default callers: silent wrong-value → LOUD ValueError with named escape hatch.
+- For the existing test that exercised non-default behavior: replaced with the lock-assertion test (1:1 swap).
+
+### Minor observations (not grills)
+
+- **Float equality `cvar_alpha != DEFAULT_CVAR_ALPHA`**: safe given `DEFAULT_CVAR_ALPHA` is a module constant (`= 0.05`, bit-identical to any other `0.05` literal). Could be misread as fragile by a future reader. A 1-line comment `# Direct float compare safe; DEFAULT_CVAR_ALPHA is a module constant` would close that. Mild.
+- **Kwarg signature retained despite being locked**: this is INTENTIONAL — keeps backward compat with the 4 call sites that pass it explicitly, and surfaces "this is the alpha used; it's the default constant" in the signature. The docstring explains the lock + the escape hatch. No additional commentary needed.
+- **The 1:1 test swap** keeps the test count delta clean. Net: 780 → 781 (the new `test_bottom_alpha_mean_remains_alpha_configurable` is purely additive). Commit body has no explicit math claim; implicit consistent with the diff.
+
+### MCP arc state (unchanged at 16/16 tools)
+
+Pure refactor of a helper in `src.analytics.cell_stats`; no new tool, no registry change.
+
+### Open grills
+
+**Empty.** All small grills closed. The only remaining item is sub-arc 3.7 docs.
+
+### Next-commit suggestion
+
+1. **`docs(p8.mcp.contract)`** — sub-arc 3.7. Arc-closing docs commit. Cover:
+   - The 16-tool catalog.
+   - The cross-cutting policies: no-p-values + multiple-comparisons + pre-pricing-arc + lowest-N truncation + cvar-α lock + ENTRY-side data_quality scope.
+   - The registry-pin tripwire mechanism (`test_server_registry_now_exposes_bootstrap_ci_and_all_16_tools`) as the forward-compat lock for the tool set.
+   - Operator-side: how to wire the server into Claude Code (`uvx ... --stdio` invocation), and how to discover tools.
+
+Standing by.
+
+---
