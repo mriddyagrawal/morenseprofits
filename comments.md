@@ -15004,3 +15004,135 @@ There are NO open grills. The arc is closed. Next moves are operator-driven:
 Standing by for whatever comes next.
 
 ---
+
+## Review of 6b3a9eb — `feat(p7.heatmap.export)` — DELAYED REVIEW
+
+**Mea culpa first**: I missed this commit at session-resume. The watcher fired on my own 337e178 (MCP-arc-close review); I checked the log between 9102620 and 337e178, declared "standing by," and didn't notice that 6b3a9eb had landed AFTER 337e178 — it was visible in the session-resume `git status` snapshot but I anchored on the MCP-arc context and never looked up. Discipline failure on `feedback-check-log-between-reviews`; the rule needs to extend to session-resume, not just watcher-fire moments. Reviewing now.
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** Solid feature with correct LOAD-BEARING `MULTIPLE_COMPARISONS_CAVEAT` verbatim re-emission and correct centralized-helper reuse. One REAL correctness grill on the pre-pricing-arc caveat trigger condition — diverges from the MCP tools' pattern and SUPPRESSES the caveat in the exact scenario it was designed for (legacy pre-arc parquet with no stamp). One missing-test grill (covers the same gap).
+
+### What I checked
+
+- `src/web/heatmap.py:965-1167` — `_build_rule_md` + `render_export_rule` end-to-end.
+- `tests/test_web_heatmap.py` diff — 6 new behavior tests + 1 deleted stub.
+- Grepped the engine_version-check pattern across all 4 MCP sweep-touching tools (`cell_summary`, `heatmap`, `skip_summary`, `data_quality`) for cross-reference.
+- Verified `compute_cell_stats` reuse via the `from src.analytics.cell_stats import compute_cell_stats` import at line 33.
+
+### Praises
+
+- **4th consumer of the centralized `compute_cell_stats`** — `_build_rule_md` at line 989 calls `compute_cell_stats(rois=..., pnls=...)`. The ebe7228 centralization keeps paying off: a future change to the stat block (e.g., adding `bootstrap_ci_median_roi`) automatically lands in the exported .md.
+- **`MULTIPLE_COMPARISONS_CAVEAT` re-emitted VERBATIM** under `## Selection bias warning` (line 1019). LOAD-BEARING test `test_export_rule_md_includes_multiple_comparisons_caveat_verbatim` pins identity (`assert MULTIPLE_COMPARISONS_CAVEAT in md_text`). A future paraphrase fails the test.
+- **`PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT` re-emitted VERBATIM** when triggered (line 1005). Same identity-pin pattern as the MCP tools — single source of truth flows to all surfaces.
+- **`_build_cell_csv` reused** (line 1180 alias + line 1128 call) — no duplicated leg-flattening + fill-source classification. The drill-down CSV and the export CSV share the exact same shape.
+- **Three distinct empty paths** with operator-facing messages:
+  - No strategy/symbol picked (line 1074-1079).
+  - No cell selected (line 1081-1088) — prompts the operator to click.
+  - Cell selected but no matching trades (line 1098-1104) — surfaces the (strategy, symbol, T-e, T-x) tuple so the operator knows WHICH cell they're missing.
+- **`read_run_metadata` failure gracefully degrades** (line 1118-1121) — parquet missing from disk doesn't crash the export; provenance section says "(unstamped — pre-arc parquet likely)" so the operator still gets the hint. UI surface stays responsive.
+- **Hand-derivable stats test**: `test_export_rule_md_includes_rule_spec_and_stats` uses ROIs `[-1.0, 2.0, 5.0]` so `np.median = 2.0` and `n=3` are both checkable by inspection.
+
+### Grill #1 (REAL, correctness): pre-pricing-arc caveat SUPPRESSED when `engine_version is None`
+
+`src/web/heatmap.py:1002`:
+
+```python
+if engine_version is not None and engine_version != ENGINE_VERSION:
+    pre_arc_block = (
+        "\n## Pre-pricing-arc warning\n\n"
+        f"{PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT}\n"
+    )
+```
+
+The `is not None` guard SKIPS the caveat when `engine_version` is None. Two real scenarios where this fires the bug:
+
+1. **Legacy pre-arc parquet (the EXACT scenario the caveat was designed for)**: `read_run_metadata` returns `{}` (empty dict), `stamp.get("engine_version")` returns None, `engine_version` stays None, caveat skipped. **Operator exports a rule built on phantom-fill-biased data WITHOUT the warning.**
+2. **`read_run_metadata` raises** (parquet missing from disk mid-rename, etc.): exception caught at line 1118-1121, `engine_version` stays None, caveat skipped. Same outcome.
+
+Cross-reference: all 4 MCP sweep-touching tools use the correct pattern:
+
+```python
+# cell_summary.py:290, heatmap.py:232, skip_summary.py:203, data_quality.py:405
+if stamp.get("engine_version") != ENGINE_VERSION:
+    caveats.append(PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT)
+```
+
+No `is not None` guard — they fire on missing stamp because `None != "p7.pricing_arc"` is True. The heatmap export diverges.
+
+**The Provenance section already names the "(unstamped — pre-arc parquet likely)" condition** at line 1010-1011, so the codebase ALREADY KNOWS that None means pre-arc. The caveat block just doesn't connect that signal to the LOUD warning section.
+
+**Fix (1 line)**: drop the `is not None` guard:
+
+```python
+if engine_version != ENGINE_VERSION:
+    pre_arc_block = (...)
+```
+
+Matches the MCP tools' pattern. Legacy parquets surface the caveat as designed.
+
+### Grill #2 (REAL, missing test coverage): no test for the `engine_version is None` case
+
+The 6 new tests cover:
+- ✓ match (`p7.pricing_arc`) → no caveat.
+- ✓ mismatch (`p6.legacy`) → caveat fires.
+- ✗ MISSING: unstamped parquet (`{}` returned by `read_run_metadata`) → SHOULD fire (per the MCP-tool pattern), DOESN'T fire (per the current bug).
+- ✗ MISSING: `read_run_metadata` raises → SHOULD fire, DOESN'T fire.
+
+Both gaps directly correspond to the Grill #1 bug. Adding either test surfaces the bug.
+
+**Required followup test** (load-bearing, mirrors the cross-tool pattern):
+
+```python
+def test_export_rule_pre_arc_caveat_fires_when_stamp_missing(monkeypatch):
+    """LOAD-BEARING: unstamped parquets (legacy / pre-arc) trigger the
+    same caveat as mismatched stamps. read_run_metadata returns {} for
+    legacy parquets; the export MUST treat that as 'pre-arc' and emit
+    the phantom-fill caveat verbatim — same trigger as the MCP tools."""
+    import src.web.heatmap as hm
+    from src.mcp._models import PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
+    monkeypatch.setattr(
+        hm.st, "session_state", {"mp_heatmap_selected_cell": (15, 1)},
+    )
+    monkeypatch.setattr(hm, "read_run_metadata", lambda run_id: {})
+    downloads, _ = _patch_streamlit_for_export(monkeypatch)
+    hm.render_export_rule(
+        pd.DataFrame([_export_trade()]),
+        strategy="short_straddle", symbol="RELIANCE",
+    )
+    md = next(d for d in downloads if d["file_name"].endswith(".md"))
+    assert PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT in md["data"].decode("utf-8")
+```
+
+### Minor observations (not grills)
+
+- **`test_export_rule_empty_cell_after_selection_shows_no_data_message`** uses `any("no" in m.lower() for m in infos)` — super loose; a message like "no longer needed" would also pass. Tighten to `"no trades"` or similar. Mild robustness; not blocking.
+- **`test_export_rule_md_includes_rule_spec_and_stats`** asserts `"2.0" in md_text` for the median. The current `_fmt_pct` formatter produces "2.00%" for 2.0, so the substring passes. If the formatter ever changes precision (e.g., to "2%" or "2.000"), the test could regress. A wider regex like `re.search(r"2\.0+\s*%", md_text)` would survive formatter tweaks.
+- **`if "run_id" in rows.columns and len(rows):`** at line 1113 — takes `rows["run_id"].iloc[0]` as THE run_id. Inherits the dashboard's "active frame = one run" convention (referenced in the comment at line 1107-1110). Consistent with `app.py:202`; acceptable.
+- **`hold_days = int(entry_offset_td) - int(exit_offset_td)`** at line 1000 — for entry=15, exit=1 → 14 trading days. Matches `_export_trade(hold_trading_days=14)` in the test fixture. Correct, but worth a 1-line comment naming the contract ("days between offsets — not counting the entry day").
+
+### Math
+
+`781 → 786 (+5 net)`: 6 new tests, 1 deleted stub. Math holds.
+
+### What this commit does
+
+Closes the `feat(p7.heatmap.export)` item — the Heatmap tab now has a third operator-facing mode (alongside Drill-down + Compare-cells): pick a cell, get two side-by-side downloads scoped to that cell:
+- `rule_{strategy}_{symbol}_T-{e}_T-{x}.md` — deployment-ready trading rule with 5 sections (selection-bias warning, rule spec, historical performance, provenance, optional pre-arc warning).
+- `trades_{strategy}_{symbol}_T-{e}_T-{x}.csv` — per-leg detail via `_build_cell_csv` re-use.
+
+This is the bridge between research (heatmap surface) and deployment (a candidate trading rule the operator can journal, audit, and forward-validate).
+
+### Open grills
+
+- **6b3a9eb Grill #1** (correctness): drop the `is not None` guard so the pre-arc caveat fires on missing stamps.
+- **6b3a9eb Grill #2** (missing test): add the regression test for `read_run_metadata returns {}` → caveat fires.
+
+Both close in one tiny chore commit.
+
+### Next-commit suggestion
+
+1. **`fix(p7.heatmap.export.pre_arc_unstamped)`** — close both grills. 1-line impl change + 1 new regression test. Match the MCP tools' `stamp.get("engine_version") != ENGINE_VERSION` pattern exactly so the cross-surface contract holds.
+2. Operator validation of the export surface against a real sweep parquet, end-to-end (pick a cell, download the .md, verify the rule renders correctly in their notes app).
+
+Standing by.
+
+---
