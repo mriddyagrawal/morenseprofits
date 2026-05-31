@@ -198,7 +198,7 @@ The shared
 `compute_cell_stats` raises `ValueError` if a non-default
 `cvar_alpha` is passed — preventing a stat block whose field name
 disagrees with its value. Callers needing a different tail fraction
-use the alpha-agnostic `bootstrap_alpha_mean` helper directly.
+use the alpha-agnostic `bottom_alpha_mean` helper directly.
 
 Pinned by
 [tests/test_analytics_cell_stats.py::test_compute_cell_stats_locks_cvar_alpha_to_default](../tests/test_analytics_cell_stats.py).
@@ -303,9 +303,15 @@ historical record.
 | `3264f37` | p8.mcp.cell_summary — cell_summary |
 | `d138fef` | p8.mcp.heatmap — heatmap |
 | `a98a29d` | p8.mcp.consolidate — pre-arc caveat constant + bootstrap method string + per_trade cap |
-| `8d34e7c` | p8.mcp.backtest_one — backtest_one |
-| `25fea3c` | p8.mcp.sweep_windows — sweep_windows |
-| `f27afb7` | p8.mcp.skip_summary — skip_summary |
+| `66ff72b` | fix(p8.mcp.heatmap.dead_comprehension) — dropped O(n×m) per-cell list-build overwritten by try/except |
+| `4d9ddc2` | test(p8.mcp.protocol_integration) — SDK-dispatcher integration tests (closed reviewer's 6-commits-deep gap) |
+| `0b39030` | fix(p8.mcp.data_validation) — NaN-guard + filter dtype-coercion + chain-truncation note |
+| `c3545cc` | p8.mcp.backtest_one — single-trade replay with VWAP-vs-close fill classification |
+| `b29d55e` | chore(p8.fill_audit.centralize) — pulled `classify_fill_source` into `src/engine/pnl` (prereq for the c3545cc/96a506c carry-over grills) |
+| `96a506c` | p8.mcp.sweep_windows — grid replay across N expiries |
+| `8a44bb8` | docs(p8.mcp.sweep_windows.pre_arc_note) — named the pre-arc caveat omission in sweep_windows's docstring |
+| `fc6356e` | p8.mcp.skip_summary — skip-by-reason breakdown for one sweep run |
+| `f27afb7` | chore(p8.mcp.skip_summary.polish) — non-default RESULTS_DIR + examples-are-first-N (closes fc6356e grills) |
 | `22104df` | p8.mcp.data_quality — three diagnostic dimensions |
 | `b25f048` | fix(p8.mcp.data_quality.liquidity_dedup) — Option B (df for trade-level, legs_df for leg-level) |
 | `ebe7228` | chore(p8.cell_stats.centralize) — shared CellStatsBlock + compute_cell_stats |
@@ -316,6 +322,9 @@ historical record.
 | `f4707e3` | chore(p8.mcp.data_quality.entry_side_docs) — ENTRY-side scope named in dimension field |
 | `69ab7e3` | chore(p8.cell_stats.cvar_alpha_lock) — raise on non-default cvar_alpha |
 
-13 commits per the consultation roadmap (10 sub-arc commits + 3
-polish commits during the arc + this docs commit + 4 post-arc polish
-chores closing reviewer carry-forward grills).
+The consultation roadmap projected 13 commits; the actual arc landed
+24 BUILDER commits before this docs commit, driven by in-arc polish
+the reviewer surfaced (the 5 fix/test/chore commits above plus the
+4 post-arc polish chores closing carry-forward grills). The growth
+is honest; the reviewer-builder loop catching coverage gaps and
+deduplication opportunities is the value the roadmap couldn't price.
