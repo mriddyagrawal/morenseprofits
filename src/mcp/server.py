@@ -42,6 +42,7 @@ from src.mcp._models import ToolEntry
 from src.mcp.backtest_one import register_backtest_one_tools
 from src.mcp.cell_summary import register_cell_summary_tools
 from src.mcp.heatmap import register_heatmap_tools
+from src.mcp.skip_summary import register_skip_summary_tools
 from src.mcp.spot_options import register_spot_options_tools
 from src.mcp.sweep_query import register_sweep_query_tools
 from src.mcp.sweep_windows import register_sweep_windows_tools
@@ -64,8 +65,9 @@ def _collect_tool_entries() -> dict[str, ToolEntry]:
     all_entries.extend(register_heatmap_tools())
     all_entries.extend(register_backtest_one_tools())
     all_entries.extend(register_sweep_windows_tools())
+    all_entries.extend(register_skip_summary_tools())
     # Future sub-arcs append here:
-    # all_entries.extend(register_diagnostics_tools())
+    # all_entries.extend(register_data_quality_tools())
     # ... etc.
 
     registry: dict[str, ToolEntry] = {}
