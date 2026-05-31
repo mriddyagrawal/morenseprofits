@@ -14482,3 +14482,110 @@ In priority order:
 Standing by.
 
 ---
+
+## Review of 72d06c6 — `feat(p8.mcp.bootstrap_ci)` — sub-arc 3.6 (2 of 2) — closes MCP arc at 16/16
+
+**Verdict: ✅ ACCEPT.** Sub-arc 3.6 closes. **16 of 16 tools landed.** Strong LOAD-BEARING registry pin enforces the v1 catalog. One small consistency grill on cap placement. Test math hand-verified.
+
+### What I checked
+
+- `src/mcp/bootstrap_ci.py` (209 LOC) end-to-end.
+- `tests/test_mcp_bootstrap_ci.py` (182 LOC, 13 new tests).
+- `src/analytics/bootstrap.py:16-66` — verified the underlying `bootstrap_ci` signature `(values, *, statistic, B, alpha, seed)` and its NaN-on-n<2 contract.
+- `src/analytics/aggregate.py:70` — verified `MIN_N_FOR_RANKING: int = 5` matches the impl's `MIN_N_FOR_RANKING` import.
+
+### Praises
+
+- **LOAD-BEARING registry pin at exactly 16 tools** with the full expected name set (`test_server_registry_now_exposes_bootstrap_ci_and_all_16_tools`). Any future commit that adds, removes, or renames a tool without updating this test fires — that's the right discipline at v1-catalog maturity. The test groups names by sub-arc (commented) so a maintainer adding a new tool sees exactly where it fits.
+- **Pure-compute design**. No parquet read; consumer passes the value array directly. The wrapper does Pydantic validation + NaN-drop + caveat policy + method-string construction, then delegates to `src.analytics.bootstrap.bootstrap_ci` — same machinery as the dashboard's Median Hero card. Identity-pin via direct import.
+- **Three-tier failure mode** is well-designed:
+  - `len(values) > MAX_VALUES` → `raise ValueError` (consumer's fault; loud).
+  - `n_finite < MIN_VALUES_FOR_CI (=2)` → None bounds + explicit caveat naming the threshold. CI is mathematically undefined; returning None is more honest than NaN.
+  - `MIN_VALUES_FOR_CI ≤ n_finite < MIN_N_FOR_RANKING (=5)` → CI computed but "treat as suggestive only" caveat surfaces — same threshold cell_summary uses for its small-N caveat. Cross-tool consistency.
+- **Self-describing `method` string** constructed from the actual call args (`f"percentile bootstrap, statistic={inp.statistic}, B={inp.B}, seed={inp.seed}, alpha={inp.alpha}"`). Single source of truth so the string can't drift from the call as long as the impl uses these vars (see grill on this below).
+- **Deterministic CI pinned by test**: `test_bootstrap_ci_deterministic_with_same_seed` proves same `(values, B, seed)` → byte-identical bounds. Reproducibility contract is asserted, not just documented.
+- **`alpha` width sanity test**: `test_bootstrap_ci_alpha_changes_bounds` asserts 95% CI is WIDER than 50% CI. Catches a future regression where someone inverts α semantics (e.g., uses α as the confidence level instead of significance level).
+- **Pydantic constraints at schema layer for 3 of 4 limits**: `min_length=1` on values, `ge=1, le=10_000` on B, `ge=0.0, lt=1.0` on alpha. Two tests pin the rejections (`empty values`, `alpha=1.0`).
+- **NaN handling is explicit + counted**: `n_input` is the raw length; `n_finite` is post-drop. The consumer Claude reads both and can compute how many NaNs were silently dropped — useful for sanity-checking the input.
+
+### Grill #1 (small, consistency): `MAX_VALUES` enforcement is at the IMPL layer; siblings are at SCHEMA layer
+
+`src/mcp/bootstrap_ci.py:137-141`:
+
+```python
+if len(inp.values) > MAX_VALUES:
+    raise ValueError(
+        f"values length {len(inp.values)} exceeds cap "
+        f"{MAX_VALUES}. Pre-aggregate or sample before passing."
+    )
+```
+
+The wrapper enforces `MAX_VALUES = 5_000` via a runtime `raise ValueError` in the impl. Compare to the SCHEMA-layer constraints in the model: `values: list[float] = Field(..., min_length=1, ...)`, `B: int = Field(..., ge=1, le=10_000, ...)`, `alpha: float = Field(..., ge=0.0, lt=1.0, ...)`.
+
+Three of four limits at schema, one at impl. The mixed pattern means:
+
+- An MCP client sending 6000 values gets `ValueError` only AFTER the request is routed to the impl. A schema-layer `max_length=MAX_VALUES` would reject at deserialization, before any impl code runs.
+- The Pydantic-generated input JSON schema (visible to consumer Claudes at tool-discovery time) would advertise the cap explicitly if it were schema-layer. Right now the consumer only sees the cap in the field description.
+- Test would shift from `pytest.raises(ValueError, match="exceeds cap")` → `pytest.raises(ValidationError)` — small test churn, but more idiomatic per the rest of the file.
+
+Fix: add `max_length=MAX_VALUES` to the `values` Field constraint. Two-line change (the Field constraint + test assertion update).
+
+### Minor observations (not grills)
+
+- **Double NaN-filter**: the wrapper filters at line 144 (`finite = arr[np.isfinite(arr)]`) to compute `n_finite`, and the underlying `src.analytics.bootstrap.bootstrap_ci` ALSO filters at line 57 (`arr = arr[np.isfinite(arr)]`). Redundant but harmless. Worth a 1-line comment in the wrapper saying "underlying bootstrap_ci also filters; we count `n_finite` here for the response field." Anti-confusion for future maintainers.
+- **`MIN_VALUES_FOR_CI = 2` is parallel to a hardcoded `n < 2` check in the underlying**: the wrapper's constant and the underlying's hardcoded threshold could drift. A one-line cross-tie assert (e.g., a test that calls `_bootstrap_ci([x])` and confirms `(nan, nan, nan)`) would tie them. Probably YAGNI.
+- **`statistic` Literal is `"median" | "mean"` only**: defensible v1 surface (mean for short-vol skew, median per dashboard convention). Future expansion candidates: `"std"`, `"min"`, `"max"`, `"p75"` if a consumer use case demands. Hold for now.
+- **`method` string is constructed inline** rather than returned by `_bootstrap_ci` alongside the bounds. If a future refactor passes different `B`/`seed`/`alpha` to the underlying than what's in `inp`, the method string would silently lie. Probably YAGNI for v1 (single call site, easy to read).
+- **The pattern `None if np.isnan(point) else float(point)` after `_bootstrap_ci`**: defensive — the n<2 case already short-circuits above, so `_bootstrap_ci` should never return NaN here. Belt-and-suspenders is fine.
+
+### Math + behavior verification (hand-checked)
+
+- `values=1..10, statistic=median` → `point=median(1..10)=5.5`; `ci_lo ≤ 5.5 ≤ ci_hi`. ✓
+- `statistic=mean, values=1..10` → `point=mean(1..10)=5.5`. ✓
+- α=0.50 (50% CI) bounds width < α=0.05 (95% CI) bounds width. ✓ (more confidence → wider interval)
+- `values=[5.0], n=1 < MIN_VALUES_FOR_CI=2` → None bounds + MIN_VALUES_FOR_CI caveat. Wrapper short-circuits BEFORE calling `_bootstrap_ci`. ✓
+- `values=[1, 2, 3], n=3` → between MIN_VALUES_FOR_CI (=2) and MIN_N_FOR_RANKING (=5). CI computed + small-N caveat fires. ✓
+- `values=[1, 2, nan, 3, nan, 4, 5]` → `n_input=7, n_finite=5`. NaN drop happens in wrapper before `_bootstrap_ci` sees them. ✓
+- Pydantic rejects `values=[]` (min_length=1) and `alpha=1.0` (lt=1.0). ✓
+- `len(values) > MAX_VALUES=5000` → ValueError with "exceeds cap" in message. ✓
+
+### Math check
+
+`779 = 766 + 13` ✓. All 13 tests are net additions.
+
+### MCP arc state — FINAL 16/16
+
+| Sub-arc | Tools |
+|---|---|
+| 3.1 universe | list_universe, expiries_for, list_strategies |
+| 3.2 time-series | get_spot_series, get_option_series, get_options_chain |
+| 3.3 sweep queries | list_runs, query_sweep, cell_summary, heatmap |
+| 3.4 backtest replay | backtest_one, sweep_windows |
+| 3.5 diagnostics | skip_summary, data_quality |
+| 3.6 research helpers | compare_cells, bootstrap_ci |
+
+**16 tools. v1 catalog complete.** Pinned in `test_server_registry_now_exposes_bootstrap_ci_and_all_16_tools` so future drift gets caught.
+
+### Open grills (carry-forward into sub-arc 3.7 docs)
+
+- **67c6d3f grill #1** (distribution-truncation-policy docs in compare_cells).
+- **b25f048 minor** (`DataQualityInput.dimension` description still implies all-leg).
+- **This commit's grill #1** (move `MAX_VALUES` cap to schema layer).
+- **ebe7228 grill #1 (latent)** (`cvar_5_roi_pct` alpha-hardcoded field name despite configurable kwarg).
+
+All small. None blocking the arc-close moment.
+
+### Next-commit suggestion
+
+1. **`docs(p8.mcp.contract)`** — sub-arc 3.7. The arc-closing docs commit. Cover:
+   - The 16-tool catalog (probably a fresh `DESIGN/PHASE_8_MCP.md` or amendment to PLAN.md).
+   - The no-p-values + multiple-comparisons + pre-pricing-arc cross-cutting policies (with the verbatim caveat strings).
+   - How the registry-pin test works as a forward-compat tripwire.
+   - Operator-side: how to wire the server into Claude Code (`uvx ... --stdio` invocation).
+2. **Optionally bundle into 3.7**: the 4 small open grills above. They're all docs/schema-layer tweaks (≤ 10 lines combined). A bundled commit titled `docs(p8.mcp.contract) + polish` would close the loop cleanly.
+
+If the BUILDER prefers to land the docs commit FIRST and the polish commits AFTER, that's fine — the docs anchor the arc; the polish doesn't need to land before the arc-close commit ships.
+
+Standing by.
+
+---
