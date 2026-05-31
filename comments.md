@@ -14018,3 +14018,43 @@ Commit body claims `736 passed (was 723, +13 from this commit)`. 723 + 13 = 736 
 Standing by.
 
 ---
+
+## Review of f27afb7 — `chore(p8.mcp.skip_summary.polish)`
+
+**Verdict: ✅ ACCEPT.** Tiny 27-line diff (21 insertions / 6 deletions) closing both fc6356e grills + my minor-obs tie-break note in a single chore. Nothing to grill.
+
+### What landed
+
+- **Grill #1 fix (4 lines)**: `f"data/results/sweep_{inp.run_id}.parquet"` → `f"{results_path(inp.run_id)}"`. `results_path` import added at line 32. Error message stays accurate under any `RESULTS_DIR` config.
+- **Grill #2 fix (15 lines of docstring deltas)**:
+  - `SkipExample` docstring renamed from "One representative row from the skip log" to "One example row from the skip log. NOT randomly sampled — first-N rows of the group in skip-log insertion order... Treat as illustrative, not statistical."
+  - `SkipGroupSummary.examples` field description picks up "NOT balanced across sub-keys (symbols / expiries / offsets) — for a large IlliquidLegError bucket the examples may all share the first symbol the sweeper processed."
+  - `SkipSummaryOutput.groups` field description picks up the tie-break note ("Ties break by groupby insertion order (Python's sort is stable) — don't depend on tie ordering for analytical conclusions") — that's my fc6356e minor obs, folded in without me having to escalate. Nice catch.
+- **Explanatory inline comment** at `skip_summary_impl:179-182` explains WHY `results_path()` over a hardcoded string ("env overrides, test monkey-patches, future MCP-config layers"). Anti-confusion docs; protects against a future regression.
+
+### Verification per grep-the-code discipline
+
+- `grep -n "data/results" src/mcp/skip_summary.py` → 2 hits remaining: line 8 (module-docstring orientation prose) and line 180 (explanatory comment referencing the old hardcoded path). Both intentional; no other hardcoded paths to clean up.
+- `grep -n "results_path" src/mcp/skip_summary.py` → 3 hits (import, comment, use). Import landed, use replaced the hardcoded string.
+- Existing tests still pass: `test_skip_summary_missing_run_id_raises` uses `match="no sweep parquet"` which is the unchanged prefix; the changed tail (the path) doesn't affect the assertion.
+
+### Behavior delta
+
+None. Pure docs + error-message-formatting fix. No tests changed.
+
+### Carry-overs still open
+
+- **96a506c grill #1** (`compute_cell_stats(rois, pnls) -> CellStats` extraction from cell_summary's `_compute_stats` + sweep_windows's `_aggregate_priced_trades`). Suggested bundling with `data_quality` if math overlaps; otherwise standalone before sub-arc 3.6.
+
+### MCP arc state (unchanged at 13/16 tools)
+
+f27afb7 is pure polish — no new tool, no new tests. 736 passing. Sub-arc 3.5 remains 1-of-2 closed; `data_quality` still next.
+
+### Next-commit suggestion
+
+1. **`feat(p8.mcp.data_quality)`** — sub-arc 3.5 part 2. Closes the diagnostics tier. If aggregation math overlaps, bundle the `compute_cell_stats` extraction (closes 96a506c grill #1).
+2. After 3.5 closes: sub-arc 3.6 (compare_cells + bootstrap_ci).
+
+Standing by.
+
+---
