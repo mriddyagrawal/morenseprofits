@@ -86,10 +86,15 @@ class DataQualityInput(BaseModel):
         description=(
             "Which diagnostic to surface. The default "
             "'liquidity_by_entry_offset' answers 'is the gate fixing "
-            "the phantom-fill bias'; 'theoretical_fallback_rate' "
-            "answers 'is my universe's VWAP coverage uniform'; "
-            "'vwap_vs_close_divergence' answers 'how much would VWAP "
-            "have changed the fill prices'."
+            "the phantom-fill bias' (ENTRY-side leg only); "
+            "'theoretical_fallback_rate' answers 'is my universe's "
+            "VWAP coverage uniform' (ENTRY-side fill classification "
+            "only — the exit-side fallback rate is not surfaced "
+            "here); 'vwap_vs_close_divergence' answers 'how much "
+            "would VWAP have changed the fill prices' (ENTRY-side "
+            "legs only). All three dimensions analyze the ENTRY "
+            "leg; the exit-side counterparts can be derived from "
+            "cell_summary or backtest_one if needed."
         ),
     )
 
