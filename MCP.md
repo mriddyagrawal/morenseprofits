@@ -266,7 +266,7 @@ No parameters.
   raise a caveat on `cell_summary`, `heatmap`, etc. — the operator
   needs to know the result might be carrying phantom-fill bias.
 - **`data_quality` is ENTRY-side only.** All three diagnostics
-  (`phantom_fill_band`, `theoretical_fallback_rate`,
+  (`liquidity_by_entry_offset`, `theoretical_fallback_rate`,
   `vwap_vs_close_divergence`) classify and measure ENTRY-leg fills
   only — exit-leg fill quality is NOT covered. Operator interpreting
   any of these dimensions must treat them as entry-fill diagnostics,
@@ -274,10 +274,12 @@ No parameters.
 - **`compare_cells.roi_distribution` keeps the LOWEST N by ROI.**
   When a cell's distribution exceeds the per-cell row cap, the right
   tail is dropped (not a random sample) — consistent with the tool's
-  tail-risk emphasis (CVaR-5%). A `roi_distribution_truncated` caveat
-  fires on truncation. Operators charting these distributions should
-  treat the right edge as a lower bound on the best trades, not a
-  full picture.
+  tail-risk emphasis (CVaR-5%). On truncation, a free-form caveat
+  fires whose text begins `"At least one cell's ROI distribution was
+  truncated to ..."` (substring-match for `"ROI distribution was
+  truncated"` — there is no named caveat key). Operators charting
+  these distributions should treat the right edge as a lower bound on
+  the best trades, not a full picture.
 - **Every tool's output has a `caveats` field** — a free-form list of
   strings surfacing data-quality issues, truncations, and known-bug
   exceptions. Treat empty caveats as the explicit "no concerns"
