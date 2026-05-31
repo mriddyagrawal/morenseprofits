@@ -14939,3 +14939,68 @@ Three small docs grills above (provenance hashes, missing entries, helper-name t
 Standing by.
 
 ---
+
+## Review of 9102620 — `fix(p8.mcp.contract.provenance)`
+
+**Verdict: ✅ ACCEPT.** Clean docs fix closing all 3 grills from my 793494b review (and addressing the minor "13 vs 24" arithmetic observation as a bonus). The Phase-8 MCP arc is now CLOSED with an accurate as-built provenance record.
+
+### What I checked
+
+- `git rev-parse` on all 9 hashes that appear in the corrected provenance entries (c3545cc, 96a506c, 66ff72b, 4d9ddc2, 0b39030, b29d55e, 8a44bb8, fc6356e, f27afb7) — every one resolves to a real commit object. ✓
+- Diff inspection of `DESIGN/PHASE_8_MCP.md` § 4.6 and § 8 and the `PLAN.md` 2026-05-31 entry.
+
+### Grill #1 (wrong hashes) — closed
+
+- `8d34e7c` → `c3545cc` ✓ (backtest_one)
+- `25fea3c` → `96a506c` ✓ (sweep_windows)
+- The skip_summary mis-attribution is fixed by SPLITTING the row: `fc6356e` is now the feat row + `f27afb7` is the polish row with the correct subtitle. Both deserve their own provenance line; conflating them undersold the polish work. ✓
+
+### Grill #2 (5 missing in-arc commits) — closed
+
+All 5 appended chronologically: `66ff72b`, `4d9ddc2`, `0b39030`, `b29d55e`, `8a44bb8`. Each entry has a one-liner subtitle naming what the commit did. The 24-vs-19 gap in my §8 enumeration is closed.
+
+### Grill #3 (typo §4.6) — closed
+
+`bootstrap_alpha_mean` → `bottom_alpha_mean` ✓. The reference now matches `src/analytics/cell_stats.py:85`. Consumer Claude following the escape-hatch advice no longer hits an AttributeError.
+
+### Bonus: closing-paragraph rewrite
+
+The "13 commits per the consultation roadmap" framing I flagged as a minor observation got tightened into a meta-acknowledgment:
+
+> The consultation roadmap projected 13 commits; the actual arc landed 24 BUILDER commits before this docs commit, driven by in-arc polish the reviewer surfaced (the 5 fix/test/chore commits above plus the 4 post-arc polish chores closing carry-forward grills). The growth is honest; the reviewer-builder loop catching coverage gaps and deduplication opportunities is the value the roadmap couldn't price.
+
+Honest about the delta AND attributes the growth to its source. Nice.
+
+### Bonus: PLAN.md mirror tightened
+
+Beyond mirroring the 3 hash corrections, the BUILDER also expanded the sub-arc 3.4 line to NAME the prereq (`b29d55e fill_audit.centralize`) and the follow-up (`8a44bb8 sweep_windows.pre_arc_note`), and the sub-arc 3.5 line to NAME the polish (`f27afb7`) alongside the feat (`fc6356e`). That's MORE complete than I asked for — the PLAN history record now matches the §8 provenance table.
+
+### Behavior delta
+
+None. Docs-only.
+
+### Math
+
+No test changes; 781 stays 781.
+
+### MCP arc state — FINAL CLOSED at 16/16 tools + accurate provenance
+
+The arc is COMPLETE:
+- 7 sub-arcs ✅ (universe, time-series, sweep queries, backtest replay, diagnostics, research helpers, docs).
+- 16 tools registered + pinned by the registry-pin test.
+- Open grill list: EMPTY. No carry-overs.
+- Provenance: §8 + PLAN.md history both accurate.
+- Cross-cutting policies pinned by LOAD-BEARING tests across the arc (no-p-values, multiple-comparisons, pre-pricing-arc, lowest-N truncation, cvar-α lock, ENTRY-side scope, schema-layer validation).
+
+The MCP arc is done. Phase 9 (paper trading) is the next surface-area expansion per §6's transition note.
+
+### Next-commit suggestion
+
+There are NO open grills. The arc is closed. Next moves are operator-driven:
+
+1. **Operator validation** — wire `~/.claude/mcp.json` per §2 and exercise the 16-tool surface end-to-end against the production sweep parquet. The pricing-arc analysis that motivated Phase 8 (the +10.9% T-41..T-45 gradient) becomes a real `data_quality(dimension="liquidity_by_entry_offset")` call. Smoke-test the headline result.
+2. **Phase 9 (paper trading)** consultation/planning when the operator is ready — that's the next arc per the SPECS roadmap.
+
+Standing by for whatever comes next.
+
+---
