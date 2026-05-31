@@ -93,8 +93,13 @@ class CellComparison(BaseModel):
         ...,
         description=(
             "Per-trade ROI values for this cell, sorted ascending. "
-            f"Capped at {MAX_DISTRIBUTION_ROWS} rows; truncation is "
-            "flagged in the response's ``caveats``."
+            f"Capped at {MAX_DISTRIBUTION_ROWS} rows. **Truncation "
+            "keeps the LOWEST N by ROI** (right tail dropped) — "
+            "consistent with the tool's tail-risk emphasis (CVaR-5%); "
+            "consumers plotting this as a histogram must NOT "
+            "generalize a left-shifted shape to mean 'cell is worse "
+            "than it looks'. Use cell_summary for the full per-trade "
+            "list including right-tail trades."
         ),
     )
 
@@ -241,8 +246,12 @@ def compare_cells_impl(inp: CompareCellsInput) -> CompareCellsOutput:
     if any_truncated:
         caveats.append(
             f"At least one cell's ROI distribution was truncated to "
-            f"{MAX_DISTRIBUTION_ROWS} rows. Use cell_summary against "
-            f"the specific cell_key for the full per-trade list."
+            f"{MAX_DISTRIBUTION_ROWS} rows (LOWEST {MAX_DISTRIBUTION_ROWS} "
+            f"by ROI; right tail dropped). The lowest-N policy matches "
+            f"the tool's tail-risk emphasis (consistent with the CVaR-"
+            f"5% framing). Use cell_summary against the specific "
+            f"cell_key for the full per-trade list — including the "
+            f"dropped right-tail trades."
         )
     # Multiple-comparisons caveat — verbatim re-export from
     # src.analytics.rank, same constant the dashboard uses. The

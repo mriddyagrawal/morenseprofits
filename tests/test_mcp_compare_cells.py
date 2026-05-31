@@ -289,6 +289,40 @@ def test_compare_cells_distribution_truncation_caveat(monkeypatch):
     assert any("truncated" in c.lower() for c in out.caveats)
 
 
+def test_compare_cells_truncation_keeps_lowest_n_by_roi(monkeypatch):
+    """LOAD-BEARING: truncation keeps the LOWEST N by ROI (right tail
+    dropped), not the highest N — consistent with the tool's tail-risk
+    emphasis (CVaR-5%). Values 1..10 truncated to 3 must return
+    [1.0, 2.0, 3.0], NOT [8.0, 9.0, 10.0]. Both the truncation caveat
+    string and the field description name this policy explicitly so a
+    consumer plotting the distribution doesn't mis-generalize a left-
+    shifted histogram."""
+    monkeypatch.setattr("src.mcp.compare_cells.MAX_DISTRIBUTION_ROWS", 3)
+    rows = _build_cell(
+        10, roi_seq=[10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+    )
+    rows += _build_cell(2, entry_offset=10, exit_offset=3,
+                         roi_seq=[100.0, 200.0])
+    r.write_results(pd.DataFrame(rows), run_id="lowest_n")
+    out = compare_cells_impl(CompareCellsInput(
+        run_id="lowest_n",
+        cell_keys=[
+            CompareCellKey(strategy="short_straddle", symbol="RELIANCE",
+                            entry_offset_td=15, exit_offset_td=1),
+            CompareCellKey(strategy="short_straddle", symbol="RELIANCE",
+                            entry_offset_td=10, exit_offset_td=3),
+        ],
+    ))
+    assert out.cells[0].roi_distribution == [1.0, 2.0, 3.0]
+    assert any(
+        "lowest" in c.lower() and "right tail dropped" in c.lower()
+        for c in out.caveats
+    ), (
+        "truncation caveat must name the lowest-N policy + right-tail "
+        "drop explicitly so consumers don't mis-generalize."
+    )
+
+
 def test_compare_cells_pre_arc_caveat_on_legacy_parquet():
     """Pre-pricing-arc parquets surface the shared phantom-fill
     caveat alongside the no-p-values + multiple-comparisons ones."""
