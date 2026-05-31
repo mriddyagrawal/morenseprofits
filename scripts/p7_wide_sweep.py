@@ -14,6 +14,7 @@ are present in the sweep parquet — no Streamlit code changes needed.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 import warnings
@@ -91,9 +92,37 @@ def _h(s: str) -> None:
     print(f"\n=== {s} ===", flush=True)
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Phase-7 wide-grid sweep. Defaults run the full 50-symbol "
+            "universe; --symbols accepts a subset for smoke testing."
+        ),
+    )
+    p.add_argument(
+        "--symbols", nargs="+", default=SYMBOLS,
+        help=(
+            "NSE symbols to sweep (space-separated). Default: full "
+            "50-symbol universe (48 blue chips + PNB + BHEL). "
+            "Mirrors scripts/prefetch_universe.py's --symbols — pass "
+            "the same list to both scripts to keep prefetch and "
+            "sweep universes in lockstep (sweep against a non-"
+            "prefetched stock yields OfflineCacheMiss skips)."
+        ),
+    )
+    p.add_argument(
+        "--workers", type=int, default=N_WORKERS,
+        help=f"Worker process count (default: {N_WORKERS}).",
+    )
+    return p.parse_args()
+
+
 def main() -> int:
+    args = _parse_args()
+    symbols: list[str] = args.symbols
+    n_workers: int = args.workers
     _h("Phase-7 wide-grid sweep — heatmap 45×16")
-    print(f"  symbols     = {SYMBOLS}")
+    print(f"  symbols     = {symbols}  (n={len(symbols)})")
     print(f"  strategies  = {STRATEGIES}")
     print(f"  entry_td    = T-{min(ENTRY_OFFSETS_TD)} … T-{max(ENTRY_OFFSETS_TD)} ({len(ENTRY_OFFSETS_TD)} values)")
     print(f"  exit_td     = T-{min(EXIT_OFFSETS_TD)} … T-{max(EXIT_OFFSETS_TD)} ({len(EXIT_OFFSETS_TD)} values)")
@@ -111,7 +140,7 @@ def main() -> int:
 
     _h(f"Building expiry list ({EXPIRY_FROM.isoformat()} → {EXPIRY_TO.isoformat()})")
     all_expiries: set = set()
-    for sym in SYMBOLS:
+    for sym in symbols:
         try:
             exps = expiry_calendar.monthly_expiries(sym, EXPIRY_FROM, EXPIRY_TO)
             print(f"  {sym}: {len(exps)} expiries")
@@ -125,13 +154,13 @@ def main() -> int:
         1 for e in ENTRY_OFFSETS_TD for x in EXIT_OFFSETS_TD if e > x
     )
     n_cells_planned = (
-        len(STRATEGIES) * len(SYMBOLS) * len(expiries) * n_valid_pairs
+        len(STRATEGIES) * len(symbols) * len(expiries) * n_valid_pairs
     )
     print(f"  valid (entry > exit) pairs: {n_valid_pairs}")
     print(f"  total cells planned: {n_cells_planned}")
 
     run_id = _compute_run_id(
-        STRATEGIES, SYMBOLS, expiries, ENTRY_OFFSETS_TD, EXIT_OFFSETS_TD,
+        STRATEGIES, symbols, expiries, ENTRY_OFFSETS_TD, EXIT_OFFSETS_TD,
     )
     print(f"  run_id (sha-trunc): {run_id}")
 
@@ -141,18 +170,18 @@ def main() -> int:
     # (the verbatim message goes to skip_detail, surfaced in the
     # heatmap drill-down's Skipped Expiries section).
 
-    _h(f"Running sweep (n_workers={N_WORKERS}; cache_only=True; force=False; cache-hit short-circuits)")
+    _h(f"Running sweep (n_workers={n_workers}; cache_only=True; force=False; cache-hit short-circuits)")
     t0 = time.perf_counter()
     df = sweep_grid(
         strategies=STRATEGIES,
-        symbols=SYMBOLS,
+        symbols=symbols,
         expiries=expiries,
         entry_offsets_td=ENTRY_OFFSETS_TD,
         exit_offsets_td=EXIT_OFFSETS_TD,
         today_fn=TODAY_FN,
         offline=False,
         force=False,
-        n_workers=N_WORKERS,
+        n_workers=n_workers,
         show_progress=True,
         cache_only=True,
     )
