@@ -348,53 +348,60 @@ def test_illiquid_leg_error_is_a_missing_data_error():
 # ============================================================
 
 def _option_frame_with_vwap(
-    dates_closes_lots_vols_ois_turnovers: list[tuple[date, float, int, int, int, float]],
+    strike: float,
+    rows: list[tuple[date, float, int, int, int, float]],
 ) -> pd.DataFrame:
-    """Like ``_option_frame_with_liquidity`` but also emits the
-    ``turnover`` column (in lakhs of rupees per NSE convention) so the
-    VWAP-fill path is exercised. For each row, turnover is what NSE
-    would report: ``vwap_rupees × volume_shares / TURNOVER_SCALE_FACTOR``
-    where vwap_rupees is the average price the contract cleared at.
+    """Build an option frame with the ``strike`` + ``turnover`` columns
+    populated so the VWAP-fill path is exercised under the strike-
+    corrected formula.
 
-    Tests can choose vwap_rupees ≈ close for healthy data (assertion
-    passes), or set them divergent to exercise the units-sanity
-    failure branch."""
+    ``rows`` = list of ``(date, close, lot, volume_shares, oi, vwap_premium)``.
+    For each row the fixture computes the turnover NSE would report
+    under the (strike + premium) × shares / 10⁵ convention:
+
+        turnover_lakhs = (strike + vwap_premium) * volume_shares / 10⁵
+
+    Tests pick the vwap_premium they want; the fixture builds the
+    turnover that drives ``_pick_fill_price`` to that recovered value.
+    Passing a NaN vwap_premium yields NaN turnover (exercises the
+    legacy-cache fall-through-to-close path)."""
+    import math
+    turnovers = [
+        ((strike + vwap) * v / 100_000) if not math.isnan(vwap) else math.nan
+        for _, _, _, v, _, vwap in rows
+    ]
+    n = len(rows)
     return pd.DataFrame({
         "date": pd.Series(
-            [pd.Timestamp(d) for d, *_ in dates_closes_lots_vols_ois_turnovers],
+            [pd.Timestamp(d) for d, *_ in rows],
             dtype="datetime64[us]",
         ),
-        "close": [c for _, c, *_ in dates_closes_lots_vols_ois_turnovers],
-        "lot_size": pd.array(
-            [l for _, _, l, *_ in dates_closes_lots_vols_ois_turnovers],
-            dtype="int64",
-        ),
-        "volume": pd.array(
-            [v for _, _, _, v, *_ in dates_closes_lots_vols_ois_turnovers],
-            dtype="int64",
-        ),
-        "oi": pd.array(
-            [o for _, _, _, _, o, _ in dates_closes_lots_vols_ois_turnovers],
-            dtype="Int64",
-        ),
-        "turnover": [t for _, _, _, _, _, t in dates_closes_lots_vols_ois_turnovers],
+        "close": [c for _, c, *_ in rows],
+        "strike": pd.array([strike] * n, dtype="float64"),
+        "lot_size": pd.array([l for _, _, l, *_ in rows], dtype="int64"),
+        "volume": pd.array([v for _, _, _, v, *_ in rows], dtype="int64"),
+        "oi": pd.array([o for _, _, _, _, o, _ in rows], dtype="Int64"),
+        "turnover": turnovers,
     })
 
 
 def test_vwap_fill_used_when_turnover_present():
-    """When turnover is present and units pass the sanity band, the
-    engine fills at VWAP = turnover * scale / volume instead of close.
+    """When turnover is present and units pass the band, the engine
+    fills at the strike-corrected VWAP (notional/share − strike), not
+    at close.
 
-    Fixture: close=100, volume=10,000 shares, turnover=9.8 lakhs of
-    rupees → vwap = 9.8 * 100,000 / 10,000 = 98. Fills at 98, not 100."""
+    Fixture: strike=2600, close=100, vwap_premium=98 (entry) / 20 (exit).
+    Fills at 98 (entry) / 20 (exit). Cross-check the turnover the
+    fixture would have produced: (2600+98)×10000/10⁵ = 269.8 lakhs."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
-    # entry: close=100, volume=10000, turnover=9.8 lakhs → vwap=98
-    # exit:  close=20, volume=5000, turnover=1.0 lakh   → vwap=20
-    df = _option_frame_with_vwap([
-        (entry, 100.0, 250, 10000, 5000, 9.8),
-        (exit_,  20.0, 250,  5000, 4500, 1.0),
-    ])
+    df = _option_frame_with_vwap(
+        strike=2600.0,
+        rows=[
+            (entry, 100.0, 250, 10000, 5000, 98.0),   # vwap=98 vs close=100
+            (exit_,  20.0, 250,  5000, 4500, 20.0),   # vwap=20 vs close=20
+        ],
+    )
     load = _stub_load_option({(2600.0, "CE"): df})
     trade = Trade(
         symbol="X", expiry=date(2024, 1, 25),
@@ -417,10 +424,13 @@ def test_vwap_falls_back_to_close_when_turnover_nan():
     import math
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
-    df = _option_frame_with_vwap([
-        (entry, 100.0, 250, 10000, 5000, math.nan),
-        (exit_,  20.0, 250,  5000, 4500, math.nan),
-    ])
+    df = _option_frame_with_vwap(
+        strike=2600.0,
+        rows=[
+            (entry, 100.0, 250, 10000, 5000, math.nan),
+            (exit_,  20.0, 250,  5000, 4500, math.nan),
+        ],
+    )
     load = _stub_load_option({(2600.0, "CE"): df})
     trade = Trade(
         symbol="X", expiry=date(2024, 1, 25),
@@ -435,56 +445,134 @@ def test_vwap_falls_back_to_close_when_turnover_nan():
     assert out["gross_pnl"] == pytest.approx(20000.0, abs=1e-6)
 
 
-def test_vwap_units_sanity_assertion_fires_on_lakhs_vs_rupees_mismatch():
-    """If NSE shifts PREMIUM VALUE from lakhs to raw rupees (or any
-    units regression), the computed VWAP would be 100,000× too small
-    relative to close. The units-sanity assertion in _pick_fill_price
-    refuses to book a trade against a fill price 5 orders of magnitude
-    off rather than silently using it.
+def test_vwap_falls_back_to_close_when_out_of_band():
+    """Replaces the prior ``test_vwap_units_sanity_assertion_fires_…``:
+    after the strike correction the band-check semantics shifted from
+    "units-sanity assertion (raises MissingDataError)" to "numerical-
+    ill-conditioning safety valve (falls through to close)".
 
-    Simulating the bug: turnover that, when scaled, gives vwap=0.001
-    while close=100 → ratio 0.00001, far outside [0.5, 2.0]."""
+    Simulating an out-of-band recovered premium: strike=100, close=100,
+    fixture computes turnover for ``vwap_premium=300`` → recovered
+    premium = 300 vs close 100 → ratio 3.0 (above 2.0 ceiling) →
+    engine falls back to close instead of raising."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
-    # turnover=0.0001 lakhs → vwap = 0.0001 * 100,000 / 10000 = 0.001
-    # close=100 → ratio = 0.00001 → fires assertion
-    df = _option_frame_with_vwap([
-        (entry, 100.0, 250, 10000, 5000, 0.0001),
-        (exit_,  20.0, 250,  5000, 4500, 1.0),
-    ])
-    load = _stub_load_option({(2600.0, "CE"): df})
+    df = _option_frame_with_vwap(
+        strike=100.0,
+        rows=[
+            (entry, 100.0, 250, 10000, 5000, 300.0),  # vwap=300 vs close=100 → out of band
+            (exit_,  20.0, 250,  5000, 4500,  20.0),  # exit healthy
+        ],
+    )
+    load = _stub_load_option({(100.0, "CE"): df})
     trade = Trade(
         symbol="X", expiry=date(2024, 1, 25),
         entry_date=entry, exit_date=exit_,
-        legs=(Leg("CE", 2600, "SELL", 1),),
+        legs=(Leg("CE", 100, "SELL", 1),),
         strategy="test",
     )
-    with pytest.raises(MissingDataError, match="VWAP/close ratio"):
-        price_trade(trade, load_option_fn=load,
-                    today_fn=lambda: date(2026, 5, 24),
-                    slippage_model=_NO_SLIPPAGE)
+    # No raise — entry falls back to close=100, exit uses VWAP=20
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # SELL @ close=100 (band reject), BUY back @ VWAP=20 → (100-20)×250 = 20,000
+    assert out["gross_pnl"] == pytest.approx(20000.0, abs=1e-6)
 
 
-def test_vwap_falls_back_to_close_when_volume_zero():
-    """Defensive: the liquidity gate above already rejects volume=0,
-    so this branch is technically dead code in production. But the
-    helper ``_compute_vwap`` is independently callable and must return
-    None on volume=0 to avoid divide-by-zero, so this pins the
-    contract directly."""
-    assert _compute_vwap(turnover=10.0, volume=0) is None
-    assert _compute_vwap(turnover=10.0, volume=None) is None
-    assert _compute_vwap(turnover=None, volume=100) is None
+def test_vwap_falls_back_to_close_when_recovered_premium_negative():
+    """Deep-OTM ill-conditioning: at premium ≪ strike, turnover's lakh-
+    rounding can push the recovered residual negative. ``_compute_vwap``
+    returns None in that case; ``_pick_fill_price`` falls through to
+    close. No raise."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    # Construct turnover_lakhs that gives notional/share = strike - 1
+    # (i.e. recovered premium would be -1). Strike = 1000, volume = 10000.
+    # notional_per_share target = 999 → turnover = 999 × 10000 / 10⁵ = 99.9
+    df = pd.DataFrame({
+        "date": pd.Series([pd.Timestamp(entry), pd.Timestamp(exit_)],
+                          dtype="datetime64[us]"),
+        "close": [0.05, 0.05],
+        "strike": pd.array([1000.0, 1000.0], dtype="float64"),
+        "lot_size": pd.array([250, 250], dtype="int64"),
+        "volume": pd.array([10000, 10000], dtype="int64"),
+        "oi": pd.array([5000, 4500], dtype="Int64"),
+        "turnover": [99.9, 99.9],   # notional/share = 999, recov_prem = -1
+    })
+    load = _stub_load_option({(1000.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 1000, "SELL", 1),),
+        strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # Both legs fall back to close=0.05 → gross = (0.05 - 0.05) × 250 = 0
+    assert out["gross_pnl"] == pytest.approx(0.0, abs=1e-6)
 
 
-def test_compute_vwap_units_match_lakhs_convention():
-    """Pin the units invariant directly: 10 lakhs of turnover over
-    50,000 shares → VWAP = 10 * 100,000 / 50,000 = 20 rupees per share.
-    Anti-regression for the TURNOVER_SCALE_FACTOR constant."""
-    assert _compute_vwap(turnover=10.0, volume=50_000) == pytest.approx(20.0)
-    # Direct check that the scale factor is the lakhs-to-rupees magic
-    # number; if a future contributor flips it to 1 (assuming rupees),
-    # this test fires.
+def test_compute_vwap_returns_none_when_inputs_missing():
+    """The independently-callable helper must return None on volume=0,
+    None volume, or None turnover — caller falls through to close.
+    Strike is required but its value doesn't matter when an earlier
+    guard trips."""
+    assert _compute_vwap(turnover=10.0, volume=0, strike=100.0) is None
+    assert _compute_vwap(turnover=10.0, volume=None, strike=100.0) is None
+    assert _compute_vwap(turnover=None, volume=100, strike=100.0) is None
+
+
+def test_compute_vwap_recovers_premium_via_strike_subtraction():
+    """Pin the formula: notional_per_share = turnover × 10⁵ / volume,
+    recovered premium = notional_per_share − strike.
+
+    Worked example: strike=100, turnover=12 lakhs, volume=10,000
+        notional/share = 12 × 100,000 / 10,000 = 120
+        premium_vwap   = 120 − 100 = 20
+
+    Anti-regression for both ``TURNOVER_SCALE_FACTOR`` and the strike
+    subtraction. If a future contributor drops the subtraction (the
+    pre-correction bug), the recovered value here would be 120 not 20
+    and this test fires."""
+    assert _compute_vwap(turnover=12.0, volume=10_000, strike=100.0) == pytest.approx(20.0)
+    # Strike=0 → behaves like the pre-correction formula (useful for
+    # synthetic tests where the caller has already absorbed the strike).
+    assert _compute_vwap(turnover=10.0, volume=50_000, strike=0.0) == pytest.approx(20.0)
     assert TURNOVER_SCALE_FACTOR == 100_000.0
+
+
+def test_compute_vwap_recovered_premium_negative_returns_none():
+    """Deep-OTM ill-conditioning guard: when notional_per_share − strike
+    goes ≤ 0, _compute_vwap returns None so the caller can fall back to
+    close. Without this, the engine could book a trade at a negative
+    fill price."""
+    # notional/share = 99 (turnover=9.9 lakhs / 10000 vol), strike=100
+    # recovered = -1 → None
+    assert _compute_vwap(turnover=9.9, volume=10_000, strike=100.0) is None
+
+
+def test_compute_vwap_time_decay_structural():
+    """The user-suggested structural test: as DTE → 0 on an OTM call,
+    premium decays toward 0, so the recovered VWAP from the formula
+    must also decay toward 0 (not stay at spot). This is the
+    falsifying test for the rejected "notional = spot" theory — that
+    theory predicts the recovered value stays at strike regardless of
+    time-decay, while the correct (strike + premium) theory predicts
+    decay toward 0.
+
+    Fixture: same OTM strike across 4 synthetic DTE points with
+    premium decaying 10 → 5 → 1 → 0.05. The recovered VWAP must
+    track that decay. Strike=1300, volume=10_000 each day."""
+    strike = 1300.0
+    # Synthetic NSE turnover for each (premium, vol) under the
+    # (strike + premium) × shares / 10⁵ formula:
+    for premium in (10.0, 5.0, 1.0, 0.05):
+        turnover = (strike + premium) * 10_000 / 100_000
+        recovered = _compute_vwap(turnover=turnover, volume=10_000, strike=strike)
+        assert recovered == pytest.approx(premium, abs=1e-9), (
+            f"premium={premium} should recover exactly; got {recovered}"
+        )
 
 
 def test_vwap_legs_json_carries_entry_turnover_and_exit_turnover():
@@ -495,10 +583,15 @@ def test_vwap_legs_json_carries_entry_turnover_and_exit_turnover():
     import json
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
-    df = _option_frame_with_vwap([
-        (entry, 100.0, 250, 10000, 5000, 9.8),
-        (exit_,  20.0, 250,  5000, 4500, 1.0),
-    ])
+    # vwap_premium=98 → turnover = (2600+98)*10000/10⁵ = 269.8
+    # vwap_premium=20 → turnover = (2600+20)*5000/10⁵ = 131.0
+    df = _option_frame_with_vwap(
+        strike=2600.0,
+        rows=[
+            (entry, 100.0, 250, 10000, 5000, 98.0),
+            (exit_,  20.0, 250,  5000, 4500, 20.0),
+        ],
+    )
     load = _stub_load_option({(2600.0, "CE"): df})
     trade = Trade(
         symbol="X", expiry=date(2024, 1, 25),
@@ -511,8 +604,8 @@ def test_vwap_legs_json_carries_entry_turnover_and_exit_turnover():
                       slippage_model=_NO_SLIPPAGE)
     legs = json.loads(out["legs_json"])
     assert len(legs) == 1
-    assert legs[0]["entry_turnover"] == pytest.approx(9.8)
-    assert legs[0]["exit_turnover"] == pytest.approx(1.0)
+    assert legs[0]["entry_turnover"] == pytest.approx(269.8)
+    assert legs[0]["exit_turnover"] == pytest.approx(131.0)
 
 
 def test_gate_silent_when_volume_oi_columns_absent():
@@ -943,56 +1036,80 @@ def test_offline_flag_propagates_to_load_option():
 # ============================================================
 
 def test_classify_fill_source_vwap_match_atm_price():
-    """₹100 ATM-ish premium, exact VWAP match → 'vwap'."""
+    """₹100 ATM-ish premium, exact VWAP match → 'vwap'. Under the
+    strike-corrected formula the synthetic turnover must encode
+    (strike + premium) × shares / 10⁵, so for strike=2500, premium=100,
+    volume=10_000 → turnover = 2600 × 10_000 / 10⁵ = 260 lakhs."""
     from src.engine.pnl import classify_fill_source
-    # turnover 10 lakhs × 100_000 / 10_000 volume = 100.0
-    assert classify_fill_source(100.0, 10_000, 10.0) == "vwap"
+    # recovered = 2600×10⁵/10⁵/10⁴×10⁴ - 2500 = 2600 - 2500 = 100
+    assert classify_fill_source(100.0, 10_000, 260.0, strike=2500.0) == "vwap"
 
 
 def test_classify_fill_source_vwap_match_with_turnover_precision_noise():
     """Real turnover values are quantised at 2 decimal places (lakhs).
-    A computed VWAP of 100.005 vs entry_px=100.00 should still
-    classify as 'vwap' — the centralized tolerance is generous enough
-    to absorb the quantisation noise."""
+    A computed recovered-premium of 100.005 vs entry_px=100.00 should
+    still classify as 'vwap' — the centralized tolerance is generous
+    enough to absorb the quantisation noise."""
     from src.engine.pnl import classify_fill_source
-    # vwap_implied = 10.0005 × 100_000 / 10_000 = 100.005
-    assert classify_fill_source(100.0, 10_000, 10.0005) == "vwap"
+    # notional/share = 260.0005 × 100_000 / 10_000 = 2600.005
+    # recovered = 2600.005 - 2500 = 100.005
+    assert classify_fill_source(100.0, 10_000, 260.0005, strike=2500.0) == "vwap"
 
 
 def test_classify_fill_source_vwap_match_deep_otm():
     """LOAD-BEARING per c3545cc reviewer grill #3 (carry-over from
     6ab4866 grill #2): deep-OTM contracts (₹0.05 premium) shouldn't
-    fail-match on turnover quantisation. Relative-OR-absolute tolerance
-    means ₹0.05 entry_px matches a VWAP-implied of ₹0.0505 (1% off)
-    or even ₹0.051 (2% off) — generous enough for real-world turnover
-    rounding."""
+    fail-match on turnover quantisation. The absolute tolerance floor
+    (~₹0.001) is what carries this — relative tolerance alone at 0.1%
+    would demand byte-perfect agreement on ₹0.05 which turnover precision
+    can't deliver."""
     from src.engine.pnl import classify_fill_source
-    # turnover 0.05 lakhs (5_000 rs) / volume 100_000 → vwap = 0.05
-    # Try slight perturbation:
-    assert classify_fill_source(0.05, 100_000, 0.0501) == "vwap"
+    # strike=2500, premium=0.05; turnover = 2500.05 × 100_000 / 10⁵ = 2500.05
+    # Perturb turnover by 0.0001 lakhs → notional/share = 2500.0510,
+    # recovered = 0.0510. Tolerance absorbs the 0.001 absolute delta.
+    assert classify_fill_source(0.05, 100_000, 2500.0510, strike=2500.0) == "vwap"
 
 
 def test_classify_fill_source_close_when_turnover_absent():
     from src.engine.pnl import classify_fill_source
-    assert classify_fill_source(100.0, 1000, None) == "close"
-    assert classify_fill_source(100.0, 1000, float("nan")) == "close"
+    assert classify_fill_source(100.0, 1000, None, strike=2500.0) == "close"
+    assert classify_fill_source(100.0, 1000, float("nan"), strike=2500.0) == "close"
 
 
 def test_classify_fill_source_close_when_volume_zero():
     from src.engine.pnl import classify_fill_source
-    assert classify_fill_source(100.0, 0, 10.0) == "close"
+    assert classify_fill_source(100.0, 0, 10.0, strike=2500.0) == "close"
+
+
+def test_classify_fill_source_close_when_strike_absent():
+    """Strike is required to recover the correct VWAP. When telemetry
+    callers haven't been updated to pass strike (None default), the
+    classifier degrades to 'close' rather than guessing — false 'vwap'
+    classification is worse than honest 'close' here."""
+    from src.engine.pnl import classify_fill_source
+    assert classify_fill_source(100.0, 10_000, 260.0, strike=None) == "close"
 
 
 def test_classify_fill_source_close_when_diverges_outside_tolerance():
-    """Engine had VWAP available (turnover + volume present) but the
-    recorded entry_px diverges from the implied — engine fell back
-    to close, probably via the units-sanity band reject. ``close``."""
+    """Engine had VWAP available (turnover + volume + strike present)
+    but the recorded entry_px diverges from the implied — engine fell
+    back to close, probably via the band-reject safety valve. ``close``."""
     from src.engine.pnl import classify_fill_source
-    # vwap_implied = 100; entry_px = 50 → 50% off → way outside band
-    assert classify_fill_source(50.0, 10_000, 10.0) == "close"
+    # recovered = 260×10⁵/10⁴ - 2500 = 100; entry_px = 50 → 50% off
+    assert classify_fill_source(50.0, 10_000, 260.0, strike=2500.0) == "close"
+
+
+def test_classify_fill_source_close_when_recovered_premium_nonpositive():
+    """Deep-OTM ill-conditioning: when the recovered premium goes ≤ 0,
+    the engine would have fallen back to close. Mirror that in
+    classify_fill_source — don't pretend it was a VWAP fill."""
+    from src.engine.pnl import classify_fill_source
+    # notional/share = 99 (turnover=9.9, vol=10_000), strike=100 →
+    # recovered = -1 → close
+    assert classify_fill_source(0.05, 10_000, 9.9, strike=100.0) == "close"
 
 
 def test_classify_fill_source_unknown_on_nan_or_none():
     from src.engine.pnl import classify_fill_source
-    assert classify_fill_source(None, 1000, 5.0) == "unknown"
-    assert classify_fill_source(float("nan"), 1000, 5.0) == "unknown"
+    assert classify_fill_source(None, 1000, 5.0, strike=100.0) == "unknown"
+    assert classify_fill_source(float("nan"), 1000, 5.0, strike=100.0) == "unknown"

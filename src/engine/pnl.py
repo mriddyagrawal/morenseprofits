@@ -56,42 +56,76 @@ LoadOptionFn = Callable[..., pd.DataFrame]
 # Units conversion for NSE F&O turnover.
 #
 # NSE's per-contract historical archive reports total traded value
-# (``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE") in LAKHS of rupees, not
-# raw rupees. Verified against jugaad-data's legacy schema where the
-# same field appears as ``VAL_INLAKH`` — the units are literally in
-# the column name. The modern direct-fetch API follows the same
-# convention.
+# (``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE" per jugaad rename) in LAKHS
+# of rupees. The "premium value" label is misleading: empirically the
+# value is the day's UNDERLYING NOTIONAL turnover — (strike + premium)
+# × shares / 10⁵ — NOT the premium turnover the name suggests. The
+# same column appears as ``VAL_INLAKH`` in the legacy ZIP bhavcopy and
+# ``TtlTrfVal`` in the UDiff bhavcopy; all three are the same NSE
+# convention. ``src/data/bhavcopy_fo_loader.py:274-278`` documented
+# this for the contract-count column independently.
 #
-# To compute a per-share VWAP in rupees: ``turnover * 100_000 / volume``.
-# A median-ratio sanity check fires per-leg (see _pick_fill_price) so
-# if NSE ever shifts the convention the wrong value surfaces loudly
-# rather than silently producing fill prices off by 5 orders of
-# magnitude.
+# Empirical verification: across the RELIANCE 2025-02-27 expiry strike
+# grid (DTE 87 → 0), notional/share for OTM strikes converges to the
+# strike, not to spot. For ITM strikes it converges to spot only
+# because premium = intrinsic = spot - strike, so strike + intrinsic
+# = spot (a coincidence of moneyness, not a universal pattern). See
+# the commit body for the row-by-row test.
+#
+# To recover the per-share premium VWAP in rupees:
+#   premium_vwap = turnover * TURNOVER_SCALE_FACTOR / volume - strike
 TURNOVER_SCALE_FACTOR = 100_000.0
 
-# VWAP-vs-close ratio bounds for the units-sanity assertion. A real
-# day's VWAP should land within the day's OHLC range; for any but the
-# most pathological intraday-trajectory contract, VWAP and close
-# should be within roughly 50% of each other. Tighter bounds risk
-# false positives on legitimately-volatile days; looser bounds risk
-# masking a real units bug.
+# Recovered-premium-vs-close ratio bounds. After the strike correction
+# the formula is arithmetically sound, so the band-check is no longer
+# a units-sanity assertion; it's a numerical-ill-conditioning safety
+# valve. Deep-OTM contracts (premium ≪ strike) push us into subtracting
+# two large nearly-equal numbers, and turnover's 0.01-lakh rounding gets
+# amplified into a residual that can swing far from close (or go
+# negative). When the band trips we fall through to ``close`` rather
+# than raising — the band reject is now an arithmetic-quality signal,
+# not a data-bug signal.
 _VWAP_CLOSE_RATIO_MIN = 0.5
 _VWAP_CLOSE_RATIO_MAX = 2.0
 
 
-def _compute_vwap(turnover: float | None, volume: int | None) -> float | None:
-    """Daily volume-weighted average price from turnover + volume.
-    Returns None if either input is missing/NaN/zero — caller falls
-    back to ``close`` in that case.
+def _compute_vwap(
+    turnover: float | None,
+    volume: int | None,
+    strike: float,
+) -> float | None:
+    """Daily volume-weighted average PREMIUM from notional turnover.
 
-    Units: turnover is lakhs of rupees per NSE's historical archive
-    convention (see ``TURNOVER_SCALE_FACTOR``), volume is shares.
-    Output is rupees per share — directly comparable to ``close``."""
+    NSE's per-contract turnover is the day's underlying-notional flow
+    (``(strike + premium) × shares / 10⁵`` in lakhs of rupees), not the
+    premium turnover the "PREMIUM VALUE" column label suggests. To
+    recover the per-share premium VWAP we subtract the strike:
+
+        premium_vwap = turnover * TURNOVER_SCALE_FACTOR / volume - strike
+
+    Returns None when:
+      - turnover or volume is missing/NaN/zero (no VWAP path possible;
+        caller falls back to ``close``); OR
+      - the recovered premium is ≤ 0 (deep-OTM ill-conditioning: at
+        premium ≪ strike, lakh-rounding of turnover gets amplified
+        into a residual that can flip negative; caller falls back to
+        ``close`` in that case too).
+
+    Units: turnover is lakhs of rupees (see ``TURNOVER_SCALE_FACTOR``);
+    volume is shares; strike is rupees. Output is rupees per share —
+    directly comparable to ``close``."""
     if turnover is None or volume is None or volume == 0:
         return None
     if pd.isna(turnover):
         return None
-    return float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
+    notional_per_share = float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
+    premium_vwap = notional_per_share - float(strike)
+    if premium_vwap <= 0:
+        # Deep-OTM numerical ill-conditioning — recovered premium went
+        # nonsensical because turnover rounding is comparable to the
+        # actual residual. Fall through to close.
+        return None
+    return premium_vwap
 
 
 def _pick_fill_price(
@@ -143,6 +177,13 @@ def _pick_fill_price(
         )
     r = row.iloc[0]
     close = float(r["close"])
+    # Strike is required for VWAP recovery (see ``_compute_vwap``);
+    # production loader frames carry it per SPECS §2.2. Test fixtures
+    # without ``strike`` get the close-fallback path (turnover/volume
+    # also typically absent in those).
+    strike: float | None = None
+    if "strike" in row.columns and pd.notna(r["strike"]):
+        strike = float(r["strike"])
     volume: int | None = None
     oi: int | None = None
     turnover: float | None = None
@@ -153,28 +194,25 @@ def _pick_fill_price(
     if "turnover" in row.columns and pd.notna(r["turnover"]):
         turnover = float(r["turnover"])
 
-    vwap = _compute_vwap(turnover, volume)
+    vwap = _compute_vwap(turnover, volume, strike) if strike is not None else None
     if vwap is None:
         # No turnover available (legacy cache, NaN turnover, zero
-        # volume). Use close — same behavior as pre-VWAP.
+        # volume), no strike (minimal test fixture), OR recovered
+        # premium ≤ 0 (deep-OTM ill-conditioning). All three fall
+        # through to close — pre-VWAP behavior, no error.
         fill_px = close
     else:
-        # Units-sanity assertion: VWAP / close must land in the
-        # plausible band. Outside the band points at a NSE units
-        # shift OR a parser regression; either way the engine should
-        # refuse to book a trade rather than silently use a fill price
-        # off by orders of magnitude.
+        # Numerical-ill-conditioning safety valve: at deep-OTM the
+        # recovered premium can wobble far from close because turnover's
+        # lakh-rounding is comparable to the residual. Out-of-band →
+        # fall through to close. This is no longer a units-sanity
+        # assertion (the strike correction makes the formula
+        # arithmetically sound); it's an arithmetic-quality guard.
         ratio = vwap / close if close != 0 else float("inf")
         if not (_VWAP_CLOSE_RATIO_MIN <= ratio <= _VWAP_CLOSE_RATIO_MAX):
-            raise MissingDataError(
-                f"{context}: VWAP/close ratio {ratio:.4g} outside "
-                f"[{_VWAP_CLOSE_RATIO_MIN}, {_VWAP_CLOSE_RATIO_MAX}] on "
-                f"{target} — likely a units mismatch on PREMIUM VALUE "
-                f"(turnover={turnover}, volume={volume}, close={close}, "
-                f"computed vwap={vwap:.4f}). Refusing to book a trade "
-                f"against a suspicious fill price."
-            )
-        fill_px = vwap
+            fill_px = close
+        else:
+            fill_px = vwap
     return fill_px, int(r["lot_size"]), volume, oi, turnover
 
 
@@ -202,21 +240,30 @@ def classify_fill_source(
     entry_px: float | int | None,
     volume: int | None,
     turnover: float | None,
+    strike: float | None = None,
 ) -> str:
     """Derive whether the engine used VWAP or close based on per-leg
     telemetry. Mirrors the ``_pick_fill_price`` decision logic from
     the perspective of a post-hoc auditor reading legs_json fields.
 
     Returns one of:
-      ``'vwap'``     — turnover + volume present AND entry_px matches
-                       ``turnover × TURNOVER_SCALE_FACTOR / volume``
+      ``'vwap'``     — turnover + volume + strike present AND entry_px
+                       matches the recovered premium VWAP
+                       ``turnover × TURNOVER_SCALE_FACTOR / volume − strike``
                        within tolerance.
-      ``'close'``    — turnover unavailable OR volume = 0 (no VWAP
-                       path possible), OR engine had VWAP available
-                       but the result fell outside the units-sanity
-                       band [_VWAP_CLOSE_RATIO_MIN, MAX] and got
-                       rejected. The recorded entry_px is the close.
+      ``'close'``    — turnover/volume/strike unavailable (no VWAP path
+                       possible), OR engine had VWAP available but the
+                       result fell outside the safety band
+                       [_VWAP_CLOSE_RATIO_MIN, MAX] or went non-positive
+                       and got rejected; the recorded entry_px is close.
       ``'unknown'``  — entry_px is missing / NaN; can't classify.
+
+    ``strike`` is required to recover the correct premium VWAP — the
+    raw notional-per-share without the strike correction is the
+    underlying-notional flow, not the premium. ``strike=None`` keeps
+    backwards compatibility with telemetry callers that haven't been
+    updated yet but degrades the classification to "close" since the
+    correct match value can't be computed.
 
     Tolerance is ``max(VWAP_MATCH_TOLERANCE_REL × |entry_px|,
     VWAP_MATCH_TOLERANCE_ABS)`` — relative-OR-absolute so deep-OTM
@@ -238,9 +285,12 @@ def classify_fill_source(
         and not (isinstance(turnover, float) and math.isnan(turnover))
     )
     has_volume = volume is not None and volume > 0
-    if not has_turnover or not has_volume:
+    if not has_turnover or not has_volume or strike is None:
         return "close"
-    vwap_implied = float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
+    notional_per_share = float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
+    vwap_implied = notional_per_share - float(strike)
+    if vwap_implied <= 0:
+        return "close"  # deep-OTM ill-conditioning — engine fell back to close
     tol = max(VWAP_MATCH_TOLERANCE_REL * abs(f), VWAP_MATCH_TOLERANCE_ABS)
     if abs(vwap_implied - f) <= tol:
         return "vwap"

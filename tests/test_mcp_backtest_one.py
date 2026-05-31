@@ -29,8 +29,10 @@ from src.mcp.backtest_one import (
 # ============================================================
 
 def test_classify_fill_source_vwap_match():
-    # turnover 10 lakhs × 100_000 / 50_000 volume = 20.0 = entry_px
-    assert _classify_fill_source(20.0, 50000, 10.0) == "vwap"
+    # Under the strike-corrected formula: notional/share - strike
+    # turnover=110 lakhs, vol=50_000 → notional/share = 220
+    # strike=200 → recovered premium = 20.0 = entry_px → vwap
+    assert _classify_fill_source(20.0, 50000, 110.0, strike=200.0) == "vwap"
 
 
 def test_classify_fill_source_close_when_turnover_missing():
@@ -125,16 +127,17 @@ def test_backtest_one_priced_trade_returns_full_breakdown(monkeypatch):
     )
 
     # 3. Option loader: return a frame with entry + exit rows where
-    # close, volume, oi, turnover are all set and entry_px equals
-    # turnover * 100_000 / volume so the classifier returns 'vwap'.
+    # close, volume, oi, turnover, strike are all set. Under the
+    # strike-corrected formula:
+    #   recovered premium = turnover × 100_000 / volume − strike
+    # Entry: close=100, volume=10_000, strike=2600
+    #   → need turnover = (2600+100)×10000/10⁵ = 270 → recovered=100 ✓
+    # Exit: close=20, volume=8_000, strike=2600
+    #   → need turnover = (2600+20)×8000/10⁵ = 209.6 → recovered=20 ✓
     entry_dt = date(2024, 1, 4)
     exit_dt = date(2024, 1, 24)
     def fake_load_option(symbol, expiry, strike, option_type,
                          from_date, to_date, **kw):
-        # close=100 per share, volume=10_000 shares, turnover=10 lakhs
-        # → vwap_implied = 10 × 100_000 / 10_000 = 100.0. entry_px=100
-        # exit: close=20, volume=8_000, turnover=1.6 lakhs
-        # → vwap_implied = 1.6 × 100_000 / 8_000 = 20.0. exit_px=20
         return pd.DataFrame({
             "date": pd.to_datetime([entry_dt, exit_dt]),
             "open": [99.0, 19.0],
@@ -144,9 +147,13 @@ def test_backtest_one_priced_trade_returns_full_breakdown(monkeypatch):
             "ltp": [100.0, 20.0],
             "settle_price": [100.0, 20.0],
             "lot_size": [250, 250],
+            "strike": [float(strike), float(strike)],   # 2600.0 in this test
             "volume": [10000, 8000],
             "oi": [pd.NA, pd.NA],
-            "turnover": [10.0, 1.6],
+            "turnover": [
+                (float(strike) + 100.0) * 10000 / 100_000,
+                (float(strike) + 20.0) * 8000 / 100_000,
+            ],
         })
     # Patch options_loader.load_option at the module the engine uses.
     import src.engine.pnl as pnl_mod

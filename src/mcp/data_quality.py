@@ -170,6 +170,10 @@ def _flatten_legs(df: pd.DataFrame) -> pd.DataFrame:
                 "exit_volume": leg.get("exit_volume"),
                 "entry_turnover": leg.get("entry_turnover"),
                 "exit_turnover": leg.get("exit_turnover"),
+                # Strike is required by classify_fill_source to recover
+                # the strike-corrected VWAP. Without it, the classifier
+                # degrades to 'close' on every leg.
+                "leg_strike": leg.get("strike"),
             })
             leg_rows.append(row)
     return pd.DataFrame(leg_rows)
@@ -266,6 +270,7 @@ def _theoretical_fallback_rate(df: pd.DataFrame) -> tuple[list[dict], str]:
     legs_df["entry_source"] = legs_df.apply(
         lambda r: classify_fill_source(
             r["entry_px"], r["entry_volume"], r["entry_turnover"],
+            strike=r.get("leg_strike"),
         ),
         axis=1,
     )
@@ -319,6 +324,7 @@ def _vwap_vs_close_divergence(df: pd.DataFrame) -> tuple[list[dict], str]:
     legs_df["entry_source"] = legs_df.apply(
         lambda r: classify_fill_source(
             r["entry_px"], r["entry_volume"], r["entry_turnover"],
+            strike=r.get("leg_strike"),
         ),
         axis=1,
     )
@@ -339,10 +345,16 @@ def _vwap_vs_close_divergence(df: pd.DataFrame) -> tuple[list[dict], str]:
             "close was used (legacy parquets)."
         )
 
+    # Recovered premium VWAP per the strike-corrected formula
+    # (see src.engine.pnl._compute_vwap): notional_per_share − strike.
+    # Without the strike subtraction the divergence here measured the
+    # underlying-notional turnover vs the premium close — orders of
+    # magnitude off and nonsensical as a "VWAP correction" estimate.
     candidates["vwap_implied"] = (
         candidates["entry_turnover"].astype(float)
         * TURNOVER_SCALE_FACTOR
         / candidates["entry_volume"].astype(float)
+        - candidates["leg_strike"].astype(float)
     )
     candidates["abs_divergence_pct"] = (
         100.0

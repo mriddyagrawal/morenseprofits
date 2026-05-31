@@ -31,13 +31,46 @@ def _redirect_results_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(r, "RESULTS_DIR", tmp_path)
 
 
+# Sentinel: "_leg(entry_turnover=None)" should explicitly mean "no
+# turnover column" (legacy-cache test paths). A separate sentinel is
+# needed because the fixture auto-computes turnover from
+# (strike + premium) × shares / 10⁵ by default — the test author
+# specifies the VWAP they want, not raw turnover values. Without this
+# sentinel, "None" would mean both "leave it None" and "fill in the
+# default", which the no-turnover tests can't disambiguate.
+_AUTO = object()
+
+
 def _leg(
     *, entry_px=20.0, exit_px=5.0,
     entry_volume=50000, exit_volume=40000,
-    entry_turnover=10.0, exit_turnover=2.0,
+    entry_turnover=_AUTO, exit_turnover=_AUTO,
+    strike=2600.0,
 ) -> dict:
+    """Build a synthetic leg dict for tests. Defaults to a healthy VWAP
+    fill: ``entry_turnover`` defaults (``_AUTO``) to the value NSE
+    would have reported under the (strike + premium) × shares / 10⁵
+    convention that recovers ``entry_px`` exactly (and likewise for
+    exit). Pass explicit ``entry_turnover=N`` to override (e.g.
+    divergence tests) or ``entry_turnover=None`` to model a legacy-
+    cache leg with no turnover at all.
+
+    Pre-strike-correction tests passed turnover values sized under the
+    old broken formula (raw notional/share = premium); the fixture
+    auto-recomputes them under the correct (strike-subtracted) formula
+    so test authors specify the VWAP they want, not raw turnover."""
+    if entry_turnover is _AUTO:
+        entry_turnover = (
+            (strike + entry_px) * entry_volume / 100_000
+            if entry_volume > 0 else None
+        )
+    if exit_turnover is _AUTO:
+        exit_turnover = (
+            (strike + exit_px) * exit_volume / 100_000
+            if exit_volume > 0 else None
+        )
     return {
-        "option_type": "CE", "strike": 2600.0, "side": "SELL",
+        "option_type": "CE", "strike": strike, "side": "SELL",
         "qty_lots": 1, "lot_size": 250,
         "entry_px": entry_px, "exit_px": exit_px,
         "entry_px_realized": entry_px * 0.99, "exit_px_realized": exit_px * 1.01,
@@ -167,11 +200,11 @@ def test_data_quality_theoretical_fallback_rate_separates_symbols():
     VWAP path; INFY legs have no turnover → close fallback. Per-symbol
     rates should distinguish them cleanly."""
     rows = []
-    # RELIANCE: 2 legs, both with turnover → VWAP (entry_px=20 matches
-    # turnover=10×100_000/50_000)
+    # RELIANCE: 2 legs, both with turnover → VWAP (fixture auto-encodes
+    # turnover = (strike + entry_px) × shares / 10⁵ so the recovered
+    # premium matches entry_px exactly)
     rows.append(_trade_row(symbol="RELIANCE",
-                           legs=[_leg(entry_px=20.0, entry_volume=50000,
-                                       entry_turnover=10.0)] * 2))
+                           legs=[_leg(entry_px=20.0, entry_volume=50000)] * 2))
     # INFY: 2 legs, no turnover → close
     rows.append(_trade_row(symbol="INFY",
                            legs=[_leg(entry_px=20.0, entry_volume=50000,
@@ -197,12 +230,12 @@ def test_data_quality_vwap_divergence_only_counts_close_with_turnover():
     Legs that used close because turnover was missing don't have
     measurable divergence."""
     # Build a leg where:
-    # - entry_px = 100 (close)
-    # - turnover=10 lakhs / volume=50_000 → vwap_implied=20
-    # - entry_px (100) ≠ vwap_implied (20) → classify_fill_source returns 'close'
+    # - entry_px = 100 (close used by engine)
+    # - turnover = 1310 lakhs / volume = 50_000, strike = 2600 →
+    #   notional/share = 2620 → recovered premium = 20 → band-reject vs entry_px=100
     # - We CAN compute divergence: |20 - 100| / 100 = 80%
     band_reject_leg = _leg(entry_px=100.0, entry_volume=50000,
-                            entry_turnover=10.0)
+                            entry_turnover=1310.0)
     # Build a leg where turnover is missing (no divergence measurable)
     pure_close_leg = _leg(entry_px=100.0, entry_volume=50000,
                            entry_turnover=None)
@@ -227,9 +260,12 @@ def test_data_quality_vwap_divergence_only_counts_close_with_turnover():
 
 def test_data_quality_vwap_divergence_empty_table_when_no_band_rejects():
     """Sweep with no band-rejects → empty table + explicit summary
-    explaining what 'no divergence measurable' means."""
-    rows = [_trade_row(legs=[_leg(entry_px=20.0, entry_volume=50000,
-                                    entry_turnover=10.0)])]
+    explaining what 'no divergence measurable' means.
+
+    Leaving ``entry_turnover`` at the fixture default makes the leg a
+    clean VWAP fill (turnover encodes (strike+premium)×shares/10⁵ so
+    the recovered premium equals entry_px exactly)."""
+    rows = [_trade_row(legs=[_leg(entry_px=20.0, entry_volume=50000)])]
     r.write_results(pd.DataFrame(rows), run_id="no_div")
     out = data_quality_impl(DataQualityInput(
         run_id="no_div", dimension="vwap_vs_close_divergence",

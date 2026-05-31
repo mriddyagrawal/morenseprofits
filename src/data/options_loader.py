@@ -281,22 +281,24 @@ def derivatives_df(symbol, from_date, to_date, expiry_date,
 
 # jugaad column → SPECS §2.2 column
 #
-# ``turnover`` (NSE: ``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE") is the
-# day's total traded value for this contract. With ``volume`` (total
-# quantity in shares per §2.3), it lets the pricing engine compute a
-# daily VWAP — materially better than ``close`` for thin strikes where
-# a single late print can be far from where the bulk of volume cleared.
+# ``turnover`` (NSE: ``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE" per jugaad
+# rename) is the day's total traded value for this contract. With
+# ``volume`` (share-units per §2.3) it feeds the engine's VWAP fill —
+# materially better than ``close`` for thin strikes where a single late
+# print can be far from where the bulk of volume cleared.
 #
-# UNITS NOTE: NSE F&O bhavcopy historically reports FH_TOT_TRADED_VAL
-# in lakhs of rupees (×10⁵). The pricing engine is responsible for
-# applying any scale factor when computing VWAP; this _RENAMES step
-# only carries the raw column through unchanged. A median-ratio
-# assertion will live alongside the VWAP fill code (next commit) to
-# bake in the units invariant and fail loudly if NSE ever shifts the
-# scale convention. Legacy cached parquets DO NOT carry turnover;
-# loading them post-this-change yields NaN in the column, which the
-# next-commit VWAP fill function falls back from gracefully to
-# ``close``.
+# UNITS NOTE (corrected post-2026-05-31): NSE reports this column in
+# LAKHS of rupees but the value is the **underlying-notional turnover**
+# — empirically (strike + premium) × shares / 10⁵, NOT premium
+# turnover the column label suggests. The same field appears as
+# ``VAL_INLAKH`` in legacy ZIP bhavcopy and ``TtlTrfVal`` in the UDiff
+# bhavcopy; all three are the same NSE underlying-notional convention
+# (already documented for the bhavcopy at bhavcopy_fo_loader.py:274-278).
+# Engine recovers the per-share premium VWAP via
+# ``turnover × 10⁵ / volume − strike`` (see _compute_vwap + SPECS §2.2).
+# This _RENAMES step carries the raw column through unchanged.
+# Legacy cached parquets pre-p7.pricing arc DO NOT carry turnover; the
+# loaded value is NaN and the VWAP path falls back to ``close``.
 _RENAMES = {
     "DATE": "date",
     "SYMBOL": "symbol",

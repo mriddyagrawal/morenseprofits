@@ -1247,6 +1247,7 @@ def _build_cell_csv(rows: pd.DataFrame) -> bytes:
                 "entry_vwap_implied": entry_vwap_implied,
                 "entry_fill_source": _classify_fill_source(
                     entry_px, entry_vol, entry_turn,
+                    strike=leg.get("strike"),
                 ),
                 "exit_px": exit_px,
                 "exit_volume": exit_vol,
@@ -1255,6 +1256,7 @@ def _build_cell_csv(rows: pd.DataFrame) -> bytes:
                 "exit_vwap_implied": exit_vwap_implied,
                 "exit_fill_source": _classify_fill_source(
                     exit_px, exit_vol, exit_turn,
+                    strike=leg.get("strike"),
                 ),
                 "entry_px_realized": leg.get("entry_px_realized"),
                 "exit_px_realized": leg.get("exit_px_realized"),

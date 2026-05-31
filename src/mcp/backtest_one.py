@@ -144,13 +144,16 @@ def _classify_fill_source(
     entry_px: float | None,
     volume: int | None,
     turnover: float | None,
+    strike: float | None = None,
 ) -> str:
     """Backward-compat shim around the centralized
     ``src.engine.pnl.classify_fill_source``. Kept under the
-    underscored name + same signature so the test module can import
-    it as before. New callers should import the public name from
-    src.engine.pnl directly."""
-    return classify_fill_source(entry_px, volume, turnover)
+    underscored name so the test module can import it as before.
+    ``strike`` is required to recover the strike-corrected VWAP; legacy
+    callers omitting it degrade to 'close' (honest) rather than
+    mis-classifying as 'vwap'. New callers should import the public
+    name from src.engine.pnl directly."""
+    return classify_fill_source(entry_px, volume, turnover, strike=strike)
 
 
 def _resolve_spot(symbol: str, entry_date: date) -> float | None:
@@ -192,11 +195,13 @@ def _extract_legs(legs_json: str) -> list[LegBreakdown]:
                 leg.get("entry_px"),
                 leg.get("entry_volume"),
                 leg.get("entry_turnover"),
+                strike=leg.get("strike"),
             ),
             exit_fill_source=_classify_fill_source(
                 leg.get("exit_px"),
                 leg.get("exit_volume"),
                 leg.get("exit_turnover"),
+                strike=leg.get("strike"),
             ),
             gross_pnl_leg=float(leg.get("gross_pnl", 0.0)),
         ))
