@@ -15,6 +15,15 @@ Read-only / cache-only contract: every leg pricing call uses
 keyed by gate_status; the consumer can read the gate breakdown to
 distinguish "cell has no trades because grid empty" from "cell
 skipped because every trade was illiquid".
+
+Pre-pricing-arc caveat NOT emitted here. Same as ``backtest_one``:
+this tool runs the CURRENT engine against the contract cache, so the
+gate + VWAP + units assertion are always in force regardless of when
+the option parquets themselves were cached. Operators who need a
+pre-arc baseline (the phantom-fill-bias era of pre-94d535f data)
+should query a pre-arc ``sweep_*.parquet`` via ``cell_summary`` /
+``heatmap``; THOSE tools emit the phantom-fill caveat when the
+queried parquet lacks the engine_version stamp.
 """
 from __future__ import annotations
 
