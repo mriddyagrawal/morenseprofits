@@ -16690,3 +16690,49 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 → P1.2 → P1.3 → P1.4 �
 Standing by.
 
 ---
+
+## Review of 545219e — `fix(docs.migration.framing_accuracy)`
+
+**Verdict: ✅ ACCEPT.** Grill #1 closed exactly as recommended. CANBK named verbatim as the counter-example; bidirectional rationale (rise → halve; fall → increase) added. Single 1-line MIGRATION.md edit; pure docs.
+
+### Grill #1 closure
+
+Old framing: "every one matched the same pattern: Apr-16 snapshot's lot_size was **exactly 2×** the May-16/Jun-12/Jul-5 snapshots' values."
+
+New framing: "the dominant pattern is the Apr-16 snapshot's lot_size being **approximately 2×** the May-16/Jun-12/Jul-5 snapshots' values (e.g. ABBOTINDIA 24MAY 40→20, ADANIPORTS 24MAY 800→400, BHARTIARTL 24MAY 950→475). The revision direction is NOT uniform: counter-examples exist where the lot_size INCREASED instead (e.g. **CANBK 24MAY 2700→6750**, ~2.5×), consistent with NSE's twice-yearly recalibration to keep contract notionals in the ₹5-10 lakhs range — when the underlying stock RISES, lot halves; when it FALLS, lot increases."
+
+Closes exactly the grill — preserves the dominant-pattern observation while honestly acknowledging the bidirectional exceptions. CANBK 2700→6750 is verbatim what I observed empirically. The NSE notional-targeting rationale ("₹5-10 lakhs range") gives operators the right mental model for future mismatches.
+
+### Praises
+
+- **CANBK named with exact numbers** (2700→6750) from the empirical output, not a hand-waved "some exceptions exist." Operators can grep for "CANBK" and find it in the build-script output to corroborate.
+- **3 halving examples + 1 increase example** is the right ratio — preserves the dominant-pattern claim while making the exception visible.
+- **NSE notional-targeting rationale** ("₹5-10 lakhs range") gives the WHY, not just the WHAT. Future mismatch on a new stock that drops in price is now self-explanatory.
+- **Single-line diff** ("1 insertion(+), 1 deletion(-)" — the only surface that changed is the one sentence I grilled). No collateral edits.
+- **Closing meta-note in commit body** ("The per-pair-exclude policy itself is direction-agnostic — handles both halving and doubling identically — so the framing fix is accuracy-only") reaffirms that this is documentation accuracy, not a behavioral defect. Right scope discipline.
+
+### Behavior delta
+
+None. Pure docs.
+
+### Math
+
+No test count change.
+
+### Open grills
+
+**Empty.** Migration spec + implementation are now fully aligned at the P0.2 boundary.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+P1.1 — `chore(data.bhavcopy_fo.parse_udiff_extension)` — extend `parse_udiff` to carry `LastPric → ltp` + `TtlTrfVal → turnover`. The anti-confusion docstring update was already partly landed in P0.2's bhavcopy_fo_loader.py edits; verify the P1.1 commit doesn't double-write the docstring.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 → P1.2 → ... → P2.4**.
+
+Standing by.
+
+---
