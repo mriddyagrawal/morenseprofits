@@ -207,8 +207,13 @@ regimes A and B.
 - **Carries every engine-required column natively** (lot_size, volume,
   turnover all included). This is the current canonical path.
 - **Cost**: one HTTP request per `(symbol, expiry, strike, option_type)`
-  tuple. For 50 syms × ~25 expiries × ~50 strikes × 2 ≈ **~125k requests**
-  for full backtest coverage. NSE WAF risk on bulk fetches.
+  tuple. Under current production strike density
+  (`DEFAULT_STRIKES_PER_SIDE = 6` per [prefetch_universe.py:61](scripts/prefetch_universe.py#L61),
+  so ATM + 6 above + 6 below = 13 strikes per type = 26 contracts per
+  (symbol, expiry)): 50 syms × ~25 expiries × ~26 contracts ≈
+  **~32,500 requests** for full backtest coverage. Under a stress
+  configuration (25 per side → 50 per type → 100 per cell):
+  **~125k requests**. NSE WAF risk on bulk fetches at either density.
 
 ### Source 4 — NSE spot EOD
 
@@ -305,18 +310,42 @@ These are the calls that affect what we build next.
 
 ### D1 — Migrate to bhavcopy-only architecture for regime C?
 
-The largest win: replace ~125k per-contract HTTP requests with ~250
-daily-bhavcopy fetches (500× reduction in NSE WAF pressure) and
-eliminate the strike-drift OfflineCacheMiss problem (every traded
-strike is naturally in the bhavcopy — no `strike_planner` pre-guess
-needed).
+The largest win: replace per-contract HTTP requests with ~250
+daily-bhavcopy fetches. Under current production strike density
+(`DEFAULT_STRIKES_PER_SIDE = 6`): ~32,500 → ~250 = **~130×
+reduction**. Under stress configurations (25 strikes per side):
+~125k → ~250 = **~500×**. Either way, 2-3 orders of magnitude less
+NSE WAF pressure. Also eliminates the strike-drift OfflineCacheMiss
+problem — every traded strike is naturally in the bhavcopy, no
+`strike_planner` pre-guess needed.
 
 Cost: build gaps #1 (UDiff column extension) and #3 (transform).
 Total maybe 50-100 LOC + tests. No new HTTP path.
 
-**Open**: do we kill Source 3 entirely, or keep it as a fallback for
-specific edge cases (single-contract drilldown, missing bhavcopy
-day)?
+**Open**: what policy do we adopt for Source 3? The decision isn't
+just "kill vs keep" — the *trigger policy* under "keep" matters for
+implementation:
+
+- **(a) Kill** — remove Source 3 entirely. Smallest code surface;
+  loses the rescue layer for missing-bhavcopy-day or single-contract
+  audit paths.
+- **(b) Keep — cache-warming on demand**. Source 3 fires ONLY when a
+  specific contract query misses the bhavcopy-derived cache. The
+  bhavcopy path is primary; Source 3 is a precise rescue. Two paths
+  to maintain but each has a well-defined trigger.
+- **(c) Keep — lazy transform, no pre-cache**. Don't pre-materialize
+  the per-contract cache from the bhavcopy; build on demand when a
+  contract is queried. Zero pre-cache disk; first-query latency on
+  every cold contract.
+- **(d) Keep — deprecated, edge-case audits only**. Always-Source-1-
+  first; Source 3 reserved for one-off operator queries (e.g. "give
+  me this single contract's raw NSE response"). Mirrors the
+  graceful-degrade pattern that legacy parquets use at
+  [pnl.py:194-203](src/engine/pnl.py#L194-L203). Maps loosely to the
+  D4 recommendation below.
+
+These aren't mutually exclusive — (b) + (d) compose cleanly if you
+want both a precise rescue layer AND deprecation framing.
 
 ### D2 — How far back do we want backtest coverage to support?
 
@@ -339,15 +368,23 @@ don't.
 
 The engine's fill-price machinery uses `close` as the canonical
 signal and falls back to settlement price when close is missing.
-`ltp` isn't on the critical path. **Recommendation: drop `ltp` for
-regime A + B coverage.** Mark the column NaN for those rows; flag in
-caveats if any downstream consumer relies on it.
+`ltp` isn't on the critical path inside the engine. **The specific
+downstream that DOES surface `ltp`** is the MCP `get_options_chain`
+tool ([spot_options.py:126](src/mcp/spot_options.py#L126) for the
+schema field and [:195](src/mcp/spot_options.py#L195) for the
+construction). An operator calling `get_options_chain` for a
+pre-2024-07-08 date would receive `ltp: None` per row.
+
+**Recommendation: drop `ltp` for regime A + B coverage.** Mark the
+column NaN for those rows; add a caveat to `get_options_chain`'s
+response when ANY row in the returned chain is from a legacy-bhavcopy
+trade date, naming the `ltp` field specifically.
 
 ### D4 — Keep per-contract loader (Source 3) as a fallback?
 
 Pros: edge-case rescue, test fixtures depend on minimal frames it
 emits, defensive layer if NSE drops a bhavcopy day.
-Cons: 500× HTTP cost, two parallel code paths to maintain.
+Cons: 130-500× HTTP cost (production vs stress), two parallel code paths to maintain.
 
 **Recommendation**: keep but mark deprecated; mirror the
 graceful-degrade pattern the legacy-parquet path uses
