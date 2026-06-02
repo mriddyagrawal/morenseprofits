@@ -14,7 +14,8 @@ build, in WHAT order, with WHAT exit gates between phases.
 - [Goals + non-goals](#goals--non-goals)
 - [Inputs available](#inputs-available)
 - [Architectural target](#architectural-target)
-- [Phase 0 — Operator fixtures](#phase-0--operator-fixtures-pre-coding)
+- [Cross-source lot-size policy](#cross-source-lot-size-policy)
+- [Phase 0 — Operator fixtures + unified lookup build](#phase-0--operator-fixtures--unified-lookup-build)
 - [Phase 1 — Regime C migration](#phase-1--regime-c-migration-headline-win)
 - [Phase 2 — Regime B extension](#phase-2--regime-b-extension)
 - [Test plan](#test-plan)
@@ -59,17 +60,21 @@ build, in WHAT order, with WHAT exit gates between phases.
 - jugaad's spot loader ([spot_loader.py](src/data/spot_loader.py)) — regime-stable
 - Engine pricing machinery ([pnl.py](src/engine/pnl.py)) — already does VWAP recovery via `turnover × 10⁵ / volume − strike`
 
-### Operator-provided fixtures (in `ONE OFF REPORTS/`)
-Four NSE_FO_contract snapshots in `Reports-Archives-Multiple-DDMMYYYY.zip` format, each containing one `NSE_FO_contract_DDMMYYYY.csv.gz`:
+### Operator-provided fixtures (committed to `data/manual/`)
+Four NSE_FO_contract snapshots are committed to the repo as
+`data/manual/contracts/NSE_FO_contract_DDMMYYYY.csv.gz` (~1.7MB each gzipped,
+~6.7MB total committed). The originals arrived inside
+`Reports-Archives-Multiple-DDMMYYYY.zip` wrappers from the NSE
+archives bundled-download UI; the outer ZIPs are not committed.
 
-| File | Snapshot date | Expiry coverage |
+| Committed file | Snapshot date | Expiry coverage |
 |---|---|---|
-| `Reports-Archives-Multiple-16042024.zip` | 2024-04-16 | Apr/May/Jun 2024 expiries |
-| `Reports-Archives-Multiple-16052024.zip` | 2024-05-16 | May/Jun/Jul 2024 expiries |
-| `Reports-Archives-Multiple-12062024.zip` | 2024-06-12 | Jun/Jul/Aug 2024 expiries |
-| `Reports-Archives-Multiple-05072024.zip` | 2024-07-05 | Jul/Aug/Sep 2024 expiries |
+| `data/manual/contracts/NSE_FO_contract_16042024.csv.gz` | 2024-04-16 | Apr/May/Jun 2024 expiries |
+| `data/manual/contracts/NSE_FO_contract_16052024.csv.gz` | 2024-05-16 | May/Jun/Jul 2024 expiries |
+| `data/manual/contracts/NSE_FO_contract_12062024.csv.gz` | 2024-06-12 | Jun/Jul/Aug 2024 expiries |
+| `data/manual/contracts/NSE_FO_contract_05072024.csv.gz` | 2024-07-05 | Jul/Aug/Sep 2024 expiries |
 
-Each snapshot is ~80-90k rows covering ~204 distinct symbols.
+Each snapshot is ~80-90k rows × 150 columns covering ~204 distinct symbols (cross-snapshot row-count + PNB lot-size-stability verified pre-commit).
 
 **Coverage per regime-B expiry month** (per reviewer grill #4 on e0bc85a):
 
@@ -117,56 +122,136 @@ on the actual raw header strings.
 ## Architectural target
 
 ```
-                        ┌──────────────────────────────────────┐
-                        │     ONE OFF REPORTS/ (fixtures)     │
-                        │  NSE_FO_contract_DDMMYYYY.csv.gz    │
-                        └──────────────┬───────────────────────┘
-                                       │ (regime B only)
-                                       ▼
-              ┌─────────────────────────────────────────┐
-              │  nse_fo_contract loader                 │
-              │  → lot_size lookup by (sym, exp_month)  │
-              └─────────────────────┬───────────────────┘
-                                    │
-        ┌───────────────────────────┴──────────────────────────────┐
-        │                                                          │
-        ▼                                                          ▼
-  ┌───────────────────────────┐                      ┌────────────────────────────┐
-  │  data/cache/bhavcopy_fo/  │                      │  data/cache/options/        │
-  │  per-day parquets         │ ─── transform ────▶ │  per-(sym,exp,strike,type) │
-  │  (already exists)         │  bhavcopy_to_       │  parquets                  │
-  │                           │  contract_          │  (already exists)          │
-  └───────────────────────────┘  timeseries()       └────────────┬───────────────┘
-                                                                  │
-                                                                  ▼
-                                                       ┌──────────────────────┐
-                                                       │  sweep_grid (unchanged) │
-                                                       └──────────────────────┘
+  ┌────────────────────────────────┐         ┌──────────────────────────────┐
+  │  data/manual/                  │         │  data/cache/bhavcopy_fo/     │
+  │  NSE_FO_contract_*.csv.gz      │         │  per-day parquets            │
+  │  (committed, 4 files,          │         │  (gitignored, jugaad-fetched)│
+  │   regime B sidecar)            │         │  (carries NewBrdLotQty       │
+  │                                │         │   per row for regime C)      │
+  └─────────────────┬──────────────┘         └────────────────┬─────────────┘
+                    │                                         │
+                    └────────────┬────────────────────────────┘
+                                 ▼
+                    ┌──────────────────────────────┐
+                    │  scripts/build_lot_size_     │
+                    │  parquet.py                  │
+                    │  (committed; merges both     │
+                    │   sources; loud-fail on      │
+                    │   cross-source mismatch)     │
+                    └─────────────┬────────────────┘
+                                  ▼
+                    ┌──────────────────────────────┐
+                    │  data/cache/lot_sizes.parquet│
+                    │  (gitignored; derived)       │
+                    │  THE unified lookup —        │
+                    │  one row per (sym, expiry)   │
+                    └─────────────┬────────────────┘
+                                  │ lot_size_lookup(symbol, expiry)
+                                  ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │  data/cache/bhavcopy_fo/   ────  transform  ────▶        │
+       │  per-day parquets                                        │
+       │                          bhavcopy_to_contract_           │
+       │                          timeseries() — joins on         │
+       │                          unified lot_size cache for      │
+       │                          volume-in-shares derivation     │
+       └──────────────────────────────┬───────────────────────────┘
+                                      ▼
+                    ┌──────────────────────────────┐
+                    │  data/cache/options/         │
+                    │  per-(sym,exp,strike,type)   │
+                    │  parquets (gitignored;       │
+                    │  materialized one-time)      │
+                    └──────────────┬───────────────┘
+                                   ▼
+                       ┌──────────────────────────┐
+                       │  sweep_grid (unchanged)  │
+                       └──────────────────────────┘
 ```
 
 Same on-disk path layout as today (`options_loader` writes to it). Sweep workers don't care which path produced the parquet. The cutover is transparent to the engine.
 
+**Re-run discipline**: `rm -rf data/cache/` wipes bhavcopies + lot_sizes + per-contract materializations + sweep results. `data/manual/` survives (committed). Next prefetch run rebuilds everything from scratch, INCLUDING the unified lot_sizes parquet (auto-trigger on missing parquet).
+
 ---
 
-## Phase 0 — Operator fixtures (pre-coding)
+## Cross-source lot-size policy
 
-**Operator action** (no commit):
-1. Unzip each ZIP into `data/manual/contracts/`, keeping the inner `.csv.gz`:
-   ```
-   data/manual/contracts/NSE_FO_contract_16042024.csv.gz
-   data/manual/contracts/NSE_FO_contract_16052024.csv.gz
-   data/manual/contracts/NSE_FO_contract_12062024.csv.gz
-   data/manual/contracts/NSE_FO_contract_05072024.csv.gz
-   ```
-2. Verify each file decompresses to a valid CSV (one quick `zcat | head -1`).
+The unified `data/cache/lot_sizes.parquet` is populated from TWO sources:
 
-**Then commit fixtures**:
+1. **Sidecar** (`data/manual/contracts/NSE_FO_contract_*.csv.gz`) — regime B coverage; static, committed.
+2. **Bhavcopies** (`data/cache/bhavcopy_fo/*.parquet`) — regime C coverage via `NewBrdLotQty` per-row; refreshed by jugaad on each prefetch.
+
+A given `(symbol, expiry)` pair can appear in BOTH sources whenever a contract listed in regime B is still tracked by a regime C bhavcopy day. NSE lot sizes are stable per `(symbol, expiry)` once the contract lists — they should NEVER differ between sources.
+
+**Mismatch policy (loud-fail per operator direction)**:
+- If `(symbol, expiry)` appears in both sources with DIFFERENT `lot_size`, the build script raises a `CrossSourceLotSizeMismatchError` naming the symbol, expiry, sidecar-value, bhavcopy-value, and snapshot dates.
+- `scripts/build_lot_size_parquet.py` exits non-zero; the prefetch run that invoked it surfaces the error in its console output (the prefetch script wraps the build with explicit logging of any cross-source mismatches under a `=== Cross-source lot-size verification ===` header).
+- Operator must investigate the mismatch (most likely a corporate-action lot revision; possibly a parser bug) before continuing. The unified cache is NOT written until the conflict is resolved (manually or via a code fix).
+
+**Why loud-fail (not latest-wins or both-stored)**: same discipline as `MissingDataError` / `IlliquidLegError` — silent data drift is the worst failure mode. Lot-size mismatch typically signals an NSE corporate action (split/bonus) that the engine's pricing math needs to know about; surfacing it loud forces an investigation rather than a wrong answer.
+
+**Reviewer ask**: confirm this is the right policy + the error-surfacing pattern (script-level loud raise + prefetch-level wrap-and-print) matches the project's error-handling discipline.
+
+---
+
+## Phase 0 — Operator fixtures + unified lookup build
 
 ### P0.1 — `chore(data.fixtures.nse_fo_contract_2024_h1)`
-- Add `data/manual/contracts/*.csv.gz` (4 files, ~2MB each = ~8MB total)
-- Add `data/manual/contracts/README.md` documenting provenance + manual-fetch nature
-- Update `.gitignore` to NOT exclude `data/manual/` (the rest of `data/` is gitignored)
+
+Already-staged-on-disk: `data/manual/contracts/NSE_FO_contract_*.csv.gz` (4 files, ~6.7MB total gzipped, produced from operator-downloaded NSE archive bundles).
+
+- Add `data/manual/contracts/NSE_FO_contract_*.csv.gz` (4 files)
+- Add `data/manual/contracts/README.md` documenting:
+  - Provenance (NSE archives "Reports-Archives-Multiple-DDMMYYYY.zip" bundled-download UI)
+  - Cadence (snapshot dates listed in §Inputs available)
+  - That these are committed sources (not auto-fetched); operator manually re-derives by re-downloading from NSE if coverage needs to expand
+  - Note that `data/manual/` is the ONLY subfolder of `data/` not gitignored
 - Tests: none — pure data add
+
+### P0.2 — `feat(scripts.build_lot_size_parquet)`
+
+New `scripts/build_lot_size_parquet.py`:
+
+```python
+def build_lot_size_parquet(
+    *, out_path: Path = CACHE_DIR / "lot_sizes.parquet",
+    sidecar_glob: str = "data/manual/contracts/NSE_FO_contract_*.csv.gz",
+    bhavcopy_cache_dir: Path = CACHE_DIR / "bhavcopy_fo",
+) -> None:
+    """Build the unified (symbol, expiry) → lot_size cache.
+
+    Sources both the regime B sidecar files (sidecar_glob) AND any
+    UDiff bhavcopies currently in bhavcopy_cache_dir (regime C; reads
+    NewBrdLotQty per row). Merges, dedupes by (symbol, expiry), and
+    cross-validates: any pair present in both sources with different
+    lot_sizes raises CrossSourceLotSizeMismatchError per the §Cross-
+    source lot-size policy.
+
+    Output schema:
+        symbol: string
+        expiry: date (canonical NSE expiry settlement date)
+        lot_size: int64 (shares per lot)
+        source: string  (one of {"sidecar", "bhavcopy", "both"})
+
+    Idempotent: rewrites the parquet on every invocation. Safe to
+    delete the output and rebuild.
+    """
+```
+
+Wire into `scripts/prefetch_universe.py` BEFORE the bhavcopy fetch loop:
+- Step 0a: ensure bhavcopy cache exists (fetch any missing days).
+- Step 0b: if `data/cache/lot_sizes.parquet` is missing OR `--rebuild-lot-sizes` is passed, invoke `build_lot_size_parquet()`. The script surfaces any cross-source mismatches under a `=== Cross-source lot-size verification ===` console-output header per the policy above.
+- Step 1+: proceed with materialize-contracts loop using the unified cache.
+
+**Tests** (`tests/test_build_lot_size_parquet.py`):
+- Synthesize a 1-day bhavcopy fixture + a 1-row sidecar fixture for the same `(symbol, expiry)` with MATCHING lot_size. Assert the parquet is built + the row has `source="both"`.
+- Same setup but MISMATCHED lot_size. Assert `CrossSourceLotSizeMismatchError` raised with the right symbol/expiry/values in the message.
+- Sidecar-only `(symbol, expiry)` (no bhavcopy). Assert row written with `source="sidecar"`.
+- Bhavcopy-only `(symbol, expiry)` (post-Jul-2024 contract). Assert row written with `source="bhavcopy"`.
+- `prefetch_universe.py` integration test: parquet missing → auto-built. Parquet present → not rebuilt (unless `--rebuild-lot-sizes`).
+
+**Reviewer ask**: schema choice (any reason NOT to keep `source` for debugging? could be dropped at v2); auto-build trigger semantics (missing-parquet → silent build is what we want, vs. error-with-hint).
 
 ---
 
@@ -176,19 +261,20 @@ Replaces per-contract API calls with daily bhavcopy ingestion for the 2024-07-08
 
 ### P1.1 — `chore(data.bhavcopy_fo.parse_udiff_extension)`
 
-Extend `parse_udiff` to carry 3 additional columns:
+Extend `parse_udiff` to carry 2 additional columns:
 - `LastPric` → `ltp` (float64, rupees per share, NaN-tolerant)
-- `NewBrdLotQty` → `lot_size` (int64, shares)
 - `TtlTrfVal` → `turnover` (float64, lakhs of rupees, underlying-notional)
 
-**Output column count**: 13 → 16 (matches options_loader's normalized schema for these fields).
+**Output column count**: 13 → 15.
+
+**Note** on `NewBrdLotQty`: the UDiff bhavcopy DOES carry lot_size per row, but the parser does NOT extract it into the bhavcopy-cache parquet schema. Instead, `NewBrdLotQty` is consumed by the unified lot-size build script (P0.2) and persisted ONCE in `data/cache/lot_sizes.parquet`. The transform in P1.3 looks it up there. Rationale: lot_size is per-`(symbol, expiry)`-stable, so storing it per-bhavcopy-row in the bhavcopy cache duplicates the same value across ~60-90 days of EOD rows per contract. The unified lookup deduplicates.
 
 **Tests** (`tests/test_bhavcopy_fo_loader.py`):
-- `test_parse_udiff_carries_ltp_lot_size_turnover` — using existing `tests/fixtures/bhavcopy_fo_udiff_20240829.csv` fixture, assert the 3 new columns appear with non-NaN values for at least one OPTSTK row.
+- `test_parse_udiff_carries_ltp_and_turnover` — using existing `tests/fixtures/bhavcopy_fo_udiff_20240829.csv` fixture, assert the 2 new columns appear with non-NaN values for at least one OPTSTK row.
 - `test_parse_udiff_ltp_is_nan_tolerant` — assert NaN passes through.
-- `test_parse_udiff_lot_size_matches_known_value` — RELIANCE 2024-08-29 should have lot_size=250.
+- `test_parse_udiff_does_not_carry_lot_size` — negative-space test pinning that the bhavcopy parser output does NOT include `lot_size` (which lives in the unified cache instead).
 
-**Reviewer ask**: column dtype + the units claim (turnover in lakhs of rupees, underlying-notional convention).
+**Reviewer ask**: column dtype + the units claim (turnover in lakhs of rupees, underlying-notional convention). Confirm the architectural decision to NOT carry lot_size in the bhavcopy-cache schema (it's lookup-resolved in the transform).
 
 ### P1.2 — `chore(data.bhavcopy_fo.parse_legacy_extension)`
 
@@ -218,9 +304,16 @@ def bhavcopy_to_contract_timeseries(
     concatenates, returns the same 16-col normalized schema that
     options_loader.load_option produces.
 
-    For UDiff-era rows: volume = TtlTradgVol × NewBrdLotQty.
-    For legacy-era rows: lot_size is NaN here; volume left as NaN.
-    The legacy lot_size join lands in Phase 2.
+    lot_size is resolved ONCE per (symbol, expiry) via the unified
+    cache (lot_size_lookup → data/cache/lot_sizes.parquet, built by
+    P0.2's build_lot_size_parquet.py). This is regime-agnostic: the
+    SAME lookup serves both UDiff-era and legacy-era rows.
+    volume = contracts × lot_size (where contracts is the bhavcopy's
+    TtlTradgVol/CONTRACTS column).
+
+    For UDiff-era rows: ltp populated from LastPric.
+    For legacy-era rows: ltp left as NaN (legacy bhavcopy doesn't
+    carry it; flagged downstream via P2.2's caveat path).
     """
 ```
 
@@ -441,49 +534,23 @@ PLAN.md history entry summarizing what landed. Update [DATA_PRODUCTS.md](DATA_PR
 
 ## Phase 2 — Regime B extension
 
-Adds 3-month historical coverage (Apr 15 → Jul 7 2024) to the bhavcopy-only architecture. Sub-commits smaller than Phase 1.
+Adds 3-month historical coverage (Apr 15 → Jul 7 2024) to the bhavcopy-only architecture. **Significantly simpler than originally planned** because the unified `lot_sizes.parquet` (built by P0.2) already covers regime B from the committed sidecar files — no separate sidecar loader is needed. Phase 2 is now just `parse_legacy` + `prefetch` window extension + the MCP caveat.
 
-### P2.1 — `feat(data.nse_fo_contract.loader)`
+> **Note on the original P2.1**: the standalone `nse_fo_contract_loader.py` originally proposed in Phase 2 is **subsumed by P0.2**. The build script in P0.2 reads the same .csv.gz files; the unified lookup in `data/cache/lot_sizes.parquet` covers regime B and regime C uniformly. Phase 2's numbering below is renumbered post-collapse (P2.1 + P2.2 + P2.3 instead of the original P2.1 → P2.6).
 
-New `src/data/nse_fo_contract_loader.py`:
-- `load_lot_sizes(snapshot_date: date) -> dict[tuple[str, date], int]` — reads the snapshot's `.csv.gz`, returns `{(symbol, expiry_date): lot_size}` mapping.
-- `lot_size_for(symbol: str, expiry: date) -> int | None` — checks all 4 committed snapshots, returns the lot size found in the earliest snapshot that lists this `(symbol, expiry)`, or None if no snapshot covers it.
-- Implementation: parse `StockNm` regex `{SYMBOL}(\d{2})([A-Z]{3})` to extract expiry year+month; cross-reference against the queried expiry date's month.
+### P2.1 — `feat(prefetch.regime_b_window)`
 
-**Tests** (`tests/test_nse_fo_contract_loader.py`):
-- Against the 4 committed fixtures: assert PNB May 2024 expiry has lot_size=8000 (hand-verified from the operator's earlier CSV inspection).
-- Assert the function returns the same lot size across different snapshot dates that both cover the contract (stability check).
-- Assert None for a contract not in any snapshot.
-
-**Reviewer ask**: StockNm regex robustness; cross-snapshot consistency policy.
-
-### P2.2 — `feat(data.contract_timeseries.legacy_path)`
-
-Extend `bhavcopy_to_contract_timeseries` to handle pre-Jul-8-2024 rows:
-- For each legacy-era row, call `nse_fo_contract_loader.lot_size_for(symbol, expiry)` to derive `lot_size`.
-- Compute `volume = contracts × lot_size`.
-- Leave `ltp` as NaN (legacy bhavcopy doesn't carry it).
-- Mark `_legacy_ltp_unavailable: True` in the output's row metadata (or via a sidecar column) for downstream caveat-triggering.
-
-**Tests**:
-- Synthesize a legacy bhavcopy day in cache, run the transform, assert volume = contracts × known-lot-size for a known (symbol, expiry).
-- Assert ltp is NaN for legacy rows.
-- Assert UDiff-era rows (when from_date/to_date span the cutover) still get ltp directly.
-
-**Reviewer ask**: cutover-handling semantics; what happens for contracts whose listing spans the Jul-8 boundary.
-
-### P2.3 — `feat(prefetch.regime_b_extension)`
-
-Update `prefetch_universe.py` to also process pre-Jul-8-2024 dates back to 2024-04-15:
-- Same flow as P1.5 but the bhavcopy parser auto-routes by date via the existing format-discriminator in [bhavcopy_fo_loader.py:74-75](src/data/bhavcopy_fo_loader.py#L74-L75).
-- The materialize step now needs the sidecar lookup for legacy-era contracts.
+Update `scripts/prefetch_universe.py` to also process pre-Jul-8-2024 dates back to 2024-04-15:
+- The bhavcopy fetch loop already handles regime B (jugaad's legacy ZIP path). Just extend the date-range argument.
+- The unified lot_size lookup is regime-agnostic — already covers regime B from P0.2's sidecar ingestion. No additional lookup wiring.
+- The materialize step in P1.4 already JOINs against the unified lookup; works for legacy-era contracts without change.
 
 **Tests**:
 - Synthesize a mixed-regime 30-day bhavcopy cache fixture (15 days legacy + 15 days UDiff). Run prefetch, assert all per-contract parquets get written with correct lot_size for both eras.
 
-**Reviewer ask**: end-to-end correctness across the regime boundary.
+**Reviewer ask**: end-to-end correctness across the regime boundary; confirm no separate regime-B materialize logic needs to land.
 
-### P2.4 — `feat(mcp.get_options_chain.legacy_caveat)`
+### P2.2 — `feat(mcp.get_options_chain.legacy_caveat)`
 
 Per operator D3 decision: when `get_options_chain` returns rows from a pre-2024-07-08 trade date, surface a caveat naming the `ltp: None` field explicitly.
 
@@ -492,7 +559,7 @@ Per operator D3 decision: when `get_options_chain` returns rows from a pre-2024-
 
 **Reviewer ask**: caveat wording + trigger condition.
 
-### P2.5 — `feat(p7.smoke_test.regime_b_extension)`
+### P2.3 — `feat(p7.smoke_test.regime_b_extension)`
 
 Operator-action commit: rerun the smoke sweep on a backtest window that crosses the regime B/C boundary (e.g., 2024-05-01 → 2024-09-30 on the 4-stock universe). Validate that:
 - Pre-Jul-8 trades have correct fill prices (using bhavcopy + sidecar)
@@ -501,7 +568,7 @@ Operator-action commit: rerun the smoke sweep on a backtest window that crosses 
 
 **Reviewer ask**: smoke results + cross-boundary correctness.
 
-### P2.6 — `docs(plan.regime_b_migration_complete)`
+### P2.4 — `docs(plan.regime_b_migration_complete)`
 
 PLAN.md history entry. Update DATA_PRODUCTS.md to mark the full 4-year window as supported.
 
@@ -527,9 +594,11 @@ PLAN.md history entry. Update DATA_PRODUCTS.md to mark the full 4-year window as
 | P1.7 | `test_pick_fill_price_falls_back_to_close_on_deep_otm` | Pins 8c2c517 design intent — case (3) deep-OTM ill-conditioning is NOT a skip; falls through to close |
 | P1.7 | `test_sweep_records_missing_turnover_as_skip_reason` | End-to-end: sweep emits skip parquet row with named reason |
 | P1.7 | `test_sweep_does_not_skip_on_deep_otm` | End-to-end: deep-OTM cell IS priced, NOT in skip parquet |
-| P2.1 | `test_lot_size_lookup_against_4_snapshots` | Sidecar correctness |
-| P2.2 | `test_legacy_volume_derived_from_contracts_times_lotsize` | Volume derivation contract |
-| P2.4 | `test_get_options_chain_surfaces_legacy_ltp_caveat` | MCP caveat trigger |
+| P0.2 | `test_build_lot_size_parquet_loud_fails_on_mismatch` | Cross-source mismatch raises CrossSourceLotSizeMismatchError per §Cross-source lot-size policy |
+| P0.2 | `test_build_lot_size_parquet_against_4_sidecar_fixtures` | Unified cache populates correctly from regime B sidecars (PNB May 2024 lot_size = 8000) |
+| P0.2 | `test_prefetch_universe_autobuilds_lot_size_parquet_if_missing` | Auto-build trigger semantics (missing → silent rebuild) |
+| P2.1 | `test_prefetch_regime_b_volume_derived_via_unified_lookup` | Legacy-era bhavcopy row → volume = contracts × unified_lookup(symbol, expiry) |
+| P2.2 | `test_get_options_chain_surfaces_legacy_ltp_caveat` | MCP caveat trigger |
 
 ### Smoke tests (manual operator action, gating P1.7 + Phase 2 close)
 - P1.6: 4-stock universe, 23-month regime C window. Acceptance: results match API-derived to float precision.
@@ -568,10 +637,21 @@ This plan embeds the operator's D1-D4 decisions from
 
 - **D1**: bhavcopy-only is the primary path; `options_loader` kept as deprecated dead code (P1.8). No production fallback after P1.7. Graceful-degrade in `pnl.py` removed.
 - **D2**: 4-year window starting 2024-04-15. Regime A skipped. Phases 1 + 2 cover the full target window.
-- **D3**: `ltp` is NaN for regime B rows; caveat surfaces in `get_options_chain` per P2.4.
+- **D3**: `ltp` is NaN for regime B rows; caveat surfaces in `get_options_chain` per P2.2.
 - **D4**: `options_loader.py` kept as dead code with deprecation header (P1.8); graceful-degrade removed (P1.7). **Refinement (2026-06-02 operator clarification)**: missing turnover triggers a per-cell SKIP (via new `MissingTurnoverError(MissingDataError)` subtype, auto-caught by `_SKIPPABLE_ERRORS`) rather than a loud failure that crashes the sweep. Operator sees missing-turnover skips as a distinct reason in skip_summary / drill-down — closer to "this is a data-quality signal" than "this is a code bug." Pattern follows `IlliquidLegError(MissingDataError)` precedent.
+
+**Architectural refinement (2026-06-02 operator direction — UNIFIED LOT-SIZE LOOKUP)**:
+- All lot-size resolution goes through ONE unified cache: `data/cache/lot_sizes.parquet`.
+- Built by `scripts/build_lot_size_parquet.py` (P0.2) from BOTH committed sidecars (`data/manual/contracts/NSE_FO_contract_*.csv.gz`, regime B) AND cached UDiff bhavcopies (`data/cache/bhavcopy_fo/*.parquet`, regime C, via per-row `NewBrdLotQty`).
+- Cross-source mismatch policy: **loud-fail** via `CrossSourceLotSizeMismatchError` (see §Cross-source lot-size policy). Mismatches surface in `prefetch_universe.py` console output under a `=== Cross-source lot-size verification ===` header.
+- Auto-build trigger: `prefetch_universe.py` invokes the build script when `data/cache/lot_sizes.parquet` is missing. Silent rebuild; no operator prompt.
+- Bhavcopy-cache schema is NOT extended to carry `lot_size` per row (originally proposed in P1.1); instead, the transform in P1.3 looks up `(symbol, expiry) → lot_size` from the unified cache. Deduplicates ~60-90 days of repeated lot_size values per contract; engine code is regime-agnostic.
+- Phase 2 collapses: the standalone `nse_fo_contract_loader.py` originally proposed (old P2.1) is subsumed by P0.2's build script. Phase 2 is now 4 sub-commits (P2.1 → P2.4) instead of 6.
 
 Plus three implicit decisions:
 - **All strikes**: no strike_planner pre-filtering. Every traded strike in the bhavcopy becomes a contract. **Disk cost note** (per reviewer grill #6 on e0bc85a): with `strike_planner` removed, per-cell strike count goes from ~13 (`DEFAULT_STRIKES_PER_SIDE = 6` + ATM = 13 per option_type) to all-traded (~30-100+ per option_type for active underlyings). Estimated **~3-5× cache growth** over current `data/cache/options/` footprint. **Verify storage capacity before Phase 1 prefetch run**.
 - **0-volume disqualifies**: handled by existing `IlliquidLegError` gate in [pnl.py](src/engine/pnl.py). No new logic.
 - **Sweep batching unchanged**: cell-granular tuples per [sweeper.py:304-312](src/engine/sweeper.py#L304-L312).
+
+**Deferred — universe expansion**:
+The bhavcopy carries every F&O-listed symbol (~204 distinct symbols per snapshot), not just our 50. Expanding the sweep universe beyond the current 48 blue chips + PNB + BHEL is technically zero-extra-fetch-cost (the data is already in the bhavcopy). However, **the materialize + sweep compounds**: ~4× more symbols × the all-strikes ~3-5× cache growth = ~12-20× total cache growth + ~4× sweep compute time. Recommendation: **stay at 50 for Phase 1**, validate the migration works at current scale, expand as a separate decision after smoke confirms. This is a SCOPE decision, not a CAPABILITY question — and explicitly NOT a goal of this migration.
