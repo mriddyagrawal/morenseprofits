@@ -16018,3 +16018,118 @@ In priority order:
 Standing by for the calibration fix or the P0.1 fixture commit.
 
 ---
+
+## Review of 10f36be — `fix(docs.migration.calibration)`
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** All 6 of my 1ea4505 grills closed cleanly + 2 operator-driven clarifications bundled with verified prior-art pattern. BUT the new P1.7 design conflates three distinct `vwap is None` cases under a single `MissingTurnoverError`, which would mis-label the deep-OTM ill-conditioning case (case 3) and overreach the operator's "skip when turnover missing" instruction.
+
+### Verification (grep-the-code discipline applied)
+
+All 6 cited identifiers verified against the actual code:
+
+- `IlliquidLegError(MissingDataError)` at `src/data/errors.py:59` ✓
+- `_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)` at `src/engine/sweeper.py:56` ✓
+- `skip_reason` extraction path at `sweeper.py:317-326` ✓ — `_handle` splits the worker's `"skip:ClassName|message"` payload to populate `skip_reason`
+- `f"skip:{type(e).__name__}|{e}"` at `sweeper.py:225` — confirms the **class-name-as-skip-reason** pattern. Subclass relationship means `MissingTurnoverError` would auto-flow as `skip_reason="MissingTurnoverError"` with zero sweeper changes. Pattern verified end-to-end.
+- `_pick_fill_price` lines `pnl.py:195-216` — exactly the VWAP-vs-close logic block that P1.7 modifies.
+- Turnover columns `TtlTrfVal` (UDiff) + `VAL_INLAKH` (legacy) — verified in prior reviews from raw fixture headers.
+
+### Grill Closures (all 6 from 1ea4505)
+
+| Grill | Recommended fix | Actually landed | Closed? |
+|---|---|---|---|
+| #1 (P1.3 column equality) | per-row value + dtypes + sorted compare + worked example | 4-bullet spec + RELIANCE 2024-08-29 2840-CE byte-identity example | ✓ |
+| #2 (P1.6 acceptance unit) | absolute delta + per-trade backup criterion | primary 0.01pp absolute + backup 0.5pp per-trade; EITHER fails halts | ✓ |
+| #3 (post-Phase-2 rollback) | name the cascade-through-Phase-2 scenario | added "Phase 1 issue discovered AFTER Phase 2 has landed" with full revert path | ✓ |
+| #4 (Apr expiry coverage gap) | per-expiry coverage table | table added naming Apr 2024 single-snapshot gap explicitly | ✓ |
+| #5 (P1.7 external-caller audit) | extend to MCP backtest_one | sub-section added enumerating MCP backtest_one (affected) / cell_summary+heatmap+sweep_windows (unaffected) / Dashboard (unaffected) / future callers | ✓ |
+| #6 (all-strikes disk cost) | one-line note on cache growth | added with `DEFAULT_STRIKES_PER_SIDE = 6` citation + "~3-5× cache growth" estimate + "verify storage capacity" call | ✓ |
+
+All six framing/spec tightenings exactly as I'd recommended. No new framing drift.
+
+### Praises on the Operator Clarifications
+
+**Clarification #1 (turnover column verification)**: load-bearing addition. The "Premium Turnover" confusion is a real operator pitfall — the website's historical CSV download UI does include a separate column under that name, but the bhavcopy doesn't. The doc now names BOTH bhavcopy formats' single turnover column AND explicitly contradicts the "two columns" framing. Cross-references the 8c2c517 strike-correction recovery formula. Anti-confusion docs at exactly the right surface — P1.1/P1.2/P1.3 implementer reads this before writing the parser extension.
+
+**Clarification #2 (skip-vs-raise refinement)**: the subclass-as-skip-reason pattern is elegant. BUILDER verified the pattern works against the existing sweeper machinery (line 225 `f"skip:{type(e).__name__}|{e}"` → class name → skip_reason), so zero sweeper code change is needed. The new `MissingTurnoverError(MissingDataError)` would flow through `_SKIPPABLE_ERRORS` automatically and emit a distinct skip_reason token. Mirrors the `IlliquidLegError` precedent exactly. The operator's "data-quality signal vs loud crash" mental model is honored.
+
+### NEW Grill A (REAL, semantic): P1.7's `if vwap is None: raise MissingTurnoverError(...)` conflates three distinct None cases
+
+`_compute_vwap` at `src/engine/pnl.py:85-100` can return None for three structurally distinct reasons:
+
+1. **Turnover/volume missing or zero**: `if turnover is None or volume is None or volume == 0: return None`
+2. **NaN turnover**: `if pd.isna(turnover): return None`
+3. **Deep-OTM ill-conditioning**: `if premium_vwap <= 0: return None` — turnover IS present + non-NaN; the recovered premium just goes negative due to lakh-rounding amplification at premium ≪ strike.
+
+The plan's new P1.7 raise:
+
+```python
+if vwap is None:
+    raise MissingTurnoverError(
+        f"{context}: turnover missing on {target}; cannot recover "
+        f"premium VWAP. close={close:.2f}, strike={strike}, "
+        f"volume={volume}."
+    )
+```
+
+This conflates ALL THREE under one error class. Two problems:
+
+**Problem 1 — mis-labeled skip on case (3)**: deep-OTM ill-conditioning has turnover PRESENT (with non-NaN, non-zero volume). The error message says "turnover missing" but turnover is in fact there. The skip_summary tool would attribute the cell to `skip_reason="MissingTurnoverError"`, hiding the deep-OTM diagnostic that an operator might want to surface.
+
+**Problem 2 — semantic overreach vs operator's instruction**: the operator's clarification was "lets not pick close when turnover missing, skip the calculation instead and add the skipreason." That instruction names CASE (1) and CASE (2). It doesn't name CASE (3). The current `_pick_fill_price` falls through to close on case (3) and the 8c2c517 inline comment explicitly designs this: "Fall through to close — pre-VWAP behavior, no error" + "Deep-OTM numerical ill-conditioning — recovered premium went nonsensical because turnover rounding is comparable to the actual residual. Fall through to close." P1.7 as drafted would change this working pricing path into a skipped cell, going beyond what the operator asked for.
+
+**Fix options** (both preserve the operator's instruction):
+
+- **Option A (smallest diff)**: detect case (3) explicitly before raising. Check whether turnover/volume/strike are all present-and-non-NaN-and-positive at the call site. If yes, vwap is None because of deep-OTM → keep fall-through to close (preserving 8c2c517's design). Only raise `MissingTurnoverError` when turnover/volume/strike are genuinely missing/NaN/zero.
+
+  ```python
+  if vwap is None:
+      data_present = (
+          turnover is not None and not pd.isna(turnover)
+          and volume is not None and volume > 0
+          and strike is not None
+      )
+      if data_present:
+          # Case (3) — deep-OTM ill-conditioning. Fall through to
+          # close per 8c2c517 design; not a missing-data signal.
+          fill_px = close
+      else:
+          raise MissingTurnoverError(
+              f"{context}: turnover missing on {target}; cannot "
+              f"recover premium VWAP. ..."
+          )
+  ```
+
+- **Option B (more visibility)**: introduce a second skippable exception class for case (3) — e.g., `DeepOtmIllConditionedError(MissingDataError)` — so deep-OTM still skips (consistent with the "skip rather than book against suspect price" stance) but with a distinct `skip_reason` token. Operator sees `skip_reason="DeepOtmIllConditionedError"` in skip_summary and can decide whether that's a data-quality issue or a structural pattern.
+
+I'd recommend Option A: it's strictly smaller diff, preserves the 8c2c517 semantic, AND keeps the deep-OTM path a working pricing path rather than a skip. Option B adds a skip class for a case that's currently NOT a skip; semantic creep beyond the operator's "missing turnover = skip" instruction.
+
+### Behavior delta
+
+None on this docs commit. The grill is on the FUTURE P1.7 commit's design, which this docs commit specifies.
+
+### Math
+
+No test count change (docs-only).
+
+### Open grills
+
+1. **NEW Grill A** (semantic): P1.7's `if vwap is None: raise MissingTurnoverError(...)` conflates three distinct None cases. Tighten to raise only on cases (1)+(2); keep fall-through to close on case (3). Option A in the fix.
+
+Single 4-line fix in the P1.7 code-block in MIGRATION.md closes it.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(docs.migration.p1_7_case3_disambiguation)`** — close New Grill A. Tighten the P1.7 code block to distinguish missing-data (raise MissingTurnoverError) from deep-OTM ill-conditioning (fall through to close, preserving 8c2c517 design).
+2. **Then start P0.1** (operator action: unzip fixtures + commit).
+3. **(operator-driven, parallel)** heatmap click-test outcome on branch.
+
+Standing by.
+
+---
