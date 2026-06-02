@@ -295,6 +295,13 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
     # is contracts. Earlier "divide by lot" math was wrong; fixed.
     contracts = df["TtlTradgVol"].fillna(0).astype("int64")
 
+    # ltp + turnover extension (P1.1 — MIGRATION.md §Phase 1). The
+    # 2-col extension lets the bhavcopy_to_contract_timeseries
+    # transform (P1.3) populate the engine's normalized schema
+    # without re-parsing the raw CSV. NewBrdLotQty (lot_size) is
+    # INTENTIONALLY NOT in this output — see module docstring +
+    # MIGRATION.md §Cross-source lot-size policy + the sibling-cache
+    # path written by _write_sibling_lot_sizes_cache.
     out = pd.DataFrame({
         "instrument": instrument,
         "symbol": df["TckrSymb"].astype("string"),
@@ -305,8 +312,10 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
         "high": df["HghPric"].astype("float64"),
         "low": df["LwPric"].astype("float64"),
         "close": df["ClsPric"].astype("float64"),
+        "ltp": df["LastPric"].astype("float64"),
         "settle_price": df["SttlmPric"].astype("float64"),
         "contracts": contracts,
+        "turnover": df["TtlTrfVal"].astype("float64"),
         "oi": df["OpnIntrst"].astype("Int64"),
         "oi_change": df["ChngInOpnIntrst"].astype("Int64"),
     })

@@ -49,15 +49,55 @@ def _redirect_cache(monkeypatch, tmp_path):
 # Schema (SPECS §2.4) — verified on both formats
 # ===========================================================
 
-SPECS_COLS = [
+# Legacy parser output (14 cols). P1.2 will extend this with
+# turnover when it lands; for now legacy stays as-is.
+LEGACY_COLS = [
     "instrument", "symbol", "expiry", "strike", "option_type",
     "open", "high", "low", "close", "settle_price",
     "contracts", "oi", "oi_change", "trade_date",
 ]
 
+# UDiff parser output (16 cols, P1.1 — MIGRATION.md §Phase 1).
+# Adds ltp (after close) + turnover (after contracts). Does NOT add
+# lot_size: per the unified-lookup architecture, lot_size lives in
+# data/cache/lot_sizes.parquet via the sibling-cache write hook.
+UDIFF_COLS = [
+    "instrument", "symbol", "expiry", "strike", "option_type",
+    "open", "high", "low", "close", "ltp", "settle_price",
+    "contracts", "turnover", "oi", "oi_change", "trade_date",
+]
 
-def _assert_specs_2_4_schema(df: pd.DataFrame) -> None:
-    assert list(df.columns) == SPECS_COLS, f"column order drift: {list(df.columns)}"
+# Backward-compat alias used by tests that don't care which parser
+# produced the frame. Points at the LEGACY schema (the smaller
+# subset; UDiff is a superset).
+SPECS_COLS = LEGACY_COLS
+
+
+def _assert_legacy_schema(df: pd.DataFrame) -> None:
+    assert list(df.columns) == LEGACY_COLS, (
+        f"legacy column-order drift: {list(df.columns)}"
+    )
+    _assert_common_dtypes(df)
+
+
+def _assert_udiff_schema(df: pd.DataFrame) -> None:
+    assert list(df.columns) == UDIFF_COLS, (
+        f"UDiff column-order drift: {list(df.columns)}"
+    )
+    _assert_common_dtypes(df)
+    # P1.1 additions: ltp + turnover are float64 (NaN-tolerant for
+    # untrade days; ltp is rupees per share; turnover is lakhs of
+    # rupees underlying-notional).
+    assert df["ltp"].dtype.name == "float64", (
+        f"ltp dtype = {df['ltp'].dtype.name}"
+    )
+    assert df["turnover"].dtype.name == "float64", (
+        f"turnover dtype = {df['turnover'].dtype.name}"
+    )
+
+
+def _assert_common_dtypes(df: pd.DataFrame) -> None:
+    """Dtype checks shared by legacy + UDiff outputs."""
     assert df["instrument"].dtype == pd.StringDtype()
     assert df["symbol"].dtype == pd.StringDtype()
     assert df["option_type"].dtype == pd.StringDtype()
@@ -74,14 +114,93 @@ def _assert_specs_2_4_schema(df: pd.DataFrame) -> None:
         assert df[c].dtype.name == "Int64", f"{c} dtype = {df[c].dtype.name}"
 
 
+def _assert_specs_2_4_schema(df: pd.DataFrame) -> None:
+    """Backward-compat alias for the legacy schema assertion. Existing
+    callers that don't care about P1.1's UDiff extension still pass."""
+    _assert_legacy_schema(df)
+
+
 def test_legacy_parser_returns_specs_2_4_schema():
     df = bfo.parse_legacy(_legacy_raw(), LEGACY_DATE)
-    _assert_specs_2_4_schema(df)
+    _assert_legacy_schema(df)
 
 
 def test_udiff_parser_returns_specs_2_4_schema():
+    """LOAD-BEARING (P1.1): UDiff parser output now carries
+    ``ltp`` (from LastPric) and ``turnover`` (from TtlTrfVal) per
+    MIGRATION.md §Phase 1 P1.1. Schema-order drift fails loud."""
     df = bfo.parse_udiff(_udiff_raw(), UDIFF_DATE)
-    _assert_specs_2_4_schema(df)
+    _assert_udiff_schema(df)
+
+
+def test_parse_udiff_carries_ltp_and_turnover():
+    """At least one OPTSTK row must surface non-NaN ltp + turnover —
+    sanity that the columns aren't silently all-NaN due to typo or
+    drift in the source field names (LastPric / TtlTrfVal)."""
+    df = bfo.parse_udiff(_udiff_raw(), UDIFF_DATE)
+    optstk = df[df["instrument"] == "OPTSTK"]
+    assert (optstk["ltp"].notna()).any(), (
+        "ltp is all-NaN for OPTSTK rows — LastPric extraction broken"
+    )
+    assert (optstk["turnover"].notna()).any(), (
+        "turnover is all-NaN for OPTSTK rows — TtlTrfVal extraction broken"
+    )
+
+
+def test_parse_udiff_ltp_is_nan_tolerant():
+    """Dtype permissiveness: ``ltp`` must be float64, which means
+    NaN passes through as NaN if NSE ever emits a missing LastPric
+    cell. NSE's actual convention writes ``0.00`` for untrade days
+    rather than NaN — the fixture reflects this — so the test
+    asserts the dtype and the no-coercion behavior on an inserted
+    NaN, NOT the fixture's NaN count."""
+    df = bfo.parse_udiff(_udiff_raw(), UDIFF_DATE)
+    # ltp must be float64 (covered by schema test; restated here as
+    # the load-bearing claim for this test's name).
+    assert df["ltp"].dtype.name == "float64"
+    # Synthetic NaN row: mutate a raw CSV row to have an empty
+    # LastPric cell; assert it survives as NaN, not 0.0.
+    raw = _udiff_raw()
+    lines = raw.splitlines()
+    header = lines[0].split(",")
+    last_pric_col = header.index("LastPric")
+    data_lines = lines[1:]
+    # Find an OPTSTK row to mutate.
+    target_idx = None
+    for i, line in enumerate(data_lines):
+        cells = line.split(",")
+        if cells[header.index("FinInstrmTp")] == "STO":
+            target_idx = i
+            break
+    assert target_idx is not None
+    cells = data_lines[target_idx].split(",")
+    cells[last_pric_col] = ""  # blank the LastPric cell
+    data_lines[target_idx] = ",".join(cells)
+    mutated = "\n".join([lines[0]] + data_lines)
+    mutated_df = bfo.parse_udiff(mutated, UDIFF_DATE)
+    assert mutated_df["ltp"].isna().any(), (
+        "blank LastPric cell should produce a NaN, not 0.0; pandas' "
+        "default CSV NaN-coercion was not preserved across the parser"
+    )
+
+
+def test_parse_udiff_does_not_carry_lot_size():
+    """LOAD-BEARING anti-regression (per reviewer grill #3 on
+    9b6c32b + the bhavcopy_fo_loader.py module docstring): the
+    main-cache parquet's schema is INTENTIONALLY narrow. ``lot_size``
+    lives in the unified ``data/cache/lot_sizes.parquet`` via the
+    sibling-cache write hook, NOT per-row in this parser's output.
+
+    Anti-regression against a future maintainer "fixing" the missing
+    column by re-adding ``NewBrdLotQty`` → ``lot_size`` here."""
+    df = bfo.parse_udiff(_udiff_raw(), UDIFF_DATE)
+    assert "lot_size" not in df.columns, (
+        "P1.1 architectural decision violated: lot_size MUST NOT be in "
+        "the bhavcopy main-cache parquet schema. See "
+        "bhavcopy_fo_loader.py module docstring + MIGRATION.md "
+        "§Cross-source lot-size policy. Consumers needing lot_size "
+        "query the unified data/cache/lot_sizes.parquet instead."
+    )
 
 
 # ===========================================================
