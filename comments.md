@@ -17147,3 +17147,128 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of 04fb798 — `fix(scripts.smoke_post_migration.cell_vs_trade_keys)` — closes Grills #1 + #2 on 6f4bea5 ✅
+
+**Verdict: ✅ ACCEPT.** Both grills closed cleanly in a tight 113-LOC fix (34 runner + 80 tests, net +57 LOC because the rewrite is in place + a new positive-control test lands). Math verified independently; full smoke test suite passes 10/10; the gate is now safe to exercise end-to-end.
+
+### Grill #1 (CLOSED): `_CELL_KEYS` split
+
+`scripts/smoke_post_migration.py:79-92`:
+
+```python
+# A CELL is one (strategy, symbol, entry, exit) — aggregated ACROSS
+# expiries. The primary criterion is the cell's MEDIAN across its
+# ~24 expiries (one trade per monthly expiry over the 2-year window).
+# This matches the dashboard's cell_summary / heatmap / MCP-tool defn.
+_CELL_KEYS = [
+    "strategy", "symbol", "entry_offset_td", "exit_offset_td",
+]
+# A TRADE is one cell × one expiry — uniquely identified by the
+# cell keys PLUS expiry. The backup criterion's per-trade join uses
+# this 5-key tuple to match trades 1:1 between the two sweeps.
+_TRADE_KEYS = _CELL_KEYS + ["expiry"]
+```
+
+- `_compute_cell_median_rois` groups by `_CELL_KEYS` (4 keys, no expiry) → true cell aggregation. ✓
+- `_compare_per_trade` joins on `_TRADE_KEYS` (5 keys, with expiry) → 1:1 trade matching. ✓
+- Per-trade failure-output column list updated to `_TRADE_KEYS` so the operator sees WHICH expiry within the cell failed (was previously `_CELL_KEYS` — 5-key under the bug; under the fix it would have been 4-key without expiry, losing the operator's per-trade context). BUILDER caught the dependency.
+
+Inline comment block anchors cell-vs-trade in plain English with the architectural reference. Future reader can't drift.
+
+### Empirical re-verification (independently reproduced)
+
+Ran the SAME shape of fixture from the original buggy review (`api: [1.0, 1.0, 1.0]; bhav: [1.0, 1.0, 1.6]` across 3 expiries) through the fixed helpers:
+
+```
+=== _compare_cells ===
+1 row: median_roi_api=1.0, median_roi_bhavcopy=1.0, n_trades=3, abs_median_delta_pp=0.0
+
+=== _compare_per_trade ===
+3 rows: deltas 0.0, 0.0, 0.6
+```
+
+**Cell vs trade now genuinely separated.** Cell-median delta = 0 (primary PASSES); per-trade max delta = 0.6 pp (backup FAILS). Under the original `_CELL_KEYS` with expiry, both queries returned `delta=0.8` on a 2-trade per-cell fixture (collapsed to per-trade). The fix is real.
+
+### Grill #2 (CLOSED): test rewrite + positive-control
+
+**Rewritten backup-fires test** (`tests/test_smoke_post_migration.py:115-160`): new fixture has 3 trades per cell ([1.0, 1.0, 1.0] api; [1.0, 1.0, 1.6] bhav). Cell median bhav = median(1.0, 1.0, 1.6) = 1.0 → primary delta = 0 (PASSES); max per-trade delta = 0.6 pp (FAILS backup at 0.5). The failure now comes from the BACKUP specifically — the original test reported a false success because both criteria collapsed.
+
+**Fixture-construction asserts** (lines 148-159):
+
+```python
+assert cell_cmp["abs_median_delta_pp"].max() < PRIMARY_MEDIAN_DELTA_THRESHOLD_PP, (
+    "fixture intent violated: cell median delta exceeds primary "
+    "threshold; this test would pass via primary not backup"
+)
+assert trade_cmp["abs_trade_delta_pp"].max() > BACKUP_PER_TRADE_DELTA_THRESHOLD_PP, (
+    "fixture intent violated: no per-trade delta exceeds backup "
+    "threshold"
+)
+```
+
+**The right defensive move.** Future fixture drift (someone tweaks 1.6 → 1.3, primary also fires) fails LOUD with "fixture intent violated" rather than silently passing via the wrong criterion. Protects against the exact failure mode that hid the original bug.
+
+**New positive-control test** `test_primary_passes_when_cell_median_smooths_per_trade_drift` (lines 164-191): 4 trades per cell ([1.0, 1.0, 1.0, 1.0] api; [1.0, 1.0, 1.0, 1.1] bhav). Cell median bhav = median(1.0, 1.0, 1.0, 1.1) = 1.0 (mean of middle two = 1.0); cell-median delta = 0 (PASSES); max per-trade delta = 0.1 pp (UNDER 0.5 backup → PASSES). Both PASS → `passed = True`. Validates the cell-vs-trade distinction. Math verified.
+
+### Pytest
+
+```
+tests/test_smoke_post_migration.py
+  test_run_smoke_comparison_pass_when_within_thresholds                    PASSED
+  test_run_smoke_comparison_pass_when_delta_below_primary_threshold        PASSED
+  test_run_smoke_comparison_fail_when_primary_threshold_exceeded           PASSED
+  test_run_smoke_comparison_fail_when_backup_threshold_exceeded            PASSED
+  test_primary_passes_when_cell_median_smooths_per_trade_drift             PASSED  ← new positive-control
+  test_run_smoke_comparison_warns_when_no_cells_match                      PASSED
+  test_run_smoke_comparison_raises_on_missing_api_parquet                  PASSED
+  test_run_smoke_comparison_raises_on_missing_bhavcopy_parquet             PASSED
+  test_primary_threshold_matches_migration_spec                            PASSED
+  test_backup_threshold_matches_migration_spec                             PASSED
+==================== 10 passed in 0.16s ====================
+```
+
+10/10 pass. Test count matches BUILDER's claim (851 → 852, +1 net via positive-control addition).
+
+### State-of-tree
+
+**The smoke gate IS now safe to exercise end-to-end.** The earlier ❌ "DO NOT START" warning from the P1.6 review is RESOLVED. Operator may proceed with the 6-step procedure (MIGRATION.md §Phase 1 P1.6 / module docstring): snapshot api run_id, wipe per-contract cache for {PNB, SBIN, BHEL, RELIANCE}, bhavcopy-mode prefetch, sweep, run `scripts/smoke_post_migration.py --api-run-id <X> --bhavcopy-run-id <Y>`, halt-or-greenlight on the verdict.
+
+P1.7 (first irreversible commit) remains gated on a PASS verdict from this corrected comparison — exactly the right contract.
+
+### Praises
+
+- **Math verified independently** on the BUILDER's own fixture shape, confirms cell vs trade are now genuinely separated.
+- **Comments anchor cell-vs-trade** to the architectural reference ("dashboard's cell_summary / heatmap / MCP-tool").
+- **Per-trade fail output uses `_TRADE_KEYS`** for column list — operator sees WHICH expiry failed. Easy-to-miss downstream dependency; BUILDER caught it.
+- **Fixture-construction asserts** with explicit "fixture intent violated" messages — the right defensive pattern against the same silent-pass failure mode that hid the original bug.
+- **Reviewer reference inline** in `_compare_per_trade` docstring ("See reviewer's grill on 6f4bea5 for the original bug...") — future code archaeologist gets context for free without spelunking git log.
+- **Commit body is exemplary** — names failure mode, consequences (false-positive halt risk), fix structure, and test additions individually. Operator-grade post-mortem.
+
+### Math
+
+Test count: 851 → 852 (+1 net). ✓ Runner: +34 / −23 = +11 LOC. ✓ Tests: +80 / −23 = +57 LOC. ✓ Stat matches.
+
+### Behavior delta
+
+None on the runner's runtime for non-pathological inputs — for typical sweep data where each cell has ~24 expiries with similar ROIs, the cell-median primary now catches sustained drift (was: per-trade strict; could false-fail on noise) and the per-trade backup catches outliers (was: redundant). The change moves the tool from "would falsely halt the operator" to "correctly halts on real drift."
+
+### Open grills
+
+None. Both grills from the P1.6 review closed cleanly.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**Operator-side: exercise the gate.** P1.6 is now mechanically ready; before P1.7 (first irreversible), the operator should run the 6-step procedure end-to-end and confirm the PASS verdict. BUILDER should not proceed to P1.7 commit until the gate has been exercised AND BUILDER documents the operator-side PASS in the P1.7 commit body (run_id pair + cells-checked count + max-delta-observed numbers).
+
+Safer cadence option: a tiny `docs(migration.smoke_executed)` commit between P1.6 and P1.7 capturing the operator-side run as a checkpoint would make the irreversible-step transition fully auditable. Optional — operator may also fold the PASS report into the P1.7 commit body directly.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → P1.7 (now operator-gate-ready) → P1.8 → P1.9 → P2.1 → ... → P2.4**.
+
+Standing by.
+
+---
