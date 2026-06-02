@@ -75,6 +75,33 @@ class CrossSourceLotSizeMismatchError(DataError):
     unexpected mismatch pattern)."""
 
 
+class MissingTurnoverError(MissingDataError):
+    """Raised by the bhavcopy-to-contract transform (P1.3) and by
+    ``src.engine.pnl._pick_fill_price`` (P1.7) when the engine cannot
+    derive ``volume = contracts × lot_size`` or compute the per-share
+    premium VWAP because lot_size / turnover / volume is missing.
+
+    Three trigger paths converge here:
+    1. Lot-size unified cache miss — the ``(symbol, expiry-month)``
+       pair was EXCLUDED from ``data/cache/lot_sizes.parquet`` due to
+       a cross-source lot_size mismatch (per MIGRATION.md §Cross-
+       source lot-size policy).
+    2. Bhavcopy row has missing / NaN / zero turnover or volume
+       (rare; typically NSE settlement-only rows with no actual
+       trading).
+    3. Deep-OTM ill-conditioning (P1.7 case (3) preservation) is
+       handled SEPARATELY — falls through to close, does NOT raise.
+
+    Subclass of ``MissingDataError`` so the sweeper's existing
+    ``_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)``
+    catches it without code change. The exception class name becomes
+    the ``skip_reason`` token in the skip parquet (per the sweeper's
+    ``_handle`` extraction at line 322-326).
+
+    See MIGRATION.md §Phase 1 P1.7 + the dce9a87 case-disambiguation
+    commit body for the full pricing-path design."""
+
+
 class IlliquidLegError(MissingDataError):
     """Raised by ``src.engine.pnl._price_one_leg`` when a leg's entry or
     exit row had ZERO traded contracts that day, or when the entry's

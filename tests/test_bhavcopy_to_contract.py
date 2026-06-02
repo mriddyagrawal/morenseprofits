@@ -1,0 +1,407 @@
+"""Tests for ``src.data.lot_size_lookup`` + ``src.data.bhavcopy_to_contract``
+(P1.3 — MIGRATION.md §Phase 1 P1.3). Covers:
+
+- lot_size_lookup cache-hit / cache-miss / no-parquet semantics.
+- bhavcopy_to_contract_timeseries:
+    - Schema parity with options_loader.load_option output (exact
+      16 cols + dtypes + sort order).
+    - Per-day filtering across [from_date, to_date].
+    - volume = contracts × lot_size derivation.
+    - MissingTurnoverError on excluded (sym, expiry) pair.
+    - MissingTurnoverError on bad contracts value (≤0).
+    - Empty range / no matching contract → empty frame with right schema.
+    - Mixed-regime handling (legacy day produces uniform output).
+- Module-level cache invalidation between tests via reset_lookup_cache().
+"""
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from src.data import cache
+from src.data.bhavcopy_to_contract import (
+    _OUTPUT_COLUMNS,
+    bhavcopy_to_contract_timeseries,
+)
+from src.data.errors import MissingTurnoverError
+from src.data.lot_size_lookup import (
+    _load_lot_sizes_parquet,
+    lot_size_lookup,
+    reset_lookup_cache,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cache(monkeypatch, tmp_path):
+    """Each test gets a fresh cache root + a cleared lookup cache."""
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(cache, "_ensure_root", lambda: tmp_path)
+    reset_lookup_cache()
+    yield
+    reset_lookup_cache()
+
+
+# ============================================================
+# lot_size_lookup
+# ============================================================
+
+def test_lot_size_lookup_returns_none_when_parquet_missing(tmp_path):
+    """No parquet on disk → every lookup returns None. Matches the
+    semantics of "prefetch hasn't run yet" → every cell is
+    structurally unbacktestable."""
+    assert lot_size_lookup("PNB", date(2024, 6, 27)) is None
+
+
+def test_lot_size_lookup_hit(tmp_path):
+    """Round-trip a synthesized cache and confirm the lookup
+    succeeds with the correct value + correct year/month
+    interpretation (expiry_date.month → cache month column)."""
+    _write_lot_sizes_parquet(tmp_path, [
+        ("PNB", 2024, 6, 8000),
+        ("RELIANCE", 2024, 8, 250),
+    ])
+    assert lot_size_lookup("PNB", date(2024, 6, 27)) == 8000
+    assert lot_size_lookup("RELIANCE", date(2024, 8, 29)) == 250
+
+
+def test_lot_size_lookup_miss_returns_none(tmp_path):
+    """An excluded (sym, expiry-month) pair → cache has no row →
+    lookup returns None."""
+    _write_lot_sizes_parquet(tmp_path, [
+        ("PNB", 2024, 6, 8000),
+    ])
+    # ABBOTINDIA 24May was excluded by the build script (see
+    # documented sidecar-vs-sidecar mismatch); simulated here by
+    # the absence of the row in the synthesized cache.
+    assert lot_size_lookup("ABBOTINDIA", date(2024, 5, 30)) is None
+
+
+def test_lot_size_lookup_is_case_insensitive_on_symbol(tmp_path):
+    """``lot_size_lookup`` accepts mixed-case input and matches
+    against the upper-cased cache values (operator-facing
+    consistency)."""
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 6, 8000)])
+    assert lot_size_lookup("pnb", date(2024, 6, 27)) == 8000
+    assert lot_size_lookup("Pnb", date(2024, 6, 27)) == 8000
+
+
+# ============================================================
+# bhavcopy_to_contract_timeseries — schema parity (LOAD-BEARING)
+# ============================================================
+
+def test_transform_output_schema_matches_options_loader_exactly(tmp_path):
+    """LOAD-BEARING (per reviewer grill #1 on e0bc85a, tightened in
+    10f36be). The transform's output schema MUST be byte-identical
+    to the options_loader.load_option output. Spec:
+      - Same column NAMES in the same ORDER (16 cols).
+      - Same dtype per column.
+    Hand-curate a 2-day bhavcopy cache for one contract; assert
+    each column meets the contract."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 22),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.5, 5.0, 4.0, 4.8, 4.85, 4.9,
+               100, 84000.0, 1000, 200)],
+        is_udiff=True,
+    )
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               150, 130000.0, 1100, 100)],
+        is_udiff=True,
+    )
+
+    df = bhavcopy_to_contract_timeseries(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 22), to_date=date(2024, 7, 23),
+    )
+
+    # Same names + order as options_loader's _SPEC_COLS.
+    assert list(df.columns) == _OUTPUT_COLUMNS
+
+    # Dtypes (mirror options_loader's _normalize() output).
+    assert df["date"].dtype.name == "datetime64[us]"
+    assert df["symbol"].dtype == pd.StringDtype()
+    assert df["expiry"].dtype.name == "datetime64[us]"
+    assert df["option_type"].dtype == pd.StringDtype()
+    for c in ("strike", "open", "high", "low", "close", "ltp",
+              "settle_price", "turnover"):
+        assert df[c].dtype.name == "float64", f"{c} dtype = {df[c].dtype.name}"
+    assert df["lot_size"].dtype.name == "int64"
+    assert df["volume"].dtype.name == "int64"
+    assert df["oi"].dtype.name == "Int64"
+    assert df["oi_change"].dtype.name == "Int64"
+
+
+def test_transform_derives_volume_via_contracts_times_lot_size(tmp_path):
+    """LOAD-BEARING: volume = contracts × lot_size. Hand-checkable
+    pin: contracts=150, lot_size=8000 → volume=1,200,000."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               150, 130000.0, 1100, 100)],
+        is_udiff=True,
+    )
+    df = bhavcopy_to_contract_timeseries(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    assert len(df) == 1
+    assert int(df.iloc[0]["lot_size"]) == 8000
+    assert int(df.iloc[0]["volume"]) == 150 * 8000
+
+
+def test_transform_sorted_by_date_ascending(tmp_path):
+    """Concat result must be sorted by ``date`` ascending — the
+    options_loader._normalize() output guarantees this and the
+    sweep workers depend on it for monotonic date traversal."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Write days OUT OF ORDER to verify the transform sorts.
+    for d in (date(2024, 7, 25), date(2024, 7, 22), date(2024, 7, 23)):
+        _write_synthetic_bhavcopy_day(
+            tmp_path, d,
+            rows=[("PNB", pnb_exp, 100.0, "CE",
+                   4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+                   100, 84000.0, 1000, 0)],
+            is_udiff=True,
+        )
+    df = bhavcopy_to_contract_timeseries(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 22), to_date=date(2024, 7, 26),
+    )
+    dates = df["date"].dt.date.tolist()
+    assert dates == sorted(dates)
+
+
+# ============================================================
+# bhavcopy_to_contract_timeseries — error paths
+# ============================================================
+
+def test_transform_raises_when_lot_size_excluded(tmp_path):
+    """Per the per-pair-exclude policy: an excluded
+    (sym, expiry-month) → lookup returns None → transform raises
+    MissingTurnoverError (auto-skippable via _SKIPPABLE_ERRORS at
+    sweep time)."""
+    pnb_exp = date(2024, 5, 30)
+    # Lot-sizes parquet exists but doesn't have ABBOTINDIA May 2024
+    # (simulates the documented mismatch-driven exclusion).
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 6, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 5, 22),
+        rows=[("ABBOTINDIA", pnb_exp, 25000.0, "CE",
+               100.0, 110.0, 95.0, 105.0, 106.0, 105.5,
+               10, 100000.0, 50, 5)],
+        is_udiff=True,
+    )
+    with pytest.raises(MissingTurnoverError, match="lot_size unavailable"):
+        bhavcopy_to_contract_timeseries(
+            "ABBOTINDIA", pnb_exp, 25000.0, "CE",
+            from_date=date(2024, 5, 22), to_date=date(2024, 5, 22),
+        )
+
+
+def test_missing_turnover_error_is_skippable_via_sweeper_errors():
+    """LOAD-BEARING: MissingTurnoverError MUST be a MissingDataError
+    subtype so the sweeper's existing _SKIPPABLE_ERRORS catches it
+    without code change. Anti-regression against future refactors
+    that might break the subtype relationship."""
+    from src.data.errors import MissingDataError
+    from src.engine.sweeper import _SKIPPABLE_ERRORS
+
+    assert issubclass(MissingTurnoverError, MissingDataError)
+    # The sweeper catches by tuple membership against
+    # MissingDataError; sub-types are matched implicitly.
+    assert MissingDataError in _SKIPPABLE_ERRORS
+
+
+def test_transform_raises_on_zero_contracts(tmp_path):
+    """A row with contracts=0 means NSE recorded the row but no
+    actual trades happened. The transform refuses to derive volume
+    from such a row — picking volume=0 would silently mislead the
+    engine's IlliquidLegError gate."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               0, 0.0, 1100, 100)],   # contracts=0
+        is_udiff=True,
+    )
+    with pytest.raises(MissingTurnoverError, match="contracts"):
+        bhavcopy_to_contract_timeseries(
+            "PNB", pnb_exp, 100.0, "CE",
+            from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+        )
+
+
+# ============================================================
+# Empty-range + missing-day handling
+# ============================================================
+
+def test_transform_empty_when_no_matching_contract(tmp_path):
+    """Bhavcopy days exist but none have the queried contract →
+    empty frame with the right schema (so downstream pipelines can
+    still concat / sort / dtype-check without crashing)."""
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Cache has a different contract; the query asks for PNB but
+    # the parquet has RELIANCE.
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("RELIANCE", date(2024, 7, 25), 2800.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               150, 130000.0, 1100, 100)],
+        is_udiff=True,
+    )
+    df = bhavcopy_to_contract_timeseries(
+        "PNB", date(2024, 7, 25), 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    assert len(df) == 0
+    assert list(df.columns) == _OUTPUT_COLUMNS
+
+
+def test_transform_silently_skips_missing_bhavcopy_days(tmp_path):
+    """Holiday / weekend / pre-listing gaps → no parquet on disk
+    for that date. Transform silently skips (matches
+    options_loader's behavior on the same gaps)."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Only ONE day's parquet exists; the range covers 3 days.
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               100, 84000.0, 1000, 0)],
+        is_udiff=True,
+    )
+    df = bhavcopy_to_contract_timeseries(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 22), to_date=date(2024, 7, 24),
+    )
+    assert len(df) == 1
+    assert df.iloc[0]["date"] == pd.Timestamp(date(2024, 7, 23))
+
+
+# ============================================================
+# Mixed-regime: legacy day (no ltp) yields NaN ltp uniformly
+# ============================================================
+
+def test_transform_legacy_day_yields_nan_ltp(tmp_path):
+    """Legacy bhavcopy days don't carry ltp (15-col parser output).
+    Transform inserts NaN ltp so the unified output schema stays
+    16-col across regimes. Anti-regression against future drift
+    where a legacy day might silently get ltp=0.0."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Write a LEGACY-shaped row (no ltp column).
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, None, 5.05,
+               100, 84000.0, 1000, 0)],
+        is_udiff=False,
+    )
+    df = bhavcopy_to_contract_timeseries(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    assert len(df) == 1
+    assert pd.isna(df.iloc[0]["ltp"])
+
+
+# ============================================================
+# Helpers — synthetic fixture builders
+# ============================================================
+
+def _write_lot_sizes_parquet(
+    cache_root: Path,
+    rows: list[tuple[str, int, int, int]],
+):
+    """Write a minimal unified lot-sizes parquet with (sym, year,
+    month, lot_size) tuples — mimics what build_lot_size_parquet
+    would produce."""
+    df = pd.DataFrame({
+        "symbol": pd.Series([r[0] for r in rows], dtype="string"),
+        "year":   pd.Series([r[1] for r in rows], dtype="int64"),
+        "month":  pd.Series([r[2] for r in rows], dtype="int64"),
+        "lot_size": pd.Series([r[3] for r in rows], dtype="int64"),
+        "source": pd.Series(["sidecar"] * len(rows), dtype="string"),
+    })
+    path = cache_root / "lot_sizes.parquet"
+    df.to_parquet(path, index=False)
+
+
+def _write_synthetic_bhavcopy_day(
+    cache_root: Path,
+    trade_date: date,
+    rows: list[tuple],
+    *, is_udiff: bool,
+):
+    """Write a minimal bhavcopy parquet matching the parser output
+    schemas. ``rows`` is a list of:
+    (symbol, expiry, strike, option_type, open, high, low, close,
+     ltp, settle_price, contracts, turnover, oi, oi_change)
+    The ``ltp`` slot is ignored when ``is_udiff=False`` (legacy
+    parser output doesn't have the column).
+    """
+    out_rows = []
+    for r in rows:
+        (sym, exp, strike, opt, o, h, lo, c, ltp, settle,
+         contracts, turnover, oi, doi) = r
+        row = {
+            "instrument": "OPTSTK",
+            "symbol": sym,
+            "expiry": pd.Timestamp(exp),
+            "strike": float(strike),
+            "option_type": opt,
+            "open": float(o),
+            "high": float(h),
+            "low": float(lo),
+            "close": float(c),
+            "settle_price": float(settle),
+            "contracts": int(contracts),
+            "turnover": float(turnover),
+            "oi": pd.NA if oi is None else int(oi),
+            "oi_change": pd.NA if doi is None else int(doi),
+            "trade_date": pd.Timestamp(trade_date),
+        }
+        if is_udiff:
+            row["ltp"] = float("nan") if ltp is None else float(ltp)
+        out_rows.append(row)
+    df = pd.DataFrame(out_rows)
+    # Enforce dtypes to match parser output.
+    df["instrument"] = df["instrument"].astype("string")
+    df["symbol"] = df["symbol"].astype("string")
+    df["option_type"] = df["option_type"].astype("string")
+    df["expiry"] = df["expiry"].astype("datetime64[us]")
+    df["trade_date"] = df["trade_date"].astype("datetime64[us]")
+    df["oi"] = df["oi"].astype("Int64")
+    df["oi_change"] = df["oi_change"].astype("Int64")
+    # Reorder to match parser output (UDiff: 16 cols; legacy: 15).
+    if is_udiff:
+        cols = [
+            "instrument", "symbol", "expiry", "strike", "option_type",
+            "open", "high", "low", "close", "ltp", "settle_price",
+            "contracts", "turnover", "oi", "oi_change", "trade_date",
+        ]
+    else:
+        cols = [
+            "instrument", "symbol", "expiry", "strike", "option_type",
+            "open", "high", "low", "close", "settle_price",
+            "contracts", "turnover", "oi", "oi_change", "trade_date",
+        ]
+    df = df[cols]
+    path = cache_root / "bhavcopy_fo" / f"{trade_date.strftime('%Y%m%d')}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)

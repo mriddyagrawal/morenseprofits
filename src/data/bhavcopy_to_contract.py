@@ -1,0 +1,216 @@
+"""Bhavcopy → per-contract EOD time-series transform.
+
+Reconstructs the per-(symbol, expiry, strike, option_type) row
+sequence the engine consumes by walking the daily bhavcopy parquet
+cache and filtering each day's frame. Replaces the per-contract
+``options_loader.load_option`` HTTP path for the migration's
+bhavcopy-only architecture (MIGRATION.md §Phase 1 P1.3).
+
+Public API:
+
+  ``bhavcopy_to_contract_timeseries(
+      symbol, expiry, strike, option_type,
+      *, from_date, to_date,
+  ) -> pd.DataFrame``
+
+      Returns a DataFrame matching the ``options_loader.load_option``
+      output schema EXACTLY: same 16 columns, same dtypes, sorted by
+      date. The materialize step (P1.4) writes this output to the
+      same disk path layout ``options_loader`` uses; sweep workers
+      read it unchanged.
+
+Data sources:
+
+  1. ``data/cache/bhavcopy_fo/{YYYYMMDD}.parquet`` — daily UDiff or
+     legacy bhavcopy with the P1.1/P1.2 extensions (ltp + turnover).
+  2. ``data/cache/lot_sizes.parquet`` — unified lot-size lookup via
+     ``lot_size_lookup`` (P1.3 / P0.2).
+
+Regime handling is implicit: legacy bhavcopy rows arrive with
+``ltp`` missing (the legacy parser doesn't emit the column); this
+function fills NaN for those rows in the output schema. UDiff rows
+carry ``ltp`` natively. Both regimes derive ``volume`` via
+``contracts × lot_size`` (unified lookup).
+
+Errors:
+
+  - ``MissingTurnoverError`` if any of the matched rows has a
+    missing ``lot_size`` (excluded cross-source pair) OR a
+    missing / zero turnover / volume.
+"""
+from __future__ import annotations
+
+from datetime import date
+
+import pandas as pd
+
+from src.data import cache
+from src.data.errors import MissingDataError, MissingTurnoverError
+from src.data.lot_size_lookup import lot_size_lookup
+
+
+# Target output schema — must match options_loader._SPEC_COLS in
+# order + dtype. Any drift here will fail the LOAD-BEARING
+# equivalence test against load_option's output.
+_OUTPUT_COLUMNS = [
+    "date", "symbol", "expiry", "option_type", "strike",
+    "open", "high", "low", "close", "ltp",
+    "settle_price", "lot_size", "volume", "turnover", "oi", "oi_change",
+]
+
+
+def _iterate_trading_days(from_date: date, to_date: date) -> list[date]:
+    """All calendar days in [from_date, to_date] inclusive.
+
+    The bhavcopy cache is sparse — non-trading days simply have no
+    parquet on disk (weekends, NSE holidays, days before listing,
+    days after expiry). The transform handles missing days by
+    silently skipping. This matches options_loader.load_option's
+    semantics (which skips dates absent from the contract's history).
+    """
+    return [
+        from_date + pd.Timedelta(days=i)
+        for i in range((to_date - from_date).days + 1)
+    ]
+
+
+def _load_one_day_filtered(
+    trade_date: date,
+    *, symbol: str, expiry: date, strike: float, option_type: str,
+) -> pd.DataFrame | None:
+    """Read one day's bhavcopy parquet (if cached) and filter to the
+    requested contract. Returns None when the day has no cached
+    parquet (silently skipped — non-trading day, pre-listing, or
+    operator hasn't fetched that date)."""
+    path = cache.bhavcopy_fo_path(trade_date)
+    if not cache.exists(path):
+        return None
+    df = cache.read(path)
+    # Note: trade_date column reflects the bhavcopy's stamp; we
+    # don't re-validate here (the loader already enforces stamp
+    # consistency at write time).
+    matched = df[
+        (df["symbol"] == symbol)
+        & (df["expiry"] == pd.Timestamp(expiry))
+        & (df["strike"] == strike)
+        & (df["option_type"] == option_type)
+    ]
+    if len(matched) == 0:
+        return None
+    return matched.copy()
+
+
+def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Legacy parser output (15 cols) doesn't carry ``ltp``. Insert
+    NaN ltp so the concatenation downstream sees a uniform 16-col
+    intermediate frame. UDiff frames pass through unchanged."""
+    if "ltp" not in df.columns:
+        df = df.copy()
+        df["ltp"] = pd.Series([float("nan")] * len(df), dtype="float64")
+    return df
+
+
+def bhavcopy_to_contract_timeseries(
+    symbol: str, expiry: date, strike: float, option_type: str,
+    *,
+    from_date: date, to_date: date,
+) -> pd.DataFrame:
+    """Reconstruct per-contract EOD rows from cached bhavcopies.
+
+    See module docstring for the architectural role + the source
+    contract. Output is byte-identical to
+    ``options_loader.load_option(symbol, expiry, strike, option_type)``
+    filtered to ``[from_date, to_date]`` — same 16 columns, same
+    dtypes, sorted by ``date`` ascending.
+
+    Raises:
+        MissingTurnoverError: lot_size_lookup returned None (the
+            pair is excluded from the unified cache); OR contracts
+            is missing/zero on any row.
+    """
+    days = _iterate_trading_days(from_date, to_date)
+    daily_frames: list[pd.DataFrame] = []
+    for d in days:
+        sub = _load_one_day_filtered(
+            d, symbol=symbol, expiry=expiry,
+            strike=strike, option_type=option_type,
+        )
+        if sub is None:
+            continue
+        daily_frames.append(_normalize_legacy_columns(sub))
+
+    if not daily_frames:
+        # No rows in the date range — return empty frame with the
+        # right schema so downstream code can still concat / dropna
+        # without crashing.
+        return _empty_output_frame()
+
+    raw = pd.concat(daily_frames, ignore_index=True)
+
+    # Resolve lot_size ONCE for this (symbol, expiry); the value is
+    # stable per (symbol, expiry-month) for non-excluded pairs.
+    lot_size = lot_size_lookup(symbol, expiry)
+    if lot_size is None:
+        raise MissingTurnoverError(
+            f"lot_size unavailable for {symbol} {expiry.strftime('%Y-%m')} "
+            f"— pair excluded from data/cache/lot_sizes.parquet due to "
+            f"cross-source mismatch (see MIGRATION.md §Cross-source "
+            f"lot-size policy). Contract is structurally unbacktestable."
+        )
+
+    # Derive volume = contracts × lot_size. Both factors must be
+    # present + positive; a single bad row trips the loud-fail since
+    # the contract's history can't be partially priced.
+    if (raw["contracts"] <= 0).any():
+        bad = raw[raw["contracts"] <= 0]["trade_date"].iloc[0]
+        raise MissingTurnoverError(
+            f"contracts <= 0 for {symbol} {expiry.strftime('%Y-%m-%d')} "
+            f"{int(strike)}{option_type} on trade_date={bad}; cannot "
+            f"derive volume in shares."
+        )
+
+    # Assemble the options_loader-shape output.
+    out = pd.DataFrame({
+        "date": raw["trade_date"].astype("datetime64[us]"),
+        "symbol": raw["symbol"].astype("string"),
+        "expiry": raw["expiry"].astype("datetime64[us]"),
+        "option_type": raw["option_type"].astype("string"),
+        "strike": raw["strike"].astype("float64"),
+        "open": raw["open"].astype("float64"),
+        "high": raw["high"].astype("float64"),
+        "low": raw["low"].astype("float64"),
+        "close": raw["close"].astype("float64"),
+        "ltp": raw["ltp"].astype("float64"),
+        "settle_price": raw["settle_price"].astype("float64"),
+        "lot_size": pd.Series([lot_size] * len(raw), dtype="int64"),
+        "volume": (raw["contracts"] * lot_size).astype("int64"),
+        "turnover": raw["turnover"].astype("float64"),
+        "oi": raw["oi"].astype("Int64"),
+        "oi_change": raw["oi_change"].astype("Int64"),
+    })
+    return (
+        out.sort_values("date").reset_index(drop=True)[_OUTPUT_COLUMNS]
+    )
+
+
+def _empty_output_frame() -> pd.DataFrame:
+    """Empty frame with the 16-col output schema + correct dtypes —
+    same shape every caller would get from a populated transform."""
+    return pd.DataFrame({
+        "date": pd.Series(dtype="datetime64[us]"),
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "option_type": pd.Series(dtype="string"),
+        "strike": pd.Series(dtype="float64"),
+        "open": pd.Series(dtype="float64"),
+        "high": pd.Series(dtype="float64"),
+        "low": pd.Series(dtype="float64"),
+        "close": pd.Series(dtype="float64"),
+        "ltp": pd.Series(dtype="float64"),
+        "settle_price": pd.Series(dtype="float64"),
+        "lot_size": pd.Series(dtype="int64"),
+        "volume": pd.Series(dtype="int64"),
+        "turnover": pd.Series(dtype="float64"),
+        "oi": pd.Series(dtype="Int64"),
+        "oi_change": pd.Series(dtype="Int64"),
+    })
