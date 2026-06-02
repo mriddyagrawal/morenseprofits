@@ -16216,3 +16216,195 @@ The MIGRATION.md doc is the authoritative reference for whoever picks up the imp
 Standing by for P0.1 or the heatmap branch update.
 
 ---
+
+## Review of 9b6c32b — `docs(migration.unified_lot_size_arch)` — REVIEWER-REQUESTED architectural refactor audit
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** Substantive architectural refactor (~178 LOC added, ~98 removed). The unified-cache architecture is materially cleaner than the segmented sidecar+per-row approach. Phase 2 collapse is sound. Bhavcopy-cache schema decision verified safe via grep at 3 call sites. Five small grills — all framing/documentation tightening, no analytical errors. BUILDER's 6 audit asks systematically addressed below.
+
+### Audit #1 — Unified-cache cleaner than segmented? Edge cases?
+
+**Cleaner: YES.** Concrete wins:
+
+1. **No UDiff-vs-legacy branching in `bhavcopy_to_contract_timeseries`** — P1.3 transform calls one `lot_size_lookup(symbol, expiry)` for ALL rows regardless of regime. The old plan had explicit regime branching in the transform.
+2. **Lot_size storage deduplicated** — was per-bhavcopy-row (lot_size duplicated across ~60-90 EOD days per contract); now per-(symbol, expiry) once.
+3. **Single source-of-truth interface** — any future consumer that needs lot_size goes through one lookup, regardless of whether the underlying data came from sidecar or bhavcopy.
+4. **Cross-source validation surfaces NSE corporate-action divergence** — if sidecar and bhavcopy disagree on a `(symbol, expiry)` lot_size, the build script raises rather than silently picking one.
+
+**Edge cases analyzed**:
+
+- **(a) Same `(symbol, expiry)` in 2 different sidecars with mismatched lot_size** — see Grill #1 below; doc names sidecar-vs-bhavcopy but not sidecar-vs-sidecar.
+- **(b) `(symbol, expiry)` not in either source** — lookup returns None; transform's behavior not explicitly named. Likely produces NaN volume, which downstream becomes a skip. Acceptable but worth a one-line note.
+- **(c) Lot-size revision mid-cycle from corporate actions** — see Grill #4 below; unified cache schema has no date dimension.
+- **(d) First prefetch on fresh clone — circular dependency?** No: build script runs in step 0b AFTER bhavcopies are cached in 0a. Sequence handled correctly.
+- **(e) Build-script source priority** — `source` column tracks `{"sidecar", "bhavcopy", "both"}`; same value in both → "both"; one source only → that label. ✓
+
+**Verdict on #1**: unified cache is materially cleaner. Edge cases (a) + (c) need framing tightening (see grills below).
+
+### Audit #2 — Cross-source mismatch policy + console surface — right discipline?
+
+**Loud-fail via `CrossSourceLotSizeMismatchError`**: matches the project's error-handling discipline (`IlliquidLegError` / `MissingDataError` / `OfflineCacheMiss` precedent). Silent data drift is the worst failure mode; surfacing it loud forces investigation rather than wrong-answer. ✓
+
+**Console surfacing** under `=== Cross-source lot-size verification ===` header: appropriate for v1. Matches the prefetch script's existing console-output structure.
+
+**Trade-off vs structured artifact** (e.g., `data/cache/lot_size_build_report.json`):
+- Console: immediately visible during prefetch; matches operator workflow.
+- JSON: persists across runs, diffable, could be exposed by an MCP tool (like the existing `skip_summary` artifact-driven pattern).
+
+For v1, console is right — over-engineering JSON for a one-time bootstrap step. Future-extension path: if operators want MCP-accessible verification state, wrap the build into a structured report. Worth a docs note (not a grill).
+
+**Verdict on #2**: loud-fail + console is the right v1 policy. Future-extension to artifact-based reporting if MCP tooling demands it.
+
+### Audit #3 — Bhavcopy-cache schema (NO lot_size per row) — break downstream consumers?
+
+**Verified via grep** (`grep -rn "bhavcopy_fo\|load_bhavcopy_fo" src/` → 3 consumer files):
+
+| Consumer | What it reads from bhavcopy | Uses `lot_size`? |
+|---|---|---|
+| `src/strategies/_strikes.py:45-58` | symbol, instrument, expiry, option_type, strike | **NO** |
+| `src/mcp/spot_options.py:268-300` (`get_options_chain_impl`) | symbol, instrument, option_type, expiry, strike, open, high, low, close, settle_price, contracts, oi | **NO** |
+| `src/data/expiry_calendar.py:80` | (expiry lookup; doesn't touch lot_size) | **NO** |
+
+The OTHER call to `r["lot_size"]` I initially flagged (`spot_options.py:197`) is in `get_option_series_impl`, which reads from the **per-contract** cache (16-col schema with lot_size), NOT the bhavcopy parquet. After the migration, per-contract parquets are materialized from bhavcopy + unified lookup; the per-contract schema stays the same. ✓
+
+**Verdict on #3**: bhavcopy-cache schema decision is safe. NO downstream consumer accesses `lot_size` from the bhavcopy parquet today. The decision is verified consistent with the existing codebase.
+
+### Audit #4 — Phase 2 collapse — unified-cache load-bearing at every step?
+
+Old Phase 2 had 6 sub-commits (P2.1-P2.6) with a standalone `nse_fo_contract_loader.py`. New Phase 2 has 4 sub-commits (P2.1-P2.4) with the standalone loader subsumed by P0.2's build script.
+
+**Sequence verification**:
+- P0.2 wires into prefetch BEFORE the materialize loop ("Step 0a fetch bhavcopies. Step 0b build lot_sizes parquet. Step 1+ materialize.").
+- The unified cache covers BOTH regime B (sidecar) and regime C (bhavcopy NewBrdLotQty).
+- P2.1 (extended regime B window) just calls prefetch with a wider date range; the materialize step uses the same unified lookup; no separate regime-B materialize logic needed.
+
+**Load-bearing assumption holds**:
+- Contract only-in-regime-B (expires before Jul 8 2024): sidecar is the source. ✓
+- Contract only-in-regime-C (starts after Jul 8 2024): bhavcopy is the source. ✓
+- Contract spans regime B + C (lists before Jul 8 2024, expires after): BOTH sources contribute; cross-source mismatch check catches NSE corporate-action divergence. ✓
+
+**Verdict on #4**: Phase 2 collapse is sound. The unified-cache assumption holds at every step. The simplification is genuine (6 commits → 4).
+
+### Audit #5 — "Deferred universe expansion" framing — right to defer?
+
+**Compounding-cost math**:
+- Current: 50 syms × ~13 strikes (DEFAULT_STRIKES_PER_SIDE=6 + ATM) = 650 contracts per cell.
+- New (all-strikes): 50 syms × ~30-100 strikes per type × 2 types = ~3,000-10,000 contracts. ~3-5× growth ✓ (already named in Grill #6 from e0bc85a).
+- Expanded universe (204 syms × all-strikes): ~12-20× total cache growth + ~4× sweep compute.
+
+Math is approximate but defensible. The "defer expansion" recommendation avoids:
+- Disk overrun risk
+- Sweep compute overrun risk
+- Confounding "migration broken" vs "expansion broken" if smoke fails
+
+**Honest framing**: "this is a SCOPE decision, not a CAPABILITY question — and explicitly NOT a goal of this migration." Right to defer. The capability claim ("bhavcopy carries ~204 symbols, expansion is zero-extra-fetch-cost") is accurate per the audit #3 fixture verification.
+
+**Verdict on #5**: right to defer. Compounding-cost analysis honest. Operator can revisit after Phase 1 smoke confirms.
+
+### Audit #6 — Auto-build trigger semantics: silent rebuild OK, mismatch loud enough?
+
+**Silent rebuild on missing parquet**: matches operator's "no prompt; just work" preference. The `--rebuild-lot-sizes` flag handles explicit refresh.
+
+**Mismatch surfacing inside silent build**: build script raises `CrossSourceLotSizeMismatchError` → exits non-zero. Prefetch run sees the error in its console output under the verification header.
+
+**Implicit assumption I want to flag**: if the build script exits non-zero on mismatch, does `prefetch_universe.py` HALT (don't continue with materialize)? Or does it continue (eventually crashing at the missing lookup)? The doc doesn't explicitly name this. See Grill #5 below.
+
+**Verdict on #6**: silent-rebuild + loud-fail-on-mismatch is the right shape. One framing tightening on error propagation (Grill #5).
+
+### Grill #1 (small, edge case): sidecar-vs-sidecar mismatch policy not named
+
+The `§Cross-source lot-size policy` covers Sidecar-vs-Bhavcopy mismatches but doesn't explicitly address Sidecar-vs-Sidecar. The 4 NSE_FO_contract snapshots can both contain the same `(symbol, expiry)` pair (e.g., PNB Jun 2024 in Apr-16 + May-16 + Jun-12 snapshots). What if those 4 snapshots disagree on `lot_size` for the same `(symbol, expiry)`?
+
+Three possible policies the doc doesn't name:
+- **(a) Loud-fail on sidecar-vs-sidecar mismatch** — same discipline as cross-source. Most consistent.
+- **(b) Earliest-wins** — use the lot_size from the earliest snapshot listing this `(symbol, expiry)`. Reasonable if NSE never revises.
+- **(c) Latest-wins** — use the lot_size from the latest snapshot.
+
+I'd recommend (a) — same discipline. The cross-source mismatch policy framing already names "silent data drift is the worst failure mode."
+
+**Fix**: add one sentence to §Cross-source lot-size policy: "The same loud-fail discipline applies to sidecar-vs-sidecar mismatches across the 4 NSE_FO_contract snapshots — any `(symbol, expiry)` pair with different lot_sizes across snapshots raises `CrossSourceLotSizeMismatchError` naming both snapshot files."
+
+### Grill #2 (small, happy-path surfacing): build script should print verification header on success too
+
+The `=== Cross-source lot-size verification ===` header is described as surfacing mismatches. What about the happy path? If the build runs cleanly and no mismatches surface, the operator can't tell verification actually ran without the header.
+
+**Fix**: amend P0.2 to print the verification header + a success summary even on happy path: e.g., `=== Cross-source lot-size verification ===\n  Verified N (symbol, expiry) pairs across 4 sidecars + M bhavcopies. No mismatches.\n`. This gives the operator confirmation that the verification step ran AND tells them the scale of what was checked.
+
+Without this, a silent success is indistinguishable from "build script didn't run."
+
+### Grill #3 (small, future-proof): document the lot_size-not-in-bhavcopy decision in `bhavcopy_fo_loader.py` module docstring
+
+The bhavcopy-cache schema decision is verified safe TODAY (no current downstream uses `r["lot_size"]` from a bhavcopy row). But a future consumer might reach for it expecting it to be there.
+
+**Fix**: amend P1.1's "parse_udiff +2 cols" entry to require updating `src/data/bhavcopy_fo_loader.py`'s module docstring to explicitly say:
+
+> Output schema is intentionally narrow — `lot_size` is NOT carried per row. Consumers needing lot_size should call `src.data.lot_size_lookup(symbol, expiry)` against the unified `data/cache/lot_sizes.parquet` instead. Rationale: lot_size is per-(symbol, expiry) stable; per-row storage duplicates ~60-90 days of repeated values. See MIGRATION.md §Cross-source lot-size policy.
+
+This prevents a future maintainer from "fixing" the missing column.
+
+### Grill #4 (small, corporate-action limitation): no date dimension in unified cache
+
+The unified cache schema is `(symbol, expiry, lot_size, source)`. If NSE issues a corporate action that changes lot_size mid-cycle (rare for already-listed contracts, but possible for bonus issues / splits), the cache can't represent both pre-action and post-action values for the same `(symbol, expiry)`.
+
+In practice this would fire as a cross-source mismatch (Apr snapshot has old size; May snapshot has new size). The mismatch raises → operator investigates → manually reconciles.
+
+**Fix**: add a one-line note in §Cross-source lot-size policy: "**Limitation**: the unified cache assumes lot_size is stable per `(symbol, expiry)`. Mid-cycle corporate actions (bonus/split adjustments) that revise lot_size within a contract's life would surface as cross-source mismatches. Resolution: manual reconciliation by the operator (typically choose the post-revision value per NSE's circular and split the contract's history at the revision date). This is a known limitation, not a defect."
+
+### Grill #5 (small, error propagation): does prefetch halt on build-script failure?
+
+The cross-source mismatch policy says the build raises and exits non-zero. The prefetch script invokes the build. Does prefetch HALT on the non-zero exit, or does it continue (eventually crashing at the materialize step)?
+
+For operator clarity: prefetch should HALT. Continuing without a unified lot_sizes parquet would produce ambiguous downstream failures (missing lookup in transform → NaN volume → skip cells with mis-attributed reasons).
+
+**Fix**: amend P0.2's prefetch-integration wiring to specify: "If `build_lot_size_parquet()` exits non-zero (e.g., `CrossSourceLotSizeMismatchError`), `prefetch_universe.py` HALTS with a clear error message naming the failure mode and the cache state. No materialize step runs. Operator must reconcile the mismatch (or pass `--skip-lot-size-verification` for an explicit override — though that bypasses the safety net)."
+
+The `--skip-lot-size-verification` flag is optional; for v1 the halt-on-failure default is enough.
+
+### Praises
+
+- **Unified-cache architecture is materially cleaner** at the transform + storage layer.
+- **Cross-source mismatch policy matches project discipline** — loud-fail consistent with `IlliquidLegError` / `MissingDataError` precedent.
+- **Phase 2 collapse (6 → 4 sub-commits)** removes the standalone sidecar loader cleanly. Sequence dependencies verified.
+- **Bhavcopy-cache schema decision verified safe** via grep at 3 call sites (`_strikes.py`, `spot_options.py`, `expiry_calendar.py`). No downstream breakage.
+- **Architectural target diagram updated** to show the unified cache flow. Operator-readable.
+- **Re-run discipline note** ("`rm -rf data/cache/` wipes everything; `data/manual/` survives") is the right operator-facing UX detail.
+- **Auto-build trigger semantics** are reasonable (silent on happy path; loud on mismatch).
+- **Deferred universe expansion** framed honestly (capability vs scope distinction).
+- **Bhavcopy-cache schema rationale named explicitly** ("lot_size is per-(symbol, expiry) stable; per-row storage duplicates ~60-90 days"). Anti-confusion docs for future maintainers.
+- **Source column** (`{"sidecar", "bhavcopy", "both"}`) is the right level of provenance tracking — diff-able at v2 if cross-source patterns shift over time.
+
+### Behavior delta
+
+None. Pure planning doc.
+
+### Math
+
+No test count change (docs-only). The plan adds 3 new P0.2 LOAD-BEARING tests + 1 renamed P2.1 test, removes 1 P2.1 standalone-sidecar test.
+
+### Open grills (after this commit) — all in MIGRATION.md
+
+1. **Grill #1** (small): sidecar-vs-sidecar mismatch policy not named.
+2. **Grill #2** (small): build script should print verification header on success too.
+3. **Grill #3** (small): document the no-lot_size-in-bhavcopy decision in `bhavcopy_fo_loader.py` module docstring (P1.1).
+4. **Grill #4** (small): no date dimension in unified cache — note corporate-action limitation.
+5. **Grill #5** (small): specify prefetch halts on build-script failure.
+
+All five framing/documentation tightening. Single tiny `fix(docs.migration.unified_lookup_calibration)` commit closes them.
+
+### MCP arc state
+
+Unchanged at 16/16. Phase-7/Phase-data architectural execution plan.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(docs.migration.unified_lookup_calibration)`** — close the 5 grills (~10-15 lines combined in MIGRATION.md).
+2. **Then P0.1 fixture commit** (operator action: commit the 4 NSE_FO_contract files + README + .gitignore update).
+3. **Then P0.2** (`feat(scripts.build_lot_size_parquet)`).
+4. **(operator-driven, parallel)** heatmap click-test outcome on `heatmap-click-scatter-owns-interactivity` branch.
+
+The MIGRATION.md doc is now the load-bearing spec for the entire Phase 0 → Phase 2 implementation. The 5 small grills don't block P0.1 but should land before P0.2 starts so the build-script behavior is fully specified.
+
+Standing by.
+
+---
