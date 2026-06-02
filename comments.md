@@ -16408,3 +16408,60 @@ The MIGRATION.md doc is now the load-bearing spec for the entire Phase 0 → Pha
 Standing by.
 
 ---
+
+## Review of 3970ccf — `fix(docs.migration.unified_lookup_calibration)`
+
+**Verdict: ✅ ACCEPT.** All 5 grills closed exactly as recommended. No scope creep, no new framing introduced. Open grill list empty.
+
+### Grill closures (all 5 from 4e521ec)
+
+| Grill | Recommended fix | Actually landed | Closed? |
+|---|---|---|---|
+| #1 (sidecar-vs-sidecar) | "same loud-fail discipline applies sidecar-vs-sidecar; raise CrossSourceLotSizeMismatchError naming both snapshot files" | Verbatim addition + concrete example (PNB Jun 2024 in 3 snapshots) | ✓ |
+| #2 (happy-path verification header) | Header + success summary on EVERY run; "Verified N pairs across 4 sidecars + M bhavcopies. No mismatches." | Verbatim success message + explicit rationale | ✓ |
+| #3 (anti-confusion docstring) | Update `bhavcopy_fo_loader.py` module docstring naming the no-lot_size decision | Dedicated "Anti-confusion docstring" sub-section in P1.1 with the recommended docstring text | ✓ |
+| #4 (no date dimension) | One-line limitation note in §Cross-source lot-size policy | "Limitation: no date dimension in unified cache" paragraph naming corporate-action scenario + manual reconciliation path | ✓ |
+| #5 (prefetch halt-on-failure) | Specify prefetch halts; no materialize step runs | Verbatim halt-with-clear-error spec + names the ambiguous-downstream-failure scenario | ✓ |
+
+### Notable bonus
+
+The Grill #5 fix paraphrases my exact "ambiguous downstream failures (missing lookup in transform → NaN volume → cells skipped with mis-attributed reasons)" framing — same words, surfacing why the halt-on-failure is the right discipline. That's the kind of cross-side cite that shows the BUILDER read the grill body, not just the headline. Same pattern observed on the prior `bottom_alpha_mean` and `phantom_fill_band` fixes.
+
+### Praises
+
+- **Five grills closed in a single tiny commit** (~21 LOC change). Bundled disciplined.
+- **No code changes; pure docs**. The spec is fully nailed down before any of P0.1/P0.2 implementation work starts — exactly the "land architectural agreement BEFORE writing the code" cadence the BUILDER established for this saga.
+- **Each grill's fix names the reviewer's grill #** ("per reviewer grill #1 on 9b6c32b", etc.). Provenance trail intact across the calibration chain.
+- **The `--skip-lot-size-verification` flag** is mentioned but explicitly excluded from v1 ("not part of v1 acceptance — operator can add it if a need arises"). Honest scope discipline; doesn't promise future flexibility that may never materialize.
+- **Concrete examples** in the sidecar-vs-sidecar grill ("PNB Jun 2024 in Apr-16 + May-16 + Jun-12") give the reader a load-bearing reference point.
+
+### Behavior delta
+
+None. Pure docs.
+
+### Math
+
+No test count change (docs-only).
+
+### Open grills
+
+**Empty.** All 5 grills closed cleanly. MIGRATION.md is now the fully-specified spec for P0.1 → P2.4 implementation.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+Operator-driven from here:
+
+1. **P0.1 fixture commit** (operator action: commit the 4 NSE_FO_contract `.csv.gz` files + README + `.gitignore` update). Kicks off Phase 0.
+2. **P0.2** (`feat(scripts.build_lot_size_parquet)`) — implements the now-fully-specified build script + prefetch integration.
+3. **Then P1.1** (parse_udiff extension + the anti-confusion docstring landing).
+4. **(operator-driven, parallel)** heatmap click-test outcome on `heatmap-click-scatter-owns-interactivity` branch.
+
+The MIGRATION.md doc is operator-ready as the implementation spec.
+
+Standing by.
+
+---
