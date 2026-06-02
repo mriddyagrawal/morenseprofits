@@ -15740,3 +15740,70 @@ In priority order:
 Standing by for the calibration fix or the architectural decisions.
 
 ---
+
+## Review of b6d3185 — `fix(docs.data_products.calibration)`
+
+**Verdict: ✅ ACCEPT.** All 3 of my 77990ef grills closed cleanly + (b)+(d) compositionality insight added beyond ask + grep-the-code discipline applied preemptively per the memory loop. No grills.
+
+### Grill #1 fix (500× quantitative overstatement) — CLOSED
+
+Source 3 cost line now names BOTH numbers:
+- Production: 50 × 25 × 26 = 32,500 requests → **~130× reduction**
+- Stress: 50 × 25 × 100 = 125,000 requests → **~500× reduction**
+
+`DEFAULT_STRIKES_PER_SIDE = 6` from `scripts/prefetch_universe.py:61` cited explicitly. Qualitative framing ("2-3 orders of magnitude less NSE WAF pressure") preserved across the range. D1 headline + D4 cons line both updated consistently. Math verified: 32500/250=130 ✓; 125000/250=500 ✓.
+
+### Grill #2 fix (D1 missing hybrid options) — CLOSED + bonus
+
+D1's binary expanded to 4 explicit options:
+- **(a)** Kill
+- **(b)** Keep — cache-warming on demand
+- **(c)** Keep — lazy transform, no pre-cache
+- **(d)** Keep — deprecated, edge-case audits only
+
+Plus an insight the BUILDER added beyond my grill: **"These aren't mutually exclusive — (b) + (d) compose cleanly if you want both a precise rescue layer AND deprecation framing."** That's the right architectural framing — (b) names the trigger semantics, (d) names the policy posture, and they layer.
+
+### Grill #3 fix (D3 downstream name) — CLOSED
+
+D3 now names the specific downstream consumer with file:line citations:
+- `src/mcp/spot_options.py:126` — schema field where `ltp` is declared
+- `src/mcp/spot_options.py:195` — dict construction where `ltp` is emitted
+
+D3 also specifies the caveat trigger: "ANY row in the returned chain is from a legacy-bhavcopy trade date, naming the `ltp` field specifically." Operator-actionable.
+
+### Memory-loop verification
+
+Commit body states: "Verified both grill-#1 and grill-#3 by direct grep of the cited files before editing — `DEFAULT_STRIKES_PER_SIDE = 6` confirmed at prefetch_universe.py:61, and `ltp` confirmed at spot_options.py:126 + :195."
+
+This is the SECOND docs commit in a row where the BUILDER applies the `feedback-grep-code-before-accepting-calibration` discipline rule preemptively at write time (the first was 4665611, where they confirmed all dimension names against the live Literal). The pattern-prevention loop sticks across multiple commits — that's compound value from the memory update.
+
+### Behavior delta
+
+None. Pure docs. No code, no tests touched.
+
+### Math
+
+No test deltas. Doc-only.
+
+### Open grills
+
+**Empty.** All three 77990ef grills closed cleanly.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+Operator-driven from here. The standing 4 actions:
+
+1. **Verify FAOP61157.pdf content** matches the regime-A→B cutover framing (2024-04-15). Operator's read needed; I can't verify PDFs from inside the repo.
+2. **Capture Source 6 URL** (`NSE_FO_contract_DDMMYY.csv.gz`) from `https://www.nseindia.com/all-reports-derivatives` if regime B coverage is wanted.
+3. **Make D1/D2/D3/D4 calls** to unblock the implementation work (parser extensions + transform).
+4. **Heatmap click-test** outcome on the `heatmap-click-scatter-owns-interactivity` branch (carry-over from 645db12) — independent track.
+
+The DATA_PRODUCTS.md doc is ready as the architectural reference for whichever direction the operator picks.
+
+Standing by.
+
+---
