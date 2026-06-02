@@ -310,18 +310,48 @@ turnover vs other reasons.
    line 322-326).
 2. In `_pick_fill_price` ([pnl.py:198-216](src/engine/pnl.py#L198-L216)),
    strip the `if vwap is None: fill_px = close` graceful-degrade
-   branch. Replace with:
+   branch and replace it with case-disambiguated logic.
+   `_compute_vwap` at [pnl.py:92-128](src/engine/pnl.py#L92-L128) can
+   return None for THREE structurally distinct reasons:
+
+   - **(1)** turnover/volume missing or zero
+   - **(2)** NaN turnover
+   - **(3)** deep-OTM ill-conditioning — turnover IS present + non-
+     NaN; recovered premium goes negative due to lakh-rounding
+     amplification at premium ≪ strike
+
+   Operator's "skip when turnover missing" instruction names cases
+   (1) + (2). Case (3) is the 8c2c517 design intent ("Deep-OTM
+   numerical ill-conditioning — recovered premium went nonsensical
+   because turnover rounding is comparable to the actual residual.
+   Fall through to close.") and must be preserved as a working
+   pricing path, not a skip.
+
+   Distinguish at the call site by checking data presence:
+
    ```python
    if vwap is None:
-       raise MissingTurnoverError(
-           f"{context}: turnover missing on {target}; cannot recover "
-           f"premium VWAP. close={close:.2f}, strike={strike}, "
-           f"volume={volume}."
+       data_present = (
+           turnover is not None and not pd.isna(turnover)
+           and volume is not None and volume > 0
+           and strike is not None
        )
+       if data_present:
+           # Case (3) — deep-OTM ill-conditioning. Fall through to
+           # close per 8c2c517 design; not a missing-data signal.
+           fill_px = close
+       else:
+           # Cases (1) + (2) — turnover/volume genuinely missing.
+           raise MissingTurnoverError(
+               f"{context}: turnover missing on {target}; cannot "
+               f"recover premium VWAP. close={close:.2f}, "
+               f"strike={strike}, volume={volume}, turnover={turnover}."
+           )
    ```
-   Engine path: raise → sweeper catches via `_SKIPPABLE_ERRORS` →
-   skip parquet row with `skip_reason="MissingTurnoverError"`,
-   `skip_detail` carrying the context string.
+   Engine path for cases (1) + (2): raise → sweeper catches via
+   `_SKIPPABLE_ERRORS` → skip parquet row with
+   `skip_reason="MissingTurnoverError"`, `skip_detail` carrying the
+   context string. Engine path for case (3): unchanged from 8c2c517.
 
 3. NO change needed in:
    - `sweeper.py` — `MissingTurnoverError` is a `MissingDataError`,
@@ -341,9 +371,19 @@ turnover vs other reasons.
   hand-curated row with `turnover=None`; assert
   `MissingTurnoverError` raised; assert it's still a
   `MissingDataError` subtype (so `_SKIPPABLE_ERRORS` catches it).
+- New test: `test_pick_fill_price_skips_when_turnover_is_nan` —
+  case (2): row with `turnover=float('nan')`; assert
+  `MissingTurnoverError` raised.
+- New test: `test_pick_fill_price_falls_back_to_close_on_deep_otm` —
+  case (3): row with VALID turnover but premium ≪ strike such that
+  recovered `premium_vwap ≤ 0`; assert NO exception; assert
+  `fill_px == close`. Pins the 8c2c517 design preservation.
 - New test: `test_sweep_records_missing_turnover_as_skip_reason` —
   run a 1-cell sweep with a no-turnover fixture; assert the skip
   parquet has a row with `skip_reason="MissingTurnoverError"`.
+- New test: `test_sweep_does_not_skip_on_deep_otm` — run a 1-cell
+  sweep with a deep-OTM ill-conditioned fixture; assert the cell
+  IS priced (using close) and does NOT appear in the skip parquet.
 
 **External-caller audit** (per reviewer grill #5 on e0bc85a):
 `_pick_fill_price` is called via `price_trade` from
@@ -483,8 +523,10 @@ PLAN.md history entry. Update DATA_PRODUCTS.md to mark the full 4-year window as
 | P1.1 | `test_parse_udiff_carries_ltp_lot_size_turnover` | Column-set contract for UDiff parser |
 | P1.2 | `test_parse_legacy_carries_turnover` | Turnover availability in legacy regime |
 | P1.3 | `test_bhavcopy_transform_matches_load_option_output` | Engine-equivalence check |
-| P1.7 | `test_pick_fill_price_skips_when_turnover_missing` | New MissingTurnoverError(MissingDataError) subtype; auto-skippable per _SKIPPABLE_ERRORS; distinct skip_reason |
+| P1.7 | `test_pick_fill_price_skips_when_turnover_missing` | New MissingTurnoverError(MissingDataError) subtype; auto-skippable per _SKIPPABLE_ERRORS; distinct skip_reason — cases (1) + (2) only |
+| P1.7 | `test_pick_fill_price_falls_back_to_close_on_deep_otm` | Pins 8c2c517 design intent — case (3) deep-OTM ill-conditioning is NOT a skip; falls through to close |
 | P1.7 | `test_sweep_records_missing_turnover_as_skip_reason` | End-to-end: sweep emits skip parquet row with named reason |
+| P1.7 | `test_sweep_does_not_skip_on_deep_otm` | End-to-end: deep-OTM cell IS priced, NOT in skip parquet |
 | P2.1 | `test_lot_size_lookup_against_4_snapshots` | Sidecar correctness |
 | P2.2 | `test_legacy_volume_derived_from_contracts_times_lotsize` | Volume derivation contract |
 | P2.4 | `test_get_options_chain_surfaces_legacy_ltp_caveat` | MCP caveat trigger |
