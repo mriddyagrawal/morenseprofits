@@ -16952,3 +16952,55 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of 8ab1f9d — `feat(prefetch.bhavcopy_first_mode)` — **P1.5**
+
+**Verdict: ✅ ACCEPT.** ~200-LOC integration commit + 105 LOC tests. Two pieces: `enumerate_contracts_from_bhavcopies` helper in `bhavcopy_to_contract.py` + `--engine-source` flag-driven branch in `prefetch_universe.py`. 4 new helper tests pin enumerate semantics. Default mode = `bhavcopy` per operator's D1 decision. No grills.
+
+### What landed
+
+- **`enumerate_contracts_from_bhavcopies(*, symbols, from_date, to_date, instrument_filter=("OPTSTK",))`** — new helper. Scans cached bhavcopies for the operator's symbol set, returns SORTED `list[tuple[symbol, expiry, strike, option_type]]`. Replaces strike_planner pre-enumeration; missing-day silent-skip semantic matches the transform.
+- **`--engine-source {bhavcopy, api}` flag** in `prefetch_universe.py`, default `bhavcopy`.
+- **Step 3 + 4 branch**: bhavcopy mode → enumerate + materialize loop with 3 skip buckets (`already-cached` / `MissingTurnoverError` / `other`); first 10 skip reasons printed for operator triage. Legacy api-mode preserved unchanged through the P1.6 smoke-gate cutover-validation window (to be removed in P1.8).
+
+### Verification
+
+- Tests pass: `tests/test_bhavcopy_to_contract.py` → 21 passed (17 prior + 4 new). ✓
+- Helper at `bhavcopy_to_contract.py:197`. ✓
+- Helper uses `sym.upper()` for case-insensitive matching; uses `instrument_set` (OPTSTK by default) to filter; defensively skips futures (`pd.isna(strike) or pd.isna(opt)`).
+
+### Praises
+
+- **Default `bhavcopy` matches operator's D1**. No flag required for the typical operator-side migration run; api-mode is opt-in for the cutover-validation comparison run.
+- **Cache-first idempotency wired before invoking materialize**: `target.exists() → n_already_cached += 1; continue`. Aligned with P1.4's `force=False` contract — no transform reinvocation on idempotent path. Operator sees the cache-hit count in the summary.
+- **Three-bucket skip categorization** in the materialize loop (`already-cached / MissingTurnoverError / other`) gives the operator a clean signal: cache-hits are expected, MissingTurnoverError-skips are the cross-source-excluded pairs (per the 101-mismatch finding from P0.2), `other` is the residual to triage. First-10-reasons print matches the same operator-triage pattern as the unified-cache verification output.
+- **`enumerate_contracts_from_bhavcopies` returns sorted tuples** for deterministic iteration order across runs. Important for sweep-determinism downstream.
+- **Defensive futures filter** (NaN-strike check) even though `instrument_filter=("OPTSTK",)` should have excluded them — belt-and-suspenders against a future schema drift.
+- **Bhavcopy scan window matches Step 2's bulk-fetch range** (`args.start → args.end`) so the bhavcopies on disk are exactly what enumerate scans. No window-mismatch race.
+- **MissingTurnoverError caught SEPARATELY from other MissingDataError** — even though they'd both flow through the same skip-with-reason machinery downstream, the named bucket lets the operator see the "lot-size excluded pair" count distinctly from "any other data gap."
+- **Integration testing for `main()` deferred honestly**: "the full flow depends on network-side fetches that aren't worth mocking out for v1." Argparse flag-parsing verified via direct ArgumentParser construction. Pre-existing argparse `%`-of-spot bug on `--help` (disclosed in P0.2 review) acknowledged.
+- **Helper tests cover the 4 right things**: dedup-across-days + symbol-filter + missing-day-silent-skip + case-insensitive-symbol. Each is the failure mode an operator would hit first.
+
+### Behavior delta
+
+- **Default prefetch path** now goes through bhavcopy materialize. The `api` legacy path is preserved but opt-in via `--engine-source api`.
+- **No engine changes**, no sweep changes. The materialize writes to the same cache.option_path that sweep workers read from.
+- **Step 3 + 4 in api-mode unchanged**, just headed by `[--engine-source api]` to disambiguate output.
+
+### Math
+
+`838 → 842 (+4 net)` per the body. Verified `21 passed` (17 prior + 4 new = 21).
+
+### Open grills
+
+**Empty.**
+
+### Next-commit suggestion
+
+P1.6 — operator-action smoke gate against the 4-stock universe (PNB, SBIN, BHEL, RELIANCE), 23-month regime C window. Acceptance criterion per the dce9a87 spec: absolute delta < 0.01 pp on cell-median ROI; per-trade backup criterion < 0.5 pp; **either failing halts before P1.7 strips graceful-degrade**. P1.6 is the LOAD-BEARING gate that validates the bhavcopy-derived data matches the API-derived results before the irreversible P1.7 lands.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 → P1.7 → P1.8 → P1.9 → P2.1 → ... → P2.4**.
+
+Standing by.
+
+---
