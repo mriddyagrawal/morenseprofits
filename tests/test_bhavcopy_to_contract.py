@@ -25,6 +25,7 @@ from src.data import cache
 from src.data.bhavcopy_to_contract import (
     _OUTPUT_COLUMNS,
     bhavcopy_to_contract_timeseries,
+    materialize_contract_from_bhavcopy,
 )
 from src.data.errors import MissingTurnoverError
 from src.data.lot_size_lookup import (
@@ -318,6 +319,149 @@ def test_transform_legacy_day_yields_nan_ltp(tmp_path):
     )
     assert len(df) == 1
     assert pd.isna(df.iloc[0]["ltp"])
+
+
+# ============================================================
+# materialize_contract_from_bhavcopy (P1.4)
+# ============================================================
+
+def test_materialize_writes_to_options_loader_path(tmp_path):
+    """LOAD-BEARING: materialize writes to the same disk path the
+    options_loader uses (``cache.option_path``). Sweep workers
+    read THIS path, so the bhavcopy-derived parquet has to land
+    there byte-identical to what options_loader.load_option would
+    have produced."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               100, 84000.0, 1000, 0)],
+        is_udiff=True,
+    )
+    expected_path = cache.option_path("PNB", pnb_exp, 100.0, "CE")
+    assert not expected_path.exists()
+
+    written = materialize_contract_from_bhavcopy(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+
+    assert written == expected_path
+    assert expected_path.exists()
+    df_on_disk = cache.read(expected_path)
+    assert list(df_on_disk.columns) == _OUTPUT_COLUMNS
+    assert len(df_on_disk) == 1
+    assert int(df_on_disk.iloc[0]["lot_size"]) == 8000
+    assert int(df_on_disk.iloc[0]["volume"]) == 100 * 8000
+
+
+def test_materialize_is_idempotent_without_force(tmp_path, monkeypatch):
+    """Second call with force=False is a no-op — does NOT re-invoke
+    the transform. Verified by monkeypatching the transform to
+    detect re-entry."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               100, 84000.0, 1000, 0)],
+        is_udiff=True,
+    )
+    materialize_contract_from_bhavcopy(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+
+    # Monkeypatch the transform to raise — if the second call doesn't
+    # short-circuit via the file-exists check, this raises.
+    import src.data.bhavcopy_to_contract as btc
+    sentinel = []
+    def _spy_transform(*args, **kwargs):
+        sentinel.append("called")
+        raise RuntimeError("transform was re-invoked on idempotent call")
+    monkeypatch.setattr(btc, "bhavcopy_to_contract_timeseries", _spy_transform)
+
+    # Second call should NOT trigger the transform.
+    materialize_contract_from_bhavcopy(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    assert sentinel == [], (
+        "idempotent call re-invoked the transform; the file-exists "
+        "short-circuit is broken"
+    )
+
+
+def test_materialize_force_true_rewrites(tmp_path):
+    """force=True rewrites unconditionally. Verified by mutating the
+    underlying bhavcopy day's contents and confirming the materialized
+    parquet picks up the new values after force=True."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               100, 84000.0, 1000, 0)],
+        is_udiff=True,
+    )
+    # First materialize.
+    materialize_contract_from_bhavcopy(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    path = cache.option_path("PNB", pnb_exp, 100.0, "CE")
+    first_close = cache.read(path).iloc[0]["close"]
+    assert first_close == 5.0
+
+    # Mutate the source bhavcopy: close → 6.5, contracts → 200.
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               6.0, 7.0, 5.5, 6.5, 6.55, 6.50,
+               200, 168000.0, 1100, 100)],
+        is_udiff=True,
+    )
+
+    # force=False would short-circuit; force=True rewrites.
+    materialize_contract_from_bhavcopy(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+        force=True,
+    )
+    refreshed = cache.read(path).iloc[0]
+    assert refreshed["close"] == 6.5
+    assert int(refreshed["volume"]) == 200 * 8000
+
+
+def test_materialize_propagates_missing_turnover_error_no_partial_file(tmp_path):
+    """When the transform raises MissingTurnoverError (e.g. on an
+    excluded (sym, expiry-month)), no partial parquet is written —
+    the caller can retry once the underlying data is fixed."""
+    pnb_exp = date(2024, 5, 30)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 5, 22),
+        rows=[("ABBOTINDIA", pnb_exp, 25000.0, "CE",
+               100.0, 110.0, 95.0, 105.0, 106.0, 105.5,
+               10, 100000.0, 50, 5)],
+        is_udiff=True,
+    )
+    expected_path = cache.option_path(
+        "ABBOTINDIA", pnb_exp, 25000.0, "CE",
+    )
+    with pytest.raises(MissingTurnoverError):
+        materialize_contract_from_bhavcopy(
+            "ABBOTINDIA", pnb_exp, 25000.0, "CE",
+            from_date=date(2024, 5, 22), to_date=date(2024, 5, 22),
+        )
+    assert not expected_path.exists(), (
+        "transform error path wrote a partial / empty file; the caller "
+        "can't distinguish 'first call failed' from 'cached empty result'"
+    )
 
 
 # ============================================================

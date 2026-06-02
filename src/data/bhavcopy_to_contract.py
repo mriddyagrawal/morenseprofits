@@ -41,11 +41,12 @@ Errors:
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 
 from src.data import cache
-from src.data.errors import MissingDataError, MissingTurnoverError
+from src.data.errors import MissingTurnoverError
 from src.data.lot_size_lookup import lot_size_lookup
 
 
@@ -191,6 +192,50 @@ def bhavcopy_to_contract_timeseries(
     return (
         out.sort_values("date").reset_index(drop=True)[_OUTPUT_COLUMNS]
     )
+
+
+def materialize_contract_from_bhavcopy(
+    symbol: str, expiry: date, strike: float, option_type: str,
+    *,
+    from_date: date, to_date: date,
+    force: bool = False,
+) -> Path:
+    """Build + persist a per-contract parquet at the SAME disk path
+    ``options_loader`` writes to (``cache.option_path``).
+
+    Wraps ``bhavcopy_to_contract_timeseries`` with disk-write
+    semantics. The sweep workers don't care which path produced the
+    parquet — same schema, same location.
+
+    Args:
+        symbol, expiry, strike, option_type: contract identity.
+        from_date, to_date: bhavcopy scan window (inclusive).
+        force: if False (default), skip writing when the target
+            parquet already exists. If True, rewrite unconditionally.
+
+    Returns:
+        The path written (or the existing path under force=False).
+
+    Raises:
+        MissingTurnoverError: lot_size_lookup returned None or any
+            row has contracts ≤ 0 (transform-level checks). No
+            partial file is written — the caller can retry.
+
+    Idempotency: the file-exists check is the only state — no
+    hash / timestamp / content-comparison. Force-rewrite is the
+    operator's escape hatch for stale data (e.g. after a
+    ``--rebuild-lot-sizes`` run that may have changed exclusion
+    membership).
+    """
+    path = cache.option_path(symbol, expiry, strike, option_type)
+    if path.exists() and not force:
+        return path
+    df = bhavcopy_to_contract_timeseries(
+        symbol, expiry, strike, option_type,
+        from_date=from_date, to_date=to_date,
+    )
+    cache.write(path, df, overwrite=True)
+    return path
 
 
 def _empty_output_frame() -> pd.DataFrame:
