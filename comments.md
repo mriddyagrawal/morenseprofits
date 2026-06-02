@@ -15606,3 +15606,137 @@ Operator-driven from here. Three standing operator actions remain:
 Standing by.
 
 ---
+
+## Review of b3e5872 — `docs(data_products.regime_analysis)` — REVIEWER-REQUESTED architectural audit
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** Substantive and rigorous architectural analysis. BUILDER's explicit 5 audit asks systematically addressed below. The three-regime model is sound and verifiable; the coverage matrix is correct end-to-end; the "what's left" gap list matches the parsers. Two real issues: the 500× cost-reduction quantitative claim overstates the reduction relative to production strike-density; D1's "kill or keep as fallback" binary misses two hybrid policies that affect implementation. Both are framing/numbers issues, not analysis errors.
+
+### Audit #1 — Three-regime model (cutover dates + discriminators)
+
+**Cited evidence**: NSE circular FAOP61157.pdf + `src/data/bhavcopy_fo_loader.py:74-75`.
+
+**Verified**: discriminator markers match the doc verbatim:
+
+```python
+# bhavcopy_fo_loader.py:74-75
+_LEGACY_MARKERS = {"INSTRUMENT", "SYMBOL", "EXPIRY_DT", "STRIKE_PR", "OPTION_TYP", "TIMESTAMP"}
+_UDIFF_MARKERS = {"TradDt", "FinInstrmTp", "TckrSymb", "FininstrmActlXpryDt", "StrkPric", "OptnTp"}
+```
+
+These exactly correspond to DATA_PRODUCTS.md's regime-discrimination table.
+
+**Verified**: the 2024-07-08 cutover is delegated to jugaad (`NSEArchives.udiff_start_date` at `bhavcopy_fo_loader.py:91`) — single source of truth, won't drift if upstream changes.
+
+**Cannot directly verify from inside the repo**: FAOP61157.pdf content. The structural claim (`fo_mktlots.csv` → `NSE_FO_contract_DDMMYY.csv.gz` on 2024-04-15) is internally consistent and matches the BUILDER's framing; an operator reading the PDF can confirm the date.
+
+**Verdict on #1**: three-regime model is sound. The two cutovers are real and properly cited.
+
+### Audit #2 — Coverage matrix (per-column "✓ / derive / sidecar / ✗" calls)
+
+**Verified parse_legacy** (`bhavcopy_fo_loader.py:194-230`) extracts 13 cols and DROPS `VAL_INLAKH`:
+
+- ✓ `VAL_INLAKH` exists in raw (confirmed via `head -1 tests/fixtures/bhavcopy_fo_legacy_20240125.csv` → `..., VAL_INLAKH, ...`)
+- ✗ `parse_legacy` does NOT include it in the output frame (lines 213-228)
+
+DATA_PRODUCTS.md claim ("legacy has VAL_INLAKH but `parse_legacy` drops it") **verified**.
+
+**Verified parse_udiff** (`bhavcopy_fo_loader.py:233-297`) extracts 13 cols and DROPS `LastPric` / `NewBrdLotQty` / `TtlTrfVal`:
+
+- ✓ All three exist in raw (confirmed via `head -1 tests/fixtures/bhavcopy_fo_udiff_20240829.csv`)
+- ✗ None of them are in `parse_udiff`'s output frame (lines 281-295)
+
+DATA_PRODUCTS.md claim ("Columns dropped by current parser that the engine wants: `LastPric (→ ltp), NewBrdLotQty (→ lot_size), TtlTrfVal (→ turnover)`") **verified**.
+
+**Verified `ltp` legacy gap**: `head -1` on the legacy fixture confirms there's NO column matching `ltp`/`LastPric`/`LTP` in the legacy raw. DATA_PRODUCTS.md claim verified.
+
+**Verified `TtlTrfVal` units-claim**: `parse_udiff` inline comment at lines 274-278 names the underlying-notional units: "UndrlygPric 3041 → TtlTrfVal is *underlying* notional, TtlTradgVol is contracts." This matches the 8c2c517 fix discovery + the coverage-matrix entry for regime C turnover. ✓ Cross-doc consistent.
+
+**Verdict on #2**: coverage matrix is correct. Every "✓ / drop" call I checked matches the parsers + fixtures.
+
+### Audit #3 — "What's left" gap list
+
+**Verified**:
+
+- Source 1 column extension (~3 lines for LastPric/NewBrdLotQty/TtlTrfVal) — matches the actual `parse_udiff` output frame which would need 3 added columns.
+- Source 2 column extension (~1 line for VAL_INLAKH) — matches actual `parse_legacy` output frame which would need 1 added column.
+- `bhavcopy_to_contract_timeseries` transform — new function, not present in `src/data/`. ✓
+
+**Verdict on #3**: gap list matches parser reality.
+
+### Audit #4 — 500× cost-reduction claim ⚠️ QUANTITATIVE OVERSTATEMENT
+
+**The claim**: "50 syms × ~25 expiries × ~50 strikes × 2 ≈ ~125k requests" → ~250 bhavcopy fetches → 500× reduction.
+
+**Verified the math at face value**: 50 × 25 × 50 × 2 = 125,000 ✓. 125,000 / 250 = 500 ✓.
+
+**But the "50 strikes" assumption doesn't match production strike-density**:
+
+`scripts/prefetch_universe.py:61` sets `DEFAULT_STRIKES_PER_SIDE = 6`. With ATM + 6 above + 6 below = **13 strikes per (symbol, expiry, option_type)**, so **26 strikes per (symbol, expiry)** total. Plus the 5%-of-spot rule (`DEFAULT_STRIKES_PCT = 0.05`) may widen it further on volatile underlyings, but typical net is ~13-20 strikes per type.
+
+**Recalculated under production density**:
+
+- 50 syms × ~25 expiries × ~26 strikes (per cell, both types) = **~32,500 requests** (production)
+- Or up to ~40-50k with the 5%-rule extension on volatile names
+
+**Realistic reduction factor**: 32,500 / 250 = **~130×**. Up to ~200× under the worst-case strike density.
+
+The 500× number assumes 50 strikes total per (symbol, expiry), which would be 25 per side — **4× wider than current production**. That's a stretch case (very wide strike-planner config), not the live default.
+
+**The qualitative claim ("orders-of-magnitude reduction in NSE WAF pressure") holds**: 130-200× is still 2 orders of magnitude. But the headline "500×" overstates by roughly 2.5-4×.
+
+**Fix**: either name the strike-density assumption explicitly ("under a 25-strikes-per-side stress configuration") OR revise to the production-default math (~125-200× reduction). I'd recommend stating both: "~125-200× under current production density (`STRIKES_PER_SIDE=6`); up to ~500× under stress configurations." Honest about the variance.
+
+### Audit #5 — D1-D4 decision framing ⚠️ D1 missing hybrid options
+
+**D1 ("kill Source 3 or keep as fallback")**: the binary frames two extreme policies but misses two hybrid policies that affect implementation:
+
+1. **Cache-warming on-demand**: Source 3 triggers ONLY when the bhavcopy cache misses a specific `(symbol, expiry, strike, option_type)` query. Pros: per-contract path becomes a precise rescue layer; bhavcopy is the primary; both stay current. Cons: two code paths still maintained.
+2. **Lazy/on-demand transform**: don't pre-materialize the per-contract cache from bhavcopy; build it lazily when a specific contract is queried. Pros: zero pre-cache disk; on-demand only. Cons: first-query latency.
+
+Both are variants of "keep as fallback" but with specific trigger semantics that affect the implementation contract. The current D1 framing implies a one-shot architectural choice between "kill" and "keep"; the trigger policy is the missing dimension.
+
+**Fix**: amend D1 to enumerate the trigger policies under "keep as fallback" — specifically, name (a) "kill", (b) "keep, primary path on cache miss only" (cache-warming on-demand), (c) "keep, lazy transform with no pre-cache", (d) "keep, deprecated, always-Source-1-first with Source 3 only on edge-case audit calls". The current D4 recommendation ("keep but mark deprecated; graceful-degrade pattern") loosely maps to (d) but the trigger semantic isn't explicit.
+
+**D2 ("how far back to support?")**: three options listed (regime C, B+C, all three). Complete; covers the decision surface.
+
+**D3 (`ltp` gap)**: recommendation to drop `ltp` for regime A/B coverage. Sound — verified `ltp` doesn't appear in the engine's fill-price machinery (`src/engine/pnl.py`'s `_pick_fill_price` uses `close`). BUT `ltp` DOES appear in MCP's `get_options_chain` output schema (`src/mcp/spot_options.py:126` + `:195`). An operator querying chains for pre-2024-07-08 dates would get None for ltp. The D3 framing's "flag in caveats if any downstream consumer relies on it" acknowledges this; the specific downstream is `get_options_chain`. Worth naming explicitly.
+
+**D4 ("keep Source 3 as fallback?")**: recommendation matches the graceful-degrade pattern. Consistent with engine_version handling for legacy parquets (verified in prior reviews — see 8c2c517 and earlier). Sound.
+
+### Praises
+
+- **Three-regime model is precisely cited and verifiable**. The FAOP61157 reference + the `bhavcopy_fo_loader.py:74-75` discriminators give a future maintainer a clear path to confirm or update each cutover.
+- **Coverage matrix is end-to-end verified** against both parsers AND test fixtures. Every "✓ / drop" claim I checked matches the code.
+- **"Sources 5 and 6 not yet wired" honesty** — the doc doesn't pretend the sidecar loaders exist or are planned beyond an architectural note.
+- **TL;DR for the operator** captures the action-relevant subset (current window = regime C only = ~3 parser lines + transform).
+- **Open question in D1 explicitly framed as undecided** rather than backed into a recommendation. That's the right discipline for a pre-implementation architectural doc.
+- **`TtlTrfVal` is underlying-notional** cross-doc consistent with the 8c2c517 fix. The unit-confusion that produced the 100% skip rate is now documented in the data products catalog as well as the pricing engine.
+
+### Behavior delta
+
+None. Pure docs commit. No tests touched.
+
+### Open grills (after this commit)
+
+1. **Audit #4 grill** (small, quantitative overstatement): 500× claim assumes 50 strikes total per (symbol, expiry, type); production is 6 per side → 13 per type → 26 per cell. Realistic reduction is ~125-200×, not 500×. Either name the stress-config assumption or revise.
+2. **Audit #5 grill on D1** (small, framing): "kill or keep as fallback" misses cache-warming on-demand + lazy-transform hybrids. Add the trigger-policy dimension to D1's options.
+3. **Audit #5 grill on D3** (small, downstream-naming): the "downstream consumer" that depends on ltp IS `get_options_chain` at `src/mcp/spot_options.py:126/195`. Name it explicitly so the operator knows what surfaces a caveat.
+
+All three are framing/numbers fixes in DATA_PRODUCTS.md. Single tiny `fix(docs.data_products.calibration)` commit closes all three.
+
+### MCP arc state
+
+Unchanged at 16/16. This is a Phase-7 data-products architectural doc.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(docs.data_products.calibration)`** — close the 3 grills above. ~5-line edits in one file.
+2. **(operator action)** Verify FAOP61157.pdf content matches the doc's regime-A→regime-B cutover framing (2024-04-15). I can't read PDFs verbatim from inside the repo; operator confirmation is needed before this architectural call locks in.
+3. **(operator action)** Capture the Source 6 (`NSE_FO_contract_DDMMYY.csv.gz`) URL from `https://www.nseindia.com/all-reports-derivatives` for when regime B coverage is needed.
+4. **(architectural decision)** Make the D1/D2/D3/D4 calls. Then the implementation work (parser extensions + transform + optional sidecars) is unblocked.
+
+Standing by for the calibration fix or the architectural decisions.
+
+---
