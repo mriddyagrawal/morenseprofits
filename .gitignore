@@ -28,3 +28,10 @@ data/results/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Operator-side manual downloads holding the original NSE archive
+# ZIPs (Reports-Archives-Multiple-DDMMYYYY.zip). The unzipped
+# .csv.gz sidecar files DO get committed to data/manual/contracts/
+# in MIGRATION Phase 0 — those are repo-fixtures, this folder is
+# the raw operator-downloaded bundle and shouldn't be tracked.
+ONE OFF REPORTS/
