@@ -123,6 +123,46 @@ def bhavcopy_fo_path(trade_date: date) -> Path:
     return _ensure_root() / "bhavcopy_fo" / f"{trade_date.strftime('%Y%m%d')}.parquet"
 
 
+def bhavcopy_fo_lot_sizes_path(trade_date: date) -> Path:
+    """Sibling-cache path for per-date UDiff lot-size triples
+    extracted from the raw bhavcopy at fetch time.
+
+    Schema written: ``symbol, expiry, lot_size, trade_date`` (one row
+    per unique ``(symbol, expiry)`` from that day's OPTSTK+OPTIDX
+    rows). Legacy bhavcopy dates get an empty parquet (legacy raw
+    doesn't carry lot_size).
+
+    Consumed by ``scripts/build_lot_size_parquet.py`` (P0.2) to merge
+    with the regime B sidecars into the unified
+    ``data/cache/lot_sizes.parquet``. Same date-stamped layout as
+    ``bhavcopy_fo_path``, so ``rm -rf data/cache/`` wipes both.
+
+    See MIGRATION.md §Architectural target diagram + §Phase 0 P0.2.
+    """
+    if isinstance(trade_date, datetime):
+        raise TypeError(
+            f"bhavcopy_fo_lot_sizes_path expects datetime.date, got "
+            f"datetime: {trade_date!r}. Call .date() on it first."
+        )
+    return (
+        _ensure_root() / "bhavcopy_fo_lot_sizes"
+        / f"{trade_date.strftime('%Y%m%d')}.parquet"
+    )
+
+
+def lot_sizes_path() -> Path:
+    """The unified ``(symbol, expiry_month) → lot_size`` lookup
+    parquet, built by ``scripts/build_lot_size_parquet.py`` from BOTH
+    the sidecars (``data/manual/contracts/NSE_FO_contract_*.csv.gz``)
+    and the bhavcopy-derived lot-sizes
+    (``data/cache/bhavcopy_fo_lot_sizes/*.parquet``).
+
+    Auto-built by ``scripts/prefetch_universe.py`` when missing. See
+    MIGRATION.md §Cross-source lot-size policy + §Phase 0 P0.2.
+    """
+    return _ensure_root() / "lot_sizes.parquet"
+
+
 def exists(path: Path) -> bool:
     return path.is_file()
 

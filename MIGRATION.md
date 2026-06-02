@@ -180,20 +180,38 @@ Same on-disk path layout as today (`options_loader` writes to it). Sweep workers
 The unified `data/cache/lot_sizes.parquet` is populated from TWO sources:
 
 1. **Sidecar** (`data/manual/contracts/NSE_FO_contract_*.csv.gz`) — regime B coverage; static, committed.
-2. **Bhavcopies** (`data/cache/bhavcopy_fo/*.parquet`) — regime C coverage via `NewBrdLotQty` per-row; refreshed by jugaad on each prefetch.
+2. **Bhavcopies** (`data/cache/bhavcopy_fo/*.parquet` + sibling `data/cache/bhavcopy_fo_lot_sizes/*.parquet`) — regime C coverage; sibling parquets written per fetch by `bhavcopy_fo_loader.py` (extracts `NewBrdLotQty` per OPTSTK/OPTIDX row).
 
-A given `(symbol, expiry)` pair can appear in BOTH sources whenever a contract listed in regime B is still tracked by a regime C bhavcopy day. NSE lot sizes are stable per `(symbol, expiry)` once the contract lists — they should NEVER differ between sources.
+A given `(symbol, expiry-month)` pair can appear in BOTH sources whenever a contract listed in regime B is still tracked by a regime C bhavcopy day. NSE lot sizes are stable per `(symbol, expiry)` **for the trading life of one contract**, but NSE does biannual lot-size reviews that revise the values for upcoming contracts. Cross-source disagreement signals one of: a corporate action mid-life (split/bonus), an NSE biannual review that took effect between snapshots, or a parser bug.
 
-**Mismatch policy (loud-fail per operator direction)**:
-- If `(symbol, expiry)` appears in both sources with DIFFERENT `lot_size`, the build script raises a `CrossSourceLotSizeMismatchError` naming the symbol, expiry, sidecar-value, bhavcopy-value, and snapshot dates.
-- `scripts/build_lot_size_parquet.py` exits non-zero; the prefetch run that invoked it surfaces the error in its console output (the prefetch script wraps the build with explicit logging of any cross-source mismatches under a `=== Cross-source lot-size verification ===` header).
-- Operator must investigate the mismatch (most likely a corporate-action lot revision; possibly a parser bug) before continuing. The unified cache is NOT written until the conflict is resolved (manually or via a code fix).
+**Policy: symmetric per-pair exclusion** (operator direction 2026-06-03). Three mismatch layers, all treated the SAME way:
 
-**Why loud-fail (not latest-wins or both-stored)**: same discipline as `MissingDataError` / `IlliquidLegError` — silent data drift is the worst failure mode. Lot-size mismatch typically signals an NSE corporate action (split/bonus) that the engine's pricing math needs to know about; surfacing it loud forces an investigation rather than a wrong answer.
+1. **Sidecar-vs-sidecar** — `(sym, year, month)` appears in multiple NSE_FO_contract snapshots with different `lot_size` values.
+2. **Bhavcopy-internal** — `(sym, year, month)` appears on multiple trade dates with different `lot_size` values.
+3. **Sidecar-vs-bhavcopy** — `(sym, year, month)` is in both sources with different `lot_size` values.
 
-**Sidecar-vs-sidecar mismatch policy** (per reviewer grill #1 on 9b6c32b): the same loud-fail discipline applies across the 4 NSE_FO_contract snapshots themselves. A `(symbol, expiry)` pair appearing in multiple snapshots (e.g. PNB Jun 2024 in Apr-16 + May-16 + Jun-12) with DIFFERENT `lot_size` raises `CrossSourceLotSizeMismatchError` naming both snapshot files. No silent earliest-wins or latest-wins resolution.
+For each detected mismatch:
+- The build script DROPS that `(symbol, expiry-month)` from the unified cache. No silent earliest-wins, no latest-wins, no operator override.
+- A diagnostic line in the operator's exact template prints inline:
 
-**Limitation: no date dimension in unified cache** (per reviewer grill #4 on 9b6c32b). The cache schema is `(symbol, expiry, lot_size, source)`. Mid-cycle NSE corporate actions (bonus / split) that revise `lot_size` within a contract's life would surface as cross-source mismatches (e.g. Apr snapshot has old size; May snapshot has new size after the corporate action). Resolution: manual reconciliation by the operator — typically choose the post-revision value per NSE's circular and split the contract's history at the revision date. This is a known limitation, not a defect.
+      mismatch found in lot sizes between {x} and {y} for {sym} for {expiry}: {lot_x} and {lot_y}
+
+  Where `{x}` / `{y}` are snapshot filenames, `bhavcopy-YYYY-MM-DD` trade-date stamps, or the literal `sidecar` / `bhavcopy` for the cross-source layer.
+- The build returns successfully even when N pairs are excluded — the prefetch wrapper does NOT halt on mismatches (only on true errors: missing source dir, parse failure, etc.).
+- Excluded pairs propagate downstream: the transform's `lot_size_lookup(sym, expiry)` returns None → it can't derive `volume = contracts × lot_size` → `MissingTurnoverError` raised → sweep skips the affected cells with `skip_reason="MissingTurnoverError"` (auto-surfaced via the existing `_SKIPPABLE_ERRORS` machinery).
+
+**Rationale for per-pair exclusion** (vs the original loud-fail framing): if NSE revised a contract's lot_size mid-life, that contract's P&L is structurally ambiguous — entry at one lot, exit at another. Picking a "winner" value would produce a wrong P&L. Skipping is more honest. Cells touching healthy contracts still backtest correctly; the operator sees the exclusion count in the build-script output AND in the skip_summary distribution.
+
+**Console-surfacing of verification** (preserved from earlier policy iteration):
+- On EVERY run of the build script (with or without exclusions), print a `=== Lot-size verification ===` header followed by:
+  - Total verified pair count + source breakdown (`sidecar_only=N | bhavcopy_only=N | both=N`).
+  - If any exclusions: `=== Excluded N (symbol, expiry-month) pair(s) ===` with per-layer subsections (sidecar-vs-sidecar / bhavcopy-internal / sidecar-vs-bhavcopy) and one diagnostic line per excluded pair.
+  - Footer pointer to MIGRATION.md §Cross-source lot-size policy.
+- A silent successful build prints the header + summary anyway — confirms the verification step ran AND tells the operator the scale of what was checked. No ambiguity between "build succeeded with no mismatches" and "build didn't run."
+
+**Reserved exception class**: `CrossSourceLotSizeMismatchError` stays in `src/data/errors.py` for a potential future strict-mode flag (`--strict-lot-size-verification` or similar) that would re-enable loud-fail behavior for debugging unexpected mismatch patterns. Not raised under the default per-pair-exclude policy.
+
+**Limitation: no date dimension in unified cache**. The cache schema is `(symbol, year, month, lot_size, source)`. The per-pair-exclude policy handles mid-cycle NSE corporate actions cleanly (the contract gets dropped from the cache → cells skip). A future enhancement could add a `(symbol, expiry, effective_from)` schema with date-windowed lookups; not part of this migration.
 
 **Reviewer ask**: confirm this is the right policy + the error-surfacing pattern (script-level loud raise + prefetch-level wrap-and-print) matches the project's error-handling discipline.
 
@@ -215,56 +233,77 @@ Already-staged-on-disk: `data/manual/contracts/NSE_FO_contract_*.csv.gz` (4 file
 
 ### P0.2 — `feat(scripts.build_lot_size_parquet)`
 
-New `scripts/build_lot_size_parquet.py`:
+Two pieces of code lands together:
+
+**(a) Sibling-cache extractor + write hook in `bhavcopy_fo_loader.py`**:
+
+The bhavcopy-cache parquet schema is intentionally narrow (see P1.1 — no `lot_size` per row). To make `NewBrdLotQty` available to the build script without re-fetching raw bhavcopies, the loader writes a per-date sibling parquet at `data/cache/bhavcopy_fo_lot_sizes/{YYYYMMDD}.parquet` alongside the main cache write.
+
+Sibling-cache schema:
+- `symbol` (string)
+- `expiry` (datetime64[us], from `FininstrmActlXpryDt`)
+- `lot_size` (int64, from `NewBrdLotQty`)
+- `trade_date` (datetime64[us], stamped from the fetch date)
+
+Extractor function `_extract_lot_sizes_udiff(raw, trade_date)` lives in `bhavcopy_fo_loader.py`. Returns deduped (one row per unique `(symbol, expiry)`) frame restricted to OPTSTK + OPTIDX rows. Legacy bhavcopy dates write an EMPTY parquet (legacy raw doesn't carry lot_size — sidecar covers those expiries).
+
+**(b) The build script `scripts/build_lot_size_parquet.py`**:
 
 ```python
 def build_lot_size_parquet(
-    *, out_path: Path = CACHE_DIR / "lot_sizes.parquet",
-    sidecar_glob: str = "data/manual/contracts/NSE_FO_contract_*.csv.gz",
-    bhavcopy_cache_dir: Path = CACHE_DIR / "bhavcopy_fo",
-) -> None:
-    """Build the unified (symbol, expiry) → lot_size cache.
+    *,
+    out_path: Path | None = None,             # default: data/cache/lot_sizes.parquet
+    sidecar_dir: Path | None = None,          # default: data/manual/contracts/
+    bhavcopy_lot_sizes_dir: Path | None = None,  # default: data/cache/bhavcopy_fo_lot_sizes/
+    verbose: bool = True,
+) -> Path:
+    """Build the unified (symbol, year, month) → lot_size cache.
 
-    Sources both the regime B sidecar files (sidecar_glob) AND any
-    UDiff bhavcopies currently in bhavcopy_cache_dir (regime C; reads
-    NewBrdLotQty per row). Merges, dedupes by (symbol, expiry), and
-    cross-validates: any pair present in both sources with different
-    lot_sizes raises CrossSourceLotSizeMismatchError per the §Cross-
-    source lot-size policy.
+    Loads sidecars + sibling bhavcopy parquets, detects mismatches
+    at all 3 layers (sidecar-vs-sidecar, bhavcopy-internal,
+    sidecar-vs-bhavcopy), EXCLUDES the offending (sym, year, month)
+    pairs per the per-pair-exclude policy, and writes the unified
+    parquet.
+
+    Returns the written path. ALWAYS succeeds when sources are well-
+    formed — mismatches are absorbed into the exclusion list, not
+    raised. True errors (missing source dir, parse failure) propagate.
 
     Output schema:
-        symbol: string
-        expiry: date (canonical NSE expiry settlement date)
-        lot_size: int64 (shares per lot)
-        source: string  (one of {"sidecar", "bhavcopy", "both"})
-
-    Idempotent: rewrites the parquet on every invocation. Safe to
-    delete the output and rebuild.
+        symbol     string
+        year       int64
+        month      int64
+        lot_size   int64
+        source     string  (one of {"sidecar", "bhavcopy", "both"})
     """
 ```
 
-Wire into `scripts/prefetch_universe.py` BEFORE the bhavcopy fetch loop:
-- Step 0a: ensure bhavcopy cache exists (fetch any missing days).
+Year+month granularity (not exact expiry date) is sufficient because lot_sizes are stable per (symbol, expiry-month). The sidecar's `StockNm` regex (`{SYMBOL}(\d{2})([A-Z]{3})\d+...`) gives us year+month directly without needing to decode NSE's proprietary `XpryDt` epoch.
+
+**Wire into `scripts/prefetch_universe.py`**:
+- Step 0a: ensure bhavcopy cache exists (fetch any missing days; sibling parquets get written by the loader as part of each fresh fetch).
 - Step 0b: if `data/cache/lot_sizes.parquet` is missing OR `--rebuild-lot-sizes` is passed, invoke `build_lot_size_parquet()`.
 - Step 1+: proceed with materialize-contracts loop using the unified cache.
 
-**Console-surfacing of verification** (per reviewer grills #2 + #5 on 9b6c32b):
+**Console-surfacing** (per the §Cross-source lot-size policy):
 
-- On EVERY run of the build script (happy path AND mismatch path), print a `=== Cross-source lot-size verification ===` header followed by a summary line:
-  - Happy path: `"Verified N (symbol, expiry) pairs across 4 sidecars + M bhavcopies. No mismatches."` — gives the operator confirmation that verification actually ran AND tells them the scale of what was checked.
-  - Mismatch path: prints the header + the `CrossSourceLotSizeMismatchError` message with symbol, expiry, both lot_sizes, and snapshot files.
-- A silent successful build (no header printed at all) is indistinguishable from "build didn't run" — explicitly avoid that ambiguity.
-- **Prefetch halt-on-failure semantics**: if `build_lot_size_parquet()` exits non-zero (any reason — `CrossSourceLotSizeMismatchError`, I/O error, fixture parse failure), `prefetch_universe.py` HALTS with a clear error message naming the failure mode and the cache state. **No materialize step runs.** Continuing without a valid unified `lot_sizes.parquet` would produce ambiguous downstream failures (missing lookup in transform → NaN volume → cells skipped with mis-attributed reasons). Operator must reconcile before continuing.
-- Optional `--skip-lot-size-verification` flag for explicit operator override (bypasses the safety net). Default = halt. Not part of v1 acceptance — operator can add it if a need arises.
+- On EVERY run of the build script (with or without exclusions), print `=== Lot-size verification ===` header + summary.
+- If any `(symbol, expiry-month)` pairs were excluded due to mismatches: print `=== Excluded N (symbol, expiry-month) pair(s) ===` section grouped by layer (sidecar-vs-sidecar / bhavcopy-internal / sidecar-vs-bhavcopy), one operator-templated diagnostic line per excluded pair.
+- A silent successful build prints the header + summary anyway — confirms verification step ran.
+
+**Prefetch halt semantics**: under the per-pair-exclude policy, the build script ALWAYS succeeds on well-formed sources (mismatches are absorbed, not raised). The prefetch wrapper does NOT halt on mismatches. It DOES halt on true failures (missing source dir, parser exception, I/O error) — those propagate as Python exceptions and the prefetch script exits with the exception. Operator sees the traceback and fixes the underlying issue.
 
 **Tests** (`tests/test_build_lot_size_parquet.py`):
-- Synthesize a 1-day bhavcopy fixture + a 1-row sidecar fixture for the same `(symbol, expiry)` with MATCHING lot_size. Assert the parquet is built + the row has `source="both"`.
-- Same setup but MISMATCHED lot_size. Assert `CrossSourceLotSizeMismatchError` raised with the right symbol/expiry/values in the message.
-- Sidecar-only `(symbol, expiry)` (no bhavcopy). Assert row written with `source="sidecar"`.
-- Bhavcopy-only `(symbol, expiry)` (post-Jul-2024 contract). Assert row written with `source="bhavcopy"`.
+- Sidecar-only `(sym, year, month)` (no bhavcopy entry). Assert row written with `source="sidecar"`.
+- Bhavcopy-only `(sym, year, month)` (post-Jul-2024 contract). Assert row written with `source="bhavcopy"`.
+- Sidecar + bhavcopy in agreement. Assert row written with `source="both"`.
+- **Sidecar-vs-sidecar mismatch** — synthesize 2 sidecar files with conflicting `lot_size` for the same `(sym, year, month)`. Assert: (a) the pair is NOT in the output parquet, (b) the diagnostic message printed matches the operator's exact format, (c) the build still returns successfully.
+- **Bhavcopy-internal mismatch** — synthesize 2 sibling bhavcopy parquets (different trade dates) with conflicting `lot_size` for the same `(sym, year, month)`. Same 3 assertions.
+- **Sidecar-vs-bhavcopy mismatch** — synthesize 1 sidecar + 1 bhavcopy with conflicting `lot_size`. Same 3 assertions.
+- Empty source dirs → empty parquet written; build succeeds.
 - `prefetch_universe.py` integration test: parquet missing → auto-built. Parquet present → not rebuilt (unless `--rebuild-lot-sizes`).
 
-**Reviewer ask**: schema choice (any reason NOT to keep `source` for debugging? could be dropped at v2); auto-build trigger semantics (missing-parquet → silent build is what we want, vs. error-with-hint).
+**Reviewer ask**: confirm the per-pair-exclude policy implementation matches the §Cross-source lot-size policy specification. Confirm the diagnostic-message template (`mismatch found in lot sizes between {x} and {y} for {sym} for {expiry}: {lot_x} and {lot_y}`) handles the ≥3-source case sensibly (current behavior: enumerate all sources rather than picking two arbitrarily). Confirm the build script returns 0 even on excluded pairs (no false-positive prefetch halt).
 
 ---
 
@@ -613,8 +652,13 @@ PLAN.md history entry. Update DATA_PRODUCTS.md to mark the full 4-year window as
 | P1.7 | `test_pick_fill_price_falls_back_to_close_on_deep_otm` | Pins 8c2c517 design intent — case (3) deep-OTM ill-conditioning is NOT a skip; falls through to close |
 | P1.7 | `test_sweep_records_missing_turnover_as_skip_reason` | End-to-end: sweep emits skip parquet row with named reason |
 | P1.7 | `test_sweep_does_not_skip_on_deep_otm` | End-to-end: deep-OTM cell IS priced, NOT in skip parquet |
-| P0.2 | `test_build_lot_size_parquet_loud_fails_on_mismatch` | Cross-source mismatch raises CrossSourceLotSizeMismatchError per §Cross-source lot-size policy |
-| P0.2 | `test_build_lot_size_parquet_against_4_sidecar_fixtures` | Unified cache populates correctly from regime B sidecars (PNB May 2024 lot_size = 8000) |
+| P0.2 | `test_build_lot_size_parquet_excludes_sidecar_vs_sidecar_mismatches` | Per-pair exclusion at the sidecar-vs-sidecar layer; build returns successfully |
+| P0.2 | `test_build_lot_size_parquet_excludes_bhavcopy_internal_mismatches` | Per-pair exclusion at the bhavcopy-internal layer |
+| P0.2 | `test_build_lot_size_parquet_excludes_sidecar_vs_bhavcopy_mismatches` | Per-pair exclusion at the sidecar-vs-bhavcopy layer |
+| P0.2 | `test_build_lot_size_parquet_against_4_sidecar_fixtures` | Unified cache populates correctly from regime B sidecars (PNB May 2024 lot_size = 8000; ABBOTINDIA May 2024 EXCLUDED) |
+| P0.2 | `test_build_lot_size_parquet_diagnostic_format_matches_operator_template` | Diagnostic line format = `mismatch found in lot sizes between {x} and {y} for {sym} for {expiry}: {lot_x} and {lot_y}` |
+| P0.2 | `test_extract_lot_sizes_udiff_returns_deduped_triples` | Sibling-cache extractor correctness (RELIANCE 2024-08-29 = 250) |
+| P0.2 | `test_load_bhavcopy_fo_writes_sibling_lot_sizes_cache` | Sibling-cache write hook fires on fresh fetch |
 | P0.2 | `test_prefetch_universe_autobuilds_lot_size_parquet_if_missing` | Auto-build trigger semantics (missing → silent rebuild) |
 | P2.1 | `test_prefetch_regime_b_volume_derived_via_unified_lookup` | Legacy-era bhavcopy row → volume = contracts × unified_lookup(symbol, expiry) |
 | P2.2 | `test_get_options_chain_surfaces_legacy_ltp_caveat` | MCP caveat trigger |
@@ -661,11 +705,19 @@ This plan embeds the operator's D1-D4 decisions from
 
 **Architectural refinement (2026-06-02 operator direction — UNIFIED LOT-SIZE LOOKUP)**:
 - All lot-size resolution goes through ONE unified cache: `data/cache/lot_sizes.parquet`.
-- Built by `scripts/build_lot_size_parquet.py` (P0.2) from BOTH committed sidecars (`data/manual/contracts/NSE_FO_contract_*.csv.gz`, regime B) AND cached UDiff bhavcopies (`data/cache/bhavcopy_fo/*.parquet`, regime C, via per-row `NewBrdLotQty`).
-- Cross-source mismatch policy: **loud-fail** via `CrossSourceLotSizeMismatchError` (see §Cross-source lot-size policy). Mismatches surface in `prefetch_universe.py` console output under a `=== Cross-source lot-size verification ===` header.
+- Built by `scripts/build_lot_size_parquet.py` (P0.2) from BOTH committed sidecars (`data/manual/contracts/NSE_FO_contract_*.csv.gz`, regime B) AND a sibling per-date bhavcopy lot-size cache (`data/cache/bhavcopy_fo_lot_sizes/*.parquet`, written by `bhavcopy_fo_loader.py` on every fresh bhavcopy fetch — regime C, extracts `NewBrdLotQty` from raw UDiff CSV).
 - Auto-build trigger: `prefetch_universe.py` invokes the build script when `data/cache/lot_sizes.parquet` is missing. Silent rebuild; no operator prompt.
-- Bhavcopy-cache schema is NOT extended to carry `lot_size` per row (originally proposed in P1.1); instead, the transform in P1.3 looks up `(symbol, expiry) → lot_size` from the unified cache. Deduplicates ~60-90 days of repeated lot_size values per contract; engine code is regime-agnostic.
+- Bhavcopy-cache schema is NOT extended to carry `lot_size` per row (originally proposed in P1.1); instead, the transform in P1.3 looks up `(symbol, year, month) → lot_size` from the unified cache. Deduplicates ~60-90 days of repeated lot_size values per contract; engine code is regime-agnostic.
 - Phase 2 collapses: the standalone `nse_fo_contract_loader.py` originally proposed (old P2.1) is subsumed by P0.2's build script. Phase 2 is now 4 sub-commits (P2.1 → P2.4) instead of 6.
+
+**Cross-source mismatch policy refinement (2026-06-03 operator direction — PER-PAIR EXCLUSION)**:
+- Initial proposal: loud-fail via `CrossSourceLotSizeMismatchError` on any sidecar-vs-bhavcopy disagreement; reviewer-extended to also cover sidecar-vs-sidecar (grill #1 on 9b6c32b).
+- Smoke-test against the committed P0.1 fixtures surfaced **101 systematic sidecar-vs-sidecar mismatches** — every one matched the same pattern: Apr-16 snapshot's `lot_size` was exactly 2× the May-16/Jun-12/Jul-5 snapshots' values. NSE biannual lot-size review took effect at the April 2024 cutover (~Apr 25, 2024).
+- Operator's revised policy: instead of loud-fail (which would block 101 pairs entirely → no Phase 1 progress), **drop the offending `(symbol, expiry-month)` pair from the unified cache**. Same treatment for ALL three mismatch types (sidecar-vs-sidecar, bhavcopy-internal, sidecar-vs-bhavcopy) — symmetric per-pair exclusion.
+- Rationale: if NSE revised a contract's lot_size mid-life, that contract's P&L is structurally ambiguous (entry at one lot, exit at another). Picking a "winner" value produces wrong P&L. Skipping is more honest.
+- Downstream impact: excluded `(sym, expiry-month)` → `lot_size_lookup` returns None → transform raises `MissingTurnoverError` → sweep skips those cells with `skip_reason="MissingTurnoverError"`. Operator sees the exclusion count both in the build-script output AND aggregated in the skip_summary distribution.
+- `CrossSourceLotSizeMismatchError` exception class retained in `src/data/errors.py` for a potential future strict-mode flag; not raised under the default policy.
+- Net impact on regime B coverage: ~25-30 symbols mostly affecting May/Jun/Jul 2024 expiries get excluded. The rest of regime B (~75% of (sym, expiry) pairs in the affected window) prices fine.
 
 Plus three implicit decisions:
 - **All strikes**: no strike_planner pre-filtering. Every traded strike in the bhavcopy becomes a contract. **Disk cost note** (per reviewer grill #6 on e0bc85a): with `strike_planner` removed, per-cell strike count goes from ~13 (`DEFAULT_STRIKES_PER_SIDE = 6` + ATM = 13 per option_type) to all-traded (~30-100+ per option_type for active underlyings). Estimated **~3-5× cache growth** over current `data/cache/options/` footprint. **Verify storage capacity before Phase 1 prefetch run**.

@@ -257,6 +257,15 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--rebuild-lot-sizes", action="store_true",
+        help=(
+            "Force-rebuild the unified data/cache/lot_sizes.parquet "
+            "even if it already exists. Default behavior is "
+            "auto-build when missing only. See MIGRATION.md §Phase 0 "
+            "P0.2."
+        ),
+    )
+    ap.add_argument(
         "--workers", type=int, default=1,
         help=(
             "Parallelize the per-(symbol, expiry) fetch loop (default 1 "
@@ -346,6 +355,42 @@ def main() -> int:
     else:
         _h("Step 2 — bulk-fetch trading-day bhavcopies  [SKIPPED via --no-bulk-bhavcopies]")
         print(f"  strike-discovery in Step 4 will lazily fetch bhavcopies as needed")
+
+    # ============================================================
+    # Step 2b — auto-build unified lot_sizes parquet (MIGRATION.md
+    # §Phase 0 P0.2). Runs after the bhavcopy fetch loop so the
+    # sibling per-date lot-size caches (written by
+    # bhavcopy_fo_loader) exist on disk. Halts loudly on any
+    # CrossSourceLotSizeMismatchError — no Step 3+ work runs against
+    # a missing/stale unified cache.
+    # ============================================================
+    from src.data import cache as _cache  # local import for clarity
+    from scripts.build_lot_size_parquet import build_lot_size_parquet
+
+    lot_sizes_parquet = _cache.lot_sizes_path()
+    if not lot_sizes_parquet.exists() or args.rebuild_lot_sizes:
+        if args.rebuild_lot_sizes:
+            _h("Step 2b — build unified lot_sizes.parquet  "
+               "[--rebuild-lot-sizes]")
+        else:
+            _h(f"Step 2b — build unified lot_sizes.parquet  "
+               f"[auto-trigger: {lot_sizes_parquet} missing]")
+        # Build emits per-pair exclusion diagnostics inline (see
+        # scripts/build_lot_size_parquet.py + MIGRATION.md
+        # §Cross-source lot-size policy). The build returns
+        # successfully even when N (sym, expiry-month) pairs are
+        # excluded — those become structural skips at sweep time
+        # via MissingTurnoverError. Only real errors (parse
+        # failure, missing source dir) escape as exceptions and
+        # halt the prefetch.
+        build_lot_size_parquet(verbose=True)
+    else:
+        _h(f"Step 2b — unified lot_sizes.parquet  "
+           f"[cache hit: {lot_sizes_parquet}]")
+        print(
+            f"  Pass --rebuild-lot-sizes to force-rebuild "
+            f"(e.g. after adding a new sidecar fixture)."
+        )
 
     # ============================================================
     # Step 3 — build per-symbol expiry list

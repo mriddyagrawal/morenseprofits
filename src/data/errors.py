@@ -56,6 +56,25 @@ class MissingDataError(DataError):
     latter raises `requests.RequestException` and is NOT wrapped."""
 
 
+class CrossSourceLotSizeMismatchError(DataError):
+    """Reserved for a future strict-mode flag on
+    ``scripts/build_lot_size_parquet.py``. Not raised under the
+    default per-pair-exclude policy (operator direction 2026-06-03 —
+    see MIGRATION.md §Cross-source lot-size policy).
+
+    Under the default policy, lot_size mismatches at any of the 3
+    layers (sidecar-vs-sidecar / bhavcopy-internal / sidecar-vs-
+    bhavcopy) cause the offending ``(symbol, expiry_month)`` pair to
+    be DROPPED from the unified cache; the build still succeeds.
+    Downstream pricing for cells touching those contracts skips with
+    ``MissingTurnoverError`` (the lookup returns no row → transform
+    can't derive volume in shares).
+
+    Class retained in the taxonomy in case a future strict-mode flag
+    needs to reactivate loud-fail behavior (e.g. for debugging an
+    unexpected mismatch pattern)."""
+
+
 class IlliquidLegError(MissingDataError):
     """Raised by ``src.engine.pnl._price_one_leg`` when a leg's entry or
     exit row had ZERO traded contracts that day, or when the entry's

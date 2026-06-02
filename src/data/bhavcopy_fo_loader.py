@@ -20,6 +20,23 @@ The loader STAMPS ``trade_date`` from the requested date (not from
 upstream's TIMESTAMP/TradDt) and asserts the upstream value matches —
 catches a mis-dispatched fetch loudly (e.g. server returns the wrong
 day, or jugaad's date arithmetic drifts).
+
+**Sibling lot-size cache** (P0.2 — MIGRATION.md §Phase 0):
+On every fresh fetch, ``load_bhavcopy_fo`` ALSO writes a per-date
+parquet to ``data/cache/bhavcopy_fo_lot_sizes/{date}.parquet``
+containing the ``(symbol, expiry, lot_size)`` triples extracted from
+the raw UDiff CSV. Legacy bhavcopy dates get an empty parquet
+(legacy raw doesn't carry lot_size — sidecar files in
+``data/manual/contracts/`` cover those expiries).
+
+The main cache parquet ``data/cache/bhavcopy_fo/{date}.parquet``
+is INTENTIONALLY NARROW — ``lot_size`` is NOT carried per row.
+Consumers needing lot_size should query the unified
+``data/cache/lot_sizes.parquet`` (built by
+``scripts/build_lot_size_parquet.py`` from sidecars + this sibling
+cache). Rationale: lot_size is per-(symbol, expiry) stable; per-row
+storage in the bhavcopy cache duplicates ~60-90 days of repeated
+values per contract. See MIGRATION.md §Cross-source lot-size policy.
 """
 from __future__ import annotations
 
@@ -298,6 +315,109 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
 
 
 # ============================================================
+# Sibling lot-size extractor (P0.2)
+# ============================================================
+#
+# Distinct from ``parse_udiff`` because the main cache parquet is
+# INTENTIONALLY narrow (no lot_size per row) — see module docstring.
+# This helper produces the per-date sibling cache content consumed by
+# ``scripts/build_lot_size_parquet.py``.
+
+_LOT_SIZE_OPTION_INSTRUMENTS = ("OPTSTK", "OPTIDX")
+
+
+def _extract_lot_sizes_udiff(raw: str, trade_date: date) -> pd.DataFrame:
+    """Extract ``(symbol, expiry, lot_size, trade_date)`` triples from
+    a raw UDiff bhavcopy CSV. One row per unique ``(symbol, expiry)``
+    on this trade date, restricted to OPTSTK + OPTIDX
+    (FUTSTK / FUTIDX intentionally excluded — our backtest scope is
+    options-only; futures lot_sizes are recoverable from the same
+    NewBrdLotQty column if a future caller needs them, just remove
+    the instrument filter).
+
+    Output schema (also the sibling-cache schema in
+    ``data/cache/bhavcopy_fo_lot_sizes/{date}.parquet``):
+
+    - ``symbol`` (string)
+    - ``expiry`` (datetime64[us], from ``FininstrmActlXpryDt``)
+    - ``lot_size`` (int64, from ``NewBrdLotQty``)
+    - ``trade_date`` (datetime64[us], stamped from caller)
+
+    Same ``_UDIFF_MARKERS`` header check as ``parse_udiff`` — same
+    loud failure mode (``BhavcopyFormatError``) on schema drift.
+    """
+    df = pd.read_csv(io.StringIO(raw))
+    df.columns = df.columns.str.strip()
+    if not _UDIFF_MARKERS.issubset(df.columns):
+        raise BhavcopyFormatError(
+            f"udiff lot-size extract: header missing required cols: "
+            f"{sorted(_UDIFF_MARKERS - set(df.columns))}; got "
+            f"{list(df.columns)}"
+        )
+    instrument = df["FinInstrmTp"].map(_UDIFF_TO_LEGACY_INSTR)
+    if instrument.isna().any():
+        unknown = sorted(set(df.loc[instrument.isna(), "FinInstrmTp"].astype(str)))
+        raise BhavcopyFormatError(
+            f"udiff lot-size extract: FinInstrmTp has unknown codes: "
+            f"{unknown}; expected only STO/IDO/STF/IDF"
+        )
+    is_option = instrument.isin(_LOT_SIZE_OPTION_INSTRUMENTS)
+    df = df[is_option]
+    if "NewBrdLotQty" not in df.columns:
+        raise BhavcopyFormatError(
+            "udiff lot-size extract: NewBrdLotQty column missing; "
+            "raw header drift?"
+        )
+    out = pd.DataFrame({
+        "symbol": df["TckrSymb"].astype("string"),
+        "expiry": pd.to_datetime(
+            df["FininstrmActlXpryDt"]
+        ).astype("datetime64[us]"),
+        "lot_size": df["NewBrdLotQty"].fillna(0).astype("int64"),
+    })
+    out = (
+        out.drop_duplicates(subset=["symbol", "expiry"], keep="first")
+        .reset_index(drop=True)
+    )
+    # Explicit [us] precision to match `expiry` + the rest of the
+    # project's datetime convention (cache.py uses [us] across products).
+    out["trade_date"] = pd.Series(
+        [pd.Timestamp(trade_date)] * len(out), dtype="datetime64[us]",
+    )
+    return out
+
+
+def _empty_lot_sizes_frame() -> pd.DataFrame:
+    """Returned by the sibling-cache write path for legacy bhavcopy
+    dates (which don't carry lot_size in their raw CSV). Schema
+    identical to ``_extract_lot_sizes_udiff`` output; just empty."""
+    return pd.DataFrame({
+        "symbol": pd.Series(dtype="string"),
+        "expiry": pd.Series(dtype="datetime64[us]"),
+        "lot_size": pd.Series(dtype="int64"),
+        "trade_date": pd.Series(dtype="datetime64[us]"),
+    })
+
+
+def _write_sibling_lot_sizes_cache(
+    raw: str, fmt: FormatTag, trade_date: date,
+) -> None:
+    """Sibling-cache writer called from ``_load_bhavcopy_fo_impl`` and
+    the ``force_refresh`` path. UDiff dates extract from raw; legacy
+    dates write an empty parquet so the build script's directory scan
+    sees a row-per-date completeness signal."""
+    lot_sizes_df = (
+        _extract_lot_sizes_udiff(raw, trade_date)
+        if fmt == "udiff"
+        else _empty_lot_sizes_frame()
+    )
+    cache.write(
+        cache.bhavcopy_fo_lot_sizes_path(trade_date),
+        lot_sizes_df, overwrite=True,
+    )
+
+
+# ============================================================
 # Public entry point
 # ============================================================
 
@@ -328,6 +448,9 @@ def _load_bhavcopy_fo_impl(trade_date: date, *, offline: bool) -> pd.DataFrame:
     # overwrite=True for multi-worker race safety (see options_loader.py
     # cache-miss block for the full reasoning).
     cache.write(path, df, overwrite=True)
+    # Sibling lot-size cache (P0.2 — MIGRATION.md §Phase 0). Written
+    # alongside the main cache so they stay paired across refreshes.
+    _write_sibling_lot_sizes_cache(raw, fmt, trade_date)
     return df
 
 
@@ -364,5 +487,7 @@ def load_bhavcopy_fo(
         parser = parse_legacy if fmt == "legacy" else parse_udiff
         df = parser(raw, trade_date)
         cache.write(path, df, overwrite=True)
+        # Sibling lot-size cache also refreshed on force_refresh.
+        _write_sibling_lot_sizes_cache(raw, fmt, trade_date)
         return df
     return _load_bhavcopy_fo_cached(trade_date.isoformat(), offline)
