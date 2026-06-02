@@ -16133,3 +16133,86 @@ In priority order:
 Standing by.
 
 ---
+
+## Review of dce9a87 — `fix(docs.migration.p1_7_case3_disambiguation)`
+
+**Verdict: ✅ ACCEPT.** Grill A closed using Option A exactly as recommended. The data_present check is logically sound; the 8c2c517 design intent is preserved; the LOAD-BEARING test set grows from 2 → 4 P1.7 entries pinning BOTH the missing-data contract AND the deep-OTM preservation contract. No grills.
+
+### Verification (logic check on the `data_present` discriminator)
+
+The fix at the call site:
+
+```python
+if vwap is None:
+    data_present = (
+        turnover is not None and not pd.isna(turnover)
+        and volume is not None and volume > 0
+        and strike is not None
+    )
+    if data_present:
+        fill_px = close  # case (3) deep-OTM
+    else:
+        raise MissingTurnoverError(...)  # cases (1) + (2)
+```
+
+Cross-checked against `_compute_vwap` at `src/engine/pnl.py:85-100`:
+
+- Case (1) "turnover/volume missing or zero" → `data_present` fails on `turnover is not None` OR `volume is not None and volume > 0`. Falls through to raise. ✓
+- Case (2) "NaN turnover" → `data_present` fails on `not pd.isna(turnover)`. Falls through to raise. ✓
+- Case (3) "deep-OTM ill-conditioning" — turnover present + non-NaN + volume > 0 + strike present, but `premium_vwap ≤ 0` → `data_present` PASSES. Falls through to close, preserving 8c2c517. ✓
+
+Plus the wrapper's defensive `strike is None` short-circuit (`vwap = _compute_vwap(...) if strike is not None else None`) → `data_present` fails on `strike is not None`. Raises. Defensible for the test-fixture case (production always provides strike).
+
+Logic is sound. The discriminator accurately separates the three structural cases.
+
+### LOAD-BEARING test growth (2 → 4 P1.7 entries)
+
+| Test | Pins | Case |
+|---|---|---|
+| `test_pick_fill_price_skips_when_turnover_missing` | New MissingTurnoverError raised | (1) + (2) |
+| `test_pick_fill_price_falls_back_to_close_on_deep_otm` | 8c2c517 design intent | (3) preservation |
+| `test_sweep_records_missing_turnover_as_skip_reason` | End-to-end skip via _SKIPPABLE_ERRORS | (1) + (2) at sweep level |
+| `test_sweep_does_not_skip_on_deep_otm` | Deep-OTM cell IS priced | (3) at sweep level |
+
+Plus a new unit-level test `test_pick_fill_price_skips_when_turnover_is_nan` (case (2) explicit).
+
+The case-(3) preservation tests are the right anti-regression shape. **"Anti-regression against future tightening that would collapse all three cases"** — that's the right framing. A future contributor reading the data_present check might think "this looks redundant, let me simplify" → fire the case-(3) preservation test → see the test docstring explain the 8c2c517 design intent → back off.
+
+### Praises
+
+- **Option A applied exactly as recommended**, no scope creep. Smallest possible diff to close the grill.
+- **Inline three-case enumeration in the P1.7 narrative** means a future implementer reading the code block can't miss the distinction. Anti-confusion docs.
+- **2 NEW tests for case (3) preservation** (`falls_back_to_close_on_deep_otm` + `does_not_skip_on_deep_otm`) are exactly the load-bearing pins to prevent silent regression. Both pin the SAME contract from different layers — unit-level + sweep-end-to-end.
+- **Explicit case (2) test** (`skips_when_turnover_is_nan`) was previously implicit in the missing-turnover test. Splitting it makes the intent surgically clear.
+- **Error message updated** to include `turnover=` in the diagnostic string — helpful for case (1) vs (2) discrimination at debug time without re-running.
+- **Sweeper claim verified**: `MissingTurnoverError(MissingDataError)` subtype still flows through `_SKIPPABLE_ERRORS` correctly; no sweeper changes. The class-name-as-skip-reason pattern at `sweeper.py:225` (`f"skip:{type(e).__name__}|{e}"`) means the new error class auto-flows into the skip parquet with the right reason token.
+
+### Behavior delta
+
+None on this docs commit. The P1.7 spec is now correctly specified; the actual P1.7 code commit will land per the updated spec.
+
+### Math
+
+No test count change (docs-only). The P1.7 spec now describes 5 new tests (was 3 in 10f36be); count will reflect when P1.7 actually lands.
+
+### Open grills
+
+**Empty.** Grill A closed. The MIGRATION.md doc is now ready as the authoritative spec for P0.1 → P2.6.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **P0.1 fixture commit** (operator action: unzip the 4 NSE_FO_contract ZIPs into `data/manual/contracts/` + commit). Kicks off Phase 1 implementation.
+2. **Then P1.1** (parse_udiff extension — +3 cols).
+3. **(operator-driven, parallel)** heatmap click-test outcome on `heatmap-click-scatter-owns-interactivity` branch — independent track.
+
+The MIGRATION.md doc is the authoritative reference for whoever picks up the implementation. Specifically, the P1.7 case-(3) preservation contract is now LOAD-BEARING-tested-at-spec-time; the implementer can't accidentally collapse the three cases.
+
+Standing by for P0.1 or the heatmap branch update.
+
+---
