@@ -16903,3 +16903,52 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of ccfc91e — `feat(engine.cache.contract_path_writes)` — **P1.4**
+
+**Verdict: ✅ ACCEPT.** Tiny 47-LOC src extension + 144-LOC tests. `materialize_contract_from_bhavcopy` wraps the P1.3 transform with disk-write semantics + idempotency. 4 LOAD-BEARING tests pin the contract. Drop-in replacement for `options_loader`'s disk path. No grills.
+
+### What landed
+
+- **`materialize_contract_from_bhavcopy`** (44 lines) — wraps `bhavcopy_to_contract_timeseries` with `cache.write(cache.option_path(...))`. Returns the path written (or the existing path on idempotent skip).
+- **Import cleanup**: drop unused `MissingDataError` import from P1.3 (only `MissingTurnoverError` is actually used at the call site); add `pathlib.Path` for the materialize return type.
+- **4 new tests** pinning the contract.
+
+### Verification
+
+- **Path equivalence**: `cache.option_path(symbol, expiry, strike, option_type)` at `cache.py:79` exists; signature matches what `options_loader` writes to. Drop-in replacement claim holds. ✓
+- **Tests pass**: `tests/test_bhavcopy_to_contract.py` → 17 pass at HEAD (P1.3's 13 + P1.4's 4 = 17). ✓
+- **Idempotency semantic**: `if path.exists() and not force: return path` is the only state check — no hash/timestamp/content compare. Predictable; matches the test's spy-monkeypatch verifying the transform is NOT reinvoked on the second call.
+
+### Praises
+
+- **Idempotency test uses spy-monkeypatch** to assert the transform is NOT called on the second invocation. This is stronger than "file still exists" — pins that the cheap file-exists check is the actual short-circuit (rather than an accidental re-call followed by overwrite).
+- **`force=True` test mutates source bhavcopy + asserts the new close/volume surface** — pins that force genuinely rewrites rather than no-ops.
+- **No-partial-file test** (`test_materialize_propagates_missing_turnover_error_no_partial_file`) is the right discipline: when the transform raises, the materialize must not leave a corrupted parquet on disk that would mislead a subsequent idempotent call.
+- **Force-rewrite rationale named explicitly** ("Operator's escape hatch after a `--rebuild-lot-sizes` run that may have changed exclusion membership") — anti-confusion docs at the right surface. A future operator wondering "why force=True?" finds the answer in the docstring.
+- **`MissingTurnoverError` propagation tested** — no swallowing, no wrapping. Caller sees the same error class the transform raises, so the caller's handler (sweeper's `_SKIPPABLE_ERRORS`) catches it natively.
+- **Import cleanup is part of the nuclear commit** — drops unused `MissingDataError` import that P1.3 added but only needed the subtype. Good hygiene.
+- **`P1.5 next` note in commit body** previews the prefetch integration shape (`--engine-source bhavcopy` vs `--engine-source api` per the original spec). Future-context for the reviewer.
+
+### Behavior delta
+
+- New function exposed. No existing code paths modified.
+- Drop-in replacement at the disk-path layer: sweep workers read the same cache.option_path, don't care which path produced the parquet.
+
+### Math
+
+`834 → 838 (+4 net)` per the body. Verified via test run (4 new tests pass).
+
+### Open grills
+
+**Empty.**
+
+### Next-commit suggestion
+
+P1.5 — `feat(prefetch.bhavcopy_first_mode)` — wire `materialize_contract_from_bhavcopy` into `scripts/prefetch_universe.py` behind `--engine-source bhavcopy` (default after smoke gate) vs `--engine-source api` (legacy options_loader fallback through cutover validation). The Step B enumeration of `(sym, expiry, strike, option_type)` tuples from cached bhavcopies replaces strike_planner's pre-guess.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 → P1.6 → ... → P2.4**.
+
+Standing by.
+
+---
