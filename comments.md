@@ -16736,3 +16736,52 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 → P1.2 → ... → P2.4**.
 Standing by.
 
 ---
+
+## Review of 2850646 — `chore(data.bhavcopy_fo.parse_udiff_extension)` — **P1.1**
+
+**Verdict: ✅ ACCEPT.** Tiny nuclear commit (9 LOC in loader, 129 in tests). UDiff parser gains `ltp` (from `LastPric`) + `turnover` (from `TtlTrfVal`); `parse_legacy` correctly untouched per nuclear-commit discipline. 3 new tests pin the change. Anti-confusion docstring already landed in P0.2 (no double-write). No grills.
+
+### What landed
+
+- **`src/data/bhavcopy_fo_loader.py:295-322`**: 2 new output columns in `parse_udiff`:
+  - `ltp` placed after `close` (natural per-share-price group).
+  - `turnover` placed after `contracts` (natural volume-and-notional group).
+  - 6-line inline comment cross-refs MIGRATION.md §Phase 1 + the sibling-cache decision.
+- **`tests/test_bhavcopy_fo_loader.py`**: 3 new tests + 1 schema-helper refactor (split into `_assert_legacy_schema` + `_assert_udiff_schema` via shared `_assert_common_dtypes`; backward-compat alias preserved).
+
+### Verification (per discipline)
+
+- **`parse_legacy` untouched at 2850646**: verified by `git show 2850646:src/data/bhavcopy_fo_loader.py | sed -n '215,260p'` — legacy output frame still has 13 cols (instrument, symbol, expiry, strike, option_type, open, high, low, close, settle_price, contracts, oi, oi_change) + trade_date appended. No `turnover` row. ✓ Commit body honest.
+- **UDiff dtypes**: both `ltp` (`LastPric`) and `turnover` (`TtlTrfVal`) cast to `float64` — correct for rupees-per-share + lakhs-of-rupees respectively.
+- **NewBrdLotQty intentionally NOT added** — inline comment explicitly names this + cross-refs the sibling-cache path written by `_write_sibling_lot_sizes_cache`. The anti-confusion docstring landed in P0.2; this commit doesn't double-write it.
+
+### Praises
+
+- **Tightly scoped to UDiff only**. Nuclear-commit discipline honored. `parse_legacy` extension correctly deferred to P1.2.
+- **Inline comment at parser** names the architectural decision in-place (rather than relying on a maintainer to find the module docstring or the MIGRATION.md spec). Anti-confusion docs at the right surface.
+- **`test_parse_udiff_does_not_carry_lot_size`** is the LOAD-BEARING anti-regression I expected — a future maintainer who "fixes" the missing `lot_size` column fires this test.
+- **NaN-tolerance test goes beyond the natural-fixture case** — synthetic-NaN injection (mutate an OPTSTK row's LastPric to blank → parsed back as NaN) future-proofs against NSE format drift if NSE ever stops writing 0.00 for untrade days.
+- **Schema-helper refactor with backward-compat alias** (`_assert_specs_2_4_schema` → `_assert_legacy_schema`) is the right discipline: split for clarity but preserve external callers.
+- **Test count claim** (`814 → 817, +3 net`) is internally consistent — the 3 explicit additions named match the +3 delta.
+
+### Behavior delta
+
+- UDiff bhavcopy cache parquets now carry 2 more columns (15 → 16 incl. trade_date).
+- Legacy bhavcopy cache parquets UNCHANGED (until P1.2 lands).
+- All current downstream consumers of the bhavcopy cache (verified in P0.2 review: `_strikes.py`, `spot_options.py:get_options_chain_impl`, `expiry_calendar.py`) don't read `ltp` or `turnover` so don't observe the change.
+
+### Math
+
+`814 → 817 (+3 net)` per the body. Verified via verbose pytest after the subsequent P1.2 commit landed: `32 passed` on the loader tests; full-suite `821 passed` includes both P1.1 and P1.2 additions. Body's `+3` for THIS commit is consistent.
+
+### Open grills
+
+**Empty.**
+
+### Next-commit suggestion
+
+P1.2 — `chore(data.bhavcopy_fo.parse_legacy_extension)` — already landed at 7c3d53f. Reviewing next.
+
+Standing by.
+
+---
