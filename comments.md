@@ -15807,3 +15807,214 @@ The DATA_PRODUCTS.md doc is ready as the architectural reference for whichever d
 Standing by.
 
 ---
+
+## Review of e0bc85a — `docs(migration.bhavcopy_only_arch)` — REVIEWER-REQUESTED architectural execution audit
+
+**Verdict: ✅ ACCEPT WITH REQUIRED FOLLOWUP.** Substantive 405-LOC execution plan. The 16-sub-commit nuclear structure is sound; phase boundaries are clean; LOAD-BEARING tests are well-selected; rollback paths are explicit. Six small grills — all framing/spec tightening, no analytical errors. BUILDER's 7 audit asks systematically addressed below.
+
+### Audit #1 — Consistency vs DATA_PRODUCTS.md (D1-D4)
+
+Verified the §Decisions encoded section against DATA_PRODUCTS.md (b6d3185 state):
+
+| Decision | DATA_PRODUCTS.md | MIGRATION.md | Match? |
+|---|---|---|---|
+| D1 | 4 options (a/b/c/d); recommendation = (d) "deprecated, edge-case audits only" | "bhavcopy-only primary; options_loader as deprecated dead code (P1.8); no production fallback after P1.7" | ✓ Maps to (d) + the "graceful-degrade removed" element from D4 |
+| D2 | "2024-04-15 onwards (regimes B+C): wire Source 6" | "4-year window starting 2024-04-15; Regime A skipped" | ✓ Matches |
+| D3 | "Drop ltp; caveat in get_options_chain when ANY row from pre-2024-07-08" | "ltp NaN for regime B; caveat in get_options_chain per P2.4" | ✓ Matches |
+| D4 | "Keep but deprecated; graceful-degrade pattern from pnl.py:194-203" | "options_loader kept as dead code; graceful-degrade removed (P1.7)" | ✓ Matches |
+
+D1 maps cleanly to option (d) + the policy posture from D4. The plan's "kept as dead code with deprecation header" + "no production fallback" is the implementation of D1's option (d) "Keep — deprecated, edge-case audits only" combined with the D4 graceful-degrade strip.
+
+**Verdict on #1**: D1-D4 decisions embedded faithfully. Cross-doc consistency holds.
+
+### Audit #2 — Phase boundaries (16 sub-commits nuclear?)
+
+Sub-commit count: P0.1 (1) + P1.1-P1.9 (9) + P2.1-P2.6 (6) = **16 total** ✓ matches doc claim.
+
+Nuclearity analysis:
+
+| Phase | Commit | Independence | Notes |
+|---|---|---|---|
+| P0.1 | fixture add | independent | pure data |
+| P1.1 | parse_udiff +3 cols | independent | only adds output cols |
+| P1.2 | parse_legacy +1 col | independent | only adds turnover |
+| P1.3 | new transform | depends on P1.1+P1.2 | **LOAD-BEARING anchor** |
+| P1.4 | materialize | depends on P1.3 | wraps transform with disk write |
+| P1.5 | prefetch flag | depends on P1.4 | adds --engine-source toggle |
+| P1.6 | smoke test | depends on P1.5 | **GATE for P1.7** |
+| P1.7 | strip graceful-degrade | depends on P1.6 acceptance | **FIRST IRREVERSIBLE** |
+| P1.8 | deprecation header + strip --engine-source api | depends on P1.7 | one-shot cleanup |
+| P1.9 | docs | depends on P1.8 | recap |
+| P2.1 | sidecar loader | independent of Phase 1 | new file |
+| P2.2 | transform extension | depends on P2.1 + P1.3 | adds legacy path |
+| P2.3 | prefetch regime B | depends on P2.2 | extends P1.5 |
+| P2.4 | MCP legacy caveat | independent | new MCP behavior |
+| P2.5 | smoke test | depends on P2.3 + P2.4 | cross-boundary validation |
+| P2.6 | docs | depends on P2.5 | recap |
+
+Phase boundaries clean. Nuclear pattern matches the project's `feedback-nuclear-commits` discipline.
+
+### Grill #1 (small, P1.3 test spec): "column equality required" is ambiguous
+
+P1.3 LOAD-BEARING equivalence test (line 199): "compare against `options_loader.load_option` output for the same `(symbol, expiry, strike, option_type)` over a 5-day period — **column equality required**."
+
+"Column equality" is ambiguous. Two interpretations:
+
+- **Column-NAMES equality**: same 16 column names present. Trivially passable by a stub that returns the right shape.
+- **Per-row VALUE equality**: same column names + same dtypes + same row count + same values per `(date, contract)` row.
+
+A future implementer reading "column equality" might pass the weaker interpretation. The LOAD-BEARING claim demands the stronger one.
+
+**Fix**: tighten P1.3's test spec to "per-row value equality across all 16 columns + identical dtypes per column + identical row order (or sorted comparison)." Could add a one-line worked example: e.g., for RELIANCE 2024-08-29 2840-CE, fixture-derived row must exactly match the API-derived row.
+
+### Grill #2 (small, P1.6 acceptance criterion): vague unit on "ROI delta"
+
+P1.6 acceptance criterion (line 246): "bhavcopy-derived results match the API-derived results to within float-precision rounding (**median ROI delta < 0.01% per cell**)."
+
+"median ROI delta < 0.01% per cell" is ambiguous:
+- Is "median ROI" the cell's median across its trades, OR each per-trade ROI value?
+- Is "per cell" the comparison granularity (cell-by-cell), OR the delta scope?
+
+Plausible reading: "the cell's median per-trade ROI differs by < 0.01% (absolute) between bhavcopy and API derivations, evaluated per cell." 0.01% absolute is one basis point — tight but reasonable for float64 + lakh-rounded inputs.
+
+But what if the cell median is 0.05% and the API gives 0.06%? That's a 0.01% absolute delta but a 20% RELATIVE difference. Is that a pass or a fail? Doc doesn't say.
+
+**Fix**: amend to "**absolute** delta < 0.01% on the cell's median per-trade ROI" + add a per-trade backup criterion: "If any individual per-trade ROI delta exceeds 0.5%, drill in even if the median tolerates it." That catches a scenario where one or two trades are wildly off but the median smooths them.
+
+### Grill #3 (small, rollback gap): post-Phase-2 rollback of a P1.7 issue isn't named
+
+Rollback section (lines 386-388):
+- Mid-Phase-1, pre-P1.7: flip --engine-source api ✓
+- Post-P1.7: revert P1.7 + re-prefetch + update tests ✓
+- Phase 2 issue: skip P2.x; engine still works on regime C only via Phase 1 ✓
+
+Missing scenario: **Phase 1 issue discovered AFTER Phase 2 has landed**. Phase 2's sidecar loader + transform extensions assume the bhavcopy-only architecture; Phase 2's tests may depend on P1.7's loud-failure semantics. Reverting P1.7 alone breaks Phase 2's test contracts.
+
+**Fix**: amend rollback section with: "Post-Phase-2 rollback of a P1.7 issue requires full revert through Phase 2 (P2.6 → P2.1), then standard P1.7 revert. The Phase-1/Phase-2 dependency ordering means a Phase-1 graceful-degrade restoration cascades through any Phase 2 work that landed on top."
+
+The "Phase 2 is gated on Phase 1 verification end-to-end" rule (line 374) makes this scenario unlikely in practice, but the rollback section should name it explicitly.
+
+### Audit #3 — 4-fixture coverage claim
+
+Snapshot coverage (each fixture covers ~3 forward months of expiries):
+
+- **2024-04-16** snapshot → Apr/May/Jun 2024 expiries
+- **2024-05-16** → May/Jun/Jul
+- **2024-06-12** → Jun/Jul/Aug
+- **2024-07-05** → Jul/Aug/Sep
+
+Trades in regime B (2024-04-15 → 2024-07-07) involve these expiries:
+
+- **Apr 2024 expiry** (settles Apr 25): traded Apr 15-25. In **only the Apr-16 snapshot** — 1 snapshot.
+- **May expiry** (settles May 30): in Apr-16 + May-16 — 2 snapshots ✓
+- **Jun expiry** (settles Jun 27): in Apr-16 + May-16 + Jun-12 — 3 snapshots ✓
+- **Jul expiry** (trades through Jul 7 in regime B, then into regime C; settles Jul 25): in May-16 + Jun-12 + Jul-05 — 3 snapshots ✓
+
+PNB Jun 2024 expiry spot-check: should appear in 3 snapshots (Apr-16 + May-16 + Jun-12). Cross-snapshot consistency verifiable.
+
+### Grill #4 (small, fixture cross-validation gap for Apr expiry)
+
+The doc claim "with multiple appearances available for sanity-check cross-validation" (line 72) holds for May/Jun/Jul expiries (2-3 snapshots each) but NOT for Apr expiry (only the 2024-04-16 snapshot covers it).
+
+"Regime B is fully covered" is true (every expiry has ≥ 1 snapshot), but the cross-validation claim has an Apr-expiry gap. If the Apr-16 snapshot's lot_size data for Apr expiry contracts is buggy, there's no second snapshot to catch it.
+
+**Fix**: amend the fixture description to note "Apr 2024 expiry: single-snapshot coverage (2024-04-16 only) — no cross-validation possible for this specific expiry. May/Jun/Jul expiries: 2-3 snapshots each (cross-validation possible)." Operator should manually spot-check Apr expiry lot sizes against a known source.
+
+### Audit #4 — LOAD-BEARING test selection
+
+The §Test plan table lists 7 LOAD-BEARING tests. Each pinning the right contract:
+
+- P1.1 column-set contract ✓
+- P1.2 turnover availability ✓
+- P1.3 engine-equivalence ✓ (modulo Grill #1 on tightness)
+- P1.7 loud-fail contract ✓
+- P2.1 sidecar correctness ✓
+- P2.2 volume derivation ✓
+- P2.4 MCP caveat trigger ✓
+
+Coverage of the critical paths is solid. One missing test category: **anti-regression for callers that legitimately needed close-fallback semantics under P1.7**. The plan says "audit the test suite" but doesn't pin a test for "tests that depend on the OLD graceful-degrade behavior and need replacement." More on this in Grill #5.
+
+### Grill #5 (small, P1.7 scope): test-suite audit should extend to external callers
+
+The plan (line 256) says: "audit the test suite: find every `_pick_fill_price` test that relied on close-fallback semantics."
+
+But `_pick_fill_price` is called via `price_trade` from `src/engine/sweeper.py`, AND from MCP tools that invoke `price_trade` (e.g., `src/mcp/backtest_one.py` for single-trade replay). After P1.7, calling backtest_one on a stale pre-migration cache (one without turnover) would raise MissingDataError instead of falling back to close.
+
+**This is the right behavior** under the bhavcopy-only architecture, BUT the plan should explicitly call out the external-caller impact:
+
+- **MCP backtest_one**: after P1.7, calls against pre-migration caches raise MissingDataError. The MCP layer's error response surfaces this to the consumer Claude. Operator should re-prefetch any stale caches before P1.7.
+- **MCP cell_summary / heatmap / sweep_windows**: don't call price_trade directly (they read sweep parquets). Unaffected by P1.7.
+- **Dashboard drill-down (src/web/heatmap.py)**: doesn't call price_trade. Unaffected.
+
+**Fix**: amend P1.7's "test-suite audit" line to: "audit the test suite AND external callers (MCP `backtest_one` + any future caller of `price_trade`). For external callers, document that pre-migration caches need re-prefetching before P1.7 can land safely."
+
+### Audit #5 — P1.7 test-suite audit (BUILDER's specific ask)
+
+Covered in Grill #5 above. The "audit the test suite" framing is realistic for in-suite tests but misses the external-caller dimension (MCP backtest_one).
+
+### Audit #6 — Risk + rollback
+
+Covered in Grill #3 above for the post-Phase-2-rollback gap. Otherwise the rollback paths look honest:
+
+- Pre-P1.7 mid-Phase-1: net-additive; flip the flag, no revert ✓
+- P1.7 itself: revert is reversible IF you re-prefetch with api mode AND restore the close-fallback tests ✓
+- Phase 2 issue: skip P2.x; regime C continues working ✓
+
+### Audit #7 — Three implicit decisions
+
+- **(a) All strikes (no strike_planner pre-filter)**: correct for COVERAGE — every traded strike naturally in bhavcopy. But increases disk footprint vs current strike_planner (6-per-side → ~30 strikes per cell vs all-traded → could be 100+ strikes per cell for active underlyings). Net storage: ~3-5× current cache size. Not a correctness issue; an operator-quality consideration.
+- **(b) 0-volume disqualifies via IlliquidLegError gate**: existing engine behavior; unchanged ✓
+- **(c) Sweep batching unchanged**: matches Non-goal #2 "no sweep batching refactor"; cell-granular sweep workers continue reading per-contract parquets ✓
+
+### Grill #6 (very minor, disk cost note)
+
+The "all strikes" implicit decision is correct for coverage but increases per-contract parquet count vs current `strike_planner` config (DEFAULT_STRIKES_PER_SIDE=6). Operator should know about the storage delta before Phase 1 lands.
+
+**Fix**: amend the implicit-decisions section to add a one-line note: "Disk footprint: with strike_planner removed, per-cell strike count goes from ~13 (6-per-side + ATM) to all-traded (~30-100+ for active underlyings). Estimated ~3-5× cache growth — verify storage capacity before Phase 1 prefetch run."
+
+### Praises
+
+- **16 nuclear sub-commits with clean dependency ordering**. Each phase has a single load-bearing GATE (P1.6 → P1.7 for Phase 1; P2.5 → P2.6 for Phase 2). Matches the project's nuclear-commits discipline.
+- **Non-goals section** explicitly prevents scope creep ("no engine logic changes", "no sweep batching refactor", "no regime A", "no Akamai bot-challenge integration", "no fo_mktlots.csv parser"). Each non-goal saves a future scope-debate.
+- **P1.6 acceptance criterion gates P1.7** — the first irreversible commit only lands after smoke validation. Right safety net.
+- **Architecture diagram** is clean and operator-readable. Names every component in the new flow.
+- **Decisions encoded explicitly** in the closing section with cross-refs to DATA_PRODUCTS.md. Single-source-of-truth pattern preserved.
+- **Operator-action commits** (P0.1, P1.6, P2.5) explicitly named as separate from code commits. The operator/builder boundary is clear.
+- **Companion-doc framing** ("read DATA_PRODUCTS.md first") prevents this doc from re-litigating the regime analysis.
+- **Phase 2 is gated on Phase 1 verification end-to-end** (line 374) — explicit halt-and-investigate rule prevents Phase 2 work on a broken Phase 1.
+- **`StockNm` regex approach for sidecar expiry extraction** (P2.1) avoids decoding NSE's proprietary epoch — pragmatic engineering call.
+
+### Behavior delta
+
+None. Pure planning doc. No code, no tests.
+
+### Math
+
+No test count changes (docs-only). The plan describes ~16 future commits each with their own test additions per §Test plan — those test deltas will land per-commit.
+
+### Open grills (after this commit)
+
+1. **Grill #1** (small, P1.3 test spec): tighten "column equality" to "per-row value equality across all 16 columns + identical dtypes + sorted comparison."
+2. **Grill #2** (small, P1.6 acceptance): qualify "ROI delta" as "absolute delta on cell's median per-trade ROI" + add a per-trade backup criterion.
+3. **Grill #3** (small, rollback gap): name post-Phase-2 P1.7 rollback scenario explicitly.
+4. **Grill #4** (small, fixture gap): note Apr-2024-expiry's single-snapshot coverage; no cross-validation possible.
+5. **Grill #5** (small, P1.7 scope): extend test-suite audit to external callers (MCP backtest_one).
+6. **Grill #6** (very minor, disk cost): note ~3-5× cache growth from all-strikes vs strike_planner.
+
+All six are framing/spec tightening in MIGRATION.md. Single tiny `fix(docs.migration.calibration)` commit closes them.
+
+### MCP arc state
+
+Unchanged at 16/16. This is a Phase-7/Phase-data architectural execution plan.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(docs.migration.calibration)`** — close the 6 grills above (most are 1-2 line edits in MIGRATION.md).
+2. **Then start the implementation work** — P0.1 (operator action: unzip + commit fixtures), then P1.1 (parse_udiff extension).
+3. **(operator-driven, parallel)** Heatmap click-test outcome on the `heatmap-click-scatter-owns-interactivity` branch — independent track.
+
+Standing by for the calibration fix or the P0.1 fixture commit.
+
+---
