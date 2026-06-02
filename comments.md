@@ -17004,3 +17004,146 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of 6f4bea5 — `feat(scripts.smoke_post_migration)` — **P1.6 (LOAD-BEARING gate) ❌ NEEDS FIX**
+
+**Verdict: ❌ REQUEST CHANGES.** 428-LOC tool commit (244 runner + 184 tests). Runner SHIPS but the cell-vs-trade key semantics are inverted — `_CELL_KEYS` includes `expiry` which collapses "cell" to "trade" (each trade is its own group of size 1; cell median = the trade's own ROI). The primary criterion becomes a per-trade 0.01 pp check (much stricter than intended); the backup at 0.5 pp becomes a strictly-looser-redundant per-trade check. **This is load-bearing for P1.7** — getting it wrong means false-positive halts on float-precision noise. State-of-tree warning: DO NOT run the smoke gate yet.
+
+### Empirical verification (independently reproduced)
+
+Ran the runner's helpers against the BUILDER's own `test_run_smoke_comparison_fail_when_backup_threshold_exceeded` fixture (intended to demonstrate the backup catching trades the cell-median smooths):
+
+```python
+api:  [(short_straddle, PNB, 24-08-29, 15, 1, 1.234),
+       (short_straddle, PNB, 24-09-26, 15, 1, 1.5)]
+bhav: [(short_straddle, PNB, 24-08-29, 15, 1, 1.234),
+       (short_straddle, PNB, 24-09-26, 15, 1, 2.3)]
+```
+
+`_compare_cells` output:
+
+```
+         strategy symbol  ... n_trades_bhavcopy  abs_median_delta_pp
+0  short_straddle    PNB  ...                 1                  0.0
+1  short_straddle    PNB  ...                 1                  0.8
+```
+
+`_compare_per_trade` output:
+
+```
+         strategy symbol  ... roi_pct_bhavcopy  abs_trade_delta_pp
+0  short_straddle    PNB  ...            1.234                 0.0
+1  short_straddle    PNB  ...            2.300                 0.8
+```
+
+**IDENTICAL output. `n_trades_bhavcopy = 1` on each cell row.** The "cell median" is just the single trade's ROI because each cell has size 1. Both rows show 0.8 delta on the same trade. Primary (0.01 pp) fails first; backup (0.5 pp) is strictly looser and redundant.
+
+### Grill #1 (REAL, LOAD-BEARING semantic bug): `_CELL_KEYS` includes `expiry`
+
+`scripts/smoke_post_migration.py:82-85`:
+
+```python
+_CELL_KEYS = [
+    "strategy", "symbol", "expiry",
+    "entry_offset_td", "exit_offset_td",
+]
+```
+
+In the sweep parquet's data model, one ROW is one TRADE, identified by `(strategy, symbol, expiry, entry_offset_td, exit_offset_td)` — these 5 fields uniquely identify a single trade. A "CELL" in the dashboard / `cell_summary` MCP tool / heatmap is `(strategy, symbol, entry_offset_td, exit_offset_td)` — aggregated ACROSS expiries.
+
+The BUILDER's `_CELL_KEYS` includes `expiry`, which makes the `_compute_cell_median_rois` `groupby` produce ONE group per trade (size always 1). The "median" of a single value IS that value. So the primary criterion's intended semantic ("cell's median per-trade ROI < 0.01 pp") collapses to "every per-trade ROI < 0.01 pp" — much stricter than intended.
+
+**Concrete consequences**:
+
+- **False-positive halt risk**: float-precision noise from the bhavcopy turnover lakh-rounding (recovered VWAP differs by 0.005-0.02 pp on individual trades vs the API path's direct premium) could halt P1.7 even when the cell-level statistics match. The 0.01 pp threshold was set for cell-level robust statistics, not per-trade.
+- **Backup becomes strictly redundant**: 0.5 pp per-trade backup is looser than 0.01 pp per-trade primary. Backup catches NOTHING the primary doesn't. The cell-vs-trade two-criterion design from dce9a87 is gone — both criteria are per-trade.
+- The over-strictness cuts toward false-positive halts (safer-but-annoying), not false-pass (which would be dangerous).
+
+### Grill #2 (REAL, misleading test name): backup-fires-but-primary-smooths scenario isn't actually validated
+
+`test_run_smoke_comparison_fail_when_backup_threshold_exceeded` claims:
+
+> Cell median delta is small; individual trade delta exceeds 0.5 pp. Construct: 2 expiries per cell. One expiry has matching ROI; the other has a large delta. Cell-level medians stay close, but per-trade backup fires.
+
+This is the SPEC intent. But under the current `_CELL_KEYS` with expiry: **the primary ALSO fires** on the row with delta 0.8 (which is > 0.01 pp). The test asserts `passed is False` — true, but the FAILURE comes from the primary, not the backup. The test doesn't distinguish so it passes either way. It does NOT validate that the backup catches what the cell-median smooths.
+
+### Fix (both grills close together)
+
+Split the keys into two named sets:
+
+```python
+# Cell-level identity (aggregation across expiries in the cell):
+_CELL_KEYS = [
+    "strategy", "symbol", "entry_offset_td", "exit_offset_td",
+]
+# Trade-level identity (one row per trade in the sweep):
+_TRADE_KEYS = _CELL_KEYS + ["expiry"]
+```
+
+- `_compute_cell_median_rois`: groupby `_CELL_KEYS` → true cell aggregation (median across expiries).
+- `_compare_per_trade`: join on `_TRADE_KEYS` → 1:1 per-trade matching.
+
+Then rebuild the misleading test with a 3+ trade fixture so the cell-median actually stays within primary threshold while one trade exceeds backup. Example:
+
+```python
+api:  [(s, PNB, 24-08-29, 15, 1, 1.0),
+       (s, PNB, 24-09-26, 15, 1, 1.0),
+       (s, PNB, 24-10-31, 15, 1, 1.0)]            # cell median 1.0
+bhav: [(s, PNB, 24-08-29, 15, 1, 1.0),
+       (s, PNB, 24-09-26, 15, 1, 1.0),
+       (s, PNB, 24-10-31, 15, 1, 1.6)]            # cell median 1.0 (delta 0; primary passes)
+                                                  # per-trade max 0.6 (backup fires)
+```
+
+Plus add a positive-control test: `test_primary_passes_when_cell_median_smooths_per_trade_drift` — 4 trades in a cell, 3 match exactly + 1 differs by 0.1 pp. Cell median delta ≈ 0; per-trade max delta = 0.1 pp. Primary passes, backup passes (0.1 < 0.5). Sanity for the cell-vs-trade distinction.
+
+### Praises
+
+- **Threshold constants pinned** (`PRIMARY_MEDIAN_DELTA_THRESHOLD_PP = 0.01`, `BACKUP_PER_TRADE_DELTA_THRESHOLD_PP = 0.5`) with anti-regression test asserting numerical values match the spec. Catches silent drift on the threshold constants — just doesn't catch the semantic-key drift.
+- **6-step operator procedure in module docstring** is operator-grade — snapshot, wipe, prefetch, sweep, compare, gate-decision.
+- **Pass / fail console output** is well-shaped: side-by-side summary, primary section, backup section, first-20 failing rows for triage. The ✅/❌ messages are operator-actionable.
+- **`run_smoke_comparison` returns `bool`** + `main()` returns 0/1 — CI-friendly exit codes.
+- **Disjoint-sweeps detection**: empty cell-join → False rather than silent pass. The right safety net.
+- **File-not-found errors are loud** with available-run_ids enumeration. Operator-triage-friendly.
+- **Constants module-level with units (`_PP` suffix)**. Anti-confusion.
+
+### State-of-tree warning — DO NOT START THE SMOKE GATE YET
+
+**Critical**: do NOT run the operator-procedure against a real sweep until Grill #1 is fixed. Under the current keys, the primary check is per-trade at 0.01 pp — likely to false-fail on legitimate float-precision noise from the bhavcopy turnover lakh-rounding (recovered VWAP can shift the per-trade ROI by a few hundredths of a percentage point even when cell-level statistics match). The fix is small (~20 LOC src + ~50 LOC tests) and should land BEFORE P1.6 is exercised end-to-end.
+
+### Behavior delta
+
+None on the runtime — this is a tool. The bug is in the tool's intended use semantics.
+
+### Math
+
+`842 → 851 (+9 net)` per the body. The threshold tests don't catch the semantic bug (the threshold values ARE correct; the keys are wrong).
+
+### Open grills
+
+1. **Grill #1** (REAL, LOAD-BEARING): `_CELL_KEYS` includes `expiry` → primary collapses to per-trade.
+2. **Grill #2** (REAL, test integrity): backup-test doesn't actually validate the cell-median-smooths-but-backup-fires scenario.
+
+Both close in one fix commit.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**`fix(scripts.smoke_post_migration.cell_vs_trade_keys)`** — close Grills #1 + #2 in one tiny commit:
+
+1. Split `_CELL_KEYS` (cell-level, no expiry) from `_TRADE_KEYS` (trade-level, with expiry).
+2. `_compute_cell_median_rois` groups by `_CELL_KEYS`.
+3. `_compare_per_trade` joins on `_TRADE_KEYS`.
+4. Rewrite the misleading backup-fires test with a 3+ trade fixture.
+5. Add a positive-control test where cell-median smooths a small per-trade drift.
+
+~20 LOC src + ~50 LOC tests. **Load-bearing before P1.7 ships.**
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 (NEEDS FIX) → P1.7 (gated) → ...**
+
+Standing by.
+
+---
