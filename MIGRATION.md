@@ -69,7 +69,18 @@ Four NSE_FO_contract snapshots in `Reports-Archives-Multiple-DDMMYYYY.zip` forma
 | `Reports-Archives-Multiple-12062024.zip` | 2024-06-12 | Jun/Jul/Aug 2024 expiries |
 | `Reports-Archives-Multiple-05072024.zip` | 2024-07-05 | Jul/Aug/Sep 2024 expiries |
 
-Each snapshot is ~80-90k rows covering ~204 distinct symbols. Cross-snapshot overlap means each (symbol, expiry) pair appears in ≥1 file, with multiple appearances available for sanity-check cross-validation. **Regime B is fully covered** by these four files.
+Each snapshot is ~80-90k rows covering ~204 distinct symbols.
+
+**Coverage per regime-B expiry month** (per reviewer grill #4 on e0bc85a):
+
+| Expiry month | Snapshots covering it | Cross-validation possible? |
+|---|---|---|
+| Apr 2024 (settles Apr 25) | 2024-04-16 only — **1 snapshot** | **No** — single-snapshot coverage; operator should manually spot-check Apr-expiry lot sizes against a known source (e.g. the operator's earlier PNB CSV inspection) |
+| May 2024 (settles May 30) | 2024-04-16 + 2024-05-16 — 2 snapshots | Yes |
+| Jun 2024 (settles Jun 27) | 2024-04-16 + 2024-05-16 + 2024-06-12 — 3 snapshots | Yes |
+| Jul 2024 (settles Jul 25) | 2024-05-16 + 2024-06-12 + 2024-07-05 — 3 snapshots | Yes |
+
+**Regime B is fully covered** (every expiry has ≥ 1 snapshot), but Apr 2024 expiry has no second-snapshot fallback for cross-validation. If the Apr-16 snapshot is buggy for that expiry, the bug surfaces silently. May/Jun/Jul expiries are cross-validatable across 2-3 snapshots each.
 
 ### Known schemas
 - NSE_FO_contract column mapping decoded in [DATA_PRODUCTS.md](DATA_PRODUCTS.md#source-6--lot-size-sidecar-regimes-a--b--nse_fo_contract_ddmmyycsvgz)
@@ -81,6 +92,25 @@ Each snapshot is ~80-90k rows covering ~204 distinct symbols. Cross-snapshot ove
 - UDiff + legacy bhavcopy column mappings already in
   [bhavcopy_fo_loader.py](src/data/bhavcopy_fo_loader.py); only the
   parsers' OUTPUT column selection needs extension (3 cols UDiff, 1 col legacy).
+
+### Turnover column verification (load-bearing for P1.1/P1.2/P1.3)
+
+The bhavcopy carries EXACTLY ONE turnover field per format. Verified
+empirically against [BhavCopy_NSE_FO_0_0_0_20260602_F_0000.csv](BhavCopy_NSE_FO_0_0_0_20260602_F_0000.csv) header
+and [tests/fixtures/bhavcopy_fo_legacy_20240125.csv](tests/fixtures/bhavcopy_fo_legacy_20240125.csv):
+
+| Format | Turnover column | Units | Volume column (DON'T confuse) |
+|---|---|---|---|
+| UDiff (post-Jul-2024) | `TtlTrfVal` | lakhs of rupees, underlying notional | `TtlTradgVol` (contract units, NOT rupees) |
+| Legacy (pre-Jul-2024) | `VAL_INLAKH` | lakhs of rupees, underlying notional | `CONTRACTS` (contract units) |
+
+Both convention-confirmed by 8c2c517's empirical verification +
+strike-correction recovery formula. No other "turnover-like" field
+exists in either format (no separate "Premium Turnover" column —
+that's a different NSE product, the website's historical CSV
+download UI, NOT the bhavcopy). Cross-check before writing P1.1 /
+P1.2 / P1.3 code: grep the parser file for `Trf|Trd|Val|InLakh`
+on the actual raw header strings.
 
 ---
 
@@ -196,7 +226,12 @@ def bhavcopy_to_contract_timeseries(
 
 **Tests** (`tests/test_bhavcopy_to_contract.py`):
 - Synthesize a 3-day bhavcopy cache fixture with known values for one contract; assert the function returns the expected per-day rows in correct schema.
-- LOAD-BEARING: compare against `options_loader.load_option` output for the same (symbol, expiry, strike, option_type) over a 5-day period — column equality required. Fixture: hand-curated; not a network call.
+- LOAD-BEARING: compare against `options_loader.load_option` output for the same (symbol, expiry, strike, option_type) over a 5-day period. Equivalence spec (tightened per reviewer grill #1 on e0bc85a):
+  - **Same row count** between the two outputs (no missing or extra rows)
+  - **Same column names** (all 16 normalized columns)
+  - **Same dtypes per column** (float64 stays float64; Int64 stays Int64)
+  - **Per-row VALUE equality** across all 16 columns after sorting both frames by `date`
+  - Worked example to pin: RELIANCE 2024-08-29 2840-CE fixture row must produce byte-identical normalized output across the bhavcopy-derived and api-derived paths (modulo float64 last-bit jitter).
 - Assert empty-date-range returns empty DataFrame.
 - Assert missing-bhavcopy-day raises a clean error (not a silent skip).
 
@@ -243,19 +278,112 @@ Operator-action commit (likely a `scripts/smoke_post_migration.py` runner):
 3. Run `p7_wide_sweep.py --symbols PNB SBIN BHEL RELIANCE --workers 4`.
 4. Diff metrics against the current production sweep on the same universe (cell counts, skip rates, headline median ROI).
 
-**Acceptance criterion**: bhavcopy-derived results match the API-derived results to within float-precision rounding (median ROI delta < 0.01% per cell). If divergence exceeds that, **halt and investigate before P1.7**.
+**Acceptance criterion** (per reviewer grill #2 on e0bc85a):
+
+- **Primary**: per-cell, `|bhavcopy_median_roi_pct - api_median_roi_pct| < 0.01` (absolute delta on the cell's median per-trade ROI, in percentage points).
+- **Backup**: per-trade, no individual ROI delta exceeds 0.5 percentage points absolute. Catches the scenario where one or two trades are wildly off but the median smooths them.
+
+If EITHER fails on any cell, **halt and investigate before P1.7**.
 
 **Reviewer ask**: smoke results table; correctness verdict.
 
-### P1.7 — `chore(engine.pnl.strip_graceful_degrade)`
+### P1.7 — `feat(engine.pnl.missing_turnover_skip)`
 
-Per operator D4 decision: in the bhavcopy-only world, missing turnover is a bug, not a graceful-degrade scenario. Strip the `if vwap is None: fill_px = close` branch at [pnl.py:198-203](src/engine/pnl.py#L198-L203). Replace with a loud `MissingDataError`.
+Per operator's clarification (2026-06-02): in the bhavcopy-only
+world, missing turnover ISN'T a hard failure — it's a per-cell
+**skip** with a distinct, named reason. Skips already flow through
+the sweeper's existing machinery to `sweep_<run_id>_skipped.parquet`
+and the dashboard's drill-down + the MCP `skip_summary` tool, so
+operators see exactly how many cells were dropped for missing
+turnover vs other reasons.
+
+**Changes**:
+
+1. Add new exception `MissingTurnoverError(MissingDataError)` in
+   [src/data/errors.py](src/data/errors.py) — mirrors the
+   `IlliquidLegError(MissingDataError)` prior-art pattern at line 59.
+   Subclass relationship means it's automatically caught by
+   `_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)` at
+   [sweeper.py:56](src/engine/sweeper.py#L56) without sweeper
+   changes. The exception class NAME becomes the `skip_reason`
+   token in the skip parquet (per sweeper's reason-extraction at
+   line 322-326).
+2. In `_pick_fill_price` ([pnl.py:198-216](src/engine/pnl.py#L198-L216)),
+   strip the `if vwap is None: fill_px = close` graceful-degrade
+   branch. Replace with:
+   ```python
+   if vwap is None:
+       raise MissingTurnoverError(
+           f"{context}: turnover missing on {target}; cannot recover "
+           f"premium VWAP. close={close:.2f}, strike={strike}, "
+           f"volume={volume}."
+       )
+   ```
+   Engine path: raise → sweeper catches via `_SKIPPABLE_ERRORS` →
+   skip parquet row with `skip_reason="MissingTurnoverError"`,
+   `skip_detail` carrying the context string.
+
+3. NO change needed in:
+   - `sweeper.py` — `MissingTurnoverError` is a `MissingDataError`,
+     already in `_SKIPPABLE_ERRORS`.
+   - `pnl.py:_compute_vwap` — still returns None on missing turnover.
+   - MCP `skip_summary` — automatically picks up the new reason name.
 
 **Test updates required**:
-- Existing tests that synthesize minimal frames without `turnover` either get `turnover` added OR move to explicit "legacy-no-turnover" fixtures with `pytest.raises(MissingDataError)` assertions.
-- Audit the test suite: find every `_pick_fill_price` test that relied on close-fallback semantics; classify each as "needs turnover added" vs "needs to assert the loud failure mode now."
+- Audit every `_pick_fill_price` test that relied on close-fallback
+  semantics. Classify each:
+  - **(a) Needs turnover added** — the test was supplying minimal
+    fixture data and accidentally exercising the fallback. Fix:
+    add a realistic turnover value.
+  - **(b) Was testing the fallback intentionally** — replace the
+    assertion with `pytest.raises(MissingTurnoverError)`.
+- New test: `test_pick_fill_price_skips_when_turnover_missing` —
+  hand-curated row with `turnover=None`; assert
+  `MissingTurnoverError` raised; assert it's still a
+  `MissingDataError` subtype (so `_SKIPPABLE_ERRORS` catches it).
+- New test: `test_sweep_records_missing_turnover_as_skip_reason` —
+  run a 1-cell sweep with a no-turnover fixture; assert the skip
+  parquet has a row with `skip_reason="MissingTurnoverError"`.
 
-**Reviewer ask**: completeness of the test-suite audit. The graceful-degrade was a real safety net; we want to be sure every legitimate caller now provides turnover.
+**External-caller audit** (per reviewer grill #5 on e0bc85a):
+`_pick_fill_price` is called via `price_trade` from
+`src/engine/sweeper.py` AND from MCP tools that invoke `price_trade`.
+After P1.7, these external callers see the new skip semantics:
+
+- **MCP `backtest_one`**: calls `price_trade` directly for single-
+  trade replay. After P1.7, calls against a pre-migration cache
+  (one without turnover) raise `MissingTurnoverError`, which the
+  MCP layer's error response surfaces to the consumer Claude.
+  **Operator action**: re-prefetch any stale single-trade-replay
+  caches before P1.7 lands. Otherwise, expect the tool to start
+  failing on pre-migration data.
+- **MCP `cell_summary` / `heatmap` / `sweep_windows`**: read sweep
+  parquets (already-priced). Don't call `price_trade`. **Unaffected
+  by P1.7.**
+- **Dashboard drill-down** (`src/web/heatmap.py`): doesn't call
+  `price_trade`. **Unaffected by P1.7.**
+- **Future callers**: any new caller of `price_trade` needs to
+  expect `MissingTurnoverError` as a possible exception. Document
+  in `price_trade`'s docstring.
+
+**Why this beats both prior framings**:
+- Closer to operator's mental model: missing data is a data-quality
+  signal, not a structural failure. Treat it as a skip; operator
+  sees the count in skip_summary; operator decides whether to
+  re-prefetch or accept the gap.
+- Doesn't lump all missing-data cases into one generic reason — the
+  named subtype is distinct from `IlliquidLegError`, plain
+  `MissingDataError`, `OfflineCacheMiss`, etc. Same precedent
+  `IlliquidLegError` set when it was introduced.
+- Adds zero sweeper code. The skippable-subtype pattern is the
+  cheapest possible integration with the existing machinery.
+
+**Reviewer ask**: confirm the subtype-as-skip-reason pattern is the
+right precedent to follow. Confirm `skip_reason` extraction in
+sweeper correctly picks up the new class name. Audit completeness
+of the test-suite classification — are there callers outside the
+test suite (dashboard drill-down? MCP backtest_one?) that depended
+on the close-fallback semantics?
 
 ### P1.8 — `chore(data.options_loader.deprecation_header)`
 
@@ -355,7 +483,8 @@ PLAN.md history entry. Update DATA_PRODUCTS.md to mark the full 4-year window as
 | P1.1 | `test_parse_udiff_carries_ltp_lot_size_turnover` | Column-set contract for UDiff parser |
 | P1.2 | `test_parse_legacy_carries_turnover` | Turnover availability in legacy regime |
 | P1.3 | `test_bhavcopy_transform_matches_load_option_output` | Engine-equivalence check |
-| P1.7 | `test_pick_fill_price_raises_when_turnover_missing` | Loud-fail contract replaces graceful-degrade |
+| P1.7 | `test_pick_fill_price_skips_when_turnover_missing` | New MissingTurnoverError(MissingDataError) subtype; auto-skippable per _SKIPPABLE_ERRORS; distinct skip_reason |
+| P1.7 | `test_sweep_records_missing_turnover_as_skip_reason` | End-to-end: sweep emits skip parquet row with named reason |
 | P2.1 | `test_lot_size_lookup_against_4_snapshots` | Sidecar correctness |
 | P2.2 | `test_legacy_volume_derived_from_contracts_times_lotsize` | Volume derivation contract |
 | P2.4 | `test_get_options_chain_surfaces_legacy_ltp_caveat` | MCP caveat trigger |
@@ -384,8 +513,9 @@ PLAN.md history entry. Update DATA_PRODUCTS.md to mark the full 4-year window as
 
 ### Rollback paths
 - **Mid-Phase-1, pre-P1.7**: flip prefetch to `--engine-source api`; all caches stay valid; no code revert needed.
-- **Post-P1.7**: revert P1.7 commit; re-prefetch with `api` mode; tests that asserted `MissingDataError` need updating back to graceful-degrade.
-- **Phase 2 issue**: skip P2.x commits; engine still works on regime C only via Phase 1.
+- **Post-P1.7, pre-Phase-2**: revert P1.7 commit; re-prefetch with `api` mode; tests that asserted `MissingTurnoverError` (skip-with-reason) need updating back to graceful-degrade.
+- **Phase 1 issue discovered AFTER Phase 2 has landed** (per reviewer grill #3 on e0bc85a): Phase 2's sidecar loader + transform extensions assume the bhavcopy-only architecture; Phase 2's tests depend on P1.7's skip-with-reason semantics. **Reverting P1.7 alone breaks Phase 2's test contracts.** Required path: full revert through Phase 2 (P2.6 → P2.1 in reverse order), then standard P1.7 revert, then re-prefetch with `api` mode. The "Phase 2 is gated on Phase 1 verification end-to-end" rule makes this scenario unlikely in practice, but the dependency ordering means a Phase-1 graceful-degrade restoration cascades through any Phase 2 work that landed on top.
+- **Phase 2 issue (Phase 1 healthy)**: skip P2.x commits; engine still works on regime C only via Phase 1.
 
 ---
 
@@ -397,9 +527,9 @@ This plan embeds the operator's D1-D4 decisions from
 - **D1**: bhavcopy-only is the primary path; `options_loader` kept as deprecated dead code (P1.8). No production fallback after P1.7. Graceful-degrade in `pnl.py` removed.
 - **D2**: 4-year window starting 2024-04-15. Regime A skipped. Phases 1 + 2 cover the full target window.
 - **D3**: `ltp` is NaN for regime B rows; caveat surfaces in `get_options_chain` per P2.4.
-- **D4**: `options_loader.py` kept as dead code with deprecation header (P1.8); graceful-degrade removed (P1.7).
+- **D4**: `options_loader.py` kept as dead code with deprecation header (P1.8); graceful-degrade removed (P1.7). **Refinement (2026-06-02 operator clarification)**: missing turnover triggers a per-cell SKIP (via new `MissingTurnoverError(MissingDataError)` subtype, auto-caught by `_SKIPPABLE_ERRORS`) rather than a loud failure that crashes the sweep. Operator sees missing-turnover skips as a distinct reason in skip_summary / drill-down — closer to "this is a data-quality signal" than "this is a code bug." Pattern follows `IlliquidLegError(MissingDataError)` precedent.
 
 Plus three implicit decisions:
-- **All strikes**: no strike_planner pre-filtering. Every traded strike in the bhavcopy becomes a contract.
+- **All strikes**: no strike_planner pre-filtering. Every traded strike in the bhavcopy becomes a contract. **Disk cost note** (per reviewer grill #6 on e0bc85a): with `strike_planner` removed, per-cell strike count goes from ~13 (`DEFAULT_STRIKES_PER_SIDE = 6` + ATM = 13 per option_type) to all-traded (~30-100+ per option_type for active underlyings). Estimated **~3-5× cache growth** over current `data/cache/options/` footprint. **Verify storage capacity before Phase 1 prefetch run**.
 - **0-volume disqualifies**: handled by existing `IlliquidLegError` gate in [pnl.py](src/engine/pnl.py). No new logic.
 - **Sweep batching unchanged**: cell-granular tuples per [sweeper.py:304-312](src/engine/sweeper.py#L304-L312).
