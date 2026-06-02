@@ -16542,3 +16542,151 @@ The migration implementation cadence per the spec is now P0.1 ✓ → P0.2 → P
 Standing by for P0.2.
 
 ---
+
+## Review of 47a997e — `feat(scripts.build_lot_size_parquet)` — **P0.2 + load-bearing policy refinement**
+
+**Verdict: ✅ ACCEPT WITH MINOR NOTE.** Substantive 1258-LOC commit. The policy refinement (loud-fail → per-pair exclude) is empirically well-motivated by an actual 101-mismatch run I reproduced independently. Sibling-cache architecture is the right call. All 6 BUILDER audit asks systematically addressed below. One minor accuracy grill on the "EXACTLY 2×" framing claim.
+
+### Independent empirical verification (gold standard for fixture/code claims)
+
+Ran `.venv/bin/python -m scripts.build_lot_size_parquet` against the committed P0.1 fixtures:
+
+```
+=== Lot-size verification ===
+Verified 1034 (symbol, expiry_month) pairs across 4 sidecars + 0 bhavcopies.
+  source breakdown: sidecar_only=1034 | bhavcopy_only=0 | both=0
+=== Excluded 101 (symbol, expiry-month) pair(s) due to lot_size mismatches ===
+--- Sidecar-vs-sidecar (101) ---
+```
+
+**BUILDER's "1034 / 101" + "all sidecar-vs-sidecar" claim verified.** Output also confirms:
+
+- All 4 sidecars contribute (`4 sidecars`).
+- No bhavcopies in cache yet (`0 bhavcopies`) — expected; smoke runs before any prefetch.
+- Operator's exact diagnostic template honored verbatim: `mismatch found in lot sizes between {x} and {y} for {sym} for {expiry}: {lot_x} and {lot_y}`.
+- 3-source enumeration fallback fires correctly: `ABBOTINDIA for 2024-06: 12062024.csv.gz=20, 16042024.csv.gz=40, 16052024.csv.gz=20`.
+
+`.venv/bin/python -m pytest -q` → `814 passed` ✓. `tests/test_build_lot_size_parquet.py` → `13 passed` ✓.
+
+### Audit #1 — Policy refinement (loud-fail → per-pair exclude)
+
+**Honest spec evolution**: §Decisions encoded's new sub-section explicitly names the original loud-fail proposal AND the empirical smoke-test-driven pivot. Names the discovery ("101 systematic sidecar-vs-sidecar mismatches") + the operator's response + the rationale ("if NSE revised a contract's lot_size mid-life, that contract's P&L is structurally ambiguous — entry at one lot, exit at another. Skipping is more honest than picking a 'winner'").
+
+**Symmetric treatment of all 3 mismatch layers** is defensible — same structural-ambiguity argument applies whether the disagreement is sidecar-vs-sidecar (NSE biannual revision) or bhavcopy-internal (corporate action) or sidecar-vs-bhavcopy (either root cause).
+
+**Downstream consequence**: excluded `(sym, expiry-month)` → `lot_size_lookup` returns None → transform raises `MissingTurnoverError` → sweeper skips with `skip_reason="MissingTurnoverError"` per the dce9a87 P1.7 spec (the case-(1)+(2) path the case-3 disambiguation was designed for). Excluded cells appear in `skip_summary`; operator audits. Coherent with prior design.
+
+**Verdict on #1**: rationale honest; symmetric treatment defensible. **See Grill #1 on framing accuracy.**
+
+### Audit #2 — Sibling-cache architectural decision
+
+The build script needs `NewBrdLotQty` per trade date. Bhavcopy main cache is intentionally narrow (P1.1 docstring). Three alternatives evaluated:
+
+| Option | Verdict |
+|---|---|
+| (a) Re-fetch raw bytes at build time | RULED OUT (slow + Akamai-adjacent) |
+| (b) Extend `parse_udiff` schema | RULED OUT (contradicts narrow-schema; duplicates lot_size ~60-90×) |
+| (c) Sibling cache at `data/cache/bhavcopy_fo_lot_sizes/{date}.parquet` | CHOSEN |
+
+**(c) is the right call.** Verified:
+- Sibling schema `(symbol, expiry, lot_size, trade_date)` — exactly what the build needs.
+- Written at TWO call sites: normal `_load_bhavcopy_fo_impl` + `force_refresh`. Both branches covered.
+- Legacy bhavcopy dates write empty parquet (correct — legacy raw doesn't carry lot_size).
+- Module docstring updated naming the design.
+- `cache.py` adds `bhavcopy_fo_lot_sizes_path` with correct `[us]` datetime convention.
+- Disk cost: ~few KB per fetched day. Negligible.
+
+**Verdict on #2**: sibling cache is correct.
+
+### Audit #3 — Diagnostic-message format
+
+Operator's template verified verbatim in empirical output. 3+ source enumeration fallback fires correctly. The enumeration approach preserves operator-visible patterns (e.g. `ABBOTINDIA Apr=40, May=20, Jun=20` shows the revision happened between Apr and May, then stable — info a 2-pick would hide).
+
+**Verdict on #3**: format honored; enumeration fallback is the right call.
+
+### Audit #4 — Empty-source-dir handling
+
+Code review: sidecar_dir empty / bhavcopy_dir empty / both empty all produce empty unified frame + correct schema columns. Downstream: every lookup returns None → every cell gets `MissingTurnoverError` → sweeper skips. Operator sees the empty cache + full skip in `skip_summary`.
+
+For v1, silent success + empty parquet matches the operator's "silent rebuild on missing" preference. Alternative (raise on empty) would conflict with auto-build trigger's "build whatever's available" semantics.
+
+**Verdict on #4**: right v1 behavior. Coherent with per-pair-exclude + `MissingTurnoverError` flow.
+
+### Audit #5 — 101-mismatch impact
+
+Empirical: 1034 / (1034 + 101) ≈ **91% retention overall**. BUILDER's "~75% of regime B (sym, expiry) pairs still price fine" is plausible if regime B has ~400 pairs total with ~100 lost. The doc honestly names the impact ("~25-30 symbols mostly across May/Jun/Jul 2024 expiries"). Acceptable for research is operator-driven.
+
+**Verdict on #5**: honestly framed; operator-side acceptance is the right gate.
+
+### Audit #6 — Phase 1 downstream contract (date → year/month lookup)
+
+Lookup helper goes in P1.3 (not P0.2). BUILDER's "P0.2 = build; P1.3 = transform + lookup" separation is defensible. The lookup is a thin wrapper (year + month + groupby filter); landing in P1.3 keeps each commit's scope focused.
+
+**Verdict on #6**: defensible. Not a grill.
+
+### Grill #1 (small, framing accuracy): "EXACTLY 2×" has empirical exceptions
+
+Commit body line: "Apr-16-2024 snapshot's lot_size is EXACTLY 2× the May-16 / Jun-12 / Jul-05 2024 snapshots' values."
+
+**Empirically verified — broadly true (~95+% of cases), NOT universal**:
+
+- ABBOTINDIA 24MAY: 40 → 20 ✓ (2× halving)
+- ADANIPORTS 24MAY: 800 → 400 ✓
+- AMBUJACEM 24MAY: 1800 → 900 ✓
+- ...most follow this pattern...
+- **CANBK 24MAY: 2700 → 6750 ✗** — INCREASE by 2.5×, not halving.
+
+CANBK is the visible exception in the output. The "biannual lot-size review" framing is still broadly correct (NSE recalibrates), but the direction isn't uniform. CANBK's stock price likely DROPPED enough between Apr and May 2024 that NSE INCREASED the lot to keep contract notional in the ₹5-10L range — the inverse of the typical "stock rose → lot halved" case.
+
+**Fix**: amend MIGRATION.md §Decisions encoded sub-section + future framing to say "APPROXIMATELY 2× for MOST mismatches (typical: stock rose → lot halved). Exceptions exist in either direction — e.g. CANBK 24MAY 2700 → 6750, where the stock likely DECLINED and NSE INCREASED the lot."
+
+**Minor**: doesn't block — per-pair-exclude policy handles all directions identically. Framing accuracy only.
+
+### Praises
+
+- **Empirically validated**: independently ran the build + got the same 1034/101 numbers + the operator-format diagnostic verbatim. Honest commit body.
+- **Sibling cache architecture** is the right tradeoff.
+- **Reserved `CrossSourceLotSizeMismatchError` class** for a future `--strict-lot-size-verification` flag is forward-thoughtful.
+- **13 P0.2 tests** cover the 3 mismatch layers + format + extractor + sibling-write + auto-build + ABBOTINDIA/PNB pins. ABBOTINDIA test is a regression guard against silent "let's just pick May value" simplification.
+- **Module docstring updates** (per Grill #3 from 4e521ec) verified — narrow-schema decision documented at the right surface.
+- **Cross-doc consistency**: MIGRATION.md §Decisions encoded names BOTH the loud-fail original AND the smoke-test-driven pivot. Spec evolution honestly tracked.
+- **Operator diagnostic output** is well-structured: header + summary + per-layer subsections + footer pointer to MIGRATION.md.
+- **`year+month` granularity** is correct for monthly OPTSTK + within-month-stable OPTIDX lots.
+- **Prefetch integration** clean: Step 2b between bhavcopy fetch + expiry build; `--rebuild-lot-sizes` flag; halts on true errors but not on per-pair mismatches.
+- **Pre-existing argparse bug disclosed honestly** ("NOT a regression from this commit; out of scope"). Right framing — surfaces issue without scope creep.
+- **`force_refresh` path** updated alongside the normal fetch path. Both sibling-write call sites covered.
+
+### Behavior delta
+
+- Bhavcopy fetcher writes 2 parquets per fetch (main narrow + sibling lot-sizes); ~few KB extra/day.
+- Prefetch gets new `Step 2b` auto-building the unified cache.
+- 2 new cache paths.
+- Engine pricing unchanged (until P1.x lands).
+
+### Math
+
+`786 → 814 (+28 net)`: 13 new P0.2 + 15 e2e un-skipped (sweep parquet now present from operator's 4-stock smoke). Verified `814 passed`.
+
+### Open grills
+
+1. **Grill #1** (minor): "EXACTLY 2×" framing has empirical exceptions. Amend to "APPROXIMATELY 2× for MOST cases; exceptions in either direction."
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **`fix(docs.migration.framing_accuracy)`** OR fold the Grill #1 framing fix into P1.1's commit. ~3-line edit.
+2. **P1.1** (`chore(data.bhavcopy_fo.parse_udiff_extension)`) — extend parse_udiff for LastPric + TtlTrfVal (+2 cols; anti-confusion docstring already largely landed in this commit's bhavcopy_fo_loader.py docstring update — verify the P1.1 commit doesn't double-write).
+3. **P1.2** (`chore(data.bhavcopy_fo.parse_legacy_extension)`) — VAL_INLAKH +1 col.
+4. **P1.3** (`feat(data.contract_timeseries.bhavcopy_path)`) — transform + lot_size_lookup helper.
+5. **(operator-driven, parallel)** heatmap click-test outcome on branch.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 → P1.2 → P1.3 → P1.4 → P1.5 → P1.6 → P1.7 → P1.8 → P1.9 → P2.1 → P2.2 → P2.3 → P2.4**.
+
+Standing by.
+
+---
