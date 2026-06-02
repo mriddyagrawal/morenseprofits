@@ -16785,3 +16785,47 @@ P1.2 — `chore(data.bhavcopy_fo.parse_legacy_extension)` — already landed at 
 Standing by.
 
 ---
+
+## Review of 7c3d53f — `chore(data.bhavcopy_fo.parse_legacy_extension)` — **P1.2**
+
+**Verdict: ✅ ACCEPT.** Tiny 15-LOC loader change + 58-LOC test additions. `parse_legacy` gains `turnover` (from `VAL_INLAKH`); `_LEGACY_MARKERS` defensively extended; `_UDIFF_MARKERS` defensively backfilled with `LastPric` + `TtlTrfVal` from P1.1. 4 new tests pin the change. Nuclear-commit discipline honored.
+
+### What landed
+
+- **`parse_legacy:228-251`**: 1 new output column (`turnover` from `VAL_INLAKH`); 10-line inline comment cross-refs MIGRATION.md + 8c2c517 + the regime A/B ltp gap.
+- **`_LEGACY_MARKERS`**: now includes `VAL_INLAKH` — future NSE column-drop fails LOUD at schema detection, not silently NaN downstream.
+- **`_UDIFF_MARKERS`**: defensively backfilled with `LastPric` + `TtlTrfVal` from P1.1. Honestly disclosed: "P1.1 defensive backfill — the parser already used them but the markers set didn't enforce their presence."
+- **4 new tests** + `LEGACY_COLS` test-helper update.
+
+### Praises
+
+- **Marker-set extension is the right discipline**: future NSE column-drop OR a parser regression naming the wrong column fires `BhavcopyFormatError` at schema-detection rather than silently emitting NaN turnover that crashes `MissingTurnoverError` downstream with mis-attributed reason. Loud-fail at the right boundary.
+- **P1.1 defensive backfill** (`_UDIFF_MARKERS += {LastPric, TtlTrfVal}`) honestly disclosed — the BUILDER caught their own gap and named it as a backfill rather than silently fixing.
+- **`test_parse_legacy_does_not_carry_ltp`** is the LOAD-BEARING negative-space test for the regime A/B gap. Anti-regression against a future maintainer adding a stub `ltp=NaN` column that would masquerade as bonafide LTP data downstream — exactly the failure mode P2.4's caveat is designed to surface.
+- **`test_legacy_marker_requires_val_inlakh`** + **`test_udiff_markers_require_lastpric_and_ttltrfval`** pin the marker contract at the schema-detection layer.
+- **Inline comment in `parse_legacy`** mirrors the P1.1 in-place documentation pattern; cross-refs the 8c2c517 strike-correction + the upcoming P2.4 caveat for the ltp gap.
+- **Backward-compat alias `_assert_specs_2_4_schema` → `_assert_legacy_schema`** preserved unchanged in behavior (now asserts 15 cols).
+
+### Behavior delta
+
+- Legacy bhavcopy cache parquets now carry 1 more column (15 cols incl. trade_date, was 14).
+- UDiff bhavcopy fetches now fail loud if `LastPric` OR `TtlTrfVal` missing from raw — was silently producing the wrong column count under the prior markers set.
+- All current downstream consumers (verified in P0.2 review) don't read `turnover` from the bhavcopy parquet directly, so no observed change.
+
+### Math
+
+`817 → 821 (+4 net)` per the body. Verified via full pytest: `821 passed`. Consistent.
+
+### Open grills
+
+**Empty.**
+
+### Next-commit suggestion
+
+P1.3 — `feat(data.contract_timeseries.bhavcopy_path)` — the LOAD-BEARING transform calling `lot_size_lookup(symbol, expiry)` against the unified cache + walking the bhavcopy cache + emitting the same 16-col normalized schema that `options_loader.load_option` produces today. Includes the 4-bullet equivalence test from dce9a87 as the correctness anchor.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 → P1.4 → ...**
+
+Standing by.
+
+---
