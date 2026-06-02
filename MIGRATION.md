@@ -191,6 +191,10 @@ A given `(symbol, expiry)` pair can appear in BOTH sources whenever a contract l
 
 **Why loud-fail (not latest-wins or both-stored)**: same discipline as `MissingDataError` / `IlliquidLegError` — silent data drift is the worst failure mode. Lot-size mismatch typically signals an NSE corporate action (split/bonus) that the engine's pricing math needs to know about; surfacing it loud forces an investigation rather than a wrong answer.
 
+**Sidecar-vs-sidecar mismatch policy** (per reviewer grill #1 on 9b6c32b): the same loud-fail discipline applies across the 4 NSE_FO_contract snapshots themselves. A `(symbol, expiry)` pair appearing in multiple snapshots (e.g. PNB Jun 2024 in Apr-16 + May-16 + Jun-12) with DIFFERENT `lot_size` raises `CrossSourceLotSizeMismatchError` naming both snapshot files. No silent earliest-wins or latest-wins resolution.
+
+**Limitation: no date dimension in unified cache** (per reviewer grill #4 on 9b6c32b). The cache schema is `(symbol, expiry, lot_size, source)`. Mid-cycle NSE corporate actions (bonus / split) that revise `lot_size` within a contract's life would surface as cross-source mismatches (e.g. Apr snapshot has old size; May snapshot has new size after the corporate action). Resolution: manual reconciliation by the operator — typically choose the post-revision value per NSE's circular and split the contract's history at the revision date. This is a known limitation, not a defect.
+
 **Reviewer ask**: confirm this is the right policy + the error-surfacing pattern (script-level loud raise + prefetch-level wrap-and-print) matches the project's error-handling discipline.
 
 ---
@@ -241,8 +245,17 @@ def build_lot_size_parquet(
 
 Wire into `scripts/prefetch_universe.py` BEFORE the bhavcopy fetch loop:
 - Step 0a: ensure bhavcopy cache exists (fetch any missing days).
-- Step 0b: if `data/cache/lot_sizes.parquet` is missing OR `--rebuild-lot-sizes` is passed, invoke `build_lot_size_parquet()`. The script surfaces any cross-source mismatches under a `=== Cross-source lot-size verification ===` console-output header per the policy above.
+- Step 0b: if `data/cache/lot_sizes.parquet` is missing OR `--rebuild-lot-sizes` is passed, invoke `build_lot_size_parquet()`.
 - Step 1+: proceed with materialize-contracts loop using the unified cache.
+
+**Console-surfacing of verification** (per reviewer grills #2 + #5 on 9b6c32b):
+
+- On EVERY run of the build script (happy path AND mismatch path), print a `=== Cross-source lot-size verification ===` header followed by a summary line:
+  - Happy path: `"Verified N (symbol, expiry) pairs across 4 sidecars + M bhavcopies. No mismatches."` — gives the operator confirmation that verification actually ran AND tells them the scale of what was checked.
+  - Mismatch path: prints the header + the `CrossSourceLotSizeMismatchError` message with symbol, expiry, both lot_sizes, and snapshot files.
+- A silent successful build (no header printed at all) is indistinguishable from "build didn't run" — explicitly avoid that ambiguity.
+- **Prefetch halt-on-failure semantics**: if `build_lot_size_parquet()` exits non-zero (any reason — `CrossSourceLotSizeMismatchError`, I/O error, fixture parse failure), `prefetch_universe.py` HALTS with a clear error message naming the failure mode and the cache state. **No materialize step runs.** Continuing without a valid unified `lot_sizes.parquet` would produce ambiguous downstream failures (missing lookup in transform → NaN volume → cells skipped with mis-attributed reasons). Operator must reconcile before continuing.
+- Optional `--skip-lot-size-verification` flag for explicit operator override (bypasses the safety net). Default = halt. Not part of v1 acceptance — operator can add it if a need arises.
 
 **Tests** (`tests/test_build_lot_size_parquet.py`):
 - Synthesize a 1-day bhavcopy fixture + a 1-row sidecar fixture for the same `(symbol, expiry)` with MATCHING lot_size. Assert the parquet is built + the row has `source="both"`.
@@ -268,6 +281,12 @@ Extend `parse_udiff` to carry 2 additional columns:
 **Output column count**: 13 → 15.
 
 **Note** on `NewBrdLotQty`: the UDiff bhavcopy DOES carry lot_size per row, but the parser does NOT extract it into the bhavcopy-cache parquet schema. Instead, `NewBrdLotQty` is consumed by the unified lot-size build script (P0.2) and persisted ONCE in `data/cache/lot_sizes.parquet`. The transform in P1.3 looks it up there. Rationale: lot_size is per-`(symbol, expiry)`-stable, so storing it per-bhavcopy-row in the bhavcopy cache duplicates the same value across ~60-90 days of EOD rows per contract. The unified lookup deduplicates.
+
+**Anti-confusion docstring** (per reviewer grill #3 on 9b6c32b): the parser change MUST update `src/data/bhavcopy_fo_loader.py`'s module docstring to explicitly call out the decision:
+
+> Output schema is intentionally narrow — `lot_size` is NOT carried per row. Consumers needing lot_size should call `src.data.lot_size_lookup(symbol, expiry)` against the unified `data/cache/lot_sizes.parquet` instead. Rationale: lot_size is per-(symbol, expiry) stable; per-row storage duplicates ~60-90 days of repeated values. See MIGRATION.md §Cross-source lot-size policy.
+
+This prevents a future maintainer from "fixing" the missing column by re-adding lot_size to the parser. The docstring is the natural surface — a maintainer reading the parser for context sees the explicit decision before touching it.
 
 **Tests** (`tests/test_bhavcopy_fo_loader.py`):
 - `test_parse_udiff_carries_ltp_and_turnover` — using existing `tests/fixtures/bhavcopy_fo_udiff_20240829.csv` fixture, assert the 2 new columns appear with non-NaN values for at least one OPTSTK row.
