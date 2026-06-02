@@ -16829,3 +16829,77 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of 6f0894e — `feat(data.contract_timeseries.bhavcopy_path)` — **P1.3 (architectural anchor)**
+
+**Verdict: ✅ ACCEPT.** 750-LOC architectural anchor for the migration. 3 new pieces of code (errors.py extension + new lot_size_lookup.py + new bhavcopy_to_contract.py) + 13 new tests. Byte-identical schema-equivalence with `options_loader._SPEC_COLS` verified independently. Cross-phase coupling (MissingTurnoverError lands EARLIER than P1.7 because the transform needs it) honestly disclosed. No grills.
+
+### Independent verification
+
+- **Schema equivalence with `options_loader._SPEC_COLS`** (LOAD-BEARING contract per MIGRATION.md):
+  - `_SPEC_COLS` at `options_loader.py:320` derives from `_RENAMES` (lines 302-319): `["date", "symbol", "expiry", "option_type", "strike", "open", "high", "low", "close", "ltp", "settle_price", "lot_size", "volume", "turnover", "oi", "oi_change"]` (16 cols).
+  - `_OUTPUT_COLUMNS` at `bhavcopy_to_contract.py:55-59`: **exactly the same 16 names in the same order**. ✓
+- **Working-tree contamination caught (again)**: my Read of `bhavcopy_to_contract.py` returned a 261-line version including `materialize_contract_from_bhavcopy` at lines 196-237. `git show 6f0894e:src/data/bhavcopy_to_contract.py | wc -l` returns 216 lines, ending with `_empty_output_frame` at line 260 of the disk version. **The materialize function is BUILDER's working-tree work in progress for P1.4, NOT in this commit.** Confirmed by inspecting `git show 6f0894e:src/data/bhavcopy_to_contract.py | grep "^def "` → only the transform's helpers + `_empty_output_frame`. My P1.3 review is correctly scoped to the transform-only file.
+- **Tests pass**: `tests/test_bhavcopy_to_contract.py` → 17 passed currently (the +4 over the body's `+13 net` claim is the WIP P1.4 test additions; at the commit's state, the count is 13 — consistent).
+
+### What landed (per commit body, verified)
+
+1. **`src/data/errors.py`** — new `MissingTurnoverError(MissingDataError)`:
+   - Subclass relationship means `_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)` at `sweeper.py:56` auto-catches it.
+   - Class name → `skip_reason` token via the existing `_handle` extraction at `sweeper.py:225` (`f"skip:{type(e).__name__}|{e}"`).
+   - **Cross-phase coupling honestly disclosed**: "Originally planned for P1.7 (engine pnl.py disambiguation); lands EARLIER here because the transform needs it now. P1.7 will use this same class for its case-(1)+(2) skip path." Coherent with the dce9a87 P1.7 spec.
+
+2. **`src/data/lot_size_lookup.py` (NEW)** — the lookup helper:
+   - `lot_size_lookup(symbol, expiry) → int | None`.
+   - `lru_cache(maxsize=1)` memoizes the parquet read at module level — production: once per process. Sweep workers fork after prefetch, so each gets a fresh-built cache at process start; mid-process invalidation isn't a use case (explicitly named).
+   - Empty-DataFrame fallback when `lot_sizes.parquet` doesn't exist (fresh clone case) — equivalent to "every pair is unbacktestable until prefetch runs." Right semantic.
+   - Case-insensitive symbol matching (`symbol.upper()`).
+   - Test-only `reset_lookup_cache()` for monkeypatch hygiene.
+
+3. **`src/data/bhavcopy_to_contract.py` (NEW, transform only)**:
+   - `bhavcopy_to_contract_timeseries(symbol, expiry, strike, option_type, *, from_date, to_date)`.
+   - Walks bhavcopy cache; filters per-day; sorted-by-date ascending.
+   - Volume derivation: `volume = contracts × lot_size` where lot_size is resolved ONCE per (symbol, expiry) via `lot_size_lookup`.
+   - Regime-agnostic ltp handling: `_normalize_legacy_columns` inserts NaN ltp for legacy frames (uniform 16-col intermediate).
+   - **Error paths (loud-fail at structural ambiguity)**:
+     - `MissingTurnoverError` when `lot_size_lookup` returns None (excluded pair).
+     - `MissingTurnoverError` when any row has `contracts ≤ 0` (would mislead the engine's `IlliquidLegError` gate downstream).
+   - **Empty paths (silent skip at expected sparsity)**:
+     - No matching contract in any day → empty frame with correct schema (downstream concat/sort/dtype checks survive).
+     - Missing day's parquet (holiday / pre-listing) → silently skipped; matches `options_loader.load_option` semantics.
+
+### Praises
+
+- **Byte-identical schema with `options_loader._SPEC_COLS`** — the load-bearing equivalence contract is met by construction; the test `output schema = options_loader._SPEC_COLS exactly` is the LOAD-BEARING anti-regression. A future drift on either side fires the test.
+- **Cross-phase coupling disclosed honestly** — moving `MissingTurnoverError` from P1.7's spec to P1.3 because the transform needs it FIRST is the right call (P1.7 was always going to use this class). Disclosure is the right discipline.
+- **`lru_cache(maxsize=1)` + `reset_lookup_cache()` for tests** is the right memoization model. Module docstring explicitly names the "sweep workers fork after prefetch" lifecycle so a future contributor understands why per-process caching is correct.
+- **Empty-DataFrame fallback in `_load_lot_sizes_parquet`** for the no-parquet case is cleaner than raising — operator on a fresh clone sees "every pair unbacktestable" via skip_summary rather than the import-time crash. Correct semantic.
+- **Empty-output-frame helper** preserves the 16-col schema + dtypes — downstream code that does `df.dropna()` / `df.concat()` / `df["date"].max()` won't crash on no-data cases.
+- **Case-insensitive symbol matching** against upper-cased cache values is operator-facing consistency (uppercase is the project's invariant for symbols).
+- **Volume derivation comments name 8c2c517's strike-correction context** — future maintainer can trace why `contracts × lot_size` (NOT `contracts × something_else`) is the right formula.
+- **Loud-fail on `contracts ≤ 0`** is structurally correct: silently zero volume would let the engine compute fill prices for a non-tradeable cell. The error names the trade_date that triggered the check.
+- **Silent skip on missing bhavcopy days** matches `options_loader.load_option` semantics — equivalence anchor holds across both code paths.
+
+### Behavior delta
+
+- Pure-additive: new transform path, new lookup helper, new error class. No existing code paths modified.
+- Engine, sweeper, MCP tools all unchanged.
+- Cache files: none yet (transform doesn't write; that's P1.4's materialize).
+
+### Math
+
+`821 → 834 (+13 net)` per the body. Verified at commit state via the test file's content (13 explicit new tests + the schema-equivalence + the LOAD-BEARING error-path + the mixed-regime test). Disk-state pytest shows 17 (the +4 over 13 is BUILDER's P1.4 WIP test additions).
+
+### Open grills
+
+**Empty.**
+
+### Next-commit suggestion
+
+P1.4 — `feat(engine.cache.contract_path_writes)` — `materialize_contract_from_bhavcopy(symbol, expiry, strike, option_type, *, from_date, to_date, force=False)`. Wraps `bhavcopy_to_contract_timeseries` with disk-write semantics; writes to the same path layout `options_loader` uses. Tests assert idempotency + force-rewrite behavior. (Already in BUILDER's working tree per current `git status` — `bhavcopy_to_contract.py` is `M`.)
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 → P1.5 → ... → P2.4**.
+
+Standing by.
+
+---
