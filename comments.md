@@ -16465,3 +16465,80 @@ The MIGRATION.md doc is operator-ready as the implementation spec.
 Standing by.
 
 ---
+
+## Review of b4960b9 — `chore(data.fixtures.nse_fo_contract_2024_h1)` — **P0.1: migration implementation begins**
+
+**Verdict: ✅ ACCEPT.** First implementation commit of the bhavcopy-only migration. Fixtures land cleanly; README is thorough; pre-commit verification independently re-verified via grep. No grills.
+
+This is the architectural-spec-→-implementation transition the saga has been building toward. **P0.1 is the foundation for Phase 0 → Phase 2** (everything else looks up against the unified cache that gets built from these 4 files + the bhavcopy NewBrdLotQty per row).
+
+### What landed
+
+- 4 `.csv.gz` files at `data/manual/contracts/NSE_FO_contract_DDMMYYYY.csv.gz`:
+  - 16042024.csv.gz (~1.7MB)
+  - 16052024.csv.gz (~1.8MB)
+  - 12062024.csv.gz (~1.9MB)
+  - 05072024.csv.gz (~1.6MB)
+  - Total ~6.7MB committed.
+- `data/manual/contracts/README.md` (81 lines).
+- No code changes; no tests. Pure data add per the P0.1 spec.
+
+### Independent verification (grep + gunzip)
+
+| Check | BUILDER claim | My verification |
+|---|---|---|
+| Column count | 150 each | 150 each ✓ |
+| Required schema columns (TckrSymb, StockNm, NewBrdLotQty, StrkPric, OptnTp) | present in all 4 | confirmed via `gunzip -c \| head -1 \| grep -E "..."` ✓ |
+| PNB OPTSTK lot_size = 8000 | across all 4 | confirmed via `awk` extraction at col 10 (NewBrdLotQty) for col 4 (TckrSymb)==PNB ✓ |
+| Column positions stable across snapshots | implicit | TckrSymb at col 4, NewBrdLotQty at col 10 in all 4 ✓ — build script's parser can rely on positional indexing |
+| Row counts within 80-90k | "82,535 / 85,980 / 93,427 / 80,039" | my count: 82,534 / 85,979 / 93,426 / 80,038 (off by 1, see Minor below). All within range ✓ |
+
+The PNB lot_size = 8000 cross-snapshot stability is the load-bearing pre-commit signal: it's both the operator's earlier inspection (referenced in DATA_PRODUCTS.md + 8c2c517) AND the canary that the build script's cross-source verification (P0.2) will check first. ✓
+
+### Minor observation (not a grill): row counts off-by-one between commit body and data
+
+The commit body claims row counts `82,535 / 85,980 / 93,427 / 80,039`; my `gunzip -c | wc -l` minus 1 (header) yields `82,534 / 85,979 / 93,426 / 80,038`. The BUILDER's numbers include the header row; my count is data-only.
+
+Both interpretations land within the "~80-90k rows" approximation in the README + MIGRATION.md, so no semantic issue downstream. The build script's row-count parsing will use one specific convention (likely `len(df)` which is data-only). If there's any future cross-doc consistency check, the convention should be named explicitly — either way doesn't matter; the convention being explicit matters.
+
+Not blocking. Just a cataloging note.
+
+### Praises
+
+- **README is operator-grade**. The 5 sections (Files / Provenance / Why committed not gitignored / Pre-commit verification / Re-derivation) each name a real future operator question. The "Don't commit additional snapshots without updating MIGRATION.md's coverage table" warning at the end is exactly the anti-drift discipline I'd hope for — silent fixture drift between doc and on-disk files is a real bug source.
+- **Provenance section names the Akamai constraint explicitly**: "programmatic fetching is explicitly not supported." Cross-references MIGRATION.md §Non-goals. Operators wondering why these are committed (rather than auto-fetched) get a clean answer.
+- **Why committed-not-gitignored** rationale is the right framing: `data/manual/` is the only subfolder of `data/` not gitignored because it's the only one with no automatic derivation path. The `rm -rf data/cache/` re-derive guarantee depends on `data/manual/` surviving. The README states this discipline explicitly.
+- **Outer ZIP wrappers correctly NOT committed** (only the inner .csv.gz that NSE distributes natively). Matches the .gitignore `ONE OFF REPORTS/` rule that 9b6c32b set up. Cross-commit consistency intact.
+- **Pre-commit verification independently re-verified by reviewer** (this review) using `gunzip` + `awk` extraction. The BUILDER's verification claims all hold under independent check — that's the gold standard for a fixture commit.
+- **5 columns named in commit body** (TckrSymb, StockNm, NewBrdLotQty, StrkPric, OptnTp) are exactly the ones P0.2's build script will consume. The fixture is provably consumable by the build script BEFORE the build script lands.
+- **Cross-commit provenance trail intact**: commit body explicitly cites "reviewer-accepted across 4 docs rounds: e0bc85a + 9b6c32b refactor + 3 calibration fixes." Future maintainer can trace the entire architectural decision chain.
+
+### Behavior delta
+
+None. Pure data add. The fixtures are dormant until P0.2 lands the build script that consumes them.
+
+### Math
+
+No tests. No test count change.
+
+### Open grills
+
+**Empty.**
+
+### MCP arc state
+
+Unchanged at 16/16. Migration work is on a parallel track.
+
+### Next-commit suggestion
+
+In priority order:
+
+1. **P0.2** (`feat(scripts.build_lot_size_parquet)`) — the build script + prefetch integration. Consumes these fixtures + the bhavcopy NewBrdLotQty per row to build `data/cache/lot_sizes.parquet`. Cross-source verification (sidecar-vs-sidecar AND sidecar-vs-bhavcopy) + verification header + halt-on-failure all per the MIGRATION.md spec. Tests per the LOAD-BEARING table.
+2. **Then P1.1** (`chore(data.bhavcopy_fo.parse_udiff_extension)`) — +2 cols (LastPric + TtlTrfVal) + the anti-confusion docstring update in `bhavcopy_fo_loader.py`.
+3. **(operator-driven, parallel)** heatmap click-test outcome.
+
+The migration implementation cadence per the spec is now P0.1 ✓ → P0.2 → P1.1 → P1.2 → ... → P2.4. Each commit ships with its own LOAD-BEARING tests per the §Test plan table; reviewer signs off between each.
+
+Standing by for P0.2.
+
+---
