@@ -77,12 +77,20 @@ BACKUP_PER_TRADE_DELTA_THRESHOLD_PP = 0.5
 
 
 # ============================================================
-# Cell-identity columns — the join key between the two sweeps
+# Identity columns — cell-level vs trade-level join keys
 # ============================================================
+# A CELL is one (strategy, symbol, entry, exit) — aggregated ACROSS
+# expiries. The primary criterion is the cell's MEDIAN across its
+# ~24 expiries (one trade per monthly expiry over the 2-year
+# window). This matches the dashboard's cell_summary / heatmap /
+# MCP-tool definition.
 _CELL_KEYS = [
-    "strategy", "symbol", "expiry",
-    "entry_offset_td", "exit_offset_td",
+    "strategy", "symbol", "entry_offset_td", "exit_offset_td",
 ]
+# A TRADE is one cell × one expiry — uniquely identified by the
+# cell keys PLUS expiry. The backup criterion's per-trade join uses
+# this 5-key tuple to match trades 1:1 between the two sweeps.
+_TRADE_KEYS = _CELL_KEYS + ["expiry"]
 
 
 def _load_sweep(run_id: str) -> pd.DataFrame:
@@ -132,13 +140,17 @@ def _compare_cells(
 def _compare_per_trade(
     api_df: pd.DataFrame, bhavcopy_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Inner-join the per-trade rows on the cell key + expiry, find
-    max abs delta per cell. Catches single-trade outliers the cell
-    median would smooth over."""
-    join_keys = _CELL_KEYS  # one trade per (cell, expiry) on each side
-    pair = api_df[join_keys + ["roi_pct"]].merge(
-        bhavcopy_df[join_keys + ["roi_pct"]],
-        on=join_keys, how="inner", suffixes=("_api", "_bhavcopy"),
+    """Inner-join the per-trade rows on ``_TRADE_KEYS`` (cell + expiry
+    = one trade), find absolute delta per trade. Catches single-trade
+    outliers the cell median would smooth over.
+
+    Distinct from `_compare_cells` (which aggregates across expiries
+    within a cell). See reviewer's grill on 6f4bea5 for the original
+    bug — `_CELL_KEYS` previously included expiry which collapsed
+    the cell aggregation to per-trade granularity."""
+    pair = api_df[_TRADE_KEYS + ["roi_pct"]].merge(
+        bhavcopy_df[_TRADE_KEYS + ["roi_pct"]],
+        on=_TRADE_KEYS, how="inner", suffixes=("_api", "_bhavcopy"),
     )
     pair["abs_trade_delta_pp"] = (
         pair["roi_pct_bhavcopy"] - pair["roi_pct_api"]
@@ -206,7 +218,7 @@ def run_smoke_comparison(
             print(f"\n  First {min(20, len(backup_fail))} failing trades:")
             print(
                 backup_fail.head(20)[
-                    _CELL_KEYS + ["roi_pct_api", "roi_pct_bhavcopy", "abs_trade_delta_pp"]
+                    _TRADE_KEYS + ["roi_pct_api", "roi_pct_bhavcopy", "abs_trade_delta_pp"]
                 ].to_string(index=False)
             )
 

@@ -113,26 +113,82 @@ def test_run_smoke_comparison_fail_when_primary_threshold_exceeded(tmp_path):
 
 
 def test_run_smoke_comparison_fail_when_backup_threshold_exceeded(tmp_path):
-    """LOAD-BEARING: backup catches the scenario where one or two
-    trades are wildly off but the cell median smooths them. Cell
-    median delta is small; individual trade delta exceeds 0.5 pp.
+    """LOAD-BEARING (per reviewer grill #2 on 6f4bea5): backup
+    catches the scenario where one trade is wildly off but the cell
+    median smooths it.
 
-    Construct: 2 expiries per cell. One expiry has matching ROI;
-    the other has a large delta. Cell-level medians stay close,
-    but per-trade backup fires."""
+    Construct: 3 trades per cell with identical api values (1.0).
+    Bhavcopy matches 2 of 3 exactly + the third differs by 0.6 pp.
+    Cell median bhavcopy = median(1.0, 1.0, 1.6) = 1.0; cell-median
+    delta = 0 (primary PASSES). Max per-trade delta = 0.6 pp
+    (backup FAILS).
+
+    Failure must come from the backup criterion specifically. The
+    earlier (6f4bea5) version of this test reported a false success
+    because _CELL_KEYS included expiry — both criteria collapsed to
+    per-trade and both fired. With _CELL_KEYS now expiry-free, the
+    cell aggregate genuinely smooths."""
     api_rows = [
-        ("short_straddle", "PNB", "2024-08-29", 15, 1, 1.234),
-        ("short_straddle", "PNB", "2024-09-26", 15, 1, 1.5),
+        ("short_straddle", "PNB", "2024-08-29", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-09-26", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-10-31", 15, 1, 1.0),
     ]
     bhav_rows = [
-        # First trade matches; second trade differs by 0.8 pp.
-        ("short_straddle", "PNB", "2024-08-29", 15, 1, 1.234),
-        ("short_straddle", "PNB", "2024-09-26", 15, 1, 2.3),  # +0.8 pp
+        ("short_straddle", "PNB", "2024-08-29", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-09-26", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-10-31", 15, 1, 1.6),  # +0.6 pp
+    ]
+    _write_sweep_parquet("api", api_rows, tmp_path)
+    _write_sweep_parquet("bhavcopy", bhav_rows, tmp_path)
+    # Verify the construction: cell median stays inside primary
+    # threshold; only the backup catches the outlier.
+    from scripts.smoke_post_migration import (
+        _compare_cells, _compare_per_trade,
+    )
+    api_df = _build_sweep_frame(api_rows)
+    bhav_df = _build_sweep_frame(bhav_rows)
+    cell_cmp = _compare_cells(api_df, bhav_df)
+    trade_cmp = _compare_per_trade(api_df, bhav_df)
+    assert cell_cmp["abs_median_delta_pp"].max() < PRIMARY_MEDIAN_DELTA_THRESHOLD_PP, (
+        "fixture intent violated: cell median delta exceeds primary "
+        "threshold; this test would pass via primary not backup"
+    )
+    assert trade_cmp["abs_trade_delta_pp"].max() > BACKUP_PER_TRADE_DELTA_THRESHOLD_PP, (
+        "fixture intent violated: no per-trade delta exceeds backup "
+        "threshold"
+    )
+    passed = run_smoke_comparison("api", "bhavcopy", verbose=False)
+    assert passed is False
+
+
+def test_primary_passes_when_cell_median_smooths_per_trade_drift(tmp_path):
+    """Positive-control sanity check (per reviewer grill #2 on
+    6f4bea5): 4 trades per cell; 3 match exactly + 1 differs by
+    0.1 pp. Cell median delta ≈ 0; max per-trade delta = 0.1 pp
+    (under 0.5 backup). Both criteria PASS.
+
+    Validates the cell-vs-trade distinction in the threshold design
+    — small per-trade drift below the backup is acceptable as long
+    as the cell aggregate is stable."""
+    api_rows = [
+        ("short_straddle", "PNB", "2024-08-29", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-09-26", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-10-31", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-11-28", 15, 1, 1.0),
+    ]
+    bhav_rows = [
+        ("short_straddle", "PNB", "2024-08-29", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-09-26", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-10-31", 15, 1, 1.0),
+        ("short_straddle", "PNB", "2024-11-28", 15, 1, 1.1),  # +0.1 pp
     ]
     _write_sweep_parquet("api", api_rows, tmp_path)
     _write_sweep_parquet("bhavcopy", bhav_rows, tmp_path)
     passed = run_smoke_comparison("api", "bhavcopy", verbose=False)
-    assert passed is False
+    assert passed is True, (
+        "small per-trade drift below the backup threshold should "
+        "not halt the gate when the cell aggregate is stable"
+    )
 
 
 def test_run_smoke_comparison_warns_when_no_cells_match(tmp_path):
