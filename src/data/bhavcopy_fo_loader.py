@@ -88,8 +88,8 @@ _NSE_HEADERS = {
 # columns unique to each schema rather than checking the full header so a
 # benign upstream column-addition (NSE has been known to do this) doesn't
 # falsely flip us into BhavcopyFormatError.
-_LEGACY_MARKERS = {"INSTRUMENT", "SYMBOL", "EXPIRY_DT", "STRIKE_PR", "OPTION_TYP", "TIMESTAMP"}
-_UDIFF_MARKERS = {"TradDt", "FinInstrmTp", "TckrSymb", "FininstrmActlXpryDt", "StrkPric", "OptnTp"}
+_LEGACY_MARKERS = {"INSTRUMENT", "SYMBOL", "EXPIRY_DT", "STRIKE_PR", "OPTION_TYP", "TIMESTAMP", "VAL_INLAKH"}
+_UDIFF_MARKERS = {"TradDt", "FinInstrmTp", "TckrSymb", "FininstrmActlXpryDt", "StrkPric", "OptnTp", "TtlTrfVal", "LastPric"}
 
 # UDiff instrument codes map 1:1 to legacy. SPECS §2.4 normalizes to legacy
 # names so downstream consumers don't care about format provenance.
@@ -228,6 +228,16 @@ def parse_legacy(raw: str, trade_date: date) -> pd.DataFrame:
         )
 
     instrument = df["INSTRUMENT"].astype("string")
+    # turnover extension (P1.2 — MIGRATION.md §Phase 1). Legacy carries
+    # VAL_INLAKH in the raw CSV (same underlying-notional convention as
+    # UDiff's TtlTrfVal per 8c2c517 — both are total traded value in
+    # lakhs of rupees including the underlying notional component).
+    # Engine recovers per-share premium VWAP via
+    # ``turnover × 10⁵ / volume − strike`` (see pnl._compute_vwap).
+    #
+    # Legacy does NOT carry ltp (no equivalent of UDiff's LastPric);
+    # the regime A/B caveat surfacing in MCP's get_options_chain (P2.4)
+    # handles that gap.
     out = pd.DataFrame({
         "instrument": instrument,
         "symbol": df["SYMBOL"].astype("string"),
@@ -240,6 +250,7 @@ def parse_legacy(raw: str, trade_date: date) -> pd.DataFrame:
         "close": df["CLOSE"].astype("float64"),
         "settle_price": df["SETTLE_PR"].astype("float64"),
         "contracts": df["CONTRACTS"].fillna(0).astype("int64"),
+        "turnover": df["VAL_INLAKH"].astype("float64"),
         "oi": df["OPEN_INT"].astype("Int64"),
         "oi_change": df["CHG_IN_OI"].astype("Int64"),
     })

@@ -49,12 +49,13 @@ def _redirect_cache(monkeypatch, tmp_path):
 # Schema (SPECS §2.4) — verified on both formats
 # ===========================================================
 
-# Legacy parser output (14 cols). P1.2 will extend this with
-# turnover when it lands; for now legacy stays as-is.
+# Legacy parser output (15 cols, P1.2 adds turnover). Legacy does
+# NOT carry ltp — no equivalent of UDiff's LastPric in raw — so
+# the legacy schema stays narrower than UDiff (15 vs 16 cols).
 LEGACY_COLS = [
     "instrument", "symbol", "expiry", "strike", "option_type",
     "open", "high", "low", "close", "settle_price",
-    "contracts", "oi", "oi_change", "trade_date",
+    "contracts", "turnover", "oi", "oi_change", "trade_date",
 ]
 
 # UDiff parser output (16 cols, P1.1 — MIGRATION.md §Phase 1).
@@ -78,6 +79,11 @@ def _assert_legacy_schema(df: pd.DataFrame) -> None:
         f"legacy column-order drift: {list(df.columns)}"
     )
     _assert_common_dtypes(df)
+    # P1.2 addition: turnover (from VAL_INLAKH; lakhs of rupees,
+    # underlying-notional convention per 8c2c517).
+    assert df["turnover"].dtype.name == "float64", (
+        f"legacy turnover dtype = {df['turnover'].dtype.name}"
+    )
 
 
 def _assert_udiff_schema(df: pd.DataFrame) -> None:
@@ -182,6 +188,52 @@ def test_parse_udiff_ltp_is_nan_tolerant():
         "blank LastPric cell should produce a NaN, not 0.0; pandas' "
         "default CSV NaN-coercion was not preserved across the parser"
     )
+
+
+def test_parse_legacy_carries_turnover():
+    """LOAD-BEARING (P1.2): legacy parser output now carries
+    ``turnover`` (from VAL_INLAKH) per MIGRATION.md §Phase 1 P1.2.
+    At least one row in the fixture surfaces a positive turnover
+    value (sanity that VAL_INLAKH isn't silently NaN'd)."""
+    df = bfo.parse_legacy(_legacy_raw(), LEGACY_DATE)
+    assert "turnover" in df.columns
+    assert df["turnover"].dtype.name == "float64"
+    assert (df["turnover"] > 0).any(), (
+        "every turnover value is 0/NaN — VAL_INLAKH extraction broken"
+    )
+
+
+def test_parse_legacy_does_not_carry_ltp():
+    """Negative-space test: legacy bhavcopy has NO equivalent of
+    UDiff's LastPric in its raw CSV (15 cols vs UDiff's 34). The
+    regime A/B caveat surfaced in MCP get_options_chain (P2.4) names
+    this gap explicitly. Anti-regression against a future maintainer
+    adding a stub ``ltp`` column with all-NaN values — those would
+    masquerade as bonafide LTP data downstream."""
+    df = bfo.parse_legacy(_legacy_raw(), LEGACY_DATE)
+    assert "ltp" not in df.columns, (
+        "Legacy parser output MUST NOT carry an ltp column. The legacy "
+        "bhavcopy doesn't have LastPric or any equivalent in its raw "
+        "CSV. MCP's get_options_chain surfaces a caveat for trade_dates "
+        "< 2024-07-08 (see P2.4). See MIGRATION.md §Coverage matrix."
+    )
+
+
+def test_legacy_marker_requires_val_inlakh():
+    """LOAD-BEARING anti-regression: VAL_INLAKH is now in
+    ``_LEGACY_MARKERS`` (P1.2). If NSE ever drops the column from a
+    historical re-publish, the parser fails LOUD on the schema check
+    rather than silently producing a turnover=NaN frame that would
+    then crash MissingTurnoverError downstream."""
+    assert "VAL_INLAKH" in bfo._LEGACY_MARKERS
+
+
+def test_udiff_markers_require_lastpric_and_ttltrfval():
+    """Same load-bearing schema check at the UDiff layer (P1.1).
+    Anti-regression in case NSE renames either field in a future
+    UDiff revision."""
+    assert "LastPric" in bfo._UDIFF_MARKERS
+    assert "TtlTrfVal" in bfo._UDIFF_MARKERS
 
 
 def test_parse_udiff_does_not_carry_lot_size():
