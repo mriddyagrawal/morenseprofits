@@ -194,6 +194,60 @@ def bhavcopy_to_contract_timeseries(
     )
 
 
+def enumerate_contracts_from_bhavcopies(
+    *,
+    symbols: list[str] | set[str],
+    from_date: date, to_date: date,
+    instrument_filter: tuple[str, ...] = ("OPTSTK",),
+) -> list[tuple[str, date, float, str]]:
+    """Scan cached daily bhavcopies in ``[from_date, to_date]`` and
+    enumerate every distinct ``(symbol, expiry, strike, option_type)``
+    that actually traded for any symbol in ``symbols``.
+
+    Replaces the strike-planner pre-enumeration step under the
+    bhavcopy-only architecture (P1.5). Every traded strike is
+    naturally present in the bhavcopy — no "guess the strike window"
+    needed, no strike-drift ``OfflineCacheMiss``.
+
+    Returns a SORTED list of contract tuples for deterministic
+    iteration order across runs.
+
+    Days with no cached parquet (weekends, holidays, pre-listing,
+    operator hasn't fetched that date) are silently skipped — same
+    semantics as the transform's missing-day handling.
+    """
+    sym_upper = {s.upper() for s in symbols}
+    instrument_set = set(instrument_filter)
+    tuples: set[tuple[str, date, float, str]] = set()
+    for d in _iterate_trading_days(from_date, to_date):
+        path = cache.bhavcopy_fo_path(d)
+        if not cache.exists(path):
+            continue
+        df = cache.read(path)
+        df = df[
+            df["symbol"].isin(sym_upper)
+            & df["instrument"].isin(instrument_set)
+        ]
+        if df.empty:
+            continue
+        for _, r in df.iterrows():
+            strike = r["strike"]
+            opt = r["option_type"]
+            # Skip futures (strike NaN) defensively even though the
+            # OPTSTK filter should have excluded them.
+            if pd.isna(strike) or pd.isna(opt):
+                continue
+            tuples.add((
+                str(r["symbol"]),
+                r["expiry"].date()
+                if isinstance(r["expiry"], pd.Timestamp)
+                else r["expiry"],
+                float(strike),
+                str(opt),
+            ))
+    return sorted(tuples)
+
+
 def materialize_contract_from_bhavcopy(
     symbol: str, expiry: date, strike: float, option_type: str,
     *,

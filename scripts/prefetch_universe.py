@@ -257,6 +257,19 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--engine-source", choices=["bhavcopy", "api"],
+        default="bhavcopy",
+        help=(
+            "Source for per-contract option EOD parquets. "
+            "bhavcopy (default; MIGRATION.md §Phase 1): scan cached "
+            "daily bhavcopies + materialize per-contract parquets "
+            "from the unified lot_sizes cache. api (legacy): fetch "
+            "per-contract via NSE direct API + jugaad. The legacy "
+            "path is retained through the cutover-validation window "
+            "(MIGRATION.md §P1.6 smoke gate) and deprecated in P1.8."
+        ),
+    )
+    ap.add_argument(
         "--rebuild-lot-sizes", action="store_true",
         help=(
             "Force-rebuild the unified data/cache/lot_sizes.parquet "
@@ -393,9 +406,82 @@ def main() -> int:
         )
 
     # ============================================================
-    # Step 3 — build per-symbol expiry list
+    # Step 3 — bhavcopy-only fast path (MIGRATION.md §Phase 1 P1.5)
     # ============================================================
-    _h("Step 3 — build expiry list per symbol")
+    # In `--engine-source bhavcopy` mode (default), enumerate every
+    # (sym, expiry, strike, option_type) that actually traded in the
+    # cached bhavcopy window for our symbol list, then materialize
+    # per-contract parquets via the bhavcopy_to_contract transform.
+    # The legacy strike_planner / spot-scan / per-contract NSE fetch
+    # path (Steps 3 + 4 below) is preserved for `--engine-source api`
+    # through the cutover-validation window (P1.6 smoke gate).
+
+    if args.engine_source == "bhavcopy":
+        from src.data.bhavcopy_to_contract import (
+            enumerate_contracts_from_bhavcopies,
+            materialize_contract_from_bhavcopy,
+        )
+        from src.data.errors import MissingTurnoverError, MissingDataError
+
+        # Bhavcopy scan window matches Step 2's bulk-fetch range.
+        bhav_scan_from = args.start
+        bhav_scan_to = args.end
+
+        _h(f"Step 3 — enumerate contracts from cached bhavcopies  "
+           f"[--engine-source bhavcopy; scan {bhav_scan_from} → {bhav_scan_to}]")
+        contracts = enumerate_contracts_from_bhavcopies(
+            symbols=symbols,
+            from_date=bhav_scan_from,
+            to_date=bhav_scan_to,
+        )
+        print(f"  unique (sym, expiry, strike, option_type) tuples: {len(contracts)}")
+
+        _h("Step 4 — materialize per-contract parquets from bhavcopy data")
+        print(f"  cache-first: already-materialized contracts skip immediately")
+        from src.data import cache as _cache_mod
+        n_materialized = 0
+        n_already_cached = 0
+        n_skipped_missing_turnover = 0
+        n_skipped_other = 0
+        skip_log: list[tuple[str, date, float, str, str]] = []
+        for (sym, exp, strike, opt) in tqdm(
+            contracts, desc="materialize", unit="contract",
+        ):
+            target = _cache_mod.option_path(sym, exp, strike, opt)
+            if target.exists():
+                n_already_cached += 1
+                continue
+            try:
+                materialize_contract_from_bhavcopy(
+                    sym, exp, strike, opt,
+                    from_date=bhav_scan_from, to_date=bhav_scan_to,
+                )
+                n_materialized += 1
+            except MissingTurnoverError as e:
+                n_skipped_missing_turnover += 1
+                skip_log.append((sym, exp, strike, opt, str(e)[:200]))
+            except MissingDataError as e:
+                n_skipped_other += 1
+                skip_log.append((sym, exp, strike, opt, f"{type(e).__name__}: {str(e)[:200]}"))
+            except Exception as e:
+                n_skipped_other += 1
+                skip_log.append((sym, exp, strike, opt, f"{type(e).__name__}: {str(e)[:200]}"))
+
+        _h("Done — bhavcopy-only materialize results")
+        print(f"  materialized:                 {n_materialized}")
+        print(f"  already cached (skipped):     {n_already_cached}")
+        print(f"  skipped (MissingTurnoverError): {n_skipped_missing_turnover}")
+        print(f"  skipped (other):              {n_skipped_other}")
+        if skip_log[:10]:
+            print(f"\n  first 10 skip reasons:")
+            for (sym, exp, strike, opt, reason) in skip_log[:10]:
+                print(f"    {sym} {exp} {strike:g}{opt}: {reason}")
+        return 0
+
+    # ============================================================
+    # Step 3 — build per-symbol expiry list  (--engine-source api)
+    # ============================================================
+    _h("Step 3 — build expiry list per symbol  [--engine-source api]")
     expiries_by_symbol: dict[str, list[date]] = {}
     for sym in tqdm(symbols, desc="expiries", unit="symbol"):
         try:

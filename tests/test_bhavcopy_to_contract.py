@@ -25,6 +25,7 @@ from src.data import cache
 from src.data.bhavcopy_to_contract import (
     _OUTPUT_COLUMNS,
     bhavcopy_to_contract_timeseries,
+    enumerate_contracts_from_bhavcopies,
     materialize_contract_from_bhavcopy,
 )
 from src.data.errors import MissingTurnoverError
@@ -462,6 +463,110 @@ def test_materialize_propagates_missing_turnover_error_no_partial_file(tmp_path)
         "transform error path wrote a partial / empty file; the caller "
         "can't distinguish 'first call failed' from 'cached empty result'"
     )
+
+
+# ============================================================
+# enumerate_contracts_from_bhavcopies (P1.5)
+# ============================================================
+
+def test_enumerate_returns_unique_sorted_tuples(tmp_path):
+    """Enumeration scans the bhavcopy cache + returns one entry per
+    unique (sym, expiry, strike, option_type), sorted for
+    deterministic iteration order across runs."""
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    pnb_exp = date(2024, 7, 25)
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[
+            ("PNB", pnb_exp, 100.0, "CE",
+             4.5, 5.0, 4.0, 4.8, 4.85, 4.9, 100, 84000.0, 1000, 0),
+            ("PNB", pnb_exp, 105.0, "CE",
+             3.5, 4.0, 3.0, 3.8, 3.85, 3.9, 50, 42000.0, 500, 0),
+            ("PNB", pnb_exp, 100.0, "PE",
+             2.5, 3.0, 2.0, 2.8, 2.85, 2.9, 75, 7500.0, 800, 0),
+        ],
+        is_udiff=True,
+    )
+    # Second day surfaces ONE new strike and re-surfaces the others.
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 24),
+        rows=[
+            ("PNB", pnb_exp, 100.0, "CE",
+             4.8, 5.5, 4.5, 5.0, 5.1, 5.05, 150, 130000.0, 1100, 100),
+            ("PNB", pnb_exp, 110.0, "CE",
+             2.5, 3.0, 2.0, 2.8, 2.85, 2.9, 25, 21000.0, 200, 0),
+        ],
+        is_udiff=True,
+    )
+    contracts = enumerate_contracts_from_bhavcopies(
+        symbols=["PNB"],
+        from_date=date(2024, 7, 22), to_date=date(2024, 7, 25),
+    )
+    # 4 unique (sym, expiry, strike, option_type) tuples across the
+    # 2 days; sorted ascending.
+    assert contracts == [
+        ("PNB", pnb_exp, 100.0, "CE"),
+        ("PNB", pnb_exp, 100.0, "PE"),
+        ("PNB", pnb_exp, 105.0, "CE"),
+        ("PNB", pnb_exp, 110.0, "CE"),
+    ]
+
+
+def test_enumerate_filters_to_operator_symbols(tmp_path):
+    """Symbols not in the operator's list are excluded from
+    enumeration (4-stock smoke shouldn't enumerate every F&O symbol
+    that traded in the bhavcopy)."""
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[
+            ("PNB", date(2024, 7, 25), 100.0, "CE",
+             4.5, 5.0, 4.0, 4.8, 4.85, 4.9, 100, 84000.0, 1000, 0),
+            ("RELIANCE", date(2024, 7, 25), 2840.0, "CE",
+             201.7, 210.0, 195.0, 205.0, 205.5, 205.1, 26, 5300000.0, 41500, -1500),
+        ],
+        is_udiff=True,
+    )
+    contracts = enumerate_contracts_from_bhavcopies(
+        symbols=["PNB"],
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    assert all(c[0] == "PNB" for c in contracts), (
+        "RELIANCE leaked into PNB-only enumeration"
+    )
+
+
+def test_enumerate_silently_skips_missing_days(tmp_path):
+    """Holidays / pre-listing gaps don't crash enumeration. The
+    days are simply not in the result."""
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", date(2024, 7, 25), 100.0, "CE",
+               4.5, 5.0, 4.0, 4.8, 4.85, 4.9, 100, 84000.0, 1000, 0)],
+        is_udiff=True,
+    )
+    # Range covers 5 days; only 1 has a cached bhavcopy.
+    contracts = enumerate_contracts_from_bhavcopies(
+        symbols=["PNB"],
+        from_date=date(2024, 7, 21), to_date=date(2024, 7, 25),
+    )
+    assert len(contracts) == 1
+
+
+def test_enumerate_is_case_insensitive_on_symbol(tmp_path):
+    """Operator passes mixed-case symbol → enumerate normalizes
+    to upper-case before matching."""
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", date(2024, 7, 25), 100.0, "CE",
+               4.5, 5.0, 4.0, 4.8, 4.85, 4.9, 100, 84000.0, 1000, 0)],
+        is_udiff=True,
+    )
+    contracts = enumerate_contracts_from_bhavcopies(
+        symbols=["pnb"],  # lowercase
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    assert len(contracts) == 1
+    assert contracts[0][0] == "PNB"
 
 
 # ============================================================
