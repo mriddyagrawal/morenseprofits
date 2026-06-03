@@ -19277,3 +19277,121 @@ Migration cadence: **P0.1 ✓ → ... → F6 SHIP verdict ✓ → smoke gate dep
 Standing by for P1.7.
 
 ---
+
+## Review of 46cbb4f — `feat(engine.pnl.p1_7_unified_vwap_or_skip)` — ✅ ACCEPT (THE LOAD-BEARING IRREVERSIBLE COMMIT)
+
+**Verdict: ✅ ACCEPT.** P1.7 lands the unified VWAP-or-skip spec exactly as the F6 + arch ship verdict authorized. Decision tree is correct across all 4 branches; comprehensive test coverage pins each branch + the IlliquidLegError back-compat collapse; fixture injection is well-designed (`lot_size=250 → volume=25k` keeps band-check path exercised).
+
+### Decision tree verified
+
+`src/engine/pnl.py:_pick_fill_price` now executes:
+
+```
+(1) turnover/volume/strike missing OR volume == 0    → raise MissingTurnoverError
+(2) recovered premium_vwap ≤ 0 (deep-OTM)            → raise MissingTurnoverError
+(3) volume ≥ 100_000 (Option C bypass)               → return VWAP unconditionally
+(4) thin contract + band-reject                      → raise MissingTurnoverError
+(default) thin contract + in-band VWAP               → return VWAP
+```
+
+All four branches verified by reading the code. Order is correct (data-availability → arithmetic-quality → liquidity-classify → band-check).
+
+### Empirical justification of Option C threshold
+
+BUILDER cites: "of 8,168 close-fallback leg-sides observed on the F1-fixed smoke-universe sweep, 0 were case-3 deep-OTM, 100% were band-rejects, 99.3% had volume > 100k." Argument:
+
+- **99.3% of pre-P1.7 close-fallback was LIQUID contracts** where close was a tick-floor artifact and VWAP integrated over many trades. Option C bypass (skip band-check for vol ≥ 100k) corrects this.
+- **0.7% remaining thin-contract band-rejects** become skips; close fallback on these was also wrong (tick fudge). Skip is honest.
+
+Math sanity-check: ~0.05% trade-level coverage loss in exchange for removing systematic close-fallback bias. Acceptable trade-off.
+
+### Test coverage — comprehensive
+
+All four branches + the IlliquidLegError back-compat collapse pinned:
+
+- **Branch 1**: `test_zero_entry_volume_raises_missing_turnover` + exit-side variant + `test_nan_turnover_raises_missing_turnover_under_p1_7`. ✓
+- **Branch 2**: `test_recovered_premium_negative_raises_missing_turnover`. ✓
+- **Branch 3** (Option C bypass): `test_band_reject_bypassed_when_volume_above_liquidity_threshold` (LOAD-BEARING). ✓
+- **Branch 4**: `test_band_reject_on_thin_contract_raises_missing_turnover`. ✓
+- **IlliquidLegError collapse**: `test_zero_oi_prices_normally_under_p1_7` (positive-control for OI=0 + volume>0); `test_illiquid_leg_error_is_a_missing_data_error` (inheritance retained); `test_missing_turnover_error_is_a_missing_data_error` (mirror pin). ✓
+
+### Fixture injection verified
+
+Verified by grep: every `_option_frame(...)` call uses `lot_size = 250` (or `500` in one exit-side test). So `volume = lot_size × 100 = 25,000` (or 50,000): safely below 100k → **band-check path is genuinely exercised** by minimal fixtures, not silently bypassed via Option C.
+
+The injection `turnover = (strike + close) × volume` makes VWAP fill numerically equal to close → legacy P&L assertions untouched. Fixtures that explicitly populate volume/turnover override defaults.
+
+### IlliquidLegError back-compat verified
+
+- Class **retained** in `src/data/errors.py`, no longer raised by engine.
+- Historical `sweep_*_skipped.parquet` files carry the literal `"IlliquidLegError"` string as `skip_reason`.
+- MCP analytics layers query by that string — still work against historical sweeps.
+- Inheritance from `MissingDataError` preserved → sweeper's `_SKIPPABLE_ERRORS` continues to catch both classes.
+
+### Pytest
+
+```
+861 passed, 2 deselected, 1 warning in 13.64s
+```
+
+Matches BUILDER's claim. +2 net vs prior ship.
+
+### NOTES (not grills)
+
+**N1: 100k threshold is empirically chosen for THIS 4-symbol smoke universe.** For broader universes (NIFTY OPTIDX, mid-caps with different volume profiles) the threshold may need adjustment. But the constant is tunable in one module-level place; the conservative direction (skip when in doubt) is correct. Future operator-universe-specific calibration; not blocking.
+
+**N2: OI=0 + volume>0 anomaly now prices through.** Pre-P1.7 was a defensive skip; now the engine trusts volume as the liquidity signal per operator authorization in the commit body. NSE settlement-day edge cases will price; documented architectural choice.
+
+**N3: Behavior is IRREVERSIBLE.** Re-running the sweep post-P1.7 will produce a different (smaller) cell count than pre-P1.7 sweeps — cells that previously close-fell-back are now honestly skipped. The displayed sweep was already using VWAP per F1; P1.7 removes the now-dead close-fallback path.
+
+### Praises
+
+- **Decision tree is operator-grade documentation** — inline docstring enumerates all 4 branches with WHY for each.
+- **Option C bypass is empirically anchored** (99.3% of pre-P1.7 close-fallback was liquid) — not arbitrary.
+- **IlliquidLegError back-compat is exemplary** — class retained, deprecated docstring, MCP queries still work, inheritance preserved.
+- **Test fixture injection is clever** — preserves legacy P&L assertions while routing through new VWAP path.
+- **Error messages are operator-triage-grade** — each raise includes target date, all three primitives, and the `P1.7 strip — cell unpriceable, skipping.` suffix for skip_reason records.
+- **Commit body cross-references both reviewer streams + operator** — F6 (50082b6), arch (aedf17a), operator authorization. Decision trail preserved.
+- **NOT-IN-SCOPE section is honest** — smoke-gate redesign + MIGRATION.md decision-log + cache-version stamping all explicitly deferred. Scope discipline.
+- **Constant naming**: `_VWAP_LIQUIDITY_BYPASS_VOLUME` describes WHAT + WHY + EFFECT.
+
+### Math
+
+- LOC: +422 / -159 = +263 net. ✓
+- Test count: 859 → 861 (+2 net). ✓
+
+### Behavior delta
+
+**P1.7 is THE LOAD-BEARING IRREVERSIBLE COMMIT.** Future sweeps will have higher VWAP fill rate (was 66.4% post-F1; should approach 99.6% post-P1.7); the small fraction (~0.05%) of cells that previously close-fell-back will now be honestly skipped rather than fudged.
+
+### State-of-tree
+
+- **All session correctness fixes hold**: F1, F1-B, F5, lot_sizes mtime, d276419 stale-cache, b3f4618 zero-contracts, dd141cc case-sens, 5631f18 fractional, P1.7 VWAP-or-skip.
+- **F6 condition 3** (bhavcopy canonical) closed by 2613129. F6 conditions 1+2 remain for P1.8.
+- **Migration arc complete through P1.7.** 🎉
+
+### Open grills (unchanged)
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry physical-settlement STT) — defer.
+- **Smoke-gate replacement** (F6 conditions 1+2) — track as P1.8.
+
+### MCP arc state
+
+16/16. MCP query layers still resolve `skip_reason == "IlliquidLegError"` against historical sweeps via the back-compat class retention.
+
+### Next-commit suggestion
+
+The migration arc is complete through P1.7. Natural next moves (BUILDER's discretion):
+
+1. **MIGRATION.md decision-log entry** for Plan C scrap + bhavcopy canonical-precision note (BUILDER's own "NOT IN SCOPE" item).
+2. **P1.8 smoke-gate replacement** (bhav-vs-bhav post-code-change baseline; per-trade primary; quantization-aware threshold) — closes F6 conditions 1+2.
+3. **Grill #1 from 12893ea** (cache-version stamping) — dual-concurred; ~20 LOC.
+4. **F3 STT caveat** — defer further.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → F1 ✓ → F1-B ✓ → F5 ✓ → lot_sizes mtime ✓ → diagnostic UX ✓ → F6 SHIP ✓ → smoke gate deprecated ✓ → 🎉 P1.7 VWAP-or-skip SHIPPED ✓ → P1.8 (smoke gate redesign) → ...**
+
+🎉 Standing by — migration arc complete through P1.7. Awaiting P1.8 cycle.
+
+---
