@@ -17722,3 +17722,129 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of d276419 — `fix(bhavcopy_fo_loader.stale_cache_auto_refetch)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Clean execution. Schema sniff is precisely the right discriminator; stale-patch-with-NaN correctly rejected with explicit rationale; one-time warning prevents 466-line spam; sibling lot-size cache stays paired via the existing re-fetch path; LRU caches the fresh frame from impl. No grills.
+
+### Sniff discriminator is correct across ALL pre-/post- schema states
+
+Verified the column shapes by reading the parsers:
+
+- **Pre-P1.1 udiff cache** (14 cols, no `ltp` no `turnover`): sniff misses `turnover` → re-fetch → post-P1.1 16-col. ✓
+- **Pre-P1.2 legacy cache** (14 cols, no `turnover`): sniff misses `turnover` → re-fetch → post-P1.2 15-col. ✓
+- **Post-P1.1 udiff cache** (16 cols, has `turnover` + `ltp`): sniff finds `turnover` → keep (correct, fresh). ✓
+- **Post-P1.2 legacy cache** (15 cols, has `turnover`, no `ltp`): sniff finds `turnover` → keep (correct; legacy has no `ltp` in the source, downstream `_normalize_legacy_columns` adds NaN at the contract-transform layer). ✓
+
+**`"turnover" in df.columns` is the right strict discriminator.** Legacy has never carried `ltp` (NSE legacy CSV has no LastPric equivalent), so testing for `ltp` would have falsely re-fetched every post-P1.2 legacy cache. BUILDER picked the correct prerequisite.
+
+### Stale-patch-with-NaN correctly rejected
+
+From `_load_bhavcopy_fo_impl` (lines 466-473):
+
+```python
+if cache.exists(path):
+    df = cache.read(path)
+    if "turnover" in df.columns:
+        return df
+    # Stale schema — fall through to re-fetch. (Skipping the cache
+    # is safer than patching turnover=NaN: VWAP fills downstream
+    # would silently degrade to MissingTurnoverError on every cell.)
+    _warn_stale_bhavcopy_cache_once(trade_date)
+```
+
+The fallback's commentary explicitly names the WHY-not — patching turnover=NaN would silently degrade to `MissingTurnoverError` at sweep time via `pnl._compute_vwap` (which returns None when `volume == 0 or volume is None or turnover is None`). Re-fetching is the only correct path because **the bhavcopy SOURCE always carried turnover** — only the parser was narrower pre-P1.1/P1.2.
+
+### Sibling lot-size cache pairing preserved
+
+The re-fetch path falls through to the existing `_fetch_raw` → `parser` → `cache.write` → `_write_sibling_lot_sizes_cache(df, trade_date)` flow (lines 484-491). **A stale main cache being re-fetched also rewrites the sibling lot-size cache**. Pairing stays consistent — the operator doesn't need to wipe `data/cache/bhavcopy_fo_lot_sizes/` separately.
+
+### One-time warning is operator-grade UX
+
+Module-level `_STALE_CACHE_WARNING_EMITTED` flag + `_warn_stale_bhavcopy_cache_once`. Operator sees ONE line ("first hit: 2024-07-08") instead of 466. The warning message names the schema delta ("14-col → 16-col, adds turnover + ltp") and that it's a "one-time cost per cache" — operator understands they should expect a ~5-15 minute network re-fetch on this run only.
+
+### LRU memoization stays correct
+
+Flow:
+
+1. `load_bhavcopy_fo(date)` → `_load_bhavcopy_fo_cached(date_iso, offline)` (LRU-wrapped, `maxsize=_LRU_MAXSIZE_BHAVCOPY`).
+2. LRU miss → `_load_bhavcopy_fo_impl(date, offline=offline)`.
+3. impl: read disk → stale check → re-fetch (if stale) → return FRESH frame.
+4. LRU caches the fresh frame returned by impl.
+
+**No LRU-staleness concern.** impl always returns a fresh-schema frame; LRU caches whatever impl returns. In a fresh process (which is what the operator's re-run will be), LRU starts empty, so the first stale-hit fires the re-fetch.
+
+### Test verified
+
+`test_stale_pre_p11_cache_triggers_silent_refetch` plants a synthetic 14-col parquet at the cache path, then asserts:
+
+1. `_fetch_raw` was called exactly once (re-fetch triggered).
+2. Returned frame has BOTH `turnover` AND `ltp` (post-P1.1 schema). ✓
+3. Exactly one stale-cache warning emitted via `recwarn`. ✓
+4. On-disk parquet has been rewritten with the fresh schema (re-read confirms `turnover` in columns). ✓ (proves subsequent loads short-circuit normally)
+
+Uses `monkeypatch.setattr(bfo, "_STALE_CACHE_WARNING_EMITTED", False)` for test isolation — without this, a previous test could have flipped the flag.
+
+`tests/test_bhavcopy_fo_loader.py`: 33/33 pass (32 existing + 1 new).
+
+### Praises
+
+- **Sniff discriminator is the strict prerequisite** — `turnover` is what the downstream consumers actually need; checking for `ltp` would have wrongly re-fetched post-P1.2 legacy caches.
+- **Explicit WHY-not-NaN-patch rationale** in the code comment names the failure mode (silent degrade to `MissingTurnoverError` via VWAP path). Future maintainer can't accidentally "optimize" this to a NaN patch.
+- **Sibling lot-size cache stays paired** via the existing re-fetch path — no separate operator action needed.
+- **One-time warning** prevents the 466-line console spam; the warning message names the cause + the one-time-cost expectation operator-grade.
+- **Test asserts the on-disk rewrite** by re-reading the parquet — proves the LRU + filesystem stay in sync for subsequent loads.
+- **Cross-commit awareness in the commit body** — explicitly references P1.1 (udiff +turnover+ltp) and P1.2 (legacy +turnover) so a future archaeologist can see the schema-version history.
+- **Test isolation via monkeypatch on the module flag** — prevents cross-test pollution.
+
+### Math
+
+- LOC: +44 / -3 (impl) + +62 / -0 (test) = +106 / -3 = +103 net. ✓ Matches `103 insertions, 3 deletions`.
+- Test count: 861 → 862 (+1 net). ✓ Matches.
+
+### Behavior delta
+
+- Loading a stale 14-col bhavcopy parquet now silently re-fetches and rewrites with the fresh 16-col schema.
+- One-time per-process warning surfaces the silent re-fetch operator-side.
+- Post-fix, **all four observed prefetch failure modes are resolved**: 4.8hr wall (ef4f71b), fractional strikes (5631f18), over-strict zero-contracts (b3f4618), stale 14-col cache (THIS COMMIT).
+
+### State-of-tree
+
+Operator can re-run the prefetch. Expected timeline:
+
+1. Step 2 (bulk-fetch bhavcopies): triggers a re-fetch for all 466 stale cached dates → ~5-15 min over the network. One-time cost.
+2. Step 2b (lot_sizes parquet): rebuilds against the FRESH sibling caches.
+3. Steps 3+4 (batch materialize): completes in seconds via the perf path. ~9000 contracts materialize successfully (vs the previous 294 due to the over-strict zero-contracts bug, against a 14-col stale cache that wasn't reaching that bug in the first place).
+4. Subsequent sweep + smoke comparison proceed normally.
+
+After PASS, BUILDER opens P1.7 with the operator-side PASS metrics embedded in the commit body.
+
+### Open grills
+
+None new. Standing grills:
+
+- **Grill #1 from ef4f71b** (per-contract vs batch case-sensitivity): still open; not load-bearing; defer at discretion.
+- **Grill #1 from b3f4618** (batch path zero-contracts handling not separately tested): still open; ~25 LOC test would lock symmetry.
+
+Both could close together in a single "small-fixes" commit; neither blocks P1.7.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**Operator-side: resume the gate exercise** (now genuinely unblocked across ALL observed failure modes). Re-run prefetch; expect ~5-15 min network re-fetch for stale bhavcopies + seconds for the batch materialize step. After PASS, BUILDER opens P1.7 with the operator's run_id pair + cells-checked count + max-delta-observed metrics.
+
+Optional small-fixes commit (BUILDER's discretion):
+
+- Close Grill #1 from ef4f71b (~3 LOC case-insensitive per-contract path).
+- Close Grill #1 from b3f4618 (~25 LOC batch zero-contracts test).
+
+Could land before or after P1.7; non-blocking.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → (operator gate exercise — unblocked across all four observed failure modes) → P1.7 → P1.8 → ...**
+
+Standing by.
+
+---
