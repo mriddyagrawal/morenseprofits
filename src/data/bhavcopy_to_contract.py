@@ -124,11 +124,28 @@ def bhavcopy_to_contract_timeseries(
     filtered to ``[from_date, to_date]`` — same 16 columns, same
     dtypes, sorted by ``date`` ascending.
 
+    Inputs are normalized once at the public boundary: ``symbol``
+    and ``option_type`` are uppercased (bhavcopies always store the
+    canonical upper-case form). Matches the batch path's
+    ``sym_upper = {s.upper() for s in symbols}`` normalization in
+    ``materialize_contracts_batch`` — closes the case-sensitivity
+    divergence Grill from the ef4f71b review.
+
     Raises:
         MissingTurnoverError: lot_size_lookup returned None (the
             pair is excluded from the unified cache); OR contracts
             is missing/zero on any row.
     """
+    # Public-boundary normalization: bhavcopies store upper-case
+    # symbol + "CE"/"PE". A lower-case caller would otherwise hit
+    # the equality filter inside ``_load_one_day_filtered`` and
+    # silently return an empty frame — invisible at the operator
+    # API surface today (all callers happen to pass upper) but a
+    # latent footgun for any future caller (REPL, paper-trading,
+    # an MCP tool). Symmetric with the batch path.
+    symbol = symbol.upper()
+    option_type = option_type.upper()
+
     days = _iterate_trading_days(from_date, to_date)
     daily_frames: list[pd.DataFrame] = []
     for d in days:

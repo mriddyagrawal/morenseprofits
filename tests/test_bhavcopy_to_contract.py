@@ -297,6 +297,61 @@ def test_transform_keeps_partial_zero_contract(tmp_path):
 
 
 # ============================================================
+# Public-boundary case normalization (Grill from ef4f71b review)
+# ============================================================
+
+def test_transform_accepts_lowercase_symbol_and_option_type(tmp_path):
+    """Public-boundary normalization: lowercase ``symbol`` /
+    ``option_type`` produce the SAME output as upper-case. Closes
+    Grill #1 from ef4f71b — without this fix the per-contract path
+    silently returned an empty frame for any lowercase caller
+    (``df["symbol"] == "pnb"`` matches zero rows since bhavcopies
+    store "PNB" canonically), while the batch path's
+    ``sym_upper = {s.upper() for s in symbols}`` happily accepted
+    lowercase. Operator API surface today doesn't exercise the
+    divergence (all callers pass upper), but a future REPL /
+    paper-trading / MCP-tool caller would have hit the silent
+    empty-frame footgun.
+    """
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Bhavcopy stores the canonical upper-case symbol + "CE".
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
+               150, 130000.0, 1100, 100)],
+        is_udiff=True,
+    )
+
+    # Reference output via the canonical upper-case call.
+    df_upper = bhavcopy_to_contract_timeseries(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+
+    # Same call with lowercase inputs — public-boundary
+    # uppercase normalization yields byte-identical output.
+    df_lower = bhavcopy_to_contract_timeseries(
+        "pnb", pnb_exp, 100.0, "ce",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+
+    assert len(df_lower) == 1, (
+        "lowercase input returned empty frame — case normalization "
+        "regressed (per-contract path is case-sensitive again)"
+    )
+    pd.testing.assert_frame_equal(df_upper, df_lower)
+
+    # Mixed-case is also normalized (defensive against typos).
+    df_mixed = bhavcopy_to_contract_timeseries(
+        "Pnb", pnb_exp, 100.0, "Ce",
+        from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
+    )
+    pd.testing.assert_frame_equal(df_upper, df_mixed)
+
+
+# ============================================================
 # Empty-range + missing-day handling
 # ============================================================
 
