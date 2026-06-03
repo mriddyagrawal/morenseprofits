@@ -313,6 +313,28 @@ Investigated the failing post-migration smoke gate (median: 4,612/6,903 cells FA
 
 ---
 
+## REVIEW: `46cbb4f` (P1.7 VWAP-or-skip) + `2613129` (smoke deprecation) → **ACCEPT** ✅ — but DISPLAYED DATA IS STALE
+
+Reviewed the two source commits + the three arch `review:` commits (`aedf17a`/`de3ba01`/`85ade54`, all ✅; arch independently caught the same oi-drop + irreversibility I did).
+
+**`46cbb4f` P1.7 — engine is now VWAP-or-skip (no close fallback anywhere).** New `_pick_fill_price` decision tree, verified against the implementation:
+1. turnover/volume/strike missing OR volume==0 → `MissingTurnoverError` (skip).
+2. `premium = turnover/vol − strike ≤ 0` (deep-OTM) → skip (pre-P1.7 fell to close).
+3. **volume ≥ 100k (Option C, `_VWAP_LIQUIDITY_BYPASS_VOLUME`)** → VWAP unconditionally (band bypass — liquid VWAP beats tick-floor close; empirically 99.3% of pre-P1.7 close-fallbacks were liquid band-rejects).
+4. thin (<100k): band ∈ [0.5,2.0] → VWAP, else skip.
+Sound and tested — 92 tests pass across pnl/sweeper/strategy suites. `IlliquidLegError` retained in `errors.py` (importable, deprecated) so historical `*_skipped.parquet` + MCP `skip_reason=="IlliquidLegError"` queries still resolve. ✅
+
+**Two caveats (both deliberate/documented, neither a bug):**
+- **oi==0 gate DROPPED** (was `entry_oi==0 → IlliquidLegError`; my original audit row #14). Now a volume>0/oi==0 contract prices through (NSE settlement-day edge). Rationale in-code: volume>0 ⟹ a real fill exists. Arch reviewer's N2 concurs. Minor coverage-edge change; acceptable.
+- **🚩 Displayed data is now STALE vs the engine.** `sweep_5f199d6984f2.parquet` was generated pre-P1.7 (and pre-F1-cache-rebuild) — it still carries close-fallback fills + pre-P1.7 coverage. **The webapp will not reflect P1.7 (VWAP-or-skip) until the operator re-prefetches + re-sweeps** on the rebuilt cache. Post-re-sweep: VWAP fill-rate ~66%→~99.6% (Option C flips liquid band-rejects to VWAP), ~0.05% of cells honestly skipped (thin/deep-OTM), ROI distributions shift off the tick-floor bias. Irreversible (arch N3). *(Fill-rate figures are from the commit's audit + my F1 66.4% measurement; not independently re-run — options cache is currently wiped, no post-P1.7 sweep exists yet.)*
+
+**`2613129` smoke-gate deprecation — honest.** Retires the api-vs-bhav parity gate (the confounded cell-criterion from F6), deletes its auto-running tests, documents the bhav-vs-bhav successor as future work. Closes F6 condition #3 (bhav canonical). **F6 conditions #1/#2 (a real bhav-vs-raw-bhavcopy precision gate) remain OPEN** — there is currently NO automated migration-parity gate until that redesign lands. Non-blocking (F1/F6 verified manually) but the successor gate should not be dropped.
+
+### STATUS (as of `46cbb4f`, P1.7 shipped)
+**Correctness: all clear.** F1/F1-B/F2/F5/F6 closed; coverage bug (`6bc95e9`) fixed; P1.7 VWAP-or-skip shipped + verified; both reviewer streams converged. **Operator action required for the webapp to be "true & best" under P1.7: re-prefetch + re-sweep** (current displayed parquet is pre-P1.7). **Open non-blocking:** F3 (expiry STT) · cache-version-stamp guard (Grill #1, dual-concurred) · bhav-vs-raw smoke-gate successor (F6 #1/#2) · 6bc95e9 iterdir-order (minor).
+
+---
+
 ## F1-B DOC SWEEP REVIEW (2026-06-03) — commit `029d175` → **ACCEPT-with-grill** ⚠️ (surfaces new finding F5)
 
 BUILDER landed `029d175 docs(turnover.units): F1-B drift-prevention sweep + fix garbled pnl.py empirical anchor` (touches `pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py`). I reviewed the diff for (a) doc accuracy and (b) any executable/formula change riding in a "docs" commit.
