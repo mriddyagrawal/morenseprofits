@@ -802,6 +802,83 @@ def test_batch_skips_excluded_lot_size_pairs_with_named_reason(tmp_path):
     )
 
 
+def test_batch_skips_never_traded_contracts_with_named_reason(tmp_path):
+    """Symmetry test for the b3f4618 ``.any()`` → ``.all()`` semantic
+    shift at the batch layer. The per-contract path's tests already
+    cover both directions; this locks the same invariant on the
+    batch path so a future regression that re-tightens
+    ``materialize_contracts_batch`` (e.g., back to ``.any()``) trips
+    LOUD instead of silently re-rejecting ~97% of contracts.
+
+    Fixture: two contracts in the same batch:
+      - PNB 100 CE: every cached day has ``contracts == 0`` →
+        truly never traded → ``skipped_missing_turnover`` with the
+        "never traded" skip-log message.
+      - PNB 105 CE: day-1 zero + day-2 traded → ``materialized``;
+        zero-day row survives in the on-disk parquet with volume=0.
+    """
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Day 1: BOTH strikes have zero contracts (listing-lag day).
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 22),
+        rows=[
+            ("PNB", pnb_exp, 100.0, "CE",
+             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0),
+            ("PNB", pnb_exp, 105.0, "CE",
+             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0),
+        ],
+        is_udiff=True,
+    )
+    # Day 2: 100 CE STILL zero (truly never traded); 105 CE trades.
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[
+            ("PNB", pnb_exp, 100.0, "CE",
+             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0),
+            ("PNB", pnb_exp, 105.0, "CE",
+             3.8, 4.0, 3.5, 3.9, 3.95, 3.85, 50, 42000.0, 500, 0),
+        ],
+        is_udiff=True,
+    )
+
+    counts = materialize_contracts_batch(
+        symbols=["PNB"],
+        from_date=date(2024, 7, 22), to_date=date(2024, 7, 23),
+    )
+
+    # 100 CE is in the never-traded bucket; 105 CE materialized.
+    assert counts["materialized"] == 1
+    assert counts["skipped_missing_turnover"] == 1
+    assert counts["already_cached"] == 0
+
+    # Skip-log carries the new "never traded" message symmetrically
+    # with the per-contract path (the b3f4618 rename ships into the
+    # operator-triage surface, not just the exception path).
+    never_traded_rows = [
+        row for row in counts["skip_log"]
+        if "never traded" in str(row[4])
+    ]
+    assert len(never_traded_rows) == 1
+    assert never_traded_rows[0][0] == "PNB"
+    assert never_traded_rows[0][2] == 100.0
+    assert never_traded_rows[0][3] == "CE"
+
+    # On-disk parquet for 105 CE: BOTH rows survive (zero-day +
+    # traded-day), with the zero-day's volume = 0. Matches the
+    # per-contract path's permissive semantic; positive-control for
+    # "partial-zero contracts pass through".
+    p105 = cache.option_path("PNB", pnb_exp, 105.0, "CE")
+    assert p105.exists()
+    df105 = cache.read(p105)
+    assert len(df105) == 2
+    assert (df105["volume"] == [0, 50 * 8000]).all()
+
+    # 100 CE NOT written — never-traded contracts get no parquet.
+    p100 = cache.option_path("PNB", pnb_exp, 100.0, "CE")
+    assert not p100.exists()
+
+
 def test_batch_progress_callback_fires_per_group(tmp_path):
     """``progress_callback`` is invoked once per (sym, expiry,
     strike, option_type) group. Lets prefetch_universe report
