@@ -136,18 +136,41 @@ def test_overwrite_protect(monkeypatch, tmp_path):
     assert cache.read(p).iloc[0, 0] == 2
 
 
-def test_strike_integer_guard(monkeypatch, tmp_path):
+def test_strike_path_encoding_integer_and_fractional(monkeypatch, tmp_path):
+    """Path encoding handles both integer and fractional strikes.
+
+    Reversal of the prior integer-only assumption: NSE genuinely
+    emits fractional strikes (e.g. BHEL ₹97.5 / 102.5 on 2024-01-04
+    — confirmed empirically from cached bhavcopies).
+
+    Integer strikes encode as the bare integer (backwards-compatible
+    with all existing per-contract caches); fractional strikes
+    encode via ``{strike:g}`` (97.5 → ``97.5``, 102.5 → ``102.5``).
+    No collisions between the two encodings."""
     _redirect_cache(monkeypatch, tmp_path)
-    # Whole-rupee strikes accepted as int OR float
+    # Whole-rupee strikes accepted as int OR float; same path.
     p_int = cache.option_path("X", date(2024, 1, 25), 2620, "CE")
     p_flt = cache.option_path("X", date(2024, 1, 25), 2620.0, "CE")
     assert p_int == p_flt
     assert p_int.name == "2620-CE.parquet"
-    # Fractional strikes refused — guards against banker's-rounding collisions
-    with pytest.raises(cache.StrikeNotIntegerError):
-        cache.option_path("X", date(2024, 1, 25), 2620.5, "CE")
-    with pytest.raises(cache.StrikeNotIntegerError):
-        cache.option_path("X", date(2024, 1, 25), 50.5, "PE")
+    # Fractional strikes encode via g-format.
+    p_frac_2620p5 = cache.option_path("X", date(2024, 1, 25), 2620.5, "CE")
+    p_frac_50p5 = cache.option_path("X", date(2024, 1, 25), 50.5, "PE")
+    assert p_frac_2620p5.name == "2620.5-CE.parquet"
+    assert p_frac_50p5.name == "50.5-PE.parquet"
+    # No collision between integer and fractional.
+    assert p_frac_2620p5 != p_int
+    # BHEL-style 2.5-rupee tick: 97.5 → "97.5".
+    p_bhel = cache.option_path("BHEL", date(2024, 1, 25), 97.5, "CE")
+    assert p_bhel.name == "97.5-CE.parquet"
+
+
+def test_strike_not_integer_error_class_retained_for_backcompat():
+    """``StrikeNotIntegerError`` class is retained as deprecated
+    backwards-compat for any external consumer that imports it.
+    Not raised by ``option_path`` anymore (fractional strikes are
+    supported), but the class itself stays importable."""
+    assert issubclass(cache.StrikeNotIntegerError, ValueError)
 
 
 def test_version_mismatch_message_is_informative(monkeypatch, tmp_path):

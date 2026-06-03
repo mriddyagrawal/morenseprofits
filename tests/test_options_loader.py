@@ -678,14 +678,24 @@ def test_partial_response_with_dropped_dates(monkeypatch, tmp_path):
 
 
 # ============================================================
-# Strike integer guard inherited from cache.option_path
+# Strike path encoding — integer + fractional both supported
 # ============================================================
 
-def test_fractional_strike_raises_via_cache_guard(monkeypatch, tmp_path):
+def test_fractional_strike_supported_via_cache_path(monkeypatch, tmp_path):
+    """LOAD-BEARING reversal of the prior integer-strike assumption:
+    NSE emits fractional strikes (e.g. BHEL ₹97.5 / 102.5 on
+    2024-01-04, confirmed empirically). ``cache.option_path`` now
+    encodes them via ``g``-format. Integer strikes are unchanged
+    (backwards compat for all existing per-contract caches)."""
     _redirect_cache(monkeypatch, tmp_path)
-    with pytest.raises(cache.StrikeNotIntegerError):
-        options_loader.load_option(
-            "RELIANCE", date(2024, 1, 25), 2620.5, "CE",
-            date(2024, 1, 25), date(2024, 1, 25),
-            today_fn=lambda: date(2026, 5, 24),
-        )
+    # Integer strike: bare integer (backwards-compatible).
+    p_int = cache.option_path("RELIANCE", date(2024, 1, 25), 2620, "CE")
+    assert p_int.name == "2620-CE.parquet"
+    # Integer-valued float: same encoding (no collision).
+    p_int_float = cache.option_path("RELIANCE", date(2024, 1, 25), 2620.0, "CE")
+    assert p_int_float == p_int
+    # Fractional strike: ``g``-format renders 2620.5 → "2620.5".
+    p_frac = cache.option_path("RELIANCE", date(2024, 1, 25), 2620.5, "CE")
+    assert p_frac.name == "2620.5-CE.parquet"
+    # Fractional ≠ integer for adjacent values.
+    assert p_int != p_frac

@@ -34,9 +34,13 @@ _root_verified: bool = False
 
 
 class StrikeNotIntegerError(ValueError):
-    """NSE stock-option strikes are whole rupees. A non-integer strike here
-    would collide via int(round(...)) with a neighbour (banker's rounding:
-    50.5 → 50, same file as a true ₹50 strike)."""
+    """**Deprecated** as of the fractional-strikes-supported fix (post-P1.5
+    perf commit). NSE genuinely emits fractional-rupee strikes for some
+    stocks (e.g. BHEL ₹97.5 / 102.5 / 107.5 on 2024-01-04 — confirmed
+    empirically from the cached bhavcopies). The original
+    "strikes are integer" assumption was wrong; the class is retained for
+    backwards-compat (test fixtures + log strings that reference it) but
+    no longer raised by ``option_path``."""
 
 
 class WouldOverwriteError(RuntimeError):
@@ -76,20 +80,42 @@ def spot_path(symbol: str, year: int) -> Path:
     return _ensure_root() / "spot" / symbol.upper() / f"{year}.parquet"
 
 
+def _strike_path_segment(strike: float) -> str:
+    """Encode ``strike`` as a filesystem-safe deterministic string.
+
+    Integer strikes use the bare integer form: 100 → "100" (backwards-
+    compatible with all existing per-contract caches written under the
+    integer-only assumption).
+
+    Fractional strikes (e.g., BHEL ₹97.5 / 102.5) use ``{strike:g}``
+    which renders 97.5 → "97.5". Collision-free: integer 100 → "100",
+    100.0 → "100" (matches int path), 97.5 → "97.5" (distinct).
+    """
+    if float(strike) == int(strike):
+        return f"{int(strike)}"
+    # ``g`` trims trailing zeros: 97.5 → "97.5", 97.50 → "97.5"
+    # (canonical). Two-decimal worst case for half-rupee tick size:
+    # 102.5 → "102.5".
+    return f"{strike:g}"
+
+
 def option_path(symbol: str, expiry: date, strike: float, option_type: Literal["CE", "PE"]) -> Path:
-    if float(strike) != int(strike):
-        raise StrikeNotIntegerError(
-            f"strike {strike!r} is not a whole rupee; NSE stock-option strikes are integer. "
-            f"Pass an int or a float with no fractional part."
-        )
-    strike_int = int(strike)
+    """Path to the per-contract EOD cache parquet.
+
+    Supports both integer and fractional NSE strikes (the latter is
+    real: BHEL had ₹97.5 / 102.5 strikes on 2024-01-04). Integer
+    strikes encode as the bare integer (``100``); fractional strikes
+    encode with ``g``-format (``97.5``). Backwards-compat: existing
+    integer-strike caches written before fractional support are
+    unaffected.
+    """
     expiry_tag = expiry.strftime("%Y%m%d")
     return (
         _ensure_root()
         / "options"
         / symbol.upper()
         / expiry_tag
-        / f"{strike_int}-{option_type.upper()}.parquet"
+        / f"{_strike_path_segment(strike)}-{option_type.upper()}.parquet"
     )
 
 
