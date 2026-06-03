@@ -19675,3 +19675,68 @@ Migration cadence: **... → 🎉 P1.7 ✓ → Option C recalibrate ✓ → 🚩
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC's 76ac14d (F7 update with empirical strengthening)
+
+LOGIC's update settles F7 empirically. The operator's expiry-day question prompted a targeted check; the answer strengthens the F7 case substantially.
+
+### Empirical strengthening — concur
+
+**Operator's question** (the load-bearing one): would an OI gate wrongly filter expiry-day trades?
+
+**LOGIC's two-part answer**:
+- **(a)** Gate keys on `entry_oi`; entry is structurally never expiry day (`entry_offset_td ≥ 1`). Empirically the 160 oi==0 trades have `entry_offset_td ∈ {30, 33, 35, 37, 41, 42}` — all far-dated.
+- **(b)** Expiry-day OI is healthy anyway — expiry-day EXIT legs have median `exit_oi ≈ 1,144,500` (0% zero). An entry_oi guard never sees expiry-day OI.
+
+So an `entry_oi == 0` guard cannot collateral-damage expiry-day close-out trades. Operator's concern empirically addressed.
+
+### Distribution-of-160 strengthens F7 — concur
+
+**All 160 oi==0 trades are far-dated entries (T-30 to T-42) into contracts with zero overnight OI.**
+
+This is the textbook dead/illiquid far-dated pattern: entering a strike 30-42 days out that nobody holds. The OPPOSITE of a benign near-expiry winddown. Empirically these are exactly the fictional fills P1.7's own "skip-don't-fudge" thesis says to drop.
+
+LOGIC's framing — "exactly the fictional fill P1.7 should skip" — is correct. Pre-update F7 was "small magnitude but principle violation." Post-update F7 is "small magnitude AND empirically validated as textbook dead far-dated contracts." The case for the fix is stronger.
+
+### Updated F7 priority
+
+P1.8a (oi==0 AND thin skip) is now better-motivated:
+
+- Far-dated entry pattern means these contracts have low expectation of fillability at exit time too (zero overnight holders at T-30 implies thin liquidity continues).
+- The "thin" check via `contracts_traded < _VWAP_LIQUIDITY_BYPASS_CONTRACTS` is precisely the right discriminator — 0/160 hit Option C, so the AND condition simplifies cleanly.
+- The fix can also surface entry_offset_td in the skip_reason for operator triage.
+
+### Operator pushback methodology
+
+The operator's expiry-day question was a precision check: "if you're going to skip on `entry_oi == 0`, are you sure that doesn't kill legitimate trades I want to see?" LOGIC's measurement (median exit_oi 1.1M, 0% zero on expiry day) confirms the gate has zero blast radius on expiry-day trades. Operator was protecting the legitimate cases before authorizing the skip; LOGIC's data confirms the protection holds.
+
+This is the right shape of operator-reviewer-builder iteration on a principle question: operator raises a concern → reviewer measures → fix or close. The operator's "LOUDLY" pushback isn't a vibe; it's a request for empirical validation of the safe-direction fix.
+
+### Updated open grills (unchanged scope, strengthened evidence)
+
+- **F7** (LOGIC's OI=0 reverse, empirically strengthened): OPEN; **P1.8a — better motivated**.
+- **N1 from P1.7** — CLOSED by 817d4e5.
+- **Grill #1 from 12893ea** (cache-version stamping) — defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+
+### MCP arc state
+
+16/16. F7 fix will add one skip_reason variant; `data_quality` could surface a "dead far-dated entry" filter. No breaking changes.
+
+### Next-commit suggestion
+
+Unchanged from my 32c79c2 review:
+
+1. **🚩 OPERATOR re-sweep** to bring webapp current.
+2. **P1.8a (F7 fix)** — `oi==0 AND contracts_traded < _VWAP_LIQUIDITY_BYPASS_CONTRACTS` skip branch in `_pick_fill_price`. Now even cleaner with 817d4e5's symbol-invariant denominator.
+3. **P1.8b (F6 #1+#2)** — smoke gate redesign.
+4. **MIGRATION.md decision-log**.
+5. **Grill #1 from 12893ea**.
+
+Migration cadence: **... → 🎉 P1.7 ✓ → Option C recalibrate ✓ → F7 empirically strengthened ✓ → 🚩 operator re-sweep → P1.8a (F7 fix) + P1.8b (gate redesign) → ...**
+
+Standing by.
+
+---
