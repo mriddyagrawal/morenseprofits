@@ -479,6 +479,68 @@ def test_load_bhavcopy_fo_udiff_cache_hit_skips_fetch(monkeypatch, tmp_path):
     pd.testing.assert_frame_equal(df1, df2)
 
 
+def test_stale_pre_p11_cache_triggers_silent_refetch(monkeypatch, tmp_path, recwarn):
+    """A pre-P1.1 14-col cached parquet (no ``turnover`` / no ``ltp``)
+    must be detected as stale and silently re-fetched to the post-
+    P1.1 16-col schema. Downstream consumers (bhavcopy_to_contract,
+    pnl._pick_fill_price) require turnover — silently returning a
+    stale frame would mask as ``MissingTurnoverError`` on every cell
+    at sweep time.
+
+    Reproduces the operator-reported failure: every contract bailed
+    with ``KeyError: 'turnover'`` because the bhavcopy cache had
+    been written in P0.x (pre-turnover-extension)."""
+    _redirect_cache(monkeypatch, tmp_path)
+    # Reset the one-time-warning flag so this test sees the warning.
+    monkeypatch.setattr(bfo, "_STALE_CACHE_WARNING_EMITTED", False)
+    # Plant a stale 14-col parquet at the cache path BEFORE any
+    # load_bhavcopy_fo call. Simulates the operator's state: cache
+    # was written by an earlier session under the pre-P1.1 parser.
+    stale = pd.DataFrame({
+        "instrument": ["OPTSTK"],
+        "symbol": ["PNB"],
+        "expiry": pd.to_datetime([date(2024, 7, 25)]),
+        "strike": [100.0],
+        "option_type": ["CE"],
+        "open": [4.8], "high": [5.5], "low": [4.5], "close": [5.0],
+        "settle_price": [5.05],
+        "contracts": [100], "oi": [1000], "oi_change": [0],
+        "trade_date": pd.to_datetime([UDIFF_DATE]),
+        # NO ``turnover``, NO ``ltp`` — pre-P1.1 14-col schema.
+    })
+    cache.write(cache.bhavcopy_fo_path(UDIFF_DATE), stale)
+
+    # Wire a synthetic fetch so the re-fetch path is observable.
+    raw = _udiff_raw()
+    calls = {"n": 0}
+
+    def fake_fetch(td):
+        calls["n"] += 1
+        return raw, "udiff"
+
+    monkeypatch.setattr(bfo, "_fetch_raw", fake_fetch)
+
+    df = bfo.load_bhavcopy_fo(UDIFF_DATE)
+    # The fetcher was called even though a parquet existed → stale
+    # detection re-routed to fetch.
+    assert calls["n"] == 1, (
+        "stale parquet should have triggered a re-fetch, but the "
+        "loader returned the cached frame unchanged"
+    )
+    # Returned frame has the post-P1.1 schema.
+    assert "turnover" in df.columns
+    assert "ltp" in df.columns
+    # Operator-visible warning fired exactly once.
+    stale_warns = [w for w in recwarn.list if "stale 14-col cache" in str(w.message)]
+    assert len(stale_warns) == 1, (
+        f"expected one stale-cache warning; got {len(stale_warns)}"
+    )
+    # On-disk parquet now carries the fresh schema (so subsequent
+    # loads short-circuit without re-fetching).
+    reread = cache.read(cache.bhavcopy_fo_path(UDIFF_DATE))
+    assert "turnover" in reread.columns
+
+
 # ===========================================================
 # Nullable Int64 for oi / oi_change — survives upstream blanks
 # ===========================================================

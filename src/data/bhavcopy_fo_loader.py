@@ -453,10 +453,27 @@ def _load_bhavcopy_fo_cached(trade_date_iso: str, offline: bool) -> pd.DataFrame
 
 def _load_bhavcopy_fo_impl(trade_date: date, *, offline: bool) -> pd.DataFrame:
     """Underlying cache-then-fetch logic; kept separate from the LRU
-    wrapper so force_refresh can call it directly."""
+    wrapper so force_refresh can call it directly.
+
+    **Schema staleness check** (post-P1.1/P1.2 — MIGRATION.md §Phase 1):
+    a cached parquet is considered stale if it lacks the ``turnover``
+    column. Pre-P1.1 caches were 14-col (no ``turnover`` / no ``ltp``);
+    downstream consumers (``bhavcopy_to_contract``, the VWAP fill path
+    in ``pnl._pick_fill_price``) require turnover. On detection, the
+    stale parquet is silently re-fetched + rewritten so the caller
+    gets the post-P1.1 16-col shape transparently. One-time warning
+    per process so the operator knows why the bulk-fetch step is
+    suddenly hitting the network for already-cached dates.
+    """
     path = cache.bhavcopy_fo_path(trade_date)
     if cache.exists(path):
-        return cache.read(path)
+        df = cache.read(path)
+        if "turnover" in df.columns:
+            return df
+        # Stale schema — fall through to re-fetch. (Skipping the cache
+        # is safer than patching turnover=NaN: VWAP fills downstream
+        # would silently degrade to MissingTurnoverError on every cell.)
+        _warn_stale_bhavcopy_cache_once(trade_date)
     if offline:
         raise OfflineCacheMiss(
             f"bhavcopy_fo for {trade_date} not in cache and offline mode "
@@ -466,12 +483,33 @@ def _load_bhavcopy_fo_impl(trade_date: date, *, offline: bool) -> pd.DataFrame:
     parser = parse_legacy if fmt == "legacy" else parse_udiff
     df = parser(raw, trade_date)
     # overwrite=True for multi-worker race safety (see options_loader.py
-    # cache-miss block for the full reasoning).
+    # cache-miss block for the full reasoning) AND for stale-schema
+    # rewrite (pre-P1.1 14-col → post-P1.1 16-col).
     cache.write(path, df, overwrite=True)
     # Sibling lot-size cache (P0.2 — MIGRATION.md §Phase 0). Written
     # alongside the main cache so they stay paired across refreshes.
     _write_sibling_lot_sizes_cache(raw, fmt, trade_date)
     return df
+
+
+_STALE_CACHE_WARNING_EMITTED: bool = False
+
+
+def _warn_stale_bhavcopy_cache_once(trade_date: date) -> None:
+    """One-time-per-process warning that the bhavcopy_fo cache is
+    pre-P1.1 14-col and is being silently re-fetched to the post-P1.1
+    16-col schema. Skips subsequent calls so the operator gets a
+    single line instead of 466."""
+    global _STALE_CACHE_WARNING_EMITTED
+    if _STALE_CACHE_WARNING_EMITTED:
+        return
+    _STALE_CACHE_WARNING_EMITTED = True
+    import warnings
+    warnings.warn(
+        f"[bhavcopy_fo] stale 14-col cache detected (first hit: "
+        f"{trade_date}). Re-fetching to post-P1.1 16-col schema "
+        f"(adds turnover + ltp). One-time cost per cache."
+    )
 
 
 def load_bhavcopy_fo(
