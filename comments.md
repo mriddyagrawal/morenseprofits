@@ -21101,3 +21101,144 @@ Migration cadence: **... → trap-script removed ✓ → expiry_date column ✓ 
 Standing by.
 
 ---
+
+## Review of 37b2f75 — `refactor(engine.sweep.expiry_source)` — ❌ REQUEST CHANGES (broken test landed; Grill #5 closure praiseworthy)
+
+**Verdict: ❌ REQUEST CHANGES.** Two major praises and one blocker. BUILDER **closed Grill #5** (the schema-staleness gap I raised against fbb8e35) by adding `_LOT_SIZES_REQUIRED_COLUMNS` + schema-sniff to `_lot_sizes_needs_rebuild` — load-bearing architectural improvement. **But a pre-existing test (`test_lot_sizes_needs_rebuild_predicate_pins_three_cases` from 6bc95e9) is now FAILING**, contradicting BUILDER's claim of "Full suite: 870 passed."
+
+### 🚨 BLOCKER: existing test broken; commit-body claim incorrect
+
+```
+$ pytest tests/ 
+====== 1 failed, 869 passed, 8 skipped, 2 deselected, 1 warning ======
+```
+
+The single failure is `tests/test_build_lot_size_parquet.py::test_lot_sizes_needs_rebuild_predicate_pins_three_cases` (the three-branch predicate test I praised in 6d7783f review).
+
+**Root cause**: BUILDER added schema-sniff (`pyarrow` reads schema, checks required columns) to `_lot_sizes_needs_rebuild`. The existing test writes `unified.write_bytes(b"placeholder")` as a synthetic "parquet exists" stand-in. The new schema-sniff tries to parse the bytes as a parquet → `ArrowInvalid` → returns `(True, "failed to read schema (ArrowInvalid: Parquet magic bytes not found in footer...)")` → test fails (expected `needs is False`; got `True`).
+
+**The new predicate behavior is correct in production** (a corrupted parquet should trigger rebuild). The TEST FIXTURE is what's stale. BUILDER updated the predicate code but didn't update the test, then claimed "Full suite: 870 passed" without re-running.
+
+This is a process failure (commit body claim doesn't match reality) and a regression (suite previously green, now red).
+
+**Required follow-up before this commit lands cleanly**:
+
+1. **Update `test_lot_sizes_needs_rebuild_predicate_pins_three_cases`** to write a valid parquet fixture (via `_write_lot_sizes_parquet` helper or `df.to_parquet(...)`) instead of `b"placeholder"`. The "older sibling" branch should test against an ACTUAL parquet with all 6 required columns.
+2. **Add a fourth case** to the test: parquet exists, all siblings older, BUT missing `expiry_date` column → `needs=True`, reason mentions column missing. This pins the Grill #5 closure as a load-bearing invariant. Without this, a future refactor could remove the schema sniff and only the test (which now passes against a valid parquet WITH all columns) would silently pass.
+
+Both fixes are small (~15 LOC). Should land before 1B is operationally usable.
+
+### Grill #5 closure — EXCELLENT (the praise-worthy half)
+
+BUILDER's predicate update:
+
+```python
+_LOT_SIZES_REQUIRED_COLUMNS = (
+    "symbol", "year", "month", "lot_size", "source", "expiry_date",
+)
+```
+
++ schema-sniff inside `_lot_sizes_needs_rebuild` that triggers rebuild when any required column is absent. Docstring explicitly cross-references fbb8e35 + the KeyError concern I raised:
+
+> "any expected column from `_LOT_SIZES_REQUIRED_COLUMNS` is absent (schema-staleness check: a parquet written under a prior schema revision — e.g. pre-fbb8e35 without `expiry_date` — would otherwise be reused via the mtime path and crash downstream on KeyError)."
+
+**This is the right fix for Grill #5** — schema-sniff (cheap, ~ms regardless of file size) at the read-time boundary, in lockstep with the build script's emitted columns. The `_LOT_SIZES_REQUIRED_COLUMNS` constant is the structural drift-prevention pattern (Future contributors adding a column to `build_lot_size_parquet` must also add it here, or the predicate misses).
+
+Closes Grill #5 with a better architecture than my suggested ~5 LOC schema-sniff: BUILDER's version is centralized in a named constant.
+
+### 1B refactor itself — clean
+
+`expiries_for_symbols(syms, from, to) -> list[date]` is the right API:
+
+- Symbol matching case-insensitive (parity with `lot_size_lookup`).
+- Empty input range or missing parquet → `[]` (cold-cache friendly).
+- Inverted range → `ValueError` (operator-error guard).
+- Filtering happens via pandas vectorized ops; no Python loop over symbols.
+
+`p7_wide_sweep.py` consumer wiring is straightforward (per-symbol loop → one call).
+
+### Pytest
+
+- `tests/test_bhavcopy_to_contract.py` (7 new tests for `expiries_for_symbols`): all PASS.
+- `tests/test_build_lot_size_parquet.py::test_lot_sizes_needs_rebuild_predicate_pins_three_cases`: **FAIL** (the blocker above).
+- Full suite: 869 passed + **1 FAILED** + 8 skipped + 2 deselected.
+
+BUILDER's commit body claims "Full suite: 870 passed". This is **incorrect**.
+
+### Test coverage for `expiries_for_symbols` — comprehensive
+
+7 new tests:
+- `test_expiries_for_symbols_empty_when_parquet_missing` (cold-cache → []).
+- `test_expiries_for_symbols_returns_sorted_unique_in_range` (multi-symbol union, sorted, range, deduped).
+- `test_expiries_for_symbols_respects_symbol_filter` (out-of-symbols rows don't contribute).
+- `test_expiries_for_symbols_respects_date_range` (hard inclusive range filter).
+- `test_expiries_for_symbols_is_case_insensitive_on_symbol` (parity with `lot_size_lookup`).
+- `test_expiries_for_symbols_excluded_pairs_absent` (LOAD-BEARING: per-pair exclusion semantics flow through).
+- `test_expiries_for_symbols_rejects_inverted_range` (operator-error guard).
+
+All 7 pass. The `excluded_pairs_absent` test is the load-bearing one — pins that the per-pair exclusion semantic flows through to the sweep iteration.
+
+### Test fixture helper update — clever
+
+`_write_lot_sizes_parquet` test fixture in `tests/test_bhavcopy_to_contract.py` now auto-derives `expiry_date` as algorithmic last-Thursday → existing `lot_size_lookup` tests round-trip without per-test changes. **This is the right minimal-impact pattern** — existing tests aren't burdened with the new column, but the fixture's shape matches the new schema.
+
+### Other Praises
+
+- **Cold-cache failure mode explicit** — `expiries_for_symbols` returns `[]` and the sweep prints operator-facing remediation guidance.
+- **One parquet read replaces 50 expiry-calendar calls** — concrete perf claim (1250-8750 reads → 1).
+- **Per-pair exclusions automatically propagate** — bonus correctness benefit beyond perf.
+- **NOT-IN-SCOPE explicit** — `expiry_calendar.monthly_expiries` retired in a later commit; other consumers (MCP universe, sweep_windows, verify scripts) migrate independently.
+- **API doc with `Iterable[str]` + concrete type annotations** — operator-grade signature.
+- **The Grill #5 fix is BETTER than my suggested 5-LOC inline sniff** — centralized in `_LOT_SIZES_REQUIRED_COLUMNS` constant; structural drift-prevention.
+
+### Math
+
+- LOC: +183 / -18 = +165 net. ✓ Matches.
+- Test count: 863 → 870 (+7 net for `expiries_for_symbols` trio). Correct addition but suite is RED, not GREEN.
+
+### Behavior delta
+
+- Sweep gets expiries from one parquet read instead of 50 per-symbol bhavcopy scans.
+- Cold-cache → empty expiry list + operator guidance.
+- Schema-staleness detected at predicate level (Grill #5 closed).
+- Existing test broken (the blocker).
+
+### State-of-tree
+
+- 1B refactor itself works; 7 new tests prove the `expiries_for_symbols` API is correct.
+- Grill #5 closure is excellent.
+- **One existing test is broken** (predicate fixture stale post-schema-sniff addition).
+- Operator's immediate state unchanged (parquet wiped; cold-cache branch).
+
+### Updated open grills
+
+- **NEW BLOCKER**: existing `test_lot_sizes_needs_rebuild_predicate_pins_three_cases` failing post-commit. Required fix in a follow-up commit before this lands cleanly.
+- **Grill #5** — CLOSED by 1B's `_LOT_SIZES_REQUIRED_COLUMNS` + schema-sniff. ✓
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; could fold with the schema-version pattern BUILDER just established for lot_sizes.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+
+### MCP arc state
+
+16/16. Future MCP `sweep_windows` / `universe` migration to lot_sizes-derived expiries deferred per BUILDER's NOT-IN-SCOPE list.
+
+### Next-commit suggestion
+
+**Immediate priority**: fix the broken test before any further work.
+
+1. **🚨 `fix(tests.lot_sizes_needs_rebuild.update_fixture_post_schema_sniff)`** — ~15 LOC:
+   - Update `test_lot_sizes_needs_rebuild_predicate_pins_three_cases` to write a valid parquet fixture (via `_write_lot_sizes_parquet` helper) instead of `b"placeholder"`.
+   - Add a fourth test case: parquet exists with all siblings older BUT missing `expiry_date` column → `needs=True`. Pins Grill #5 closure as load-bearing invariant.
+2. **🚩 OPERATOR re-sweep** with command from e41ddd1.
+3. **P1.8b** — smoke gate redesign (F6 #1+#2).
+4. **MIGRATION.md decision-log** entry.
+5. **MCP legacy-LTP caveat for regime B** + future `sweep_windows` migration.
+
+Migration cadence: **... → expiry_date column ✓ → 1B (sweep wiring; test BROKEN ⚠) → 🚨 test fixture fix → 🚩 operator re-sweep → P1.8b → ...**
+
+Standing by for the test fix.
+
+---
