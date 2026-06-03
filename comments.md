@@ -19193,3 +19193,87 @@ Migration cadence: **P0.1 ✓ → ... → diagnostic UX ✓ → F6 SHIP verdict 
 Standing by for P1.7.
 
 ---
+
+## Review of 2613129 — `chore(scripts.smoke_post_migration)` deprecation — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Clean deprecation honoring F6's third binding condition (document bhavcopy as canonical). The script body is preserved for historical replay of the F1+lot_sizes verification procedure; the test suite (240 LOC) is deleted because the gate is no longer iterated on. Deprecation header is unmissable and names the empirical reasons.
+
+### Deprecation header verified
+
+`scripts/smoke_post_migration.py` opens with a clear DEPRECATED 2026-06-03 block that:
+
+1. Names the two empirical reasons (enumeration asymmetry → cell-aggregate confounded; jugaad lakhs quantization → backup threshold structurally floored at 0.5 pp).
+2. Cross-references F6 (50082b6) + my arch concurrence (aedf17a) — both reviewer streams converged.
+3. Anchors the verification it WAS designed for ("99.97% of 101,779 shared trades within 0.5 pp, median delta 0.0008 pp"; matches LOGIC's + my independent measurements).
+4. Names the replacement direction (bhavcopy-vs-bhavcopy regression gate, no quantization floor).
+
+The script remains callable for historical replay; future operators running `--help` will see the deprecation reason inline.
+
+### Test deletion — honest scope management
+
+240 LOC of tests deleted (`tests/test_smoke_post_migration.py`). Defensible because:
+
+- The tests pinned a tool's specific semantics that is no longer iterated on.
+- Skip-marking would leave 10 tests showing as "skipped" in CI output, clutter the signal.
+- Removing tests for deprecated tools is honest — keeps the test suite as a contract for ACTIVE code.
+
+The script remains importable (verified independently: `import scripts.smoke_post_migration` succeeds), so a historical-replay invocation still works. Over time the deprecated tool will rot as the codebase evolves (imports drift, signatures change). That's the typical fate of deprecated tools and is correct behavior — the deprecation header sets the expectation.
+
+### Pytest
+
+```
+859 passed, 2 deselected, 1 warning in 13.30s
+```
+
+859 passed — matches BUILDER's claim. -10 from the deleted smoke tests vs the prior f720dc3 baseline.
+
+### Cross-references reviewer threads
+
+Commit body explicitly cites: "logic-review F6 in 50082b6 + arch-review concurrence in aedf17a". Operator analysis also referenced. Three-way convergence (LOGIC + arch + operator) preserved as the decision trail for any future archaeologist asking "why was this gate deprecated 2026-06-03."
+
+### Praises
+
+- **Deprecation header is operator-grade** — names the empirical reasons + the verification it was designed for + the replacement direction. Reads like the kind of explanation a future contributor would WANT to find when wondering whether to revive the script.
+- **Test deletion is honest** — pinning the semantics of a tool you don't iterate on is busy-work; deleting them is the right scope discipline.
+- **Script body preserved** for historical replay — operator can re-run the F1+lot_sizes verification procedure if they want to confirm the numbers from the deprecation rationale.
+- **Memory link** `[[project-dual-path-engine-source]]` cited correctly — api stays as a permanent parallel mode (per my [project_dual_path_engine_source.md](file:///Users/mriddy/.claude/projects/-Users-mriddy-Documents-GitHub-morenseprofits/memory/project_dual_path_engine_source.md) memory), not deprecated as an engine source. Only the api-vs-bhav comparison gate is deprecated.
+
+### Math
+
+- LOC: +40 / -241 = -201 net. ✓ Matches `40 insertions, 241 deletions`.
+- Test count: 869 → 859 (−10 deleted). ✓ Matches.
+
+### Behavior delta
+
+- `pytest` no longer runs the smoke gate tests (240 LOC deleted).
+- `python scripts/smoke_post_migration.py --help` would now show the deprecation header in the docstring.
+- The script still executes if invoked; operator can replay the F1+lot_sizes verification.
+
+### State-of-tree
+
+- **F6 condition 3 (document bhavcopy as canonical)**: closed by this commit ✓
+- F6 conditions 1 (quantization-aware threshold) + 2 (gate bhav-vs-raw-bhavcopy): pending; deferred to the future replacement gate (P1.8 candidate per F6 binding conditions).
+- **All correctness fixes from this session hold**: F1, F1-B, F5, lot_sizes mtime predicate, d276419 stale-cache hook, b3f4618 zero-contracts semantics, dd141cc case-sensitivity, 5631f18 fractional strikes — all in production.
+
+### Open grills (unchanged)
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry physical-settlement STT) — defer, non-blocking.
+- **Smoke-gate replacement** per F6 conditions 1+2 — track as P1.8 candidate.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**P1.7 — strip graceful-degrade in `pnl.py`** is the natural next move. The migration arc's correctness signal is no longer gated through api-as-baseline; the per-trade equivalence on shared trades + the displayed-sweep reproducibility (both empirically anchored by both reviewers + operator) are the SHIP evidence. BUILDER should embed the F6 + arch ACK references in the P1.7 commit body.
+
+After P1.7: the smoke-gate replacement per F6 conditions 1+2 (bhav-vs-bhav baseline + per-trade primary + quantization-aware threshold) is the natural P1.8 candidate.
+
+Migration cadence: **P0.1 ✓ → ... → F6 SHIP verdict ✓ → smoke gate deprecated ✓ → P1.7 (READY TO LAND) → P1.8 smoke gate replacement → ...**
+
+Standing by for P1.7.
+
+---
