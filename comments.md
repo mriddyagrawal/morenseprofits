@@ -20142,3 +20142,138 @@ Migration cadence: **... → ENGINE_VERSION bump ✓ → regime B start ✓ → 
 Standing by.
 
 ---
+
+## Review of 216d15e — `docs(mcp.version_stamp_drift)` — ✅ ACCEPT (closes Grill #4)
+
+**Verdict: ✅ ACCEPT.** Grill #4 closed comprehensively. All four specific stale references I flagged are fixed; the **interpolation pattern** for the list_runs caveat (`{ENGINE_VERSION!r}`) is the structural drift-prevention fix I would have suggested — future bumps automatically propagate. BUILDER's explicit NOT-TOUCHED audit confirms every site was deliberately reviewed, not just the ones I flagged.
+
+### Grill #4 closure verified
+
+The four stale references in my 98a9af5 review, all addressed:
+
+**1. `sweep_query.py:engine_version` field** — was binary "p7.pricing_arc-or-legacy"; now **3-tier examples** with per-stamp behavior summary:
+
+```
+"Examples: 'p1.7.vwap_or_skip' (current arc — VWAP-or-skip fills, ...);
+'p7.pricing_arc' (prior arc — IlliquidLegError gate + VWAP fill *with*
+close fallback); ``None`` for legacy parquets cached before
+chore(p8.engine.version_stamp) landed — pre-stamp data with phantom-fill
+bias likely present."
+```
+
+Closes my "binary framing doesn't distinguish the middle layer" point. ✓
+
+**2. `sweep_query.py:pricing_arc_applied` field** — was the worst case (hardcoded `'p7.pricing_arc'` as current + described p7-era IlliquidLegError gate as current). Now:
+
+```
+"...the current ENGINE_VERSION (currently 'p1.7.vwap_or_skip' — bumped
+from 'p7.pricing_arc' in a32c8c0 when P1.7 stripped close fallback)..."
+```
+
+Names BOTH stamps with their semantics; names the bump commit (`a32c8c0`) for archaeologists; distinguishes the two bias modes (close-fallback for p7 era, phantom-fill for pre-stamp era). ✓
+
+**3. `sweep_query.py:list_runs` caveat — STRUCTURAL FIX via interpolation**:
+
+```python
+caveats.append(
+    f"{n_legacy} of {len(runs)} run(s) do not match the current "
+    f"ENGINE_VERSION ({ENGINE_VERSION!r}). " + PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT
+)
+```
+
+The `{ENGINE_VERSION!r}` interpolation is **the gold-standard drift-prevention pattern**. Future ENGINE_VERSION bumps automatically propagate to the operator-facing caveat. This is what I'd have suggested but BUILDER got there first. ✓
+
+**4. `_models.py:PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT`** — single source of truth for the caveat across `list_runs` / `query_sweep` / `cell_summary`. Reworded to:
+- Attribute phantom-fill to pre-stamp era specifically.
+- Point at current `p1.7.vwap_or_skip` engine as the re-sweep target.
+- Note "strips close fallback entirely, so VWAP-or-skip semantics apply" — operator gets honest expectations.
+
+✓
+
+### Additional sites touched (audit completeness)
+
+BUILDER went beyond my four flagged items:
+
+**5. `spot_options.py:OptionRow.turnover` field** — rephrased "before the turnover-ingest landed in the p7.pricing_arc era" so the description stays accurate regardless of future stamp bumps.
+
+**6. `spot_options.py:get_option_series` caveat** for pre-turnover-ingest contracts — now describes BOTH outcomes (P1.7's skip vs pre-P1.7's silent close fallback) so a client inspecting a pre-ingest contract under either engine arc gets honest expectations.
+
+**7. `data_quality.py:theoretical_fallback_rate` summary** — note that under current P1.7 engine, `close_fill_rate_pct = 0 by construction on new sweeps`. Important operator-facing data — explains why post-P1.7 sweeps' fallback-rate diagnostic looks different.
+
+### NOT-TOUCHED audit — explicit + correct
+
+BUILDER enumerated 4 NOT-TOUCHED categories with rationale:
+
+- `options_loader.py:309` describes a structural fact (legacy parquets pre-p7 don't carry turnover) → historical accuracy ✓ stays.
+- `results.py:283` (`read_run_metadata` doc) describes how absent stamps map → historical accuracy ✓ stays.
+- `results.py:33-53` version-stamp comment block (added in a32c8c0 specifically for stamp lineage docs) → ✓ stays.
+- Tests using `"p7.pricing_arc"` as synthetic OLD stamp → ✓ no update needed, they work BETTER post-bump.
+
+**This explicit audit confirms every site was reviewed, not just the ones I flagged.** Future contributors can trust that the "what should be updated" question was answered exhaustively.
+
+### Pytest
+
+```
+855 passed + 8 skipped + 2 deselected
+```
+
+Unchanged from 5eea3a2. Pure docstring + caveat sweep; no test changes needed (existing fixtures use synthetic OLD stamp which works better under the bump).
+
+### Praises
+
+- **Interpolation pattern** for the list_runs caveat is the gold-standard drift-prevention fix — `{ENGINE_VERSION!r}` propagates automatically on future bumps.
+- **Single source of truth** for the phantom-fill caveat (`_models.py:PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT`) is referenced from 3 MCP tools — one edit, three places update.
+- **Three-tier framing** consistently applied across field descriptions (pre-stamp / p7 era / current).
+- **Cross-references the bump commit** (a32c8c0) inline so archaeologists can find the WHY without git log spelunking.
+- **NOT-TOUCHED audit** explicit and correct — proves the sweep was exhaustive, not just hit-list-driven.
+- **`get_option_series` caveat upgrade** — addresses an operator-confusion mode (what would happen under either engine arc) that I hadn't flagged. BUILDER went beyond my list.
+- **`data_quality.py` `close_fill_rate_pct = 0` note** — preempts the future "why is this metric always 0 now?" operator question.
+- **Phantom-fill caveat names "VWAP-or-skip semantics apply"** — gives the operator the correct expectation for re-sweep outcomes.
+
+### Math
+
+- LOC: +47 / -28 = +19 net. ✓ Matches.
+- Test count: unchanged. ✓
+
+### Behavior delta
+
+- MCP tool catalog field descriptions now consistent with post-P1.7 engine.
+- `list_runs` caveat uses constant interpolation → never stale.
+- Phantom-fill caveat across 3 tools now points at `p1.7.vwap_or_skip` as the target arc.
+- No runtime behavior change.
+
+### State-of-tree
+
+- **Grill #4** — CLOSED. ✓
+- **All architectural-review grills now closed.** Remaining items: F3 (defer), cache-version stamping (defer, dual-concurred), iterdir order (defer, MINOR), smoke-gate replacement (P1.8b).
+- **MCP arc remains 16/16** and post-sweep is consistent with engine semantics.
+
+### Updated open grills
+
+- ~~Grill #4 (MCP docstring drift)~~ — **CLOSED.** ✓
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** (BUILDER's NOT-IN-SCOPE from 5eea3a2) — small follow-up.
+
+### MCP arc state
+
+16/16. **All field descriptions now reflect post-P1.7 engine.** Operator re-sweep is mechanically safe: the fresh parquet will stamp `"p1.7.vwap_or_skip"`, and MCP clients inspecting it will read consistent field descriptions + caveats.
+
+### Next-commit suggestion
+
+1. **🚩 OPERATOR re-sweep** — now mechanically safe with consistent MCP descriptions. Use the UPDATED single-line command from e41ddd1:
+   ```
+   rm -rf data/cache/options/ && rm -f data/results/sweep_*.parquet && .venv/bin/python scripts/prefetch_universe.py --symbols PNB SBIN BHEL RELIANCE --workers 4 --engine-source bhavcopy && .venv/bin/python scripts/p7_wide_sweep.py --symbols PNB SBIN BHEL RELIANCE --workers 4
+   ```
+2. **P1.8b** — smoke gate redesign (F6 #1+#2).
+3. **MIGRATION.md decision-log** entry.
+4. **MCP legacy-LTP caveat for regime B** (from 5eea3a2 NOT-IN-SCOPE).
+5. **Grill #1 from 12893ea** (per-contract cache-version stamping).
+
+Migration cadence: **... → ENGINE_VERSION bump ✓ → regime B start ✓ → Grill #4 fix ✓ → 🚩 operator re-sweep (mechanically safe) → P1.8b → ...**
+
+Standing by.
+
+---
