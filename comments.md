@@ -20277,3 +20277,94 @@ Migration cadence: **... → ENGINE_VERSION bump ✓ → regime B start ✓ → 
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC's F8 (commit 06ca4b9): regime B = LAKHS now empirically confirmed; closes my prior inference-only caveat
+
+LOGIC operator-authorized a live NSE bhavcopy download for both regimes (UDiff 2024-08-29 + legacy 2024-05-15) and verified every unit assertion in the column dossier against ground truth. This closes a load-bearing gap from my prior reviews.
+
+### My prior caveat — now resolved
+
+In my F1 fix review (2842281) I wrote:
+
+> "**N3 (limits acknowledged):** LOGIC's §METHODOLOGY notes the legacy bhavcopy regime is **inference-only** — current legacy caches are 14-col (no `turnover`); the stale-cache auto-refetch in `d276419` would rewrite to 15-col, but no operator-side data has been re-fetched from pre-2024-07-08 bhavcopies yet to empirically confirm `VAL_INLAKH` is lakhs."
+
+**LOGIC just empirically confirmed it.** RELIANCE 2860CE on 2024-05-15:
+
+```
+VAL_INLAKH = 131,327.52
+× 1e5 / (TtlTradgVol 18,114 × lot 250) = 2,900.02
+2,900.02 − strike 2,860 = premium VWAP 40.02 ✓
+(as rupees: 131,327.52 / 4.5M ≈ ₹0.029 — absurd; lakhs confirmed)
+```
+
+The F1 parser fix (`parse_legacy: VAL_INLAKH × 1e5`) is now first-hand empirically validated for the regime it serves. The legacy=lakhs assumption was correct.
+
+### VWAP-vs-close nuance (instructive)
+
+LOGIC catches a subtle point that the operator raised: the recovered VWAP (40.02) vs the close (36.9) for the regime B example differs by ~3.12 — and this is **genuine intraday VWAP-vs-close divergence, NOT a bug**:
+
+- The option OPENED at 43.25, CLOSED at 36.9 (drifted down).
+- Volume-weighted ~40.02 sits naturally mid-range (∈ [LOW 35.25, HIGH 47.5]).
+- VAL_INLAKH's 0.01-lakh rounding over 4.5M shares = ₹0.0002/share — NOT the source of the 3.12 delta.
+
+This is exactly the "close is a stale last print" pattern P1.7 + Option C target. The empirical example validates both:
+1. The recovery math is correct (VWAP bracketed by OHLC).
+2. The decision to ship VWAP fills instead of close fallback is correct (3.12 rupees/share = ~8.5% premium-level delta — large enough to matter).
+
+### Dossier error (operator-side)
+
+LOGIC notes one error in an **external dossier** (not in this repo per my grep) the operator is preparing to send to a validator:
+
+- **Dossier says**: regime B `INSTRUMENT` values are `STKOPT / IDXOPT / STKFUT / IDXFUT`.
+- **Downloaded reality**: `OPTSTK / OPTIDX / FUTSTK / FUTIDX`.
+- **Code is correct**: `parse_legacy` filters on `["OPTSTK", "OPTIDX"]`.
+
+The dossier has the morphemes transposed (STK+OPT → OPT+STK). Operator should fix before sending; the code path is fine.
+
+### Concurrence on Phase 2 strategic implication
+
+LOGIC's framing: "with both regimes normalizing turnover → rupees (verified), a contract whose life spans the 2024-07-08 cutover yields a **contiguous rupee `turnover` series with no unit step** — so BUILDER's planned cross-boundary materialization test (Phase 2b) should pass, and it's the right anti-regression to lock the legacy↔UDiff handoff."
+
+This is correct. The cross-boundary smoke test BUILDER deferred from 5eea3a2 ("cross-boundary smoke test exercising a 2024-08 expiry whose life spans the 2024-07-08 regime cutover") is the natural Phase 2b anti-regression. With F8's verification:
+
+- The cross-boundary contract's `turnover` series will be continuous in rupees through the regime cutover.
+- The cross-boundary contract's VWAP recovery will be continuous in premium values.
+- Any future regression to the parsers' unit-normalization would break this contiguity → loud test failure.
+
+### Phase 2b implications updated
+
+LOGIC notes the regime B / Phase 2 specifics:
+- `ltp` is NaN for legacy regime (parser correctly leaves it NaN; downstream `_normalize_legacy_columns` fills NaN). **Non-pricing** (fills use close/VWAP, never ltp). So the deferred MCP LTP caveat from 5eea3a2 is "honest-signal polish, not a correctness fix."
+- BUILDER's "regime B mostly already works post-F1" assessment is **empirically supported**.
+
+### Action items
+
+This is informational + a small operator-side dossier fix:
+
+1. **Operator-side**: fix the dossier's regime B INSTRUMENT names before sending to validator (STKOPT → OPTSTK, etc.).
+2. **No code action required** for F8 itself.
+3. **Phase 2b** cross-boundary materialization test remains the right anti-regression for the legacy↔UDiff handoff (BUILDER's deferred item).
+
+### Updated open grills (unchanged)
+
+- ~~Grill #4~~ — CLOSED.
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish, not correctness.
+- **Phase 2b cross-boundary smoke test** — anti-regression for legacy↔UDiff handoff.
+
+### State-of-tree
+
+All correctness assertions across both regimes are now empirically validated. The migration arc + F1 fix + Option C recalibrate + F7 fix + ENGINE_VERSION bump + Grill #4 sweep all hold under verified ground truth. Operator re-sweep is mechanically safe AND empirically validated for both regimes.
+
+### MCP arc state
+
+16/16. F8 finding doesn't touch MCP surface.
+
+Migration cadence: **... → Grill #4 fix ✓ → F8 empirical verification ✓ → 🚩 operator re-sweep (mechanically + empirically safe) → P1.8b → ...**
+
+Standing by.
+
+---
