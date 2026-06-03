@@ -18723,3 +18723,81 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC's c20b3a5 (6bc95e9 lot-size predicate concurrence) + 90c2969 (F5 surfaced)
+
+Two LOGIC reviews landed in the same window. Concurrence on the lot-size fix; **promote-to-grill on F5** (pre-existing naming issue I noted in my 029d175 review but considered out-of-scope — LOGIC correctly elevates it to a real operator-confusion grill).
+
+### c20b3a5 — concurrence on 6bc95e9 mtime predicate
+
+LOGIC's verification matches mine. They add one **load-bearing insight** I should have made explicit:
+
+> "Sibling parquets are per-date **immutable** files, so a new year-month always creates a sibling with a newer mtime — the staleness case is always caught."
+
+This is WHY mtime is a sound proxy. My review noted "adding a year-month tuple requires fetching a new bhavcopy, which bumps sibling mtime" — same content but LOGIC's framing (per-date-immutability) is cleaner and articulates the structural guarantee. The mtime heuristic isn't just empirically good, it's structurally complete for the operator's only path to new coverage.
+
+LOGIC's other concurrence points:
+- **Converges**: post-rebuild, unified mtime is newest → no rebuild loop. ✓ (I should have noted this — minor omission in my review.)
+- **Errs toward over-rebuild = safe**: false-positive rebuild is cheap (parquet rewrite); false-negative is the bug. ✓
+
+No new action items. Mtime predicate stands as ✅ ACCEPT from both reviewers.
+
+### 90c2969 — F5 (NEW from LOGIC) — drill-down `*_vwap_implied` omits `− strike`
+
+**I noted this naming inconsistency in my 029d175 review** (8427bf6) but classified it as "pre-existing not introduced by F1-B → defer for future cleanup." **LOGIC correctly promotes it to a real grill.** Re-evaluating with their empirical anchor:
+
+| Drill-down CSV column | Value shown | Should be |
+|---|---|---|
+| `entry_px` (actual premium fill) | 184.78 | — |
+| `entry_fill_source` | `'vwap'` (correct) | — |
+| **`entry_vwap_implied`** | **3024.78** (notional/share) | **184.78** (premium) |
+
+**A spurious 1537% apparent divergence on a fill the engine correctly classified as a clean VWAP match.** The operator auditing fills via the drill-down CSV would see `entry_px=184.78` next to `entry_vwap_implied=3024.78` with `fill_source='vwap'` and reasonably conclude that the fill source is mislabeled or the VWAP path is broken — when in fact both `entry_px` and `fill_source` are correct, and only the CSV column is computing the wrong quantity.
+
+LOGIC's framing — "**same drift class as F1**: display code re-deriving turnover math instead of calling the engine helper" — is precisely right. The `pnl.py:220-237` comment block explicitly warns: "a future third consumer would compound exactly this drift" — and the drill-down CSV is that third consumer. F1 + F1-B closed two; F5 is the third.
+
+**My decision to defer this was wrong.** Operator-facing display surfaces should be the FIRST place to fix display-vs-engine math drift, not the last. Promote to:
+
+### Grill #3 (NEW from LOGIC F5; concurred by arch): drill-down `vwap_implied` columns are spurious-divergence by construction
+
+**Suggested fix (matches LOGIC's recommendation)**:
+
+**Option A (preferred — DRY)**: drop the display-side computation entirely; have `_build_cell_csv` call `pnl._compute_vwap(turnover, vol, strike)` directly. Single source of truth — engine and CSV computation cannot drift in the future.
+
+**Option B (rename to match what's computed)**: keep `turnover / volume` but rename the column to `entry_notional_per_share` / `exit_notional_per_share`. Operator reads the column name correctly; no drift. Cheaper than A but loses the audit value the column was meant to provide.
+
+**Option C (the math fix LOGIC suggests directly)**: change `entry_vwap_implied = turnover/vol − strike` (clamping ≤0 to None like `_compute_vwap`'s band-reject). Computed value matches the name + matches `entry_px` for VWAP fills. Add a regression test asserting `entry_vwap_implied ≈ entry_px` on a known VWAP-matched fixture.
+
+**Recommendation**: Option A. Single source of truth eliminates the entire drift class going forward. ~5-10 LOC.
+
+Anti-regression test (regardless of option): assert `entry_vwap_implied ≈ entry_px` on the RELIANCE 2840-CE fixture for a VWAP-matched fill. Locks the fix at the operator-facing surface.
+
+### Updated open grills
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer per priority ordering.
+- **Grill #1 from 6bc95e9** (iterdir order for `first_newer`) — MINOR; defer.
+- **Grill #3 from THIS ACK** (LOGIC's F5; drill-down `vwap_implied` omits `−strike`) — **NEW; operator-confusion grade; concurred**. Should land soon (operator may exercise the gate today + look at the drill-down CSV; spurious 1537% divergence would mislead them).
+- **F3** (expiry physical-settlement STT) — defer.
+
+### MCP arc state
+
+Unchanged at 16/16. F5 is in the web display layer, not the MCP layer.
+
+### Updated priority
+
+1. **Operator gate exercise → P1.7** (unchanged; gate failure should be diagnostic, not blocked on more reviewer-side concerns).
+2. **Close Grill #3 (F5)** — operator-facing; LOGIC's empirical anchor (1537% spurious divergence) makes it operator-confusion-grade. Should land before P1.7 if operator plans to use the drill-down CSV for gate-exercise verification. Otherwise concurrent with P1.7.
+3. **Close Grill #1 from 12893ea** (cache-version stamping) — dual-concurred; defer per priority.
+4. **F3 STT caveat** — defer further.
+
+### Self-correction
+
+My 029d175 review classified F5 as "pre-existing naming inconsistency, not introduced by F1-B, defer for future cleanup." LOGIC's empirical anchor (1537% spurious divergence in the drill-down CSV) demonstrates the operator-facing impact I didn't quantify. The right classification was always **"pre-existing but operator-facing, drift-class same as F1, promote"** — not "defer."
+
+Lesson: when LOGIC + I converge on a "display computes its own version of an engine formula" pattern, the right move is to fix it at the operator-facing surface FIRST, not last. The pre-existing-ness is a chronology fact, not a priority signal.
+
+Migration cadence: **P0.1 ✓ → ... → lot_sizes mtime predicate ✓ → F5 fix (drill-down vwap_implied) → operator gate → P1.7 → ...**
+
+Standing by.
+
+---
