@@ -19924,3 +19924,131 @@ Migration cadence: **... → F7 fix ✓ → ENGINE_VERSION bump (~3 LOC) → �
 Standing by.
 
 ---
+
+## Review of a32c8c0 — `chore(engine.engine_version.bump_p1_7_vwap_or_skip)` — ✅ ACCEPT with Grill #4 (MCP docstring drift)
+
+**Verdict: ✅ ACCEPT.** The version bump itself is clean — tight 18-LOC change with excellent comment-block preservation of both stamps' meaning + commit lineage. **But BUILDER didn't sweep the MCP docstrings**, which still describe `ENGINE_VERSION` as `"p7.pricing_arc"` and the engine as having an `IlliquidLegError gate` — both stale post-bump. Same F1-B drift-prevention failure mode I worked hard to flag previously.
+
+### Version bump verified
+
+`src/engine/results.py:41`: `ENGINE_VERSION = "p1.7.vwap_or_skip"` (was `"p7.pricing_arc"`). Comment block preserves BOTH stamps' meaning with full commit lineage for each — analysts opening historical sweeps can trace which stamp covers which commits. Right comment hygiene.
+
+### Pytest
+
+```
+855 passed, 8 skipped, 2 deselected, 1 warning in 9.57s
+```
+
+Total 863 unchanged. The 8 skipped are `test_web_e2e` cases that need a sweep parquet (operator pre-emptively wiped `data/results/` per d0454f4). Not a regression.
+
+### Test fixture interaction verified
+
+BUILDER's claim that synthetic `"p7.pricing_arc"` OLD-stamp test fixtures still work — verified:
+- `test_web_heatmap.py:982/1010/1073/1103`: tests pass `engine_version: "p7.pricing_arc"` to simulate pre-bump runs. Post-bump, that stamp ≠ current → caveat fires. Tests work BETTER post-bump (now genuinely simulating old runs).
+- `test_mcp_spot_options.py:152`: caveat strings at `src/mcp/_models.py:39` reference "BEFORE the p7.pricing_arc landed" — historical text correctly describing pre-stamp era.
+
+### Grill #4 (NEW) — MCP docstring drift (F1-B-style)
+
+`grep -rn "p7.pricing_arc" src/mcp/` finds **stale references in operator-facing docstrings**:
+
+**`src/mcp/sweep_query.py:94`** (most problematic):
+
+```python
+description=(
+    "True iff engine_version is set AND matches the current "
+    "ENGINE_VERSION ('p7.pricing_arc'). Use this to identify "
+    "which runs have the IlliquidLegError gate + VWAP fill "
+    "applied, vs. which are pre-arc data."
+),
+```
+
+Double-stale:
+1. **Hardcodes OLD value as current**: `"ENGINE_VERSION ('p7.pricing_arc')"`. Current is `"p1.7.vwap_or_skip"`. MCP clients reading the field get the wrong value.
+2. **Describes p7-era engine** as current: `"IlliquidLegError gate + VWAP fill"`. Post-bump there's NO IlliquidLegError gate (collapsed per 46cbb4f); VWAP fill is VWAP-or-skip.
+
+**`src/mcp/sweep_query.py:84`** (example value outdated):
+
+```
+"KV metadata (e.g. 'p7.pricing_arc'). ``None`` for legacy"
+```
+
+**`src/mcp/sweep_query.py:96`** (3-tier reality now, not 2-tier):
+
+```
+"which runs have the IlliquidLegError gate + VWAP fill applied, vs. which are pre-arc data."
+```
+
+Three stamp categories now: pre-stamp / `p7.pricing_arc` / `p1.7.vwap_or_skip`. Binary framing doesn't distinguish the middle layer.
+
+**`src/mcp/sweep_query.py:145`** (caveat text hardcodes old stamp):
+
+```
+f"{n_legacy} of {len(runs)} run(s) lack the p7.pricing_arc stamp"
+```
+
+Post-bump, legacy runs lack the `p1.7.vwap_or_skip` stamp specifically. Needs generalization.
+
+### The pattern (F1-B-style drift)
+
+Same drift I worked to close with 029d175 + 50de591 (F5). When the canonical constant moves, the operator-facing docstrings describing it must move too. Otherwise the next code archaeologist re-derives the wrong assumption — precisely how F1 itself was born (stale `options_loader.py:290-298` "all three are lakhs" comment).
+
+The `sweep_query.py:94` description is the worst case: it tells MCP tool clients that the current ENGINE_VERSION is `"p7.pricing_arc"`. Post-bump, that's false. Any client that pins on the documented value would treat all post-bump sweeps as "not current" forever.
+
+### Suggested fix (small F1-B-style sweep)
+
+Tiny `docs(mcp.engine_version.docstring_sweep_p1_7)` follow-up:
+
+- `sweep_query.py:84`: example reference both stamps OR interpolate from the constant.
+- `sweep_query.py:94`: stop hardcoding the value; describe field behavior; replace "IlliquidLegError gate + VWAP fill" with "VWAP-or-skip pricing (post-46cbb4f) + Option C bypass + F7 oi==0 skip."
+- `sweep_query.py:96`: 3-tier discrimination (pre-stamp / p7.pricing_arc / p1.7.vwap_or_skip).
+- `sweep_query.py:145`: caveat text from constant value or import, not hardcoded string.
+
+~20 LOC. Same scope as 029d175. **Should land BEFORE operator re-sweep** so MCP clients see consistent field descriptions when querying the fresh sweep.
+
+Not blocking the re-sweep mechanically; **load-bearing for MCP consumer correctness** post-re-sweep.
+
+### Praises
+
+- **Comment block updates** preserve both stamps' meaning + commit lineage. Future archaeologist gets context inline.
+- **Tight scope** — constant + comment only. No unrelated bundling.
+- **Empirical anchor in comment** — "post-bump ~99.6% VWAP fill vs ~66.4% under p7.pricing_arc; MCP list_runs needs to distinguish."
+- **Honest test-count framing** — 8 skipped are operator-side cache state, not regression.
+- **Cross-references all four constituent commits** — 46cbb4f + 817d4e5 + IlliquidLegError collapse + a1b74e2.
+- **"Land BEFORE operator re-sweep"** — timing correct (fresh sweep stamps cleanly under new version).
+
+### Math
+
+- LOC: +18 / -4 = +14 net. ✓
+- Test count: unchanged. ✓
+
+### Behavior delta
+
+- New sweeps stamp `engine_version="p1.7.vwap_or_skip"`.
+- MCP `list_runs` + web heatmap caveat path distinguishes pre-P1.7 from post-P1.7 sweeps via the stamp.
+- Both pre-stamp era + `p7.pricing_arc` era register as "not current" against the bump.
+
+### Updated open grills
+
+- **NEW: Grill #4** (MCP docstring drift) — sweep_query.py docstrings reference OLD stamp as if current; describe p7-era engine semantics as current. ~20 LOC F1-B-style fix. **Should land before operator re-sweep.**
+- **Grill #1 from 12893ea** (per-contract cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+
+### MCP arc state
+
+16/16. **Grill #4 means field descriptions across `sweep_query` are misleading post-bump until swept.** Operators querying the MCP catalog get wrong values + wrong behavior descriptions.
+
+### Next-commit suggestion
+
+1. **🚨 `docs(mcp.engine_version.docstring_sweep_p1_7)`** — Grill #4 fix; ~20 LOC F1-B-style sweep. Before operator re-sweep.
+2. **🚩 OPERATOR re-sweep** with UPDATED single-line command from e41ddd1.
+3. **P1.8b** — smoke gate redesign (F6 #1+#2).
+4. **MIGRATION.md decision-log** entry.
+5. **Grill #1 from 12893ea** (per-contract cache-version stamping).
+
+Migration cadence: **... → F7 fix ✓ → ENGINE_VERSION bump ✓ → 🚨 MCP docstring sweep (Grill #4, ~20 LOC) → 🚩 operator re-sweep → P1.8b → ...**
+
+Standing by.
+
+---
