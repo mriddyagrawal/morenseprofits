@@ -330,8 +330,22 @@ Sound and tested — 92 tests pass across pnl/sweeper/strategy suites. `Illiquid
 
 **`2613129` smoke-gate deprecation — honest.** Retires the api-vs-bhav parity gate (the confounded cell-criterion from F6), deletes its auto-running tests, documents the bhav-vs-bhav successor as future work. Closes F6 condition #3 (bhav canonical). **F6 conditions #1/#2 (a real bhav-vs-raw-bhavcopy precision gate) remain OPEN** — there is currently NO automated migration-parity gate until that redesign lands. Non-blocking (F1/F6 verified manually) but the successor gate should not be dropped.
 
+### 🚩 F7 — the `oi==0` gate drop is the OPTIMISTIC direction and contradicts P1.7's own thesis (LOUD)
+
+On re-examination (operator pushed back on my too-easy "it's decided"), I do **not** fully bless the `oi==0` drop. The commit's rationale — *"volume>0 ⟹ a real fill exists"* — answers **priceability** but dodges **holdability**, which is what the gate protected. `entry_oi==0` at EOD means **nobody carried the contract overnight**; the backtest then models you holding it for N days as the sole holder of a contract with zero open interest. Volume>0 says it *traded*, not that the position was *holdable/exitable in reality*. And the drop was bundled into a cosmetic "flatten the skip-reason taxonomy" change — the wrong reason to remove a liquidity-realism guard.
+
+**The irony:** P1.7's entire thesis is *skip rather than book an unrealistic fill* (it now skips deep-OTM and thin band-rejects on exactly this principle). Dropping the OI gate does the **opposite** for these contracts — it *admits* an arguably-unrealistic fill on a zero-OI contract. Internally inconsistent, in the optimistic (unsafe) direction.
+
+**Blast radius (measured against the real skip log, not asserted):** of 42,807 `IlliquidLegError` skips in the pre-P1.7 sweep, **42,647 (99.6%) were `volume==0`** → still skip under P1.7 (correct). Only **≤160 (0.4%)** were `oi==0` with volume on both legs → these newly price under P1.7. **All 160 are thin (`<100k` shares, median ~1,875 ≈ a few lots; 0 hit Option C)** → all go through the weak band check, so the true newly-priced count is ≤160 (~0.14% of the 113,801-row sweep). **Small magnitude — NOT a ship-blocker.**
+
+**Recommendation (cheap, safe-direction — NOT a revert to the blunt old gate):** the old gate was itself crude (checked `entry_oi` but ignored `exit_oi`; would skip liquid-but-low-OI contracts). Don't restore it. Instead:
+1. **Minimum:** surface `entry_oi==0` (and a low-OI threshold) as a **visible/filterable flag** in the drill-down + `data_quality` — `entry_oi`/`exit_oi` are already in every leg's `legs_json`. Research-honesty = visibility, not silent admission of 160 zero-OI fills.
+2. **Better:** if a guard is wanted, skip on `oi==0 AND thin` (e.g., `volume < ` a small lot floor) — kills the truly-dead contracts where it bites, without the old gate's over-reach. The liquid-zero-OI case essentially never occurs (0/160 ≥ 100k), so this is precise.
+
+Verdict: **accept P1.7 to ship** (0.14% impact), but **F7 stays OPEN** as a correctness-principle follow-up — the rationale as written should not stand, and the safe-direction fix is ~20 LOC.
+
 ### STATUS (as of `46cbb4f`, P1.7 shipped)
-**Correctness: all clear.** F1/F1-B/F2/F5/F6 closed; coverage bug (`6bc95e9`) fixed; P1.7 VWAP-or-skip shipped + verified; both reviewer streams converged. **Operator action required for the webapp to be "true & best" under P1.7: re-prefetch + re-sweep** (current displayed parquet is pre-P1.7). **Open non-blocking:** F3 (expiry STT) · cache-version-stamp guard (Grill #1, dual-concurred) · bhav-vs-raw smoke-gate successor (F6 #1/#2) · 6bc95e9 iterdir-order (minor).
+**Correctness: all clear.** F1/F1-B/F2/F5/F6 closed; coverage bug (`6bc95e9`) fixed; P1.7 VWAP-or-skip shipped + verified; both reviewer streams converged. **Operator action required for the webapp to be "true & best" under P1.7: re-prefetch + re-sweep** (current displayed parquet is pre-P1.7). **Open non-blocking:** **F7 (oi==0 drop — surface/filter OR re-skip oi==0-AND-thin; ≤160 trades, optimistic-direction principle violation)** · F3 (expiry STT) · cache-version-stamp guard (Grill #1, dual-concurred) · bhav-vs-raw smoke-gate successor (F6 #1/#2) · 6bc95e9 iterdir-order (minor).
 
 ---
 
