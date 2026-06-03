@@ -20052,3 +20052,93 @@ Migration cadence: **... → F7 fix ✓ → ENGINE_VERSION bump ✓ → 🚨 MCP
 Standing by.
 
 ---
+
+## Review of 5eea3a2 — `chore(scripts.prefetch_universe.default_start_regime_b)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Tight 6-LOC bump of `DEFAULT_START` from 2024-05-01 → 2024-04-15 in both prefetch scripts. Anchors the boundary in MIGRATION.md §Goals (regime B starts 2024-04-15; earlier is regime A, out of scope). F1 parser fix (12893ea) is correctly cited as the dependency that makes regime B price under the same VWAP-or-skip semantics as regime C with no special-case code path.
+
+### Boundary verified
+
+`DEFAULT_START = date(2024, 4, 15)` with inline comment:
+
+> "Regime B start (legacy bhavcopy format, parser F1-normalized to rupees). Earlier than this is regime A — out of scope per MIGRATION.md §Goals (4-year window)."
+
+Per my memory and earlier reviews, regime B is 2024-04-15 → 2024-07-07 (legacy bhavcopy + close, no ltp). Prior `DEFAULT_START = 2024-05-01` started mid-regime; bump pushes to the natural boundary.
+
+### F1 dependency verified
+
+Per 12893ea, `parse_legacy` multiplies `VAL_INLAKH × 1e5` to normalize to rupees at parse time. The bhavcopy_fo loader dispatches by date (`_fetch_raw → _fetch_legacy` for `trade_date < 2024-07-08`, `_fetch_udiff` otherwise). So regime B contracts now produce turnover in rupees, feed into the engine's `TURNOVER_SCALE_FACTOR = 1.0`, and price correctly under VWAP-or-skip. **No special-case code path needed** — BUILDER's claim verified.
+
+### Cost estimate sanity-check
+
+BUILDER cites ~75s cold-cache cost (NSE archive fetch rate ~1.25 days/s × ~60 additional trading days). Math check: 60 / 1.25 = 48s — slightly more than 75 but BUILDER's 75 is conservative (NSE rate varies). Acceptable.
+
+### Sweep coverage caveat is correct
+
+BUILDER's note: `EXPIRY_FROM = 2024-05-01` in `p7_wide_sweep.py` stays unchanged because:
+
+- 2024-04 expiry (last Thursday = April 25, 2024) has only ~7 trading days of cached life under the new start (Apr 15 → Apr 25).
+- The sweep's 45-trading-day entry window (T-45..T-1) would require T-45 ≈ February 2024 (regime A) for a 2024-04 expiry — out of scope.
+- Adding 2024-04 expiry would yield heavily-skipped cells.
+
+This is the right scope discipline. The bump deepens entry-window coverage for the EXISTING sweep expiries (2024-05 onward), not adding new expiries.
+
+### Deepening coverage for 2024-05 expiry verified
+
+For 2024-05 expiry (May 30, 2024), the sweep's T-45 ≈ March 25, 2024 (regime A). Pre-bump, the bhavcopy cache had only 2024-05-01 onwards → entries between T-45 (Mar 25) and T-30 (Apr 18) skipped due to no per-contract cache. Post-bump, the cache extends back to 2024-04-15 → entries between T-30 (Apr 18) and T-25 (Apr 23) now backstopped. Roughly 1-2 trading weeks of additional priceable entries for the 2024-05 expiry; similar for 2024-06 / 2024-07.
+
+T-45..T-30 (before Apr 18) still skipped — that's the natural regime-A boundary. Operator could not extend coverage further without dealing with regime A's separate data path. BUILDER's choice to stop at the regime-B boundary is structurally correct.
+
+### Pytest
+
+```
+855 passed + 8 skipped + 2 deselected
+```
+
+Unchanged from a32c8c0. No tests reference `DEFAULT_START` (BUILDER's claim verified by my prior grep). Constant-only change; no fixtures to update.
+
+### Praises
+
+- **Boundary anchored in MIGRATION.md §Goals** — the comment cites the 4-year window spec; future contributor reading the constant understands WHY 2024-04-15 and not earlier.
+- **F1 dependency cited explicitly** — "no special-case code path needed" makes the design tighter than it might appear (one parser, one engine, one constant).
+- **Both prefetch scripts updated for consistency** — `prefetch_universe.py` + `prefetch_universe_no_timeout.py` stay in sync.
+- **Three NOT-IN-SCOPE items explicit**: MCP legacy-LTP caveat for regime B (no `ltp` column), cross-boundary smoke test, Grill #4 (MCP docstring drift). Scope discipline.
+- **EXPIRY_FROM caveat is honest** — operator might naively wonder "why doesn't the sweep now cover 2024-04 expiry?"; BUILDER preempts the question with the entry-window math.
+
+### Math
+
+- LOC: +4 / -2 = +2 net (two scripts × +2/-1 each). ✓ Matches.
+- Test count: unchanged. ✓
+
+### Behavior delta
+
+- Operator's `--start`-less prefetch runs now cover 2024-04-15 → 2026-05-31 (~530 trading days vs ~510 prior).
+- For 2024-05 / 2024-06 / 2024-07 expiries: entry-window coverage deepens by ~1-2 trading weeks per expiry.
+- 2024-04 expiry NOT added to sweep (EXPIRY_FROM unchanged); ~7 cached trading days is too thin for the entry grid.
+- Cold-cache prefetch wall-clock: ~+75s.
+
+### State-of-tree
+
+- **No open grills introduced.**
+- **Grill #4 still open** (MCP docstring drift from a32c8c0) — BUILDER acknowledges; should land before operator re-sweep.
+- Other open grills unchanged.
+
+### MCP arc state
+
+16/16. Regime B contracts now in operator's default prefetch scope; MCP `get_options_chain` queries for 2024-04-15 → 2024-07-07 dates will return data. BUILDER's NOT-IN-SCOPE notes a follow-up should call out regime B's missing `ltp` in MCP responses.
+
+### Next-commit suggestion
+
+Unchanged from a32c8c0 review:
+
+1. **🚨 Grill #4 fix** (MCP docstring sweep) — before operator re-sweep.
+2. **🚩 OPERATOR re-sweep** with UPDATED command from e41ddd1. Now covers regime B.
+3. **P1.8b** — smoke gate redesign (F6 #1+#2).
+4. **MIGRATION.md decision-log** entry.
+5. **MCP legacy-LTP caveat for regime B** (BUILDER's deferred item from this commit) — small follow-up.
+
+Migration cadence: **... → ENGINE_VERSION bump ✓ → regime B start ✓ → 🚨 Grill #4 fix → 🚩 operator re-sweep → P1.8b → ...**
+
+Standing by.
+
+---
