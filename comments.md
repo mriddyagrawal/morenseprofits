@@ -19740,3 +19740,103 @@ Migration cadence: **... → 🎉 P1.7 ✓ → Option C recalibrate ✓ → F7 e
 Standing by.
 
 ---
+
+## Review of a1b74e2 — `fix(engine.pnl.p1_8a_f7_oi_zero_thin_skip)` — ✅ ACCEPT (P1.8a; closes F7)
+
+**Verdict: ✅ ACCEPT.** Surgical F7 fix with an elegant code-ordering insight: the `if oi == 0:` check is naturally scoped to thin contracts by **placement**, not by an explicit AND clause. Three-test trio covers all branches; reviewer self-correction note preserves the methodology lesson.
+
+### F7 — CLOSED
+
+The fix places `if oi == 0:` between Option C bypass (branch 3) and band check (branch 5):
+
+```
+(1) missing data → MissingTurnoverError
+(2) premium_vwap ≤ 0 → MissingTurnoverError
+(3) contracts_traded ≥ 20 → VWAP unconditional  ← liquid + oi==0 exits here
+(4) NEW: oi == 0 → MissingTurnoverError (F7)   ← only thin contracts reach this
+(5) thin + band check → VWAP or skip
+```
+
+**The code-ordering insight**: I had suggested `oi==0 AND contracts_traded < threshold` as the F7 fix. BUILDER realized that because Option C (branch 3) returns early on liquid contracts, the `contracts_traded < threshold` condition is implicit at branch 4 — no AND clause needed. The naked `if oi == 0:` check is structurally only reachable on thin contracts. Cleaner architecture than my suggestion.
+
+**Liquid + oi==0 (empirically impossible today; 0/160 hit Option C):** still prices via branch 3. Preserves the operator's "trust real liquidity over data anomalies" intuition for a hypothetical future NSE anomaly. Defensible design.
+
+### Test trio — comprehensive
+
+- **`test_zero_oi_on_thin_contract_raises_missing_turnover_f7`** (NEW, load-bearing): thin (~8 contracts) + entry_oi=0 → MissingTurnoverError with "oi=0" in message. The F7 case itself. ✓
+- **`test_zero_oi_on_liquid_contract_prices_normally_f7`** (NEW, positive-control): liquid + oi=0 → prices via Option C bypass. Pins design intent for the empirically-not-reachable case. ✓
+- **`test_thin_contract_with_nonzero_oi_in_band_prices_normally_f7`** (NEW, anti-regression): thin + oi>0 + in-band → prices. Catches a future contributor accidentally generalizing the gate into a "thin → skip" blanket. ✓
+- **`test_zero_oi_prices_normally_under_p1_7`** (DELETED): was asserting the now-incorrect P1.7 behavior. ✓
+
+### Pytest
+
+```
+3 F7 tests pass; full suite 863 passed in 13.46s
+```
+
+863 = 861 + 2 net (-1 deleted + 3 new). Matches BUILDER's claim.
+
+### Per-leg behavior verified
+
+`_pick_fill_price` is called once per leg per side; `oi` is local to that call. So:
+- Entry leg call: `oi = entry_oi`. If 0 + thin → skip via F7 branch.
+- Exit leg call: `oi = exit_oi`. If 0 + thin → skip via F7 branch.
+
+The F7 rationale (holdability — backtest models holding the leg N days; oi==0 empirically means nobody held it) applies symmetrically to entry and exit. The per-leg code path delivers this for free.
+
+### Praises
+
+- **Code-ordering insight** — `if oi == 0:` naturally scoped to thin via structural ordering, no explicit AND clause needed. Cleaner than my suggested `oi==0 AND contracts_traded < threshold`. Future contributors reading the decision tree can't accidentally fire the gate on liquid contracts because they would have already returned at branch 3.
+- **Comprehensive test trio** — negative case (the F7 itself) + positive control (liquid bypass) + anti-regression (thin+oi>0 must still price). All three named with `_f7` suffix for easy grep.
+- **Reviewer self-correction note in commit body** — explicit reference to "both reviewers treated as N2 — note not grill" + operator pushback + memory cross-reference [[feedback-review-loudly-not-decided]]. Methodology lesson preserved.
+- **Decision-tree docstring updated** — full enumeration of all 5 branches with WHY for each, including the empirical anchor (logic-review 76ac14d: 100% far-dated entries). Future contributor reading `_pick_fill_price` understands both the architecture AND the empirical motivation.
+- **Operator-triage error message** — includes target date, oi value, contracts_traded count, threshold, F7 reference, and the holdability rationale ("backtest would model holding a leg empirically never held"). Skip_reason records will be richly actionable.
+- **NOT-IN-SCOPE acknowledged** — P1.8b (smoke gate redesign) + MIGRATION.md decision-log queued separately. Scope discipline.
+- **Cross-references all three reviewer turns**: 1597aec (LOGIC's F7 raise) + 5fab6e6 (my self-correction ACK) + 76ac14d (LOGIC's empirical strengthening). Full decision trail.
+
+### Math
+
+- LOC: +118 / -23 = +95 net. ✓ Matches.
+- Test count: 861 → 863 (+2 net): -1 deletion + 3 new. ✓
+
+### Behavior delta
+
+- Post-P1.8a, ~160 trades (~0.14% of the 113,801-row sweep) that were newly-priced under naked P1.7 will now skip via F7 branch. These are 100% far-dated entries (T-30 to T-42) into contracts with zero overnight holders — textbook dead-far-dated pattern.
+- The MCP analytics layers (`sweep_query`, `skip_summary`, `data_quality`) will see a new skip_reason variant containing "F7 — backtest would model holding a leg empirically never held." Operators filtering by skip_reason can grep for "F7" to inspect the dead-far-dated population.
+- Liquid + oi==0 (empirically zero today) preserves pricing via Option C — no behavioral change for the empirically-occurring cases.
+
+### State-of-tree
+
+- **F7** — CLOSED. ✓
+- **N1 from P1.7** — CLOSED by 817d4e5. ✓
+- **Migration arc + correctness audit**: P1.7 + Option C recalibrate + F7 fix all shipped.
+- **Operator re-sweep still required** to bring webapp current with all three.
+- **Open**: F6 #1+#2 (P1.8b smoke gate redesign), Grill #1 from 12893ea (cache-version stamping), Grill #1 from 6bc95e9 (iterdir order, MINOR), F3 (expiry STT).
+
+### Open grills (updated)
+
+- ~~F7~~ (LOGIC's OI=0 reverse) — **CLOSED by THIS commit.** ✓
+- ~~N1 from P1.7~~ (100k not universe-invariant) — closed by 817d4e5. ✓
+- **Grill #1 from 12893ea** (cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — **P1.8b**, next BUILDER move.
+
+### MCP arc state
+
+16/16. The new F7 skip_reason variant is operator-facing but doesn't break MCP contracts. `data_quality` could optionally surface "F7 dead-far-dated" as a filter; defer.
+
+### Next-commit suggestion
+
+The principle-correctness work is done; remaining items are operator-side + smoke-gate replacement:
+
+1. **🚩 OPERATOR re-sweep** to bring webapp current with P1.7 + Option C recalibrate + F7 fix. (Operator-side.)
+2. **P1.8b** — smoke gate redesign (F6 #1+#2: bhav-vs-raw-bhavcopy precision gate + per-trade primary + quantization-aware threshold).
+3. **MIGRATION.md decision-log entry** for Plan C scrap + bhavcopy canonical + F7 saga (including the operator-pushback-overrides-reviewer-concurrence methodology lesson).
+4. **Grill #1 from 12893ea** (cache-version stamping) — ~20 LOC.
+
+Migration cadence: **... → 🎉 P1.7 ✓ → Option C recalibrate ✓ → F7 fix ✓ → 🚩 operator re-sweep → P1.8b (smoke gate redesign) → ...**
+
+Standing by.
+
+---
