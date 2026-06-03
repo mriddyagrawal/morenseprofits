@@ -20709,3 +20709,156 @@ Migration cadence: **... → F9 fix ✓ → F10 scope refined ✓ → 🚩 opera
 Standing by.
 
 ---
+
+## Review of feddb5b — `fix(p1.8d.f10.vwap_transaction_reference)` — ✅ ACCEPT (P1.8d; closes F10)
+
+**Verdict: ✅ ACCEPT.** F10 implementation matches LOGIC's refined scope exactly. **`vol.py` is verifiably untouched** (load-bearing per my F10 ACK). Inline NOT-TOUCHED comment preserves the 1.2-3.9 pp bias rationale. Explicit-suffix schema is operator-driven and removes downstream ambiguity. Drilldown shows both vwap + close for operator audit.
+
+### vol.py untouched — VERIFIED
+
+```bash
+$ git diff feddb5b^..feddb5b -- src/engine/vol.py
+# (empty)
+```
+
+**The load-bearing piece**: my F10 ACK (27edc21) flagged that vwap-to-vwap realized vol would understate vol by 1.2-3.9 pp annualized → margin understated → ROI overstated 2-12% across smoke universe. BUILDER's empty diff on vol.py preserves this exactly. The KEEP-close-for-realized_vol principle held.
+
+### Inline NOT-TOUCHED comment — preserves the lesson
+
+`src/engine/sweeper.py:201-219` (new comment block):
+
+> "NOT TOUCHED: realized_vol (src/engine/vol.py) still uses close-to-close per the canonical realized-vol convention. Measured VWAP-to-VWAP is smoother than close-to-close by 1.2-3.9 pp (lower variance → margin understated → ROI overstated), so departing from close-to-close in the vol estimator would silently bias margin."
+
+**Future contributors reading sweeper.py see the role-separation principle inline**. They can't accidentally extend the VWAP switch to vol.py without re-reading this commentary. F1-B-style drift prevention applied at the source-of-truth level.
+
+### F9 prereq cross-referenced inline
+
+`sweeper.py:217-219`: "F9 prereq (8f10b6d): spot_loader now filters series=='EQ' at the read boundary, so T0/BL micro-print rows that had degenerate single-print VWAP can no longer leak in."
+
+Cross-references both the LOGIC raise (1347b8c + 6aebb31) AND my reviews (8f10b6d + a98e4ab). Future archaeologist gets the full decision trail without git log spelunking.
+
+### Implementation verified
+
+`sweeper.py:201-242`:
+
+```python
+spot_at_entry = float(spot_df.iloc[0]["vwap"])   # used for math
+entry_spot_close = float(spot_df.iloc[0]["close"]) # informational
+exit_spot = float(exit_spot_df.iloc[0]["vwap"])
+exit_spot_close = float(exit_spot_df.iloc[0]["close"])
+...
+result["entry_spot_vwap"] = spot_at_entry
+result["exit_spot_vwap"] = exit_spot
+result["entry_spot_close"] = entry_spot_close
+result["exit_spot_close"] = exit_spot_close
+result["notional_at_entry_vwap"] = spot_at_entry * total_share_exposure
+```
+
+- Both vwap (used) and close (informational) read in one `load_spot` call. No duplicate I/O.
+- `exit_spot_df.empty` defensive: both vwap and close = None.
+- `notional_at_entry_vwap` only — engine commits to vwap; no `_close` variant. Honest.
+
+### Schema rename — no stale code paths
+
+`grep -rn "entry_spot\|exit_spot\|notional_at_entry" src/` finds only:
+- Comments / docstrings (concept references).
+- Local variable names in `sweeper.py` (`exit_spot_df`, etc.).
+
+**Zero stale column-access references in code.** All `result["..."]` writes use the new suffixed names; all web/MCP consumers updated.
+
+`grep` of tests: only docstrings + test name `test_notional_at_entry_uses_per_leg_lot_size_not_constant` (semantic name, not column access). Clean.
+
+### Drilldown labels — operator-grade
+
+`src/web/heatmap.py:1602-1606`:
+
+```python
+"Spot entry (vwap, used)": rows["entry_spot_vwap"].round(2),
+"Spot exit (vwap, used)": rows["exit_spot_vwap"].round(2),
+"Spot entry (close, info)": rows["entry_spot_close"].round(2),
+"Spot exit (close, info)": rows["exit_spot_close"].round(2),
+```
+
+Operator can sanity-check the vwap-vs-close gap on any cell. The `(vwap, used)` / `(close, info)` labels remove "which is which?" ambiguity.
+
+### Pytest
+
+```
+856 passed, 8 skipped, 2 deselected, 1 warning in 9.65s
+```
+
+Same total as a98e4ab. Test fixtures updated in place (`_spot_frame` defaults `vwap=close` so legacy P&L assertions pin); no count change.
+
+### NOTES (not grills)
+
+**N1: schema rename is back-incompatible for external operator tooling.** Commit body acknowledges: "existing data/results/sweep_*.parquet are not readable by the new code." But any operator-side analysis scripts / notebooks / etc. that read the parquet outside the pipeline (e.g., the operator's `lotsize_testing.ipynb` in the working tree) would also break silently on `KeyError` for `entry_spot` / `exit_spot` / `notional_at_entry`.
+
+The commit body's compatibility framing is honest for the pipeline side; external tooling is the operator's surface to maintain. Not blocking; worth noting.
+
+**N2: ENGINE_VERSION stays at `p1.7.vwap_or_skip`.** BUILDER's defense: "F10 is a consistency upgrade within that engine, not a behavior change of the same magnitude as the P1.7 fill-pricing flip." Defensible — but the sweep parquet SCHEMA changed. A client reading a `p1.7.vwap_or_skip` parquet without knowing about F10 would fail on `entry_spot` lookup.
+
+Strictly speaking, F10 is a sweep-parquet-shape change in addition to a consistency tweak. Future consideration: a `parquet_schema_version` stamp in parquet KV metadata to distinguish pre-F10 vs post-F10 schemas independently of ENGINE_VERSION. Or fold a sub-version into ENGINE_VERSION (e.g., `p1.7.vwap_or_skip.f10`). Defer; not blocking.
+
+**N3: Operator re-sweep is now load-bearing for code compat**, not just for the run_id hash dedup issue from d0454f4 gotcha #1. Both gotchas resolve to the same operator action (`rm -f data/results/sweep_*.parquet`), so the operator command from e41ddd1 is still correct. **But the URGENCY shifts**: pre-F10, skipping `rm -f data/results/` made the re-sweep a silent no-op (annoying). Post-F10, skipping `rm -f data/results/` means subsequent reads on the stale parquet would CRASH (`KeyError: entry_spot`) — louder failure, easier to triage. Net: slightly more operator-friendly.
+
+### Praises
+
+- **vol.py truly untouched** — verified by empty diff. Load-bearing per my F10 ACK + LOGIC's 27edc21 update.
+- **Inline NOT-TOUCHED comment** with 1.2-3.9 pp bias + ROI 2-12% impact rationale. Future contributors can't accidentally extend the VWAP switch.
+- **Explicit-suffix schema** (`_vwap` vs `_close`) — operator-driven; preempts "is `entry_spot` close or vwap?" confusion downstream.
+- **BOTH vwap + close written to parquet** — operator can audit gap on any drilldown cell.
+- **F9 prereq cross-referenced inline** to 8f10b6d. Decision trail preserved.
+- **`notional_at_entry_vwap` has no `_close` variant** — engine commits; honest about the choice.
+- **Drilldown labels `(vwap, used)` / `(close, info)`** — operator-grade clarity.
+- **One `load_spot` call reads both vwap + close** — no duplicate I/O.
+- **`exit_spot_df.empty` defensive symmetric** — both vwap and close go to None.
+- **Commit body cross-references all three LOGIC turns + my reviews + memory entry** — full decision trail.
+- **Test fixture pattern** (`_spot_frame` defaults vwap=close) — preserves legacy P&L assertions while routing through new VWAP path.
+
+### Math
+
+- LOC: +163 / -64 = +99 net. ✓ Matches.
+- Test count: 856 + 8 skipped + 2 deselected (unchanged net). ✓ Fixture updates in place; no count change.
+
+### Behavior delta
+
+- Sweeper reads spot VWAP for ATM picker + margin notional + exit_spot. Per LOGIC's measurement, ~24-36% of days will pick a different ATM strike (not directionally biased; delta-neutral strategies offset).
+- Sweep parquet schema changes: 5 columns rename/add; existing parquets unreadable.
+- vol.py reads close-to-close unchanged — no smoothing bias on realized vol.
+- Drilldown shows both vwap + close for operator audit.
+- MCP test fixtures updated; live MCP queries reflect new schema.
+
+### State-of-tree
+
+- **F10** — CLOSED. ✓
+- **F9** — CLOSED. ✓ (prereq landed first)
+- **Operator re-sweep** still required AND now load-bearing for code compat.
+- Migration arc through F10 hold.
+
+### Open grills (updated)
+
+- ~~F9, F10, Grill #4, F8~~ — all CLOSED.
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+
+### MCP arc state
+
+16/16. F10 schema rename ripples through MCP test fixtures cleanly per BUILDER's 6-file update. Live MCP queries on post-F10 sweeps will return the new column names.
+
+### Next-commit suggestion
+
+1. **🚩 OPERATOR re-sweep** with UPDATED command from e41ddd1. NOW load-bearing for code compat (KeyError if skipped).
+2. **P1.8b** — smoke gate redesign (F6 #1+#2).
+3. **MIGRATION.md decision-log** entry — now includes the F9/F10/role-separation lessons.
+4. **MCP legacy-LTP caveat for regime B**.
+5. **Phase 2b cross-boundary smoke test**.
+
+Migration cadence: **... → F9 fix ✓ → F10 fix ✓ → 🚩 operator re-sweep (code-compat-required) → P1.8b (smoke gate redesign) → ...**
+
+Standing by.
+
+---
