@@ -20944,3 +20944,160 @@ Migration cadence: **... → F10 fix ✓ → trap-named script removed ✓ → �
 Standing by.
 
 ---
+
+## Review of fbb8e35 — `feat(data.lot_sizes.expiry_date)` — ✅ ACCEPT with Grill #5 (schema-staleness gap)
+
+**Verdict: ✅ ACCEPT.** Substantive feature that retires a 50× redundant per-month I/O pattern. Design choice (one column vs separate parquet) well-reasoned. Provenance counts + two-tier resolution (bhavcopy-preferred, algorithmic fallback) are operator-grade. **But the auto-rebuild predicate from 6bc95e9 doesn't detect schema-stale parquets** — load-bearing for future upgraders even though immediate operator state is fine (parquet already wiped).
+
+### Architecture verified
+
+`scripts/build_lot_size_parquet.py` resolves `expiry_date` per `(year, month)` anchor via two tiers:
+
+1. **Bhavcopy-derived (preferred)**: samples days 1..28 of `(year, month)` → first usable bhavcopy → filters OPTSTK rows whose expiry's `(year, month)` matches → takes singular distinct expiry. **Holiday-shift-correct**: NSE's rare last-Wednesday Christmas/Republic-Day adjustments are baked into the bhavcopy itself.
+
+2. **Algorithmic fallback**: `_last_thursday_of_month(year, month)`. Used ONLY when NO bhavcopy is cached for the entire month (primarily future-expiry case). Wrong by 1 day on rare holiday-shift months; accepted for the future-month edge case.
+
+**Provenance counts** `{"bhavcopy": int, "fallback": int}` printed in verification header — operator can spot anomalies (e.g., historical month with no bhavcopy → incompletely-warmed cache).
+
+### Design choice (one column vs separate parquet) — concur
+
+NSE monthly OPTSTK share expiry within `(year, month)` — function of `(year, month)` alone, not `(symbol, year, month)`. Redundant storage across symbols within a month: 6× duplication at 1k-row scale = ~12KB. Trivial cost.
+
+Win: same parquet supports BOTH filter-by-symbol and filter-by-date:
+
+```python
+lot_df = pd.read_parquet('data/cache/lot_sizes.parquet')
+mask = lot_df['symbol'].isin(syms) & lot_df['expiry_date'].between(FROM, TO)
+expiries = sorted(lot_df.loc[mask, 'expiry_date'].unique())
+```
+
+No second cache file to maintain. ✓
+
+### Bonus benefits verified
+
+- **Cross-source exclusions automatically propagate**: 101 excluded `(sym, expiry-month)` pairs already absent from `lot_sizes.parquet` → no longer iterated in expiry derivation → no `OfflineCacheMiss` skip rows polluting the result.
+- **One parquet read replaces 50 `monthly_expiries` calls**.
+- **`data/cache/expiries/` directory + `expiry_calendar.monthly_expiries`** become deprecated post-migration (per BUILDER's next commit note).
+
+### Test coverage — comprehensive
+
+7 new tests + 17 existing tests pass:
+
+- `test_last_thursday_of_month_pins_known_dates`: algorithmic fallback formula pinned on May/Jun/Aug/Feb-leap/Dec.
+- `test_resolve_expiry_date_uses_bhavcopy_when_present`: bhavcopy-derived path correctness + FUTSTK filter.
+- `test_resolve_expiry_date_falls_back_when_no_bhavcopy`: fallback path + provenance tagging.
+- **`test_attach_expiry_date_column_dedups_month_lookups`** (LOAD-BEARING): 50 symbols sharing one `(year, month)` anchor → ONE bhavcopy read, not 50. Pins the build perf at scale.
+- `test_attach_expiry_date_column_mixed_provenance`: bhavcopy + future-only anchors route independently; provenance counts accurate.
+- `test_attach_expiry_date_column_on_empty_frame`: empty input → empty output with column present.
+- `test_build_lot_size_parquet_emits_expiry_date_column`: end-to-end via `build_lot_size_parquet` against committed sidecar fixtures + empty bhavcopy_fo dir → exercises fallback.
+
+### Pytest
+
+```
+tests/test_build_lot_size_parquet.py: 24 passed
+Full suite: 863 passed + 8 skipped + 2 deselected
+```
+
+856 (post-bfd30be) → 863 = +7 net for the new feature tests. Matches BUILDER's claim.
+
+### Immediate operator state verified safe
+
+```
+data/cache/lot_sizes.parquet not on disk (operator already wiped)
+```
+
+The operator's pre-existing parquet is gone. Next prefetch will hit the "missing" branch of `_lot_sizes_needs_rebuild` (from 6bc95e9) → fresh rebuild WITH the new `expiry_date` column. **Immediate operator state is safe.** ✓
+
+### 🚩 Grill #5 (NEW) — auto-rebuild predicate doesn't detect schema-stale parquets
+
+The auto-rebuild predicate from 6bc95e9 (`_lot_sizes_needs_rebuild`) checks:
+
+1. Parquet missing → rebuild.
+2. Any sibling parquet newer mtime than unified → rebuild.
+3. Otherwise → use cache.
+
+**Schema staleness is NOT checked.** Consider a future operator state:
+- Pre-this-commit `lot_sizes.parquet` exists (no `expiry_date` column).
+- Sibling mtimes ≤ unified mtime.
+- Operator pulls latest code (post-this-commit + post-1B which consumes `expiry_date`).
+- Runs prefetch.
+- Predicate: "no rebuild" → loads stale parquet → 1B's consumer code crashes on `KeyError: expiry_date`.
+
+The commit body says: "re-prefetch (or `python -m scripts.build_lot_size_parquet --rebuild`) rebuilds with it. Auto-trigger in `prefetch_universe.py` already handles cold-cache rebuilds." **This is incomplete** — auto-trigger only handles cold-cache; warm-cache-with-stale-schema is the unprotected case.
+
+Same family as **Grill #1 from 12893ea** (per-contract options cache-version stamping, dual-concurred + still open). The lot_sizes parquet now joins the list of caches that need schema-version detection.
+
+### Suggested fix (~5 LOC, optional follow-up)
+
+Extend `_lot_sizes_needs_rebuild` in `scripts/prefetch_universe.py` to schema-sniff:
+
+```python
+if parquet_path.exists():
+    df = pd.read_parquet(parquet_path, columns=None)  # or read schema only
+    if "expiry_date" not in df.columns:
+        return True, f"{parquet_path.name} missing expiry_date column (post-fbb8e35 schema)"
+```
+
+Or — more durable — stamp a `_LOT_SIZES_SCHEMA_VERSION` constant in parquet KV metadata; sniff at read time; rebuild if missing/older. This is the Grill #1-from-12893ea pattern applied to lot_sizes. Could fold both grills into one cache-version-stamping commit.
+
+**Should land before or with 1B** (the next commit consuming `expiry_date`) so future upgraders don't silently break. Not blocking THIS commit; flag for next-commit attention.
+
+### Praises
+
+- **Two-tier resolution with provenance counts** — operator can detect anomalies (e.g., unexpected fallback spike → cache warmth gap).
+- **Bhavcopy-preferred path is holiday-shift-correct** — NSE's rare Christmas/Republic-Day shifts are baked into the bhavcopy.
+- **One-column design well-reasoned** — explicit cost/benefit analysis in commit body (12KB redundancy vs second-cache complexity).
+- **Cross-source exclusions automatically propagate** — bonus correctness benefit beyond the perf win.
+- **`_load_lot_sizes_parquet` empty-frame helper updated** — backwards-compat for cold-cache consumers.
+- **`lot_size_lookup(symbol, expiry: date)` API unchanged** — additive column doesn't break existing callers.
+- **Dedup-month-lookups test is load-bearing** — pins the build perf at scale (50 symbols × 1 month → 1 bhavcopy read, not 50).
+- **NOT-IN-SCOPE explicit** — `p7_wide_sweep.py` consumer wiring deferred to next commit (1B). Right scope discipline.
+- **Operator-direction cross-reference** — commit body cites the 2026-06-04 operator conversation that motivated the design choice.
+
+### Math
+
+- LOC: +354 / -12 = +342 net. ✓ Matches.
+- Test count: 856 → 863 (+7 net). ✓
+
+### Behavior delta
+
+- `lot_sizes.parquet` schema: gains `expiry_date datetime64[us]`.
+- `lot_size_lookup` API: unchanged.
+- Build performance: dedups month lookups (50 → 1 per anchor).
+- Build verification header: gains provenance counts.
+- Existing parquets without `expiry_date` would crash downstream consumers (next commit) IF not auto-detected — see Grill #5.
+
+### State-of-tree
+
+- Operator's immediate state safe (parquet wiped).
+- Grill #5 latent for future upgraders.
+- 1B (next commit) wires `p7_wide_sweep.py` to consume the new column — should also address Grill #5 OR be sequenced after a small schema-sniff fix.
+
+### Open grills (updated)
+
+- **NEW: Grill #5** (lot_sizes schema-staleness detection) — auto-rebuild predicate doesn't sniff schema. ~5 LOC fix; same family as dual-concurred Grill #1 from 12893ea. Should land with or before 1B.
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer or fold into schema-version-stamping commit.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+
+### MCP arc state
+
+16/16. Future MCP `sweep_windows` / `universe` tools can consume the new column per BUILDER's comment in next-commit suggestions. Not breaking yet.
+
+### Next-commit suggestion
+
+1. **Grill #5 fix** (schema-staleness detection in `_lot_sizes_needs_rebuild`) — ~5 LOC; should land before or with 1B.
+2. **1B (`p7_wide_sweep.py` consumes new column)** — per BUILDER's next-commit note.
+3. **🚩 OPERATOR re-sweep** with command from e41ddd1.
+4. **P1.8b** — smoke gate redesign (F6 #1+#2).
+5. **MIGRATION.md decision-log** entry.
+6. **MCP legacy-LTP caveat for regime B** + future `sweep_windows` migration to lot_sizes-derived expiries.
+
+Migration cadence: **... → trap-script removed ✓ → expiry_date column ✓ → Grill #5 fix (5 LOC) → 1B (sweep wiring) → 🚩 operator re-sweep → P1.8b → ...**
+
+Standing by.
+
+---
