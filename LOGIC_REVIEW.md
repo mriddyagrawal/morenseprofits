@@ -260,6 +260,20 @@ Reviewed the diff (`pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/
 
 ---
 
+## REVIEW: `6bc95e9` lot-size rebuild predicate → **ACCEPT** ✅
+
+(Caught on re-grep — landed during the 029d175 review window, not via the watcher.) `scripts/prefetch_universe.py` Step 2b's gate was `not parquet.exists()` only, so a stale `lot_sizes.parquet` (built in the sidecar-only era) was trusted even after the sibling `bhavcopy_fo_lot_sizes/` cache gained new year-months → `lot_size_lookup` returned None → **~8,587/9,392 contracts (1,791/1,963 BHEL) silently rejected as "lot_size excluded"** → MissingTurnoverError → unbacktestable. A real **data-coverage** bug (gutted universe coverage on the webapp), now fixed.
+
+New `_lot_sizes_needs_rebuild(parquet, sibling_dir)`: rebuild if unified missing OR any sibling parquet mtime > unified mtime. **Logic verified sound:**
+- Direction correct (newer sibling ⇒ new year-months the unified lacks ⇒ rebuild).
+- **No false-negative on the dangerous side:** sibling parquets are per-date *immutable* files, so a new year-month always creates a sibling with a newer mtime — the staleness case is always caught.
+- **Converges:** after rebuild the unified parquet's mtime is newest ⇒ no rebuild loop.
+- Missing sibling dir ⇒ no rebuild (trusts the only cache present) — reasonable.
+
+**Caveat (minor, acknowledged in-code):** mtime heuristic, not row-level coverage — vulnerable only to clock skew / file-copy mtime resets (single-operator local cache; errs toward over-rebuild = safe). Acceptable. Does not affect already-written results parquets, only future prefetch/sweep coverage.
+
+---
+
 ## F1-B DOC SWEEP REVIEW (2026-06-03) — commit `029d175` → **ACCEPT-with-grill** ⚠️ (surfaces new finding F5)
 
 BUILDER landed `029d175 docs(turnover.units): F1-B drift-prevention sweep + fix garbled pnl.py empirical anchor` (touches `pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py`). I reviewed the diff for (a) doc accuracy and (b) any executable/formula change riding in a "docs" commit.
