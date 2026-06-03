@@ -18390,3 +18390,87 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC reviewer's F1-fix verification (commit 9ff2d77)
+
+LOGIC reviewer's empirical verification of 12893ea is stronger than mine in two dimensions and catches two findings I missed.
+
+### Stronger empirical anchor
+
+LOGIC measured **VWAP usage 0% → 66.4% across 24,019 cached fills** for the 4-symbol smoke universe. My verification was limited to 2 contracts (RELIANCE 2840-CE, SBIN 880-CE) — both producing the correct VWAP under the new convention. LOGIC's 24k-fill rate is the right scale to confirm the fix is broadly correct, not just on the anchor cases.
+
+The 33.6% remaining close-fallback is correctly characterized as **legitimate** (premium ≤ 0 / band-reject / illiquid leg gate) — not residual F1-style misconfiguration. Confirms the band-check + recovered-premium guards are firing on real edge cases now, not on a global scale-factor artifact.
+
+### Reproducibility restored — proven, not inferred
+
+LOGIC confirms `entry_px` recovered from `_compute_vwap(turnover, vol, strike)` is **identical** to the value stored in `sweep_5f199d6984f2.parquet`. So once `data/cache/options/` is wiped + re-materialized via the F1-corrected parsers, a re-sweep will **reproduce the displayed parquet bit-for-bit**, not silently re-price every fill. This was a structural concern in my original F1 concurrence; LOGIC empirically closes it.
+
+### Cache-stamping suggestion — concurrence
+
+LOGIC's residual #1 (cache-version stamping) is the same as **Grill #1 from my 12893ea review**. Both reviewers independently converged on this fix idea. LOGIC's framing — "self-healing invariant" via the same pattern as `d276419`'s 14-col auto-refetch hook — is the right way to think about it. **Promotes Grill #1 to a stronger optional follow-up**: not blocking, but two independent reviewers asking for it strengthens the signal that BUILDER should land it as the next small commit after operator-side gate PASS.
+
+### NEW Grill #2 (from LOGIC): garbled engine docstring comment
+
+LOGIC catches that the new `src/engine/pnl.py:TURNOVER_SCALE_FACTOR` comment block has a misleading explanatory note (LOGIC's residual #3). Verified:
+
+- BUILDER wrote: "matches spot 3,041 + premium 184.78 ≈ 3,225 (deep-OTM coincidence of moneyness)".
+- Correct: `notional_per_share = 3,024.78 = strike 2,840 + premium 184.78`. The identity is `notional = strike + premium`, NOT `notional = spot + premium`. For an ITM call, the two happen to be equal (because `premium ≈ spot − strike` near expiry implies `strike + premium ≈ spot`), but the formula's structure is `strike + premium`.
+- A 2840-strike CALL with spot 3041: `spot > strike` → **ITM**, not OTM. BUILDER's note says "deep-OTM" — wrong direction.
+
+This is in the load-bearing file's load-bearing comment block. **Operator-grade documentation matters here** — F1 itself was caused by stale/misleading commentary at `options_loader.py:290-298`. A new contributor reading the corrected block would now be confused about whether to use `strike + premium` or `spot + premium` in their head model.
+
+**Suggested fix**: a tiny 2-3 line docstring patch to `src/engine/pnl.py:TURNOVER_SCALE_FACTOR` comment block:
+
+```
+EMPIRICAL ANCHOR: RELIANCE 2024-08-29 2840-CE.
+  TtlTrfVal = 19,661,050 rupees, volume = 6,500 shares, strike = 2,840.
+  notional_per_share = 19,661,050 / 6,500           = 3,024.78
+  premium_vwap       = notional_per_share − strike  =   184.78  ✓
+  (Underlying-notional identity: notional ≈ strike + premium. For
+  this contract, spot=3,041, so it happens to be deep ITM with
+  premium ≈ spot − strike = 201 ≈ 185 (close = 201.70).)
+```
+
+Could fold into the F1-B docstring sweep, or land as a standalone tiny commit.
+
+### Concurrence on F1-B re-framing
+
+LOGIC notes (residual #2): F1-B is **NOT just cosmetic**; "it's exactly the kind of stale-doc drift that *caused* F1 — worth closing soon so the next reader doesn't re-derive the wrong scale." This re-framing is correct and elevates F1-B from a tidy-up commit to a **prevention-against-future-F1** commit. The architectural reviewer concurs: the original `options_loader.py:290-298` comment was the smoking gun for the original drift; leaving similar comments elsewhere keeps the trap loaded.
+
+I now classify F1-B as **non-blocking but high-leverage** — should land before any heavy P2.x work where additional contributors might read the stale comments and re-introduce a wrong-units assumption.
+
+### Concurrence on F3 deferral
+
+F3 (expiry physical-settlement STT) correctly non-blocking. No new architectural concerns.
+
+### Updated open grills
+
+- **Grill #1** from my 12893ea review (cache-version stamping for legacy bhavcopy + jugaad-era per-contract parquets) — **now CONCURRED by LOGIC residual #1**. Strong signal.
+- **Grill #2** from LOGIC residual #3 (garbled `pnl.py` comment) — tiny docstring patch.
+- **F1-B** (stale docstrings in MCP / web layer) — re-framed by LOGIC as drift-prevention, not just cosmetic. Promote priority.
+- **F3** (expiry physical-settlement STT) — defer, non-blocking.
+
+### MCP arc state
+
+16/16. F2 closure cascade verified by LOGIC's `test_mcp_data_quality.py` pass (56 tests). F1-B sweep still pending but no correctness impact.
+
+### Next-commit suggestion (unchanged, but updated priority)
+
+**Operator-side** (unchanged):
+
+1. `rm -rf data/cache/options/`
+2. Re-run prefetch → sweep → smoke comparison.
+3. Report PASS.
+
+**BUILDER** (priority-ordered):
+
+1. **Open P1.7** with operator-side PASS metrics + cross-reference to F1 fix `12893ea` (if gate PASSES).
+2. **Close Grill #1** (cache-version stamping) — now-concurred by both reviewers; lowers F1-class risk going forward. ~20 LOC.
+3. **F1-B docstring sweep** — re-framed by LOGIC as drift-prevention. ~30-50 LOC across src/mcp/* + src/web/heatmap.py. Could fold Grill #2 (garbled pnl.py comment) into this same commit.
+4. **F3 STT caveat** — defer; non-blocking.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → F1 fix ✓ → (operator gate exercise — VWAP-engaged 66.4%, reproducibility proven) → P1.7 → P1.8 → ...**
+
+Standing by — pivot on operator-side gate PASS or BUILDER's next move.
+
+---
