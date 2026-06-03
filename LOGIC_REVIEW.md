@@ -246,3 +246,51 @@ BUILDER landed `12893ea fix(engine.turnover.parse_time_normalization)`. I logic-
 2. **F1-B (deferred by BUILDER): docstrings / MCP tool descriptions / UI help strings outside the fix path still say "lakhs / ×10⁵."** Code is correct; the operator-facing *text* in `src/mcp/spot_options.py`, `src/mcp/backtest_one.py`, `src/web/heatmap.py` is now wrong about units. Cosmetic for P&L correctness, but it's exactly the kind of stale-doc drift that *caused* F1 — worth closing soon so the next reader doesn't re-derive the wrong scale.
 3. **Minor doc nit in the new `pnl.py` comment** (`TURNOVER_SCALE_FACTOR` block): "matches spot 3,041 + premium 184.78 ≈ 3,225 (deep-OTM coincidence of moneyness)" is garbled — (a) the identity is `notional/share 3024.78 = strike 2840 + premium 184.78`, not `spot + premium`; (b) a 2840-strike call with spot 3041 is deep **ITM**, not OTM. Code is correct; only the explanatory comment misleads. Trivial, but it's in the load-bearing file.
 4. **F3 (expiry physical-settlement STT)** — still open, correctly deemed non-blocking.
+
+---
+
+## REVIEW: `029d175` F1-B doc sweep → **ACCEPT-with-grill** (surfaces F5)
+
+Reviewed the diff (`pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py`) for doc accuracy + any code change hiding in a "docs" commit.
+
+**Correct ✅:** `pnl.py` anchor comment fixed (`notional/share = strike + premium`, RELIANCE 2840-CE is **ITM** — closes Grill #2/residual #3); lakhs→rupees doc strings updated (residual #2); the drill-down's own hardcoded `× 100_000` (which `12893ea` never touched — a webapp tentacle of F1) removed; CSV field rename `*_turnover_lakhs → *_turnover_rupees` is clean (value unchanged, zero stale refs). No other stale ×1e5 in the display layer.
+
+### 🚨 F5 (NEW, found reviewing 029d175) — drill-down `*_vwap_implied` omits `− strike`
+**[src/web/heatmap.py:1223-1232](src/web/heatmap.py#L1223-L1232). WRONG (operator-facing CSV; no P&L impact).** `entry_vwap_implied = turnover/volume` = notional/share, but the name + adjacency to `entry_px` (a premium) imply it should be the premium VWAP `turnover/vol − strike` (as `pnl._compute_vwap`, `classify_fill_source`, and `data_quality` all compute). For RELIANCE 2840-CE the CSV shows `entry_px=184.78`, `fill_source='vwap'`, **`entry_vwap_implied=3024.78`** — a spurious 1537% apparent divergence on a clean VWAP fill. `029d175` fixed the ×1e5 half, left the `−strike` half. Same drift class as F1 (display re-deriving turnover math instead of calling the engine — [pnl.py:220-237](src/engine/pnl.py#L220-L237) warns of exactly this). **Fix:** `entry_vwap_implied = turnover/vol − strike` (or rename to `*_notional_per_share`); +1 regression test asserting `vwap_implied ≈ entry_px` on a VWAP-matched fixture.
+
+---
+
+## F1-B DOC SWEEP REVIEW (2026-06-03) — commit `029d175` → **ACCEPT-with-grill** ⚠️ (surfaces new finding F5)
+
+BUILDER landed `029d175 docs(turnover.units): F1-B drift-prevention sweep + fix garbled pnl.py empirical anchor` (touches `pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py`). I reviewed the diff for (a) doc accuracy and (b) any executable/formula change riding in a "docs" commit.
+
+**What's correct (ACCEPT):**
+- `pnl.py` empirical-anchor comment fixed — now states `notional/share == strike + premium` (not spot) and correctly labels RELIANCE 2840-CE as **ITM** (spot 3041 > strike 2840). Closes Grill #2 / my residual #3. ✅
+- F1-B doc strings in `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py` updated lakhs→rupees — closes the drift-prevention residual #2. ✅
+- **It also contains real (correctly-flagged-as-needed) CODE changes the "docs" label undersells, all verified correct:**
+  - `web/heatmap.py` drill-down carried its OWN hardcoded `× 100_000.0` (it did NOT import `TURNOVER_SCALE_FACTOR`), so the original F1 fix `12893ea` did **not** touch it — the dashboard drill-down was an undetected webapp tentacle of F1. `029d175` removes the ×1e5 here (`turnover/vol`). ✅ correct direction.
+  - Output-field rename `entry_turnover_lakhs → entry_turnover_rupees` (+ exit) in the drill-down CSV. **Verified clean:** value unchanged (still `entry_turn`, rupees); zero remaining references to the old `_lakhs` key in `src/`/`tests/`/`app.py`; commit body confirms no test depended on it. ✅
+- Display-layer scan: **no other stale hardcoded ×1e5 / ×100_000 computing displayed values** anywhere in `src/web` or `src/mcp` (the only remaining `*1e5` are the two legitimate parser normalizations). F1-display cleanup is now complete *except for F5 below*.
+
+### 🚨 F5 (NEW — surfaced while reviewing 029d175) — drill-down `*_vwap_implied` columns omit `− strike`
+
+**File:** [src/web/heatmap.py:1223-1232, 1250, 1259](src/web/heatmap.py#L1223-L1232). **Verdict: WRONG (operator-facing display; no P&L impact).**
+
+```python
+entry_vwap_implied = float(entry_turn) / float(entry_vol)   # = notional/share (≈3025)
+...
+"entry_vwap_implied": entry_vwap_implied,                   # sits next to entry_px (premium ≈185)
+"entry_fill_source": _classify_fill_source(entry_px, entry_vol, entry_turn, strike=...),  # correct (uses −strike)
+```
+
+The CSV column is named **`entry_vwap_implied`** (and `exit_vwap_implied`) and sits beside `entry_px`/`exit_px`, which are per-share **premiums**. But it computes `turnover / volume` = **underlying notional per share**, omitting the `− strike` term that the engine's `pnl._compute_vwap` ([pnl.py:121-122](src/engine/pnl.py#L121-L122)) and `classify_fill_source` ([pnl.py:290-291](src/engine/pnl.py#L290-L291)) — and the `data_quality` MCP tool — all apply. Empirically for RELIANCE 2840-CE:
+
+| Drill-down CSV column | Value shown | Should be |
+|---|---|---|
+| `entry_px` (actual premium fill) | 184.78 | — |
+| `entry_fill_source` | `'vwap'` (correct) | — |
+| **`entry_vwap_implied`** | **3024.78** (notional/share) | **184.78** (premium) |
+
+So the operator auditing fills via the drill-down CSV sees `entry_px=184.78` next to `entry_vwap_implied=3024.78` and `fill_source='vwap'` — a spurious **1537% apparent divergence** on a fill the engine correctly classified as a clean VWAP match. The column is non-comparable to the price columns it's meant to be audited against. (Pre-existing: the `− strike` was never there; `029d175` fixed the ×1e5 half and left this half. This is the **same drift class as F1** — display code re-deriving turnover math instead of calling the engine; ironically [pnl.py:220-237](src/engine/pnl.py#L220-L237) explicitly warns that a "future third consumer" would compound exactly this drift, and this drill-down is that consumer.)
+
+**Suggested fix (next-commit candidate):** make the column match the engine's definition — `entry_vwap_implied = turnover/vol − strike` (clamp/None on ≤0 like `_compute_vwap`) — OR, better and DRY-er, call a shared helper rather than re-deriving (the centralized `classify_fill_source` already lives in `pnl.py` for this reason). If the notional/share figure is genuinely wanted, rename the column to `entry_notional_per_share` so it isn't read as a premium. One regression test asserting `entry_vwap_implied ≈ entry_px` for a known VWAP-matched fixture would lock it.
