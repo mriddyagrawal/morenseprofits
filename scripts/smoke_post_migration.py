@@ -1,4 +1,42 @@
-r"""Smoke-test runner for the bhavcopy-only migration cutover gate
+r"""DEPRECATED 2026-06-03 — api-vs-bhavcopy parity gate is no longer
+the right tool for migration verification. See reviewer F6
+(50082b6) + operator + my own analysis converging on the same
+finding:
+
+  - The two engines enumerate different (sym, expiry, strike) sets
+    by design (api uses ATM ± strikes_per_side from spot scan; bhav
+    uses every-strike-that-ever-traded). Cell-aggregate ROIs are
+    structurally not comparable across enumerations — cell-median
+    or cell-mean both fail on the same 4000+ cells that have
+    n_trades differing by 1-2 expiries, regardless of underlying
+    pricing accuracy. That's sample composition, not pricing drift.
+  - The 0.5 pp backup threshold is calibrated to jugaad's
+    FH_TOT_TRADED_VAL lakhs quantization noise floor (₹1000 turnover
+    rounding amplifies to ~₹1/share VWAP error on 1-lot iron-condor
+    wings). That floor is structural to the api path and won't
+    shrink. Tightening below 0.5 pp would flag 5,655+ trades on
+    the post-F1 verification as fails when they're just jugaad
+    coarseness, not engine bugs.
+  - One-shot api-vs-bhavcopy was the right gate for F1+lot_sizes
+    correctness verification (verified 2026-06-03: 99.97% of
+    101,779 shared trades within 0.5 pp, median delta 0.0008 pp).
+    Post-verification it's not the right ongoing regression gate.
+
+Bhavcopy is canonical (native rupee turnover, no quantization
+loss); api is the coarser fallback per the dual-path-engine-source
+design. Future smoke gates should compare bhavcopy-vs-bhavcopy
+(post-code-change re-run vs prior baseline) so deltas reflect
+engine math only, with no structural noise floor.
+
+The script body below is preserved for historical replay of the
+original P1.6 verification procedure; ``tests/test_smoke_post_migration.py``
+has been deleted so this script no longer auto-runs under pytest.
+Do not extend this gate further; design the bhavcopy-vs-bhavcopy
+replacement instead.
+
+== Original docstring (preserved for replay reproducibility) ==
+
+Smoke-test runner for the bhavcopy-only migration cutover gate
 (MIGRATION.md §Phase 1 P1.6).
 
 Operator-driven comparison tool: takes TWO sweep run_ids (one
