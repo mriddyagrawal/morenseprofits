@@ -36,11 +36,14 @@ from pydantic import BaseModel, Field, field_validator
 # referencing a newer analysis) is one edit, not N.
 
 PRE_PRICING_ARC_PHANTOM_FILL_CAVEAT = (
-    "Run was generated BEFORE the p7.pricing_arc landed; results may "
-    "be inflated by phantom-fill artifact (zero-volume legs priced "
-    "at stale close → +10pts T-41..T-45 per the 2026-05-30 analysis). "
-    "Treat as pre-arc data; re-sweep against the post-arc engine for "
-    "correctness."
+    "Run was generated BEFORE the engine_version stamp landed (the "
+    "p7.pricing_arc era introduced both turnover-ingest + the "
+    "IlliquidLegError gate). Results may be inflated by phantom-fill "
+    "artefact (zero-volume legs priced at stale close → +10pts "
+    "T-41..T-45 per the 2026-05-30 analysis). Re-sweep against the "
+    "current ``p1.7.vwap_or_skip`` engine (which also strips close "
+    "fallback entirely, so VWAP-or-skip semantics apply) for honest "
+    "post-fix numbers."
 )
 
 

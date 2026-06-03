@@ -136,9 +136,9 @@ class OptionRow(BaseModel):
             "and LOGIC_REVIEW.md F1; pre-F1 this was carried in lakhs "
             "and the engine multiplied by 1e5). Combined with "
             "``volume`` yields per-row notional-per-share: "
-            "``turnover / volume``. NaN on legacy parquets "
-            "cached before the p7.pricing_arc — the response carries "
-            "a caveat in that case."
+            "``turnover / volume``. NaN on legacy parquets cached "
+            "before the turnover-ingest landed in the p7.pricing_arc "
+            "era — the response carries a caveat in that case."
         ),
     )
 
@@ -205,10 +205,14 @@ def get_option_series_impl(inp: GetOptionSeriesInput) -> GetOptionSeriesOutput:
     capped, caveats = _truncate_rows(rows)
     if not turnover_present or (turnover_all_nan and len(rows) > 0):
         caveats.append(
-            "Contract was cached before the p7.pricing_arc turnover "
-            "ingest landed; ``turnover`` is unavailable so VWAP cannot "
-            "be reconstructed. Engine fill-price for any cell touching "
-            "this contract falls back to ``close``."
+            "Contract was cached before the turnover-ingest landed in "
+            "the p7.pricing_arc era; ``turnover`` is unavailable so "
+            "VWAP cannot be reconstructed. Under the current "
+            "``p1.7.vwap_or_skip`` engine arc (which strips close "
+            "fallback) any sweep cell touching this contract will "
+            "skip with ``skip_reason='MissingTurnoverError'``; pre-"
+            "P1.7 (``p7.pricing_arc``) sweeps quietly used ``close`` "
+            "as a fallback fill."
         )
     return GetOptionSeriesOutput(
         symbol=inp.symbol.upper(),
