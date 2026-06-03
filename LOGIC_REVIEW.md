@@ -214,3 +214,35 @@ Triggered by the architectural reviewer's independent concurrence with F1 (commi
 3. **The two regimes have genuinely different units** (jugaad/legacy = lakhs; UDiff = rupees). This is the root of F1 and confirms the fix must normalize units at parse time, not just tweak one constant. (I concur with the architectural reviewer's recommendation #3 and the anti-regression test in #4.)
 
 Net effect on the §METHODOLOGY limits: the jugaad-regime item is now **resolved** (lakhs, proven). The legacy-bhavcopy regime remains inference-only (current legacy caches are 14-col, no `turnover`), but it is *not* the regime the displayed data or current sweeps run under, so it is not operator-facing today.
+
+---
+
+## F1 FIX VERIFICATION (2026-06-03) — commit `12893ea` → **ACCEPT** ✅
+
+BUILDER landed `12893ea fix(engine.turnover.parse_time_normalization)`. I logic-reviewed the diff (source: `pnl.py`, `bhavcopy_fo_loader.py`, `options_loader.py`; +4 test files) and **empirically re-verified against the live cache**.
+
+**What the fix does (all three ingest sites normalized to a single rupees convention):**
+- `pnl.py`: `TURNOVER_SCALE_FACTOR` `100_000.0 → 1.0` ✅
+- `bhavcopy_fo_loader.py::parse_legacy`: `VAL_INLAKH × 1e5` (lakhs → rupees) ✅
+- `bhavcopy_fo_loader.py::parse_udiff`: `TtlTrfVal` unchanged (already rupees) ✅
+- `options_loader.py::_normalize`: jugaad `turnover × 1e5` (lakhs → rupees), NaN-safe ✅
+- New named regression test `test_f1_recovers_premium_for_reliance_2840_ce_under_rupees_convention` pins the anchor fixture ✅
+
+**Empirical verification (live cache, with the fixed code loaded):**
+| Check | Pre-fix | Post-fix | Verdict |
+|---|---|---|---|
+| RELIANCE 2840-CE 2024-08-29 fill | close 201.70 | **VWAP 184.7769** (`classify_fill_source='vwap'`) | ✅ |
+| Matches displayed sweep's stored `entry_px` (turnover/vol−strike) | — | **184.78 — identical** | ✅ reproducibility restored |
+| VWAP usage across 24,019 cached fills (4 symbols) | 0.0% | **66.4%** (rest are legit close-fallbacks: premium≤0 / band-reject / illiquid) | ✅ |
+| `tests/test_pnl.py` + `tests/test_mcp_data_quality.py` | — | **56 passed** | ✅ |
+
+**F2** (data_quality ~10⁹% divergence + wrong root-cause text) closes transitively — it imports `TURNOVER_SCALE_FACTOR`; now numerically sane. Confirmed by the passing `test_mcp_data_quality.py`.
+
+**Verdict: ACCEPT.** F1 and F2 are correctly closed. The re-enabled VWAP equals the value the displayed sweep already used, so once the cache is rebuilt a re-sweep will *reproduce* `sweep_5f199d6984f2.parquet` rather than silently re-price to close.
+
+### Residual items (not blockers, flagged for follow-up)
+
+1. **⚠️ The fix's correctness depends on a manual operator step (`rm -rf data/cache/options/`) on an UNSTAMPED mixed-unit cache.** Jugaad-era (lakhs) and bhavcopy-era (rupees) per-contract parquets coexist in one tree with no version/unit marker. I verified the *current* cache is bhavcopy-era (rupees) → works today. But if the operator skips the wipe, or a future jugaad-mode (`--engine-source api`) fetch repopulates lakhs-era parquets alongside rupees ones, the engine (SCALE=1.0) silently falls back to `close` on the lakhs rows — a quiet partial re-introduction of F1, invisible without a fill-source audit. **De-risking suggestion (next-commit candidate):** stamp a turnover-unit/schema version into the option parquet (or its KV-metadata) and have the loader treat an unstamped/old-unit parquet as stale — exactly the pattern already used for the 14-col `bhavcopy_fo` auto-refetch (`d276419`). That converts "operator must remember to wipe" into a self-healing invariant and gives the load-bearing units fix a structural guard, not just a procedural one.
+2. **F1-B (deferred by BUILDER): docstrings / MCP tool descriptions / UI help strings outside the fix path still say "lakhs / ×10⁵."** Code is correct; the operator-facing *text* in `src/mcp/spot_options.py`, `src/mcp/backtest_one.py`, `src/web/heatmap.py` is now wrong about units. Cosmetic for P&L correctness, but it's exactly the kind of stale-doc drift that *caused* F1 — worth closing soon so the next reader doesn't re-derive the wrong scale.
+3. **Minor doc nit in the new `pnl.py` comment** (`TURNOVER_SCALE_FACTOR` block): "matches spot 3,041 + premium 184.78 ≈ 3,225 (deep-OTM coincidence of moneyness)" is garbled — (a) the identity is `notional/share 3024.78 = strike 2840 + premium 184.78`, not `spot + premium`; (b) a 2840-strike call with spot 3041 is deep **ITM**, not OTM. Code is correct; only the explanatory comment misleads. Trivial, but it's in the load-bearing file.
+4. **F3 (expiry physical-settlement STT)** — still open, correctly deemed non-blocking.
