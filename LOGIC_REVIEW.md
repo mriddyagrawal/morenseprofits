@@ -274,6 +274,19 @@ New `_lot_sizes_needs_rebuild(parquet, sibling_dir)`: rebuild if unified missing
 
 ---
 
+## REVIEW: `50de591` F5 fix → **ACCEPT** ✅ (F5 closed)
+
+`web/heatmap.py:1223-1232` drill-down now computes `entry/exit_vwap_implied = turnover/vol − strike` (+ `strike_val is not None` back-compat guard) — matches `pnl._compute_vwap`. For the RELIANCE 2840-CE example it now returns 184.78 = `entry_px`. Regression test added asserting `df["entry_vwap_implied"] == pytest.approx(20.0) == entry_px` on its anchor (131M/50k − 2600 = 20); 41 web-heatmap tests pass. Exactly the fix + test recommended in F5.
+
+**Trivial note (no action):** unlike `_compute_vwap`, the CSV doesn't apply the `≤0 → None` deep-OTM clamp, so deep-OTM rows show a (possibly negative) raw recovered premium next to `fill_source='close'`. Honest — the negative value + the close classification together convey the ill-conditioning; not misleading. **F5 closed.**
+
+---
+
+### STATUS (as of `50de591`)
+F1 ✅ fixed+verified (VWAP 0%→66.4%, reproducibility restored) · F2 ✅ closed transitively · F5 ✅ closed · Grill #2 ✅ closed · F1-B ✅ doc sweep done · coverage bug (`6bc95e9`) ✅ fixed. **Open (non-blocking): F3** (expiry physical-settlement STT) · cache-version-stamp follow-up (both reviewers concurred; converts the `rm -rf` operator step into a self-healing guard).
+
+---
+
 ## F1-B DOC SWEEP REVIEW (2026-06-03) — commit `029d175` → **ACCEPT-with-grill** ⚠️ (surfaces new finding F5)
 
 BUILDER landed `029d175 docs(turnover.units): F1-B drift-prevention sweep + fix garbled pnl.py empirical anchor` (touches `pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py`). I reviewed the diff for (a) doc accuracy and (b) any executable/formula change riding in a "docs" commit.
