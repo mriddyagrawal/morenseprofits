@@ -452,7 +452,12 @@ def main() -> int:
         # via MissingTurnoverError. Only real errors (parse
         # failure, missing source dir) escape as exceptions and
         # halt the prefetch.
-        build_lot_size_parquet(verbose=True)
+        # symbols_filter scopes the verbose mismatch dump to the
+        # operator's --symbols list so NIFTY/BANKNIFTY noise stays
+        # out of the prefetch output; exclusion behaviour is
+        # unchanged (out-of-filter pairs still get dropped from
+        # the parquet, just summarized as a count).
+        build_lot_size_parquet(verbose=True, symbols_filter=symbols)
     else:
         _h(f"Step 2b — unified lot_sizes.parquet  "
            f"[cache hit: {lot_sizes_parquet}]")

@@ -84,6 +84,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
@@ -99,6 +100,52 @@ from src.data import cache  # noqa: E402
 # Diagnostic message format (operator-directed 2026-06-03)
 # ============================================================
 
+def _compress_pairs_to_runs(
+    pairs: list[tuple[str, int]],
+) -> list[tuple[str, str, int, int]]:
+    """Group consecutive same-value entries in ``pairs`` into runs.
+
+    Returns a list of ``(first_source, last_source, count, value)``
+    tuples — one per run. A pair list of length N with K distinct
+    consecutive runs becomes K tuples; if every value differs from
+    its neighbour, K == N and the compression is a no-op.
+
+    Load-bearing for the bhavcopy-internal mismatch case where a
+    far-dated NIFTY expiry (e.g. 2027-12) can carry 450+ trade-date
+    observations across the prefetch window: NSE lot-size revisions
+    create 2–3 contiguous runs (lot=25 for ~120 days, lot=75 for
+    ~250 days, lot=65 for ~95 days). Without compression the
+    diagnostic line is ~hundreds of bytes per excluded pair × dozens
+    of NIFTY expiries = thousands of lines of unscannable output.
+    """
+    if not pairs:
+        return []
+    runs: list[tuple[str, str, int, int]] = []
+    cur_first, cur_value = pairs[0]
+    cur_last = cur_first
+    cur_count = 1
+    for src, val in pairs[1:]:
+        if val == cur_value:
+            cur_last = src
+            cur_count += 1
+        else:
+            runs.append((cur_first, cur_last, cur_count, cur_value))
+            cur_first, cur_last, cur_value, cur_count = src, src, val, 1
+    runs.append((cur_first, cur_last, cur_count, cur_value))
+    return runs
+
+
+def _format_run(run: tuple[str, str, int, int]) -> str:
+    """Format one run from ``_compress_pairs_to_runs``. A 1-date
+    run prints as ``{src}={value}`` (matches the pre-compression
+    output for short pair lists); a multi-date run prints as
+    ``{value} ({first} → {last}, N dates)``."""
+    first, last, count, value = run
+    if count == 1:
+        return f"{first}={value}"
+    return f"{value} ({first} → {last}, {count} dates)"
+
+
 def _format_mismatch_message(
     sym: str, year: int, month: int,
     source_value_pairs: list[tuple[str, int]],
@@ -107,10 +154,12 @@ def _format_mismatch_message(
     template: ``mismatch found in lot sizes between {x} and {y}
     for {sym} for {expiry}: {lot_x} and {lot_y}``.
 
-    For pairs with ≥3 distinct (source, value) entries (rare; e.g. an
-    NSE corporate action mid-window), the line enumerates all of them
-    rather than picking two arbitrarily — the operator should see the
-    full conflict shape.
+    For pairs with ≥3 entries (bhavcopy-internal with many trade-date
+    observations, or rare 3+-source corporate-action cases), the line
+    compresses consecutive same-value runs via
+    ``_compress_pairs_to_runs`` to keep the output scannable. A
+    1-date run prints in the original ``{src}={value}`` form so
+    short conflict shapes look identical to pre-compression output.
     """
     sym_expiry = f"{sym} for {year}-{month:02d}"
     if len(source_value_pairs) == 2:
@@ -119,7 +168,8 @@ def _format_mismatch_message(
             f"mismatch found in lot sizes between {s1} and {s2} "
             f"for {sym_expiry}: {v1} and {v2}"
         )
-    items = ", ".join(f"{s}={v}" for s, v in source_value_pairs)
+    runs = _compress_pairs_to_runs(source_value_pairs)
+    items = ", ".join(_format_run(r) for r in runs)
     return f"mismatch found in lot sizes for {sym_expiry}: {items}"
 
 
@@ -194,13 +244,19 @@ def parse_sidecar(path: Path) -> pd.DataFrame:
 
 def _detect_within_source_mismatches(
     df: pd.DataFrame, *, source_col: str,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     """Detect (sym, year, month) pairs with conflicting lot_sizes
     within a single source set (sidecar OR bhavcopy). Drops the
     offending pairs from the returned frame; emits one diagnostic
     message per excluded pair.
 
-    Returns ``(consistent_rows_only, messages)``.
+    Returns ``(consistent_rows_only, messages_with_symbol)`` where
+    each ``messages_with_symbol`` entry is a ``(symbol, message)``
+    tuple. The symbol tag lets the build's print-time code filter
+    diagnostics by the prefetch's ``--symbols`` list without
+    re-parsing the message string (per the symbol-scoping cleanup).
+    Excluded pairs are dropped from the consistent frame regardless
+    of any symbol filter — correctness preserved.
     """
     if df.empty:
         return df, []
@@ -210,7 +266,7 @@ def _detect_within_source_mismatches(
         return df.drop_duplicates(
             subset=["symbol", "year", "month"], keep="first",
         ).reset_index(drop=True), []
-    messages: list[str] = []
+    messages: list[tuple[str, str]] = []
     for sym, yr, mo in sorted(bad_keys):
         sub = df[
             (df["symbol"] == sym)
@@ -226,7 +282,10 @@ def _detect_within_source_mismatches(
         # Dedup to distinct (source, value) tuples; if a source has
         # multiple rows with the same value, keep one.
         pairs = list(dict.fromkeys(pairs))
-        messages.append(_format_mismatch_message(sym, yr, mo, pairs))
+        messages.append((
+            str(sym),
+            _format_mismatch_message(sym, yr, mo, pairs),
+        ))
     # Drop offending pairs.
     df_keyed = df.set_index(["symbol", "year", "month"])
     keep_mask = ~df_keyed.index.isin(bad_keys)
@@ -243,7 +302,7 @@ def _detect_within_source_mismatches(
 
 def _load_all_sidecars(
     sidecar_dir: Path,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     """Load + concat every NSE_FO_contract_*.csv.gz under
     ``sidecar_dir``. Detects sidecar-vs-sidecar mismatches and EXCLUDES
     those (symbol, year, month) pairs from the returned frame per the
@@ -266,7 +325,7 @@ def _load_all_sidecars(
 
 def _load_all_bhavcopy_lot_sizes(
     bhavcopy_dir: Path,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     """Load + concat every per-date sibling parquet in
     ``data/cache/bhavcopy_fo_lot_sizes/``. Detects bhavcopy-internal
     mismatches (same (sym, yr, mo) with different lot_size across
@@ -308,7 +367,7 @@ def _load_all_bhavcopy_lot_sizes(
 
 def _merge_with_cross_source_exclusion(
     sidecar_df: pd.DataFrame, bhavcopy_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
     """Outer-merge sidecar + bhavcopy on (sym, yr, mo). Detect
     sidecar-vs-bhavcopy disagreements and EXCLUDE those pairs from
     the unified frame per the per-pair-exclude policy. Returns
@@ -332,16 +391,19 @@ def _merge_with_cross_source_exclusion(
         in_both_mask
         & (merged["lot_size_sidecar"] != merged["lot_size_bhavcopy"])
     )
-    messages: list[str] = []
+    messages: list[tuple[str, str]] = []
     for _, r in merged[bad_mask].iterrows():
         sym = str(r["symbol"])
         yr = int(r["year"])
         mo = int(r["month"])
         v_side = int(r["lot_size_sidecar"])
         v_bhav = int(r["lot_size_bhavcopy"])
-        messages.append(_format_mismatch_message(
-            sym, yr, mo,
-            [("sidecar", v_side), ("bhavcopy", v_bhav)],
+        messages.append((
+            sym,
+            _format_mismatch_message(
+                sym, yr, mo,
+                [("sidecar", v_side), ("bhavcopy", v_bhav)],
+            ),
         ))
     # Exclude the disagreeing pairs from the output.
     surviving = merged[~bad_mask].copy()
@@ -388,12 +450,21 @@ def build_lot_size_parquet(
     sidecar_dir: Path | None = None,
     bhavcopy_lot_sizes_dir: Path | None = None,
     verbose: bool = True,
+    symbols_filter: Iterable[str] | None = None,
 ) -> Path:
     """Build the unified ``(symbol, year, month) → lot_size`` cache
     and write to ``out_path``. Returns the written path.
 
     Verification header + summary printed on EVERY invocation when
     ``verbose=True``.
+
+    ``symbols_filter`` (case-insensitive) scopes the printed
+    diagnostic messages to mismatches involving symbols in the
+    filter. Out-of-filter excluded pairs are still DROPPED from the
+    parquet (correctness preserved); their messages are summarized
+    as a single ``Suppressed N message(s)`` line instead. Defaults
+    to ``None`` (all messages printed — backwards compatible with
+    standalone CLI invocations).
 
     Raises ``CrossSourceLotSizeMismatchError`` (a ``DataError``) on
     any of the 3 mismatch layers per MIGRATION.md §Cross-source
@@ -412,6 +483,21 @@ def build_lot_size_parquet(
     unified, cross_msgs = _merge_with_cross_source_exclusion(
         sidecar_df, bhavcopy_df,
     )
+
+    filter_upper: set[str] | None = (
+        {s.upper() for s in symbols_filter}
+        if symbols_filter is not None
+        else None
+    )
+
+    def _split_in_out(
+        msgs: list[tuple[str, str]],
+    ) -> tuple[list[str], int]:
+        if filter_upper is None:
+            return [m for _, m in msgs], 0
+        in_filter = [m for sym, m in msgs if sym.upper() in filter_upper]
+        suppressed = len(msgs) - len(in_filter)
+        return in_filter, suppressed
 
     if verbose:
         n_sidecar_only = int((unified["source"] == "sidecar").sum())
@@ -439,28 +525,47 @@ def build_lot_size_parquet(
         )
 
         if n_excluded:
+            sidecar_print, sidecar_suppressed = _split_in_out(sidecar_msgs)
+            bhavcopy_print, bhavcopy_suppressed = _split_in_out(bhavcopy_msgs)
+            cross_print, cross_suppressed = _split_in_out(cross_msgs)
+            total_suppressed = (
+                sidecar_suppressed + bhavcopy_suppressed + cross_suppressed
+            )
+            scope_tag = (
+                f"  [symbol-scoped: {sorted(filter_upper)}]"
+                if filter_upper is not None else ""
+            )
             print(
                 f"\n=== Excluded {n_excluded} (symbol, expiry-month) "
-                f"pair(s) due to lot_size mismatches ==="
+                f"pair(s) due to lot_size mismatches ==={scope_tag}"
             )
-            if sidecar_msgs:
+            if sidecar_print:
                 print(
-                    f"\n--- Sidecar-vs-sidecar ({len(sidecar_msgs)}) ---"
+                    f"\n--- Sidecar-vs-sidecar ({len(sidecar_print)}"
+                    f"/{len(sidecar_msgs)}) ---"
                 )
-                for m in sidecar_msgs:
+                for m in sidecar_print:
                     print(f"  {m}")
-            if bhavcopy_msgs:
+            if bhavcopy_print:
                 print(
-                    f"\n--- Bhavcopy-internal ({len(bhavcopy_msgs)}) ---"
+                    f"\n--- Bhavcopy-internal ({len(bhavcopy_print)}"
+                    f"/{len(bhavcopy_msgs)}) ---"
                 )
-                for m in bhavcopy_msgs:
+                for m in bhavcopy_print:
                     print(f"  {m}")
-            if cross_msgs:
+            if cross_print:
                 print(
-                    f"\n--- Sidecar-vs-bhavcopy ({len(cross_msgs)}) ---"
+                    f"\n--- Sidecar-vs-bhavcopy ({len(cross_print)}"
+                    f"/{len(cross_msgs)}) ---"
                 )
-                for m in cross_msgs:
+                for m in cross_print:
                     print(f"  {m}")
+            if total_suppressed:
+                print(
+                    f"\n  Suppressed {total_suppressed} message(s) for "
+                    f"symbols outside the --symbols list "
+                    f"(still dropped from parquet)."
+                )
             print(
                 f"\nExcluded pairs are NOT written to "
                 f"{out_path.name}. Cells touching these contracts "

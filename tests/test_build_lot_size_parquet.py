@@ -162,18 +162,75 @@ def test_format_mismatch_message_2_source_pair_matches_operator_template():
     )
 
 
-def test_format_mismatch_message_n_source_enumerates_all():
-    """≥3 source case (e.g. ABBOTINDIA 2024-06 across 3 snapshots).
-    Format falls back to enumeration so no source is silently dropped
-    from the diagnostic."""
+def test_format_mismatch_message_n_source_compresses_consecutive_runs():
+    """≥3 source case: format compresses consecutive same-value runs
+    to keep the bhavcopy-internal NIFTY-style 450+ trade-date dump
+    scannable. Single-date runs print as ``{src}={value}`` (matches
+    pre-compression output for short conflicts); multi-date runs
+    print as ``{value} ({first} → {last}, N dates)``.
+
+    Fixture: 3 sources, 40 at apr (1 date), 20 at may + jun
+    (2 consecutive dates). Compresses to 2 runs.
+    """
     msg = _format_mismatch_message(
         "ABBOTINDIA", 2024, 6,
         [("apr.csv.gz", 40), ("may.csv.gz", 20), ("jun.csv.gz", 20)],
     )
     assert "ABBOTINDIA for 2024-06" in msg
+    # Run 1: single-date → bare s=v form.
     assert "apr.csv.gz=40" in msg
-    assert "may.csv.gz=20" in msg
-    assert "jun.csv.gz=20" in msg
+    # Run 2: 2-date run compressed.
+    assert "20 (may.csv.gz → jun.csv.gz, 2 dates)" in msg
+    # NEGATIVE: the legacy uncompressed form must NOT survive — would
+    # mean the compression regressed back to per-date enumeration.
+    assert "may.csv.gz=20" not in msg
+    assert "jun.csv.gz=20" not in msg
+
+
+def test_format_mismatch_message_bhavcopy_internal_compresses_hundreds_to_runs():
+    """LOAD-BEARING: the bhavcopy-internal case with NIFTY-style
+    lot-size revisions (450+ trade-date observations across 2-3
+    lot-size runs) must compress to a single readable line, not
+    hundreds of bytes per excluded pair.
+
+    Synthesized fixture mirrors the operator-reported NIFTY 2027-12
+    shape (121 days @ 25, 250 days @ 75, 95 days @ 65). Asserts the
+    compressed output is short + names the value-by-range structure.
+    """
+    from datetime import date as _date, timedelta as _td
+    pairs: list[tuple[str, int]] = []
+    d = _date(2024, 7, 8)
+    for _ in range(121):
+        pairs.append((f"bhavcopy-{d.isoformat()}", 25))
+        d += _td(days=1)
+    for _ in range(250):
+        pairs.append((f"bhavcopy-{d.isoformat()}", 75))
+        d += _td(days=1)
+    for _ in range(95):
+        pairs.append((f"bhavcopy-{d.isoformat()}", 65))
+        d += _td(days=1)
+
+    msg = _format_mismatch_message("NIFTY", 2027, 12, pairs)
+
+    # Compression hit: three runs, each named by value + endpoints +
+    # count. Confirms the operator gets the "value-by-range" view
+    # instead of the per-date dump.
+    assert "NIFTY for 2027-12" in msg
+    assert "25 (bhavcopy-2024-07-08" in msg
+    assert ", 121 dates)" in msg
+    assert "75 (bhavcopy-" in msg
+    assert ", 250 dates)" in msg
+    assert "65 (bhavcopy-" in msg
+    assert ", 95 dates)" in msg
+
+    # Size bound: pre-compression dump would be ~hundreds of bytes
+    # per pair × 466 pairs = many KB. Post-compression must fit in
+    # a single short line. 350-byte ceiling locks the regression.
+    assert len(msg) < 350, (
+        f"compressed message grew past the 350-byte budget — "
+        f"per-date dump probably regressed. Got len={len(msg)}: "
+        f"{msg[:200]}..."
+    )
 
 
 # ============================================================
@@ -199,10 +256,13 @@ def test_detect_within_source_excludes_offending_pairs_and_emits_messages():
     bbb = consistent[consistent["symbol"] == "BBB"]
     assert len(bbb) == 1
     assert int(bbb.iloc[0]["lot_size"]) == 50
-    # Exactly one mismatch message for AAA.
+    # Exactly one mismatch entry for AAA — (sym_tag, message) tuple
+    # per the symbol-scoping cleanup.
     assert len(msgs) == 1
-    assert "AAA for 2024-05" in msgs[0]
-    assert "100" in msgs[0] and "200" in msgs[0]
+    sym_tag, message = msgs[0]
+    assert sym_tag == "AAA"
+    assert "AAA for 2024-05" in message
+    assert "100" in message and "200" in message
 
 
 def test_detect_within_source_no_mismatch_returns_full_frame_no_messages():
@@ -253,9 +313,11 @@ def test_merge_excludes_sidecar_vs_bhavcopy_mismatches():
     # BBB excluded entirely (cross-source mismatch).
     assert (unified["symbol"] == "BBB").sum() == 0
     assert len(msgs) == 1
-    assert "BBB for 2024-05" in msgs[0]
-    assert "sidecar" in msgs[0] and "bhavcopy" in msgs[0]
-    assert "200" in msgs[0] and "999" in msgs[0]
+    sym_tag, message = msgs[0]
+    assert sym_tag == "BBB"
+    assert "BBB for 2024-05" in message
+    assert "sidecar" in message and "bhavcopy" in message
+    assert "200" in message and "999" in message
 
     # CCC sidecar-only.
     ccc = unified[unified["symbol"] == "CCC"]
@@ -347,6 +409,87 @@ def test_build_returns_successfully_when_only_mismatches_exist(tmp_path):
     )
     df = pd.read_parquet(out_path)
     assert len(df) == 0, "all 2 pairs should be excluded"
+
+
+def test_build_symbols_filter_scopes_mismatch_diagnostics(tmp_path, capsys):
+    """Symbol-scope cleanup: when ``symbols_filter`` is set, only
+    mismatches whose symbol is in the filter print loud; the others
+    are summarized as ``Suppressed N message(s)``. The PARQUET
+    contents are unchanged — out-of-filter pairs still get excluded
+    (the policy is a correctness invariant, not a verbosity knob).
+
+    Fixture: 2 sidecars with conflicting lot_sizes for both PNB and
+    NIFTY. Filter scopes to ``["PNB"]``; the NIFTY message gets
+    suppressed-and-counted, the PNB message prints.
+    """
+    sidecar_dir = tmp_path / "sidecars"
+    sidecar_dir.mkdir()
+    bhavcopy_dir = tmp_path / "bhavcopy_lot_sizes"
+    bhavcopy_dir.mkdir()
+    _write_synthetic_sidecar(
+        sidecar_dir / "NSE_FO_contract_01012025.csv.gz",
+        rows=[("PNB", "JAN", 100), ("NIFTY", "JAN", 25)],
+    )
+    _write_synthetic_sidecar(
+        sidecar_dir / "NSE_FO_contract_15012025.csv.gz",
+        rows=[("PNB", "JAN", 50), ("NIFTY", "JAN", 75)],
+    )
+    out_path = tmp_path / "lot_sizes.parquet"
+    build_lot_size_parquet(
+        out_path=out_path,
+        sidecar_dir=sidecar_dir,
+        bhavcopy_lot_sizes_dir=bhavcopy_dir,
+        verbose=True,
+        symbols_filter=["PNB"],
+    )
+
+    # Parquet: both PNB AND NIFTY excluded. Filter does NOT affect
+    # the policy — only the verbosity.
+    df = pd.read_parquet(out_path)
+    assert (df["symbol"] == "PNB").sum() == 0
+    assert (df["symbol"] == "NIFTY").sum() == 0
+
+    captured = capsys.readouterr().out
+    # PNB diagnostic prints loud.
+    assert "PNB for 2025-01" in captured
+    # NIFTY diagnostic does NOT print loud — only the suppression summary.
+    assert "NIFTY for 2025-01" not in captured
+    assert "Suppressed 1 message(s)" in captured
+    # Scope tag in the header so the operator sees what was filtered.
+    assert "symbol-scoped" in captured and "PNB" in captured
+
+
+def test_build_symbols_filter_none_prints_all_messages(tmp_path, capsys):
+    """Backwards compat: ``symbols_filter=None`` (default) prints
+    every mismatch message — same as before the cleanup. Locks the
+    standalone CLI invocation path (``python build_lot_size_parquet.py``
+    with no filter)."""
+    sidecar_dir = tmp_path / "sidecars"
+    sidecar_dir.mkdir()
+    bhavcopy_dir = tmp_path / "bhavcopy_lot_sizes"
+    bhavcopy_dir.mkdir()
+    _write_synthetic_sidecar(
+        sidecar_dir / "NSE_FO_contract_01012025.csv.gz",
+        rows=[("PNB", "JAN", 100), ("NIFTY", "JAN", 25)],
+    )
+    _write_synthetic_sidecar(
+        sidecar_dir / "NSE_FO_contract_15012025.csv.gz",
+        rows=[("PNB", "JAN", 50), ("NIFTY", "JAN", 75)],
+    )
+    out_path = tmp_path / "lot_sizes.parquet"
+    build_lot_size_parquet(
+        out_path=out_path,
+        sidecar_dir=sidecar_dir,
+        bhavcopy_lot_sizes_dir=bhavcopy_dir,
+        verbose=True,
+    )
+    captured = capsys.readouterr().out
+    # Both messages print under no-filter.
+    assert "PNB for 2025-01" in captured
+    assert "NIFTY for 2025-01" in captured
+    # No suppression banner when nothing was suppressed.
+    assert "Suppressed" not in captured
+    assert "symbol-scoped" not in captured
 
 
 # ============================================================
