@@ -73,6 +73,58 @@ def _h(s: str) -> None:
     print(f"\n=== {s} ===", flush=True)
 
 
+def _lot_sizes_needs_rebuild(
+    parquet_path: Path, sibling_dir: Path,
+) -> tuple[bool, str]:
+    """Return ``(rebuild?, reason)`` for Step 2b's unified-cache
+    auto-build gate. Replaces the prior ``not parquet.exists()``-only
+    check that missed the staleness case empirically observed on
+    2026-06-03: ``data/cache/lot_sizes.parquet`` had 4 BHEL rows from
+    the sidecar-only era while ``bhavcopy_fo_lot_sizes/`` had all 25
+    BHEL year-months, but the exists-guard took the cache-hit path
+    and 805/9392 contracts got skipped as `lot_size excluded`.
+
+    Triggers a rebuild when:
+
+      - the unified parquet is missing (fresh clone or operator nuke);
+      - any sibling per-date lot-size parquet in ``sibling_dir`` has
+        an mtime newer than the unified parquet (operator fetched
+        new bhavcopies after the last unified build — the new
+        per-date sibling carries year-months the unified cache won't
+        have).
+
+    Does NOT do a row-by-row coverage check (more expensive, same
+    end-state in 99% of operator flows because the only way to add
+    a year-month tuple is to fetch a new bhavcopy, which always
+    bumps the sibling mtime). The mtime check is the cheapest
+    defensible heuristic per the architectural reviewer's
+    Plan A.1 spec.
+    """
+    if not parquet_path.exists():
+        return True, f"{parquet_path} missing"
+    if not sibling_dir.exists():
+        # No siblings to compare against; the unified cache is the
+        # only thing we have, so trust it (rebuild is a no-op).
+        return False, "no sibling dir to compare against"
+    parquet_mtime = parquet_path.stat().st_mtime
+    newer_count = 0
+    first_newer: str | None = None
+    for child in sibling_dir.iterdir():
+        if not child.is_file() or child.suffix != ".parquet":
+            continue
+        if child.stat().st_mtime > parquet_mtime:
+            newer_count += 1
+            if first_newer is None:
+                first_newer = child.name
+    if newer_count > 0:
+        return True, (
+            f"{newer_count} sibling parquet(s) in "
+            f"{sibling_dir.name}/ have mtime > unified cache "
+            f"(first: {first_newer})"
+        )
+    return False, "up-to-date vs sibling cache"
+
+
 def _pick_reference_day(expiry: date, bhavcopy_dates: list[date]) -> date | None:
     """Pick a mid-cycle reference day for an expiry — used to read
     the strike grid + spot. We want a day that:
@@ -381,13 +433,17 @@ def main() -> int:
     from scripts.build_lot_size_parquet import build_lot_size_parquet
 
     lot_sizes_parquet = _cache.lot_sizes_path()
-    if not lot_sizes_parquet.exists() or args.rebuild_lot_sizes:
+    sibling_dir = lot_sizes_parquet.parent / "bhavcopy_fo_lot_sizes"
+    needs_rebuild, rebuild_reason = _lot_sizes_needs_rebuild(
+        lot_sizes_parquet, sibling_dir,
+    )
+    if needs_rebuild or args.rebuild_lot_sizes:
         if args.rebuild_lot_sizes:
             _h("Step 2b — build unified lot_sizes.parquet  "
                "[--rebuild-lot-sizes]")
         else:
             _h(f"Step 2b — build unified lot_sizes.parquet  "
-               f"[auto-trigger: {lot_sizes_parquet} missing]")
+               f"[auto-trigger: {rebuild_reason}]")
         # Build emits per-pair exclusion diagnostics inline (see
         # scripts/build_lot_size_parquet.py + MIGRATION.md
         # §Cross-source lot-size policy). The build returns

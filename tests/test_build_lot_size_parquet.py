@@ -382,6 +382,55 @@ def _write_synthetic_sidecar(
 # prefetch auto-build trigger
 # ============================================================
 
+def test_lot_sizes_needs_rebuild_predicate_pins_three_cases(tmp_path):
+    """Anti-regression on the stale-lookup bug observed 2026-06-03:
+    ``data/cache/lot_sizes.parquet`` had 4 BHEL year-months while
+    ``bhavcopy_fo_lot_sizes/`` had 25, but the prior exists-only
+    guard at scripts/prefetch_universe.py:384 took the cache-hit
+    path and the prefetch wrongly skipped 805/9392 contracts as
+    ``lot_size excluded``.
+
+    The new mtime-based predicate fires a rebuild in three cases;
+    pinning each separately so a future contributor can't collapse
+    them and reintroduce the bug.
+    """
+    from scripts.prefetch_universe import _lot_sizes_needs_rebuild
+
+    unified = tmp_path / "lot_sizes.parquet"
+    sibling = tmp_path / "bhavcopy_fo_lot_sizes"
+
+    # Case 1: unified parquet missing → rebuild.
+    sibling.mkdir()
+    needs, reason = _lot_sizes_needs_rebuild(unified, sibling)
+    assert needs is True
+    assert "missing" in reason
+
+    # Case 2: unified parquet present, no sibling parquets newer
+    # than it → no rebuild (cache hit).
+    unified.write_bytes(b"placeholder")
+    import os
+    base_t = os.path.getmtime(unified)
+    # Plant an OLDER sibling parquet (mtime = base - 60s).
+    older_sibling = sibling / "20240725.parquet"
+    older_sibling.write_bytes(b"placeholder")
+    os.utime(older_sibling, (base_t - 60, base_t - 60))
+    needs, reason = _lot_sizes_needs_rebuild(unified, sibling)
+    assert needs is False, (
+        f"older sibling shouldn't trigger rebuild, got: {reason}"
+    )
+    assert "up-to-date" in reason
+
+    # Case 3: sibling parquet NEWER than the unified parquet →
+    # rebuild (the bug we're fixing). Reason names the newer sibling.
+    newer_sibling = sibling / "20251231.parquet"
+    newer_sibling.write_bytes(b"placeholder")
+    os.utime(newer_sibling, (base_t + 60, base_t + 60))
+    needs, reason = _lot_sizes_needs_rebuild(unified, sibling)
+    assert needs is True
+    assert "newer" in reason or "mtime" in reason
+    assert "20251231" in reason  # operator-visible: first offending sibling
+
+
 def test_prefetch_autobuilds_lot_size_parquet_when_missing(tmp_path, monkeypatch):
     """LOAD-BEARING: the prefetch wrapper auto-invokes
     build_lot_size_parquet when data/cache/lot_sizes.parquet is
