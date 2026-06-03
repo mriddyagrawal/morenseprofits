@@ -19466,3 +19466,91 @@ Migration cadence: **... → 🎉 P1.7 VWAP-or-skip SHIPPED ✓ → 🚩 operato
 Standing by.
 
 ---
+
+## 🚩 Architectural ACK + SELF-CORRECTION — LOGIC's F7 (commit 1597aec): OI=0 drop violates P1.7's own skip-don't-fudge principle
+
+LOGIC reverses their (and my) earlier "acceptable / N2" framing of the OI=0 drop after **operator pushback**. F7 is a real principle-conflict grill I should have raised in my P1.7 review. Both reviewers under-weighted it; operator caught it.
+
+### F7 substance — concur
+
+LOGIC's argument is airtight:
+
+- The OI=0 drop's rationale ("volume>0 ⟹ priceable") **conflates priceability with HOLDABILITY**.
+- `entry_oi == 0` at EOD means nobody carried the contract overnight; the backtest then models holding it for N days as the sole holder of a zero-OI contract. Volume>0 proves a FILL was achievable, NOT that the POSITION was holdable in reality.
+- **P1.7's entire thesis is "skip rather than book an unrealistic fill"** (applied to deep-OTM + thin band-rejects). Dropping the OI gate does the OPPOSITE for zero-OI contracts — admits a fudge-able fill in the OPTIMISTIC direction. Internally inconsistent.
+- The drop was bundled into a "taxonomy flatten" — a cosmetic reason for removing a liquidity-realism guard. Wrong reason for the change.
+
+**Empirical magnitude (LOGIC measured against real skip log):**
+
+- 42,807 pre-P1.7 `IlliquidLegError` skips total.
+- 42,647 (99.6%) were `volume == 0` → still skip post-P1.7. ✓
+- ≤160 (0.4%) were `oi==0 AND volume>0` → newly priced post-P1.7.
+- All 160 are thin (`<100k` shares, median ~1,875; 0 hit Option C bypass).
+- ~0.14% of the 113,801-row sweep.
+
+**NOT a ship-blocker** (small magnitude), but F7 is a real OPEN principle-violation.
+
+### My self-correction (sharper)
+
+My P1.7 review's N2 said:
+
+> "OI=0 + volume>0 anomaly now prices through. Pre-P1.7 was a defensive skip; now the engine trusts volume as the liquidity signal per operator authorization in the commit body."
+
+This was **soft-deference to "operator-authorized" framing**. The principle conflict — that P1.7 simultaneously argues "skip don't fudge" for deep-OTM/band-reject AND "trust volume, drop OI guard" for zero-OI — was visible in the commit body itself. I should have surfaced it as a grill, not a note.
+
+**Operator's "LOUDLY" pushback is the load-bearing signal**: when BOTH reviewers concur with BUILDER on a principle-laden change and the operator pushes back, the operator is the source of truth on intent. My role isn't to assume the workflow ("BUILDER said operator authorized") resolved the principle question.
+
+This is exactly the failure mode the user just memorialized in `feedback_review_loudly_not_decided`: don't defer to "decided/accepted/authorized" — if logic feels wrong, say so loudly + measure blast radius. I had the principle conflict visible in the commit body; I treated it as a note instead of a grill. Lesson logged.
+
+### Concur with LOGIC's recommendation
+
+LOGIC's safe-direction fix (NOT a revert to the blunt pre-P1.7 gate that ignored exit_oi):
+
+1. **Minimum**: surface `entry_oi==0` (+ low-OI threshold) as visible/filterable in drilldown + `data_quality` — the data is already in `legs_json`. Research-honesty via visibility.
+2. **Better**: skip on `oi==0 AND thin` (e.g., `volume < <small_lot_floor>`). Kills truly-dead contracts where it bites; preserves the liquid-zero-OI case (which essentially never occurs: 0/160 hit ≥100k).
+
+Option 2 is the right fix — surgical, preserves P1.7's skip-don't-fudge principle exactly where it applies, doesn't resurrect the old gate's over-reach (which would have skipped liquid-but-low-OI contracts too).
+
+**Estimated scope**: ~20 LOC src (one branch in `_pick_fill_price` between current branches 3 and 4) + 2-3 anti-regression tests (zero-OI + thin → skip; zero-OI + liquid → price; OI>0 + thin → price).
+
+### Updated F7 priority
+
+LOGIC marks F7 OPEN; I concur. **Track as P1.8 candidate alongside the smoke-gate replacement (F6 #1+#2)**. Both are small + same area of code:
+
+1. **P1.8a** — F7 fix: `oi==0 AND thin` skip branch in `_pick_fill_price` (~20 LOC src + tests).
+2. **P1.8b** — F6 conditions 1+2: bhav-vs-raw-bhavcopy precision gate.
+
+Could land as a single P1.8 commit or two atomic commits. BUILDER's choice.
+
+### Updated open grills
+
+- **F7** (NEW from LOGIC, concurred by arch): `oi==0` drop violates P1.7 principle; OPEN; safe-direction fix `oi==0 AND thin` skip; ~20 LOC. **Track as P1.8a.**
+- **Grill #1 from 12893ea** (cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — **P1.8b**.
+
+### MCP arc state
+
+16/16. F7 fix would add one more skip_reason variant (`"oi_zero_thin"` or similar); `data_quality` would surface OI=0 flag for filtering. No breaking changes to MCP contracts.
+
+### Updated state-of-tree
+
+- Code shipped through P1.7.
+- **Operator re-sweep still required** to bring webapp current.
+- **F7 OPEN** as principle-violation follow-up; small magnitude (~0.14%); not a re-sweep blocker.
+- F6 #1+#2 OPEN as smoke-gate-redesign follow-up.
+
+### Next-commit suggestion
+
+1. **Operator re-sweep** (unchanged from prior ACK).
+2. **P1.8a (F7 fix)** — surgical `oi==0 AND thin` skip branch. Small.
+3. **P1.8b (F6 #1+#2)** — bhav-vs-raw-bhavcopy precision gate.
+4. **MIGRATION.md decision-log** — including the F7 lesson on principle-conflict review.
+5. **Grill #1 from 12893ea** — cache-version stamping; ~20 LOC.
+
+Migration cadence: **... → 🎉 P1.7 SHIPPED ✓ → 🚩 operator re-sweep → P1.8a (F7: oi==0 AND thin skip) + P1.8b (gate redesign) → ...**
+
+Standing by.
+
+---
