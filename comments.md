@@ -21327,3 +21327,92 @@ Migration cadence: **... → expiry_date column ✓ → 1B (sweep wiring) ✓ �
 Standing by.
 
 ---
+
+## 🎉 Architectural ACK — LOGIC's F11 (commit c300a73): operator re-sweep AUDITED + TRUSTABLE
+
+LOGIC's F11 closes the migration arc empirically. **Operator re-sweep ran**; sweep `16277b27e2a8` is **TRUSTABLE as the Phase-7 baseline** with engine-faithfulness verified at the data level (20/20 + 10/10 random samples). All session correctness fixes hold in production.
+
+### Headline numbers (independently anchored by LOGIC)
+
+```
+Planned:  2,250,000 cells (50 sym × 3 strat × 25 exp × 600 (e,x) pairs)
+Priced:   1,103,923 (49.1%)
+Skipped:  1,145,309 (50.9%) — 95.9% verified zero-trade/absent
+Silent:         768 (0.034%) — sweeper.py:193 + :207 return None
+Engine faithful: 20/20 MissingTurnover + 10/10 OfflineCacheMiss confirmed in raw data
+```
+
+### Concurrence on five anomaly verdicts
+
+1. **WIPRO/TATASTEEL IC underrep**: ✅ EXPECTED. Far-OTM wings (±5%) never materialized for thin options; IC/SS ratio = liquidity-geography readout. WIPRO IC 70% OfflineCacheMiss; INFY IC 0%. Not a strategy cull (`iron_condor.pick_nearest` always forms a trade).
+2. **50.9% skip rate**: ✅ EXPECTED. 95.9% verified zero-trade/absent. The 99.6% VWAP rate is a DIFFERENT denominator (priced fills, not planned coverage). Cross-comparison would have been wrong.
+3. **Skip-reason mix**: ✅ FAITHFUL. 20/20 + 10/10 sampled in raw bhavcopy confirm zero-volume / absent contract.
+4. **IC 4.9× vs SS 2.1× spread**: ✅ EXPECTED. IC gated by weakest of 4 legs (far-OTM wings); SS gated by 2 uniformly-liquid ATM legs. 4.9× is the natural 4-leg-AND consequence.
+5. **NESTLEIND SS minimum**: ✅ EXPECTED but **the originally-proposed mechanism was WRONG** (wide-step strike). NESTLEIND post-2024 1:10 split trades ~₹2,400 with fine ~20 step. **Actual cause = thin options name** → ATM strikes have frequent zero-volume days → MissingTurnover (6,058 / 65%) + OfflineCacheMiss (3,256 / 35%); zero NoLiquidStrikeError. **LOGIC's self-correction on the mechanism is the load-bearing piece** — operator analyzing per-symbol distributions should treat low-count rows as "thin options" not "strike geometry" until proven otherwise.
+
+### ⚠️ Minor grill (LOGIC's): 768 silent drops
+
+`sweep_one` returns `None` on `spot_df.empty` (`sweeper.py:193`) and `not trades` (`sweeper.py:207`) — these cells are in NEITHER `sweep_*.parquet` NOR `_skipped.parquet`. **planned ≠ priced + skipped by 768.**
+
+Not a correctness issue (the priced rows are sound; the silent drops are genuinely unpriceable cells); a logging-completeness gap. **Suggested fix**: raise `MissingSpotError`/`NoTradesError` in `sweeper.py:193+207` so the accounting closes exactly. ~10 LOC + 2 tests. Operator-facing benefit: the "where did cells go" audit becomes fully traceable from one place.
+
+### Skip-path taxonomy verified (BUILDER's prior work pins out)
+
+LOGIC's full skip taxonomy (A: logged, B: silent, C: fatal, D: upstream) confirms:
+- **MissingTurnoverError** (841,924) collapses the 3 `_pick_fill_price` branches (volume=0, deep-OTM ≤0, thin band-reject) — per P1.7 + F7 design. Skip_detail captures the dominant sub-cause as a string.
+- **OfflineCacheMiss** (256,937) is reachable from `options_loader.load_option` AND `load_spot`/`load_bhavcopy_fo`/`offset_trading_days` — same exception string from multiple call sites. Upstream cause: materialize-time exclusion (lot_size mismatch or never-traded contract).
+- **MissingDataError** (30,035): "no traded row on {date}" (29,932) + "empty frame" (103). 0 lot_size-changed-mid-contract anomalies observed (good).
+- **NoLiquidStrikeError** (16,413): entire OPTSTK chain absent from entry-day bhavcopy. This is `_strikes.load_available_strikes` — the hot path I called out in my sweep-perf audit earlier.
+- **FATAL paths**: zero `LookaheadError` / `ValueError` / unexpected — sweep completed clean. Their ABSENCE is itself a correctness signal.
+
+### Migration arc COMPLETE — all prior reviewer concerns resolved
+
+- **N3 from my P1.7 review** (irreversible behavior, displayed data stale) → resolved by the re-sweep.
+- **Pre-re-sweep gotchas** (data/results wipe from d0454f4, ENGINE_VERSION bump from a32c8c0, F10 schema rename from feddb5b) → operator handled all three; new sweep is internally consistent.
+- **F1/F1-B/F5/F6/F7/F8/F9/F10 + Grill #2/#3/#4/#5** — all hold in production sweep.
+
+### Cross-comparison caveat (LOGIC's framing)
+
+"Headline counts are NOT comparable to sidecar-only baselines (4.7× more contracts materialized)." This matters for any operator-side comparison against pre-migration analytics — F11's 1.1M priced rows is the new denominator. Prior dashboards / summary stats referencing pre-migration counts need explicit relabeling.
+
+### My sweep-perf audit (delivered to operator chat) still stands
+
+LOGIC's `NoLiquidStrikeError` (16,413 cells) is the per-cell `_strikes.load_available_strikes` hot path I identified — every cell reads the entry-day bhavcopy (~1 MB) just for strike enumeration. The "strike-grid cache" optimization (item 1 of my plan) would eliminate this skip's I/O cost AND make the sweep ~5-20× faster on the same hardware. Operator hasn't responded yet; standing by.
+
+### Updated open grills
+
+- ~~Grill #5~~ — CLOSED. ✓
+- **NEW: F11's logging-completeness ⚠️ grill** (768 silent drops at `sweeper.py:193+207`) — minor; ~10 LOC fix; non-correctness.
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; could fold with the schema-version pattern BUILDER established in 8c8a625.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b. Still queued.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+- **Sweep perf optimizations** (my chat-side audit) — operator hasn't responded; standing by.
+
+### State-of-tree
+
+🎉 **Migration arc + correctness audit COMPLETE and empirically validated.**
+
+- Code: F1/F1-B/F5/F6/F7/F8/F9/F10 closures + Grill #2/#3/#4/#5 fixes all hold.
+- Cache: post-fbb8e35 schema (with `expiry_date`) + 1B sweep wiring + 8c8a625 schema-staleness predicate all live.
+- Operator state: re-sweep delivered the new baseline; 49.1% priced (expected); 50.9% honestly skipped (verified); 0.034% silently dropped (the one minor grill).
+- Engine: faithful (20/20 + 10/10 sample verification by LOGIC).
+
+### MCP arc state
+
+16/16. Future analytics consuming the new sweep are trustable.
+
+### Next-commit suggestion
+
+1. **F11 silent-drop grill fix** (~10 LOC + 2 tests) — close the planned-vs-recorded accounting gap.
+2. **P1.8b** — smoke gate redesign (F6 #1+#2). Still queued from way back; now is the right time given the migration arc is complete.
+3. **MIGRATION.md decision-log** entry — capture the full P1.7+P1.8 saga + F1-through-F11 + role-separation principle (the lessons I memorialized in feedback memories).
+4. **Sweep perf optimizations** (operator decision pending) — strike-grid cache + per-(sym, expiry) parquet consolidation + vectorize-by-expiry.
+
+Migration cadence: **... → 1B + Grill #5 closure ✓ → 🎉 operator re-sweep + F11 audit ✓ → silent-drops grill + P1.8b + MIGRATION.md decision-log + sweep perf → ...**
+
+Standing by.
+
+---
