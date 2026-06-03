@@ -52,6 +52,7 @@ def _load_lot_sizes_parquet() -> pd.DataFrame:
             "month": pd.Series(dtype="int64"),
             "lot_size": pd.Series(dtype="int64"),
             "source": pd.Series(dtype="string"),
+            "expiry_date": pd.Series(dtype="datetime64[us]"),
         })
     return pd.read_parquet(path)
 

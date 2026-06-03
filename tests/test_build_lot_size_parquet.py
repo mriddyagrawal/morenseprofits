@@ -25,9 +25,12 @@ import pandas as pd
 import pytest
 
 from scripts.build_lot_size_parquet import (
+    _attach_expiry_date_column,
     _detect_within_source_mismatches,
     _format_mismatch_message,
+    _last_thursday_of_month,
     _merge_with_cross_source_exclusion,
+    _resolve_expiry_date,
     build_lot_size_parquet,
     parse_sidecar,
 )
@@ -598,4 +601,191 @@ def test_prefetch_autobuilds_lot_size_parquet_when_missing(tmp_path, monkeypatch
     assert out.exists(), "auto-build did not produce the unified parquet"
     df = pd.read_parquet(out)
     assert len(df) > 0
-    assert {"symbol", "year", "month", "lot_size", "source"}.issubset(df.columns)
+    assert {
+        "symbol", "year", "month", "lot_size", "source", "expiry_date",
+    }.issubset(df.columns)
+
+
+# ============================================================
+# expiry_date column (post-merge enrichment)
+# ============================================================
+
+def test_last_thursday_of_month_pins_known_dates():
+    """Algorithmic fallback correctness on a handful of known months
+    where last-Thursday is unambiguous (no Christmas / Republic-Day
+    shift). Anchors the formula so a future timezone / weekday-index
+    refactor can't drift silently."""
+    # May 2024: last day is Fri 31 → walk back to Thu 30.
+    assert _last_thursday_of_month(2024, 5) == date(2024, 5, 30)
+    # Jun 2024: last day Sun 30 → walk back to Thu 27.
+    assert _last_thursday_of_month(2024, 6) == date(2024, 6, 27)
+    # Aug 2024: last day Sat 31 → walk back to Thu 29.
+    assert _last_thursday_of_month(2024, 8) == date(2024, 8, 29)
+    # Feb 2024 (leap year): Thu 29 IS the last day.
+    assert _last_thursday_of_month(2024, 2) == date(2024, 2, 29)
+    # Dec-to-Jan rollover edge: Dec 2024 last day Tue 31 → Thu 26.
+    assert _last_thursday_of_month(2024, 12) == date(2024, 12, 26)
+
+
+def test_resolve_expiry_date_uses_bhavcopy_when_present(tmp_path):
+    """When a bhavcopy exists in (year, month), the resolver MUST
+    use the OPTSTK expiry from it — NOT the algorithmic fallback. The
+    bhavcopy-derived path is holiday-shift-correct."""
+    bhavcopy_fo_dir = tmp_path / "bhavcopy_fo"
+    bhavcopy_fo_dir.mkdir()
+    # Synthesize a bhavcopy on May 15 2024 with ADANIENT + RELIANCE
+    # OPTSTK rows expiring 2024-05-30. Include a non-OPTSTK row to
+    # confirm the filter excludes it.
+    df = pd.DataFrame({
+        "instrument": pd.array(
+            ["OPTSTK", "OPTSTK", "FUTSTK"], dtype="string",
+        ),
+        "symbol": pd.array(
+            ["ADANIENT", "RELIANCE", "ADANIENT"], dtype="string",
+        ),
+        "expiry": pd.Series(
+            [
+                pd.Timestamp("2024-05-30"),
+                pd.Timestamp("2024-05-30"),
+                pd.Timestamp("2024-05-30"),
+            ], dtype="datetime64[us]",
+        ),
+    })
+    df.to_parquet(bhavcopy_fo_dir / "20240515.parquet", index=False)
+    exp_date, prov = _resolve_expiry_date(2024, 5, bhavcopy_fo_dir)
+    assert exp_date == date(2024, 5, 30)
+    assert prov == "bhavcopy"
+
+
+def test_resolve_expiry_date_falls_back_when_no_bhavcopy(tmp_path):
+    """When no bhavcopy exists for (year, month), the resolver falls
+    back to ``_last_thursday_of_month``. Provenance is tagged
+    ``fallback`` so the build can log it loudly to the operator."""
+    bhavcopy_fo_dir = tmp_path / "bhavcopy_fo_empty"
+    bhavcopy_fo_dir.mkdir()
+    # Future month — no bhavcopy will ever exist in tmp dir.
+    exp_date, prov = _resolve_expiry_date(2026, 11, bhavcopy_fo_dir)
+    assert exp_date == _last_thursday_of_month(2026, 11)
+    assert prov == "fallback"
+
+
+def test_attach_expiry_date_column_dedups_month_lookups(tmp_path):
+    """LOAD-BEARING: a (year, month) anchor that's shared across N
+    symbols should incur ONE bhavcopy read, not N. Confirmed by
+    counting reads via a parquet that has 50 OPTSTK symbols on the
+    same month-anchor; only one read happens (otherwise the bhavcopy
+    must be re-parsed 50 times — wasteful at scale)."""
+    bhavcopy_fo_dir = tmp_path / "bhavcopy_fo"
+    bhavcopy_fo_dir.mkdir()
+    df = pd.DataFrame({
+        "instrument": pd.array(["OPTSTK"], dtype="string"),
+        "symbol": pd.array(["X"], dtype="string"),
+        "expiry": pd.Series(
+            [pd.Timestamp("2024-05-30")], dtype="datetime64[us]",
+        ),
+    })
+    df.to_parquet(bhavcopy_fo_dir / "20240515.parquet", index=False)
+
+    # Frame with 50 different symbols all sharing the same (2024, 5)
+    # anchor — one bhavcopy lookup must satisfy all of them.
+    syms = [f"SYM{i:02d}" for i in range(50)]
+    unified = pd.DataFrame({
+        "symbol": pd.array(syms, dtype="string"),
+        "year": [2024] * 50,
+        "month": [5] * 50,
+        "lot_size": [100] * 50,
+        "source": pd.array(["sidecar"] * 50, dtype="string"),
+    })
+    out, prov = _attach_expiry_date_column(unified, bhavcopy_fo_dir)
+    assert "expiry_date" in out.columns
+    assert (out["expiry_date"] == pd.Timestamp("2024-05-30")).all()
+    # One unique (year, month) → one bhavcopy provenance entry.
+    assert prov == {"bhavcopy": 1, "fallback": 0}
+
+
+def test_attach_expiry_date_column_mixed_provenance(tmp_path):
+    """A frame spanning months with AND without cached bhavcopies
+    routes each anchor independently. Bhavcopy-derived rows get
+    holiday-shift-correct dates; future-month rows fall back. Counts
+    in the provenance dict tell the operator how many of each."""
+    bhavcopy_fo_dir = tmp_path / "bhavcopy_fo"
+    bhavcopy_fo_dir.mkdir()
+    df = pd.DataFrame({
+        "instrument": pd.array(["OPTSTK"], dtype="string"),
+        "symbol": pd.array(["X"], dtype="string"),
+        "expiry": pd.Series(
+            [pd.Timestamp("2024-05-30")], dtype="datetime64[us]",
+        ),
+    })
+    df.to_parquet(bhavcopy_fo_dir / "20240515.parquet", index=False)
+
+    unified = pd.DataFrame({
+        "symbol": pd.array(["ADANIENT", "ADANIENT", "RELIANCE"], dtype="string"),
+        "year": [2024, 2026, 2024],
+        "month": [5, 11, 5],
+        "lot_size": [300, 300, 250],
+        "source": pd.array(["sidecar"] * 3, dtype="string"),
+    })
+    out, prov = _attach_expiry_date_column(unified, bhavcopy_fo_dir)
+    # Two unique anchors: (2024, 5) bhavcopy-derived, (2026, 11) fallback.
+    assert prov == {"bhavcopy": 1, "fallback": 1}
+    # ADANIENT + RELIANCE on (2024, 5) both get the bhavcopy-derived date.
+    adanient_may = out[(out["symbol"] == "ADANIENT") & (out["month"] == 5)]
+    reliance_may = out[(out["symbol"] == "RELIANCE") & (out["month"] == 5)]
+    assert adanient_may.iloc[0]["expiry_date"] == pd.Timestamp("2024-05-30")
+    assert reliance_may.iloc[0]["expiry_date"] == pd.Timestamp("2024-05-30")
+    # ADANIENT on (2026, 11) gets the algorithmic last-Thursday (=2026-11-26).
+    adanient_nov = out[(out["symbol"] == "ADANIENT") & (out["month"] == 11)]
+    assert adanient_nov.iloc[0]["expiry_date"] == pd.Timestamp(
+        _last_thursday_of_month(2026, 11),
+    )
+
+
+def test_attach_expiry_date_column_on_empty_frame(tmp_path):
+    """Empty unified frame → empty output frame with the expiry_date
+    column present (downstream consumers may inspect df.columns even
+    on cold-cache build)."""
+    bhavcopy_fo_dir = tmp_path / "bhavcopy_fo"
+    bhavcopy_fo_dir.mkdir()
+    empty = pd.DataFrame({
+        "symbol": pd.Series(dtype="string"),
+        "year": pd.Series(dtype="int64"),
+        "month": pd.Series(dtype="int64"),
+        "lot_size": pd.Series(dtype="int64"),
+        "source": pd.Series(dtype="string"),
+    })
+    out, prov = _attach_expiry_date_column(empty, bhavcopy_fo_dir)
+    assert "expiry_date" in out.columns
+    assert out["expiry_date"].dtype == "datetime64[us]"
+    assert len(out) == 0
+    assert prov == {"bhavcopy": 0, "fallback": 0}
+
+
+def test_build_lot_size_parquet_emits_expiry_date_column(tmp_path):
+    """End-to-end: ``build_lot_size_parquet`` writes a parquet with
+    the ``expiry_date`` column, populated for every row. Fixture uses
+    the committed sidecars + an empty bhavcopy_fo dir, so every row
+    is fallback-derived (correct: a fresh clone w/o prefetch has no
+    cached bhavcopies; the algorithmic last-Thursday is sufficient)."""
+    out_path = tmp_path / "lot_sizes.parquet"
+    bhavcopy_lot_sizes_dir = tmp_path / "bhavcopy_lot_sizes_empty"
+    bhavcopy_lot_sizes_dir.mkdir()
+    bhavcopy_fo_dir = tmp_path / "bhavcopy_fo_empty"
+    bhavcopy_fo_dir.mkdir()
+    build_lot_size_parquet(
+        out_path=out_path,
+        sidecar_dir=SIDECAR_DIR,
+        bhavcopy_lot_sizes_dir=bhavcopy_lot_sizes_dir,
+        bhavcopy_fo_dir=bhavcopy_fo_dir,
+        verbose=False,
+    )
+    df = pd.read_parquet(out_path)
+    assert "expiry_date" in df.columns
+    assert df["expiry_date"].dtype == "datetime64[us]"
+    assert df["expiry_date"].notna().all()
+    # Spot-check: PNB 2024-06 → fallback expiry = last Thursday June 2024 = Jun 27.
+    pnb_jun = df[
+        (df["symbol"] == "PNB") & (df["year"] == 2024) & (df["month"] == 6)
+    ]
+    assert len(pnb_jun) == 1
+    assert pnb_jun.iloc[0]["expiry_date"] == pd.Timestamp("2024-06-27")

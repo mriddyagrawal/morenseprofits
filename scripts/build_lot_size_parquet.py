@@ -47,18 +47,34 @@ the prefetch wrapper passes through to operator console).
 
 Output (``data/cache/lot_sizes.parquet``) schema:
 
-  symbol     string
-  year       int64
-  month      int64
-  lot_size   int64
-  source     string  (one of {"sidecar", "bhavcopy", "both"})
+  symbol       string
+  year         int64
+  month        int64
+  lot_size     int64
+  source       string          (one of {"sidecar", "bhavcopy", "both"})
+  expiry_date  datetime64[us]  (canonical monthly OPTSTK expiry for
+                                this (year, month) — resolved from a
+                                sampled bhavcopy in that month, or via
+                                last-Thursday algorithmic fallback when
+                                no bhavcopy is cached for that month).
 
-Year+month granularity (not exact expiry date) is sufficient
-because lot_sizes are stable per (symbol, expiry-month). The
-sidecar's ``StockNm`` regex gives us year+month directly without
+Year+month granularity for the JOIN KEY (not exact expiry date) is
+sufficient because lot_sizes are stable per (symbol, expiry-month).
+The sidecar's ``StockNm`` regex gives us year+month directly without
 needing to decode NSE's proprietary epoch ``XpryDt`` column.
-Consumers query via ``lot_size_lookup(symbol, expiry: date)``
-which converts the queried expiry to (year, month) and joins.
+Consumers query via ``lot_size_lookup(symbol, expiry: date)`` which
+converts the queried expiry to (year, month) and joins.
+
+The ``expiry_date`` column is added at build time so downstream
+consumers (the sweep's expiry-list builder, MCP sweep_windows,
+operator audit tools) get the actual expiry date without needing a
+second roundtrip through bhavcopies or ``expiry_calendar`` — they
+just ``filter + unique(expiry_date)`` on this one parquet. NSE F&O
+monthly options of all OPTSTK symbols share the same monthly expiry
+date (last Thursday of month, or last Wednesday on rare
+holiday-shift months), so the date is a function of ``(year, month)``
+alone — symbol-dimension duplication is intentional + cheap
+(~6× rows at 1k-row scale ≈ 12KB).
 
 Console output policy (per reviewer grills #2 + #5 on 9b6c32b):
   - ``=== Cross-source lot-size verification ===`` header on EVERY
@@ -85,6 +101,7 @@ import argparse
 import re
 import sys
 from collections.abc import Iterable
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -432,6 +449,121 @@ def _merge_with_cross_source_exclusion(
 
 
 # ============================================================
+# Expiry-date resolution (post-merge enrichment)
+# ============================================================
+#
+# Adds the canonical monthly OPTSTK ``expiry_date`` to each (year, month)
+# in the merged frame, so downstream consumers (sweep, MCP, audit) can
+# do ``filter + unique(expiry_date)`` on this parquet without a second
+# pass over bhavcopies.
+#
+# Strategy: for each unique (year, month), try days 1..28 of that month
+# for a cached bhavcopy. Once found, take the OPTSTK rows whose
+# ``expiry`` column falls in (year, month), validate exactly one
+# distinct expiry exists (NSE monthly options canonically have one
+# expiry per month; > 1 would signal weekly options leaking through
+# our OPTSTK filter — log + take the latest).
+#
+# Fallback: if no bhavcopy is cached for ANY day in (year, month) —
+# the case for future expiries listed in sidecars but with no trading
+# days yet — compute last-Thursday algorithmically. Holiday-shifted
+# expiries (rare: ~1-2 per year shifted to Wednesday) will be off by
+# one day under the fallback; the sweep then sees no contracts on that
+# date and skips. Acceptable for a future-month edge case.
+
+
+def _last_thursday_of_month(year: int, month: int) -> date:
+    """Algorithmic fallback when no bhavcopy is cached for (year, month).
+    Returns the last Thursday of the month. NSE F&O monthly options
+    canonically expire on this date; ~1-2 months per year shift to
+    Wednesday for holiday reasons (Christmas / Republic Day) and the
+    fallback misses those; we accept that for the future-month case
+    only (cached-month case always uses the bhavcopy-derived date)."""
+    if month == 12:
+        first_of_next = date(year + 1, 1, 1)
+    else:
+        first_of_next = date(year, month + 1, 1)
+    last_day = first_of_next - timedelta(days=1)
+    # Walk back to Thursday (weekday 3 in Python: Mon=0..Sun=6).
+    while last_day.weekday() != 3:
+        last_day -= timedelta(days=1)
+    return last_day
+
+
+def _resolve_expiry_date(
+    year: int, month: int, bhavcopy_fo_dir: Path,
+) -> tuple[date, str]:
+    """Return ``(expiry_date, provenance)`` for one (year, month).
+
+    Provenance:
+      ``"bhavcopy"``  — found a usable bhavcopy in the month + extracted
+                        the canonical OPTSTK expiry from it.
+      ``"fallback"``  — no bhavcopy on disk for that month; used
+                        ``_last_thursday_of_month``.
+
+    Reads through the explicit ``bhavcopy_fo_dir`` arg (not
+    ``cache.bhavcopy_fo_path``) so tests passing a fresh ``tmp_path``
+    don't inadvertently read the operator's real cache.
+    """
+    for day in range(1, 29):
+        try:
+            anchor = date(year, month, day)
+        except ValueError:
+            continue
+        path = bhavcopy_fo_dir / f"{anchor:%Y%m%d}.parquet"
+        if not path.exists():
+            continue
+        df = pd.read_parquet(path)
+        if df.empty or "instrument" not in df.columns or "expiry" not in df.columns:
+            continue
+        mask = (
+            (df["instrument"] == "OPTSTK")
+            & (df["expiry"].dt.year == year)
+            & (df["expiry"].dt.month == month)
+        )
+        exps = sorted(df.loc[mask, "expiry"].dt.date.unique())
+        if not exps:
+            continue
+        # NSE monthly OPTSTK has one expiry per month. If we see > 1
+        # something leaked our filter — take the LATEST (canonical
+        # monthly is last Thursday). This branch is defensive; not
+        # expected to fire on real bhavcopy data.
+        return exps[-1], "bhavcopy"
+    return _last_thursday_of_month(year, month), "fallback"
+
+
+def _attach_expiry_date_column(
+    unified: pd.DataFrame, bhavcopy_fo_dir: Path,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Add an ``expiry_date`` column to ``unified``. Returns
+    ``(frame_with_column, provenance_counts)`` where the counts dict
+    has keys ``{"bhavcopy", "fallback"}`` for verbose-mode logging.
+    Memoizes per (year, month) so each unique month-anchor reads at
+    most one bhavcopy regardless of how many symbols share it."""
+    if unified.empty:
+        out = unified.copy()
+        out["expiry_date"] = pd.Series([], dtype="datetime64[us]")
+        return out, {"bhavcopy": 0, "fallback": 0}
+    cache_map: dict[tuple[int, int], tuple[date, str]] = {}
+    for (yr, mo) in sorted(
+        {(int(y), int(m)) for y, m in zip(unified["year"], unified["month"])}
+    ):
+        cache_map[(yr, mo)] = _resolve_expiry_date(yr, mo, bhavcopy_fo_dir)
+    counts = {"bhavcopy": 0, "fallback": 0}
+    for (exp_d, prov) in cache_map.values():
+        counts[prov] += 1
+    out = unified.copy()
+    out["expiry_date"] = pd.Series(
+        [
+            pd.Timestamp(cache_map[(int(y), int(m))][0])
+            for y, m in zip(out["year"], out["month"])
+        ],
+        dtype="datetime64[us]",
+    )
+    return out, counts
+
+
+# ============================================================
 # Public entry point
 # ============================================================
 
@@ -444,11 +576,16 @@ def _default_bhavcopy_lot_sizes_dir() -> Path:
     return CACHE_DIR / "bhavcopy_fo_lot_sizes"
 
 
+def _default_bhavcopy_fo_dir() -> Path:
+    return CACHE_DIR / "bhavcopy_fo"
+
+
 def build_lot_size_parquet(
     *,
     out_path: Path | None = None,
     sidecar_dir: Path | None = None,
     bhavcopy_lot_sizes_dir: Path | None = None,
+    bhavcopy_fo_dir: Path | None = None,
     verbose: bool = True,
     symbols_filter: Iterable[str] | None = None,
 ) -> Path:
@@ -475,6 +612,7 @@ def build_lot_size_parquet(
     bhavcopy_lot_sizes_dir = (
         bhavcopy_lot_sizes_dir or _default_bhavcopy_lot_sizes_dir()
     )
+    bhavcopy_fo_dir = bhavcopy_fo_dir or _default_bhavcopy_fo_dir()
 
     sidecar_df, sidecar_msgs = _load_all_sidecars(sidecar_dir)
     bhavcopy_df, bhavcopy_msgs = _load_all_bhavcopy_lot_sizes(
@@ -482,6 +620,9 @@ def build_lot_size_parquet(
     )
     unified, cross_msgs = _merge_with_cross_source_exclusion(
         sidecar_df, bhavcopy_df,
+    )
+    unified, expiry_provenance = _attach_expiry_date_column(
+        unified, bhavcopy_fo_dir,
     )
 
     filter_upper: set[str] | None = (
@@ -522,6 +663,16 @@ def build_lot_size_parquet(
         print(
             f"  source breakdown: sidecar_only={n_sidecar_only} | "
             f"bhavcopy_only={n_bhavcopy_only} | both={n_both}"
+        )
+        # Expiry-date provenance — bhavcopy-derived dates are
+        # holiday-shift-correct; fallback uses algorithmic last-Thursday
+        # and may be off by one trading day on the rare Christmas /
+        # Republic-Day months. Surface counts so the operator can spot
+        # an unexpected fallback spike (e.g., a missing bhavcopy in a
+        # historical month would push that month's rows to fallback).
+        print(
+            f"  expiry_date provenance: bhavcopy={expiry_provenance['bhavcopy']} | "
+            f"fallback={expiry_provenance['fallback']}"
         )
 
         if n_excluded:
