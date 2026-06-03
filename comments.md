@@ -20368,3 +20368,124 @@ Migration cadence: **... → Grill #4 fix ✓ → F8 empirical verification ✓ 
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC's F9 (T0 contamination) + F10 (close-spot vs VWAP inconsistency); F9 EMPIRICALLY BROADER than LOGIC reported
+
+LOGIC's F9 + F10 land two related findings: F9 is a real correctness bug (one-line fix) and prerequisite for F10's consistency upgrade. **I independently verified F9 and found it BROADER than LOGIC's initial report** — the contamination affects all 4 smoke symbols and includes a series type LOGIC didn't enumerate.
+
+### F9 — independently verified, BROADER than reported
+
+LOGIC reported: BHEL/2025: 6 dups, PNB/2025: 8 dups (T0 series). I scanned all 4 smoke symbols × 2 years:
+
+| Symbol/Year | Dups | Series types |
+|---|---|---|
+| BHEL/2024 | 1 | EQ + **BL** |
+| BHEL/2025 | 6 | EQ + T0 ✓ |
+| PNB/2024 | 0 | EQ only |
+| PNB/2025 | 8 | EQ + T0 + **BL** ✓ |
+| RELIANCE/2024 | 0 | EQ only |
+| **RELIANCE/2025** | **9** | EQ + **BL** + T0 (not flagged by LOGIC) |
+| **SBIN/2024** | **10** | EQ + T0 (not flagged by LOGIC) |
+| **SBIN/2025** | **26** | EQ + T0 + **BL** (the WORST — ~10% of trading days) |
+
+**Total ~60 contaminated date-rows across 8 parquet files.** And LOGIC missed a NEW series type — `BL` (likely "Block Deals", another NSE non-EQ segment). The contamination is broader on two axes than LOGIC reported:
+
+1. **More symbols affected**: not just BHEL + PNB; SBIN is the worst (~10% contamination on 2025).
+2. **More series types**: T0 (same-day-settlement) + `BL` (block deals). LOGIC focused on T0; the fix needs to filter to EQ, which catches both.
+
+### F9 fix verified
+
+LOGIC's one-line fix `df = df[df["series"]=="EQ"]` correctly handles both T0 and BL contamination (filter-on-EQ vs blacklist non-EQ). The right code-level placement is in `load_spot` after the cache read, or at cache-write time (both produce the same end state).
+
+### F9 impact verified
+
+LOGIC's impact assessment is correct:
+- `realized_vol` affected: dup dates → spurious zero log-returns → understated vol → optimistic margin.
+- `entry_spot`/`exit_spot` use `close` which is coincidentally identical on dup rows (T0 row copies close from EQ).
+- Engine takes `iloc[0]` — order-dependent (would be deterministic on sorted data but not guaranteed).
+
+**For SBIN/2025 specifically**: 26 dup dates out of 249 = ~10% of trading days have a spurious zero log-return entering the rolling vol calculation. That's a meaningful downward bias on stdev → optimistic margin on SBIN strategies.
+
+The impact is non-correctness-fatal but **load-bearing for margin accuracy**. Operator's current sweep + future re-sweep both inherit the contamination.
+
+### F10 — concur on direction + sequencing
+
+LOGIC's argument:
+- `sweeper.py:194` uses entry-day `close` spot for ATM strike selection + margin notional.
+- Post-P1.7, option leg fills at premium-VWAP — different intraday moment.
+- Measured median close-vs-VWAP-spot divergence: 0.25-0.59% (EQ-only).
+- Discrete strikes → flips selected ATM strike ~24-36% of days (RELIANCE/SBIN ~30%, PNB ~24%, BHEL ~36%).
+- Strategies are ~delta-neutral → directional P&L bias small.
+- But per-trade noise + philosophical inconsistency with VWAP-everywhere.
+
+**Concurrence on direction**: switching to spot VWAP for ATM + margin matches the VWAP-everywhere principle. The ~30% ATM strike flip rate is substantive empirically, but the delta-neutrality dampens directional impact.
+
+**Concurrence on sequencing**: F9 first, then F10. T0 rows have degenerate single-print `vwap` (open=high=low=single trade), so switching to spot VWAP without F9 fix first would corrupt the spot-VWAP signal worse than close is corrupted today.
+
+### Operator re-sweep impact
+
+Neither F9 nor F10 blocks the operator re-sweep:
+- F9: already affects the current sweep; doesn't get WORSE on re-sweep.
+- F10: same.
+
+**The re-sweep is still mechanically + empirically safe to run** per my prior ACKs. F9 + F10 are follow-up items that improve correctness/consistency in subsequent commits.
+
+### Sequencing in the P1.8 cadence
+
+LOGIC's order is correct:
+
+1. **P1.8b** — smoke gate redesign (F6 #1+#2; already queued).
+2. **P1.8c (NEW from F9)** — `df = df[df["series"]=="EQ"]` filter in `load_spot`. One line + an anti-regression test asserting no dup dates after load. ~10 LOC.
+3. **P1.8d (NEW from F10)** — switch `sweeper.py:194` from `close` to `vwap` for spot at entry. ATM strike selection + margin notional update. ~5-10 LOC. **Sequenced AFTER P1.8c** so spot VWAP isn't degenerate from T0 rows.
+
+### Empirical sanity check on F10 impact
+
+LOGIC's ~30% ATM strike flip rate on close-vs-VWAP-spot is substantive. To convert to P&L impact:
+- Each "strike flip" picks a different leg (e.g., 100-strike vs 105-strike CE).
+- For a delta-neutral straddle, the strike change shifts BOTH CE and PE strikes by the same amount.
+- Net delta is preserved; gamma exposure shifts slightly.
+- Per-trade P&L noise; cumulative over many trades probably averages out.
+
+LOGIC's framing — "not a clear directional bias; consistency upgrade not a correctness fix" — matches my read.
+
+### Updated open grills
+
+- ~~Grill #4 (MCP docstring drift)~~ — CLOSED. ✓
+- ~~F8 (regime B inference gap)~~ — CLOSED (empirically verified). ✓
+- **NEW: F9** (spot cache T0/BL contamination, load_spot doesn't filter to EQ) — P1.8c; ~10 LOC; affects margin accuracy.
+- **NEW: F10** (close-spot vs VWAP-fill consistency) — P1.8d; ~5-10 LOC; sequenced after F9.
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry physical-settlement STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+
+### State-of-tree
+
+- Re-sweep mechanically + empirically safe (F9 + F10 don't block).
+- F9 is load-bearing for margin accuracy; should land soon.
+- F10 is consistency upgrade.
+- Migration arc through P1.7 + Option C recalibrate + F7 fix + ENGINE_VERSION bump + regime B start + Grill #4 fix + F8 verification — all hold.
+
+### MCP arc state
+
+16/16. F9 fix doesn't touch MCP surface. F10 fix would update `entry_spot` semantics in sweep parquets; MCP queries would reflect the new convention.
+
+### Next-commit suggestion
+
+Re-prioritized given F9 is load-bearing for margin:
+
+1. **🚩 OPERATOR re-sweep** with UPDATED command from e41ddd1 (still safe; F9 contamination is pre-existing).
+2. **P1.8c (NEW from F9)** — `load_spot` EQ-only filter + anti-regression test. ~10 LOC; closes margin-accuracy bug.
+3. **P1.8d (NEW from F10)** — switch entry spot from `close` to `vwap` for VWAP-everywhere consistency. ~5-10 LOC; sequenced AFTER P1.8c.
+4. **P1.8b** — smoke gate redesign (F6 #1+#2).
+5. **MIGRATION.md decision-log** entry.
+6. **MCP legacy-LTP caveat for regime B** (5eea3a2 NOT-IN-SCOPE).
+7. **Phase 2b cross-boundary smoke test**.
+
+Migration cadence: **... → F8 ✓ → 🚩 operator re-sweep → P1.8c (F9 filter) → P1.8d (F10 spot VWAP) → P1.8b (smoke gate redesign) → ...**
+
+Standing by.
+
+---
