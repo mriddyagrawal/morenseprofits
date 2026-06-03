@@ -18933,3 +18933,106 @@ Migration cadence: **P0.1 ✓ → ... → lot_sizes mtime ✓ → F5 drill-down 
 Standing by.
 
 ---
+
+## Review of f720dc3 — `chore(prefetch.step2b.lot_size_diagnostics)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Pure operator UX commit. Two orthogonal cleanups (value-run compression + symbol-scope filter) with **correctness invariant preserved**: "the parquet contents + per-pair exclusion policy are UNCHANGED." Rigorous test coverage including a 350-byte ceiling pin and a NEGATIVE assertion against the legacy enumeration form.
+
+### Two cleanups, both clean
+
+**Cleanup 1 — value-run compression in `_format_mismatch_message`**:
+
+- 2-source case (`len(source_value_pairs) == 2`): preserved byte-for-byte at `scripts/build_lot_size_parquet.py:165-169`. Locked by `test_format_mismatch_message_2_source_pair_matches_operator_template` (existing). ✓
+- ≥3-source case: walks pair list via new `_compress_pairs_to_runs` helper, formats each run via `_format_run`. Single-date runs (`count == 1`) print as bare `{src}={value}` so short conflict shapes are byte-identical to pre-compression output. ✓
+
+**`_compress_pairs_to_runs` algorithm verified**: walks pairs sequentially, accumulates same-value consecutive runs, emits `(first_source, last_source, count, value)` tuples. Edge cases: empty → `[]`; single pair → one run with count=1; alternating values → no compression (K=N runs). ✓
+
+**Cleanup 2 — symbol-scope filter on the verbose dump**:
+
+- `build_lot_size_parquet(symbols_filter: Iterable[str] | None = None)`. Default `None` = backwards-compat with standalone CLI invocation. ✓
+- Inner-detection return type changed from `list[str]` to `list[tuple[str, str]]` — symbol tag added so the build's print-time code can filter without re-parsing message strings. Plumbed through 4 functions. ✓
+- `_split_in_out` helper inside `build_lot_size_parquet`: when `filter_upper is None` → return all (suppressed=0). Otherwise → split by `sym.upper() in filter_upper`. ✓
+- Case-insensitive filter (`.upper()` on both sides). ✓
+- **Suppression banner** ("`Suppressed N message(s) for symbols outside the --symbols list (still dropped from parquet).`") emits ONLY when `total_suppressed > 0`. The parenthetical "still dropped from parquet" makes the correctness-vs-UX separation operator-clear. ✓
+- Section counts now show `len(print)/len(msgs)` so operator sees fraction-surfaced-of-total at a glance. ✓
+
+### Correctness invariant verified
+
+The parquet contents + per-pair exclusion policy are unchanged across the filter setting. Locked by `test_build_symbols_filter_scopes_mismatch_diagnostics`:
+
+```python
+# 2 sidecars with PNB + NIFTY conflicts
+# filter=["PNB"]
+# Asserts: PNB message printed + NO NIFTY message + suppression-count
+#          banner + scope tag
+# AND: the parquet still excludes BOTH pairs (policy invariant)
+```
+
+The "AND" clause is load-bearing — UX scope ≠ correctness scope. Filtering the print stream doesn't filter the exclusion stream.
+
+### Test coverage — strong anti-regression pinning
+
+- `test_format_mismatch_message_2_source_pair_matches_operator_template` (existing): byte-for-byte template still holds. ✓
+- `test_format_mismatch_message_n_source_compresses_consecutive_runs` (REPLACES `n_source_enumerates_all`): positive (`apr.csv.gz=40` + `20 (may.csv.gz → jun.csv.gz, 2 dates)`) **AND NEGATIVE** assertion that legacy `may.csv.gz=20` per-date form does NOT survive. The negative assertion catches a future contributor who reintroduces enumeration silently. ✓
+- `test_format_mismatch_message_bhavcopy_internal_compresses_hundreds_to_runs` (NEW): synthesizes NIFTY 2027-12 shape (121 + 250 + 95 days), asserts all 3 value runs + correct date counts + **350-byte ceiling**. The byte ceiling is gold-standard regression-prevention — without it, a future "small enhancement" could regress to ~10 KB lines without breaking the run-count assertion. ✓
+- `test_build_symbols_filter_scopes_mismatch_diagnostics` (NEW): correctness-vs-UX split. ✓
+- `test_build_symbols_filter_none_prints_all_messages` (NEW): backwards-compat anchor for standalone CLI. ✓
+
+### Pytest
+
+```
+tests/test_build_lot_size_parquet.py: 17 passed in 4.33s
+```
+
+17/17 pass. Full-suite claim (861 passed + 8 skipped + 2 deselected, +3 net vs 50de591) matches: 3 new tests + 1 rewritten in place = +3.
+
+### Praises
+
+- **350-byte ceiling regression pin** in the bhavcopy-internal test is the standout. Locks the size-of-output invariant, not just the structural shape. Future "enhancements" to the diagnostic format can't silently regress to per-date enumeration without firing this test loud.
+- **NEGATIVE assertion** in `test_format_mismatch_message_n_source_compresses_consecutive_runs` (legacy form does NOT survive) catches silent re-enumeration regressions. Pairs with the positive assertion for two-sided coverage.
+- **Correctness-invariant pin** in `test_build_symbols_filter_scopes_mismatch_diagnostics`: parquet still excludes BOTH pairs regardless of filter. UX scope ≠ correctness scope, verified.
+- **Section count format** `(len(print)/len(msgs))` gives the operator at-a-glance fraction-surfaced — bonus UX touch beyond the basic suppression banner.
+- **"Still dropped from parquet" parenthetical** in the suppression banner: operator-grade clarity about what filtering does and doesn't change.
+- **Backwards-compat preserved** for standalone CLI via `symbols_filter=None` default + explicit test.
+- **Return-type plumbing changes are mechanical** (3 functions + 1 caller updated symmetrically; existing tests minorly updated to unpack tuples; assertion content unchanged).
+
+### Math
+
+- LOC: +292 / -39 = +253 net. ✓ Matches `292 insertions, 39 deletions`.
+- Test count: 861 passed + 8 skipped + 2 deselected (+3 net vs 50de591). ✓
+
+### Behavior delta
+
+- Operator's prefetch console output: previously ~thousands of lines of unscannable per-date enumeration for NIFTY/BANKNIFTY/etc. mismatches the operator didn't ask about. **Now**: 4-symbol prefetch shows diagnostics scoped to {PNB, SBIN, BHEL, RELIANCE} + a single `Suppressed N` line + compressed value-runs for any remaining bhavcopy-internal cases.
+- Parquet content + sweep-time behavior: **identical**.
+- Standalone CLI (`python scripts/build_lot_size_parquet.py`): unchanged (no filter, no compression suppression).
+
+### State-of-tree
+
+- All correctness fixes from this session's review chain (F1, F1-B, F5, lot_sizes mtime predicate, stale-cache hook) hold.
+- This commit is pure operator UX on the lot-size pipeline — no impact on the gate exercise's correctness path.
+- Operator's next prefetch will have substantially cleaner Step 2b output. The gate exercise itself is unblocked across all observed failure modes.
+
+### Open grills (unchanged from prior reviews)
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer per priority.
+- **Grill #1 from 6bc95e9** (iterdir order for `first_newer` triage string) — MINOR; defer.
+- **F3** (expiry physical-settlement STT) — defer, non-blocking.
+
+### MCP arc state
+
+Unchanged at 16/16. This commit is in the prefetch / build-script layer.
+
+### Next-commit suggestion
+
+Unchanged:
+
+1. **Operator gate exercise → P1.7** (all observed blockers + display drift closed; diagnostic output now scannable).
+2. **Optional small-fixes**: Grill #1 from 12893ea + Grill #1 from 6bc95e9 (~25 LOC combined).
+3. **F3 STT caveat** — defer further.
+
+Migration cadence: **P0.1 ✓ → ... → F5 ✓ → diagnostic UX cleanup ✓ → (operator gate exercise — scannable output, all blockers closed) → P1.7 → ...**
+
+Standing by.
+
+---
