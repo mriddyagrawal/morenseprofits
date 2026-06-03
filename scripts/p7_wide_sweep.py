@@ -37,7 +37,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-from src.data import bhavcopy_fo_loader, expiry_calendar, options_loader, spot_loader  # noqa: E402
+from src.data import bhavcopy_fo_loader, options_loader, spot_loader  # noqa: E402
+from src.data.lot_size_lookup import expiries_for_symbols  # noqa: E402
 from src.engine.sweeper import _compute_run_id, sweep_grid  # noqa: E402
 
 
@@ -138,17 +139,25 @@ def main() -> int:
           f"{(WALL_TODAY - anchor).days} day(s) for usable bhavcopy)")
     TODAY_FN = lambda: anchor  # noqa: E731 — local override for the rest of main
 
-    _h(f"Building expiry list ({EXPIRY_FROM.isoformat()} → {EXPIRY_TO.isoformat()})")
-    all_expiries: set = set()
-    for sym in symbols:
-        try:
-            exps = expiry_calendar.monthly_expiries(sym, EXPIRY_FROM, EXPIRY_TO)
-            print(f"  {sym}: {len(exps)} expiries")
-            all_expiries.update(exps)
-        except Exception as e:
-            print(f"  ⚠ {sym}: failed to load expiries ({type(e).__name__}: {e})")
-    expiries = sorted(all_expiries)
-    print(f"  union of expiries across symbols: {len(expiries)}")
+    # Expiry list derives from lot_sizes.parquet's expiry_date column
+    # (added 2026-06-04): one parquet read covers all 50 symbols, and
+    # the (sym, expiry-month) pairs excluded by lot-size mismatch are
+    # automatically absent from the iteration. Replaces the prior
+    # per-symbol expiry_calendar.monthly_expiries scan which re-read
+    # the same monthly bhavcopy ~50× to assemble per-symbol lists.
+    _h(f"Loading expiry list from lot_sizes.parquet ({EXPIRY_FROM.isoformat()} → {EXPIRY_TO.isoformat()})")
+    expiries = expiries_for_symbols(symbols, EXPIRY_FROM, EXPIRY_TO)
+    if not expiries:
+        print(
+            "  ⚠ no expiries found in lot_sizes.parquet for the symbol set. "
+            "Either the cache is empty (run scripts/prefetch_universe.py to "
+            "populate) OR all (sym, expiry-month) pairs were excluded by "
+            "lot-size mismatch — re-check the prefetch's Step 2b output."
+        )
+    else:
+        print(
+            f"  {len(expiries)} expiries  ({min(expiries)} → {max(expiries)})"
+        )
 
     n_valid_pairs = sum(
         1 for e in ENTRY_OFFSETS_TD for x in EXIT_OFFSETS_TD if e > x

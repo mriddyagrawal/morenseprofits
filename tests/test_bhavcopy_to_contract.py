@@ -32,6 +32,7 @@ from src.data.bhavcopy_to_contract import (
 from src.data.errors import MissingTurnoverError
 from src.data.lot_size_lookup import (
     _load_lot_sizes_parquet,
+    expiries_for_symbols,
     lot_size_lookup,
     reset_lookup_cache,
 )
@@ -89,6 +90,107 @@ def test_lot_size_lookup_is_case_insensitive_on_symbol(tmp_path):
     _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 6, 8000)])
     assert lot_size_lookup("pnb", date(2024, 6, 27)) == 8000
     assert lot_size_lookup("Pnb", date(2024, 6, 27)) == 8000
+
+
+# ============================================================
+# expiries_for_symbols — sweep's expiry-list builder
+# ============================================================
+
+def test_expiries_for_symbols_empty_when_parquet_missing(tmp_path):
+    """No parquet on disk (= prefetch never ran) → empty list. The
+    sweep treats this as "no work" and prints a no-op message — the
+    operator then runs the prefetch."""
+    assert expiries_for_symbols(["PNB"], date(2024, 1, 1), date(2026, 12, 31)) == []
+
+
+def test_expiries_for_symbols_returns_sorted_unique_in_range(tmp_path):
+    """Round-trip a fixture with multiple symbols across multiple
+    months; assert the output is the de-duplicated, sorted union of
+    expiry_date values that fall in the requested range."""
+    _write_lot_sizes_parquet(tmp_path, [
+        ("PNB", 2024, 6, 8000),       # expiry 2024-06-27 (last Thu)
+        ("PNB", 2024, 7, 8000),       # expiry 2024-07-25
+        ("PNB", 2024, 8, 8000),       # expiry 2024-08-29
+        ("RELIANCE", 2024, 6, 250),   # expiry 2024-06-27 (dup with PNB)
+        ("RELIANCE", 2024, 8, 250),   # expiry 2024-08-29 (dup with PNB)
+        ("RELIANCE", 2025, 1, 250),   # expiry 2025-01-30
+    ])
+    out = expiries_for_symbols(
+        ["PNB", "RELIANCE"], date(2024, 1, 1), date(2024, 12, 31),
+    )
+    # Union deduped to 4 distinct dates, sorted, range-filtered.
+    assert out == [
+        date(2024, 6, 27),
+        date(2024, 7, 25),
+        date(2024, 8, 29),
+    ]
+
+
+def test_expiries_for_symbols_respects_symbol_filter(tmp_path):
+    """A row whose symbol isn't in the input filter MUST NOT
+    contribute to the returned expiry list."""
+    _write_lot_sizes_parquet(tmp_path, [
+        ("PNB", 2024, 6, 8000),
+        ("RELIANCE", 2024, 7, 250),
+    ])
+    # Only PNB → no 2024-07-25 in output.
+    assert expiries_for_symbols(
+        ["PNB"], date(2024, 1, 1), date(2024, 12, 31),
+    ) == [date(2024, 6, 27)]
+
+
+def test_expiries_for_symbols_respects_date_range(tmp_path):
+    """Expiries outside ``[from_date, to_date]`` MUST NOT be returned."""
+    _write_lot_sizes_parquet(tmp_path, [
+        ("PNB", 2024, 5, 8000),   # 2024-05-30
+        ("PNB", 2024, 6, 8000),   # 2024-06-27
+        ("PNB", 2024, 7, 8000),   # 2024-07-25
+        ("PNB", 2024, 8, 8000),   # 2024-08-29
+    ])
+    out = expiries_for_symbols(
+        ["PNB"], date(2024, 6, 1), date(2024, 7, 31),
+    )
+    assert out == [date(2024, 6, 27), date(2024, 7, 25)]
+
+
+def test_expiries_for_symbols_is_case_insensitive_on_symbol(tmp_path):
+    """Operator-facing consistency: mixed-case input matches uppered
+    cache values (mirrors ``lot_size_lookup``)."""
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 6, 8000)])
+    assert expiries_for_symbols(
+        ["pnb"], date(2024, 1, 1), date(2024, 12, 31),
+    ) == [date(2024, 6, 27)]
+
+
+def test_expiries_for_symbols_excluded_pairs_absent(tmp_path):
+    """LOAD-BEARING: (sym, expiry-month) pairs excluded by lot-size
+    mismatch are absent from the parquet → automatically absent from
+    the expiry iteration. No `OfflineCacheMiss` skip rows from
+    iterating an excluded pair.
+
+    Simulated by ABBOTINDIA 2024-05 being absent from the fixture
+    (mirrors the real ABBOTINDIA Apr-16/May-16 sidecar conflict
+    documented in build_lot_size_parquet tests)."""
+    _write_lot_sizes_parquet(tmp_path, [
+        # ABBOTINDIA 2024-05 absent (= excluded by the build).
+        ("ABBOTINDIA", 2024, 6, 20),
+        ("ABBOTINDIA", 2024, 7, 20),
+    ])
+    out = expiries_for_symbols(
+        ["ABBOTINDIA"], date(2024, 5, 1), date(2024, 7, 31),
+    )
+    # 2024-05-30 NOT in output — exclusion propagated.
+    assert date(2024, 5, 30) not in out
+    assert date(2024, 6, 27) in out
+    assert date(2024, 7, 25) in out
+
+
+def test_expiries_for_symbols_rejects_inverted_range(tmp_path):
+    """Operator-error guard: from_date > to_date raises loudly."""
+    with pytest.raises(ValueError, match="from_date.*>.*to_date"):
+        expiries_for_symbols(
+            ["PNB"], date(2024, 7, 1), date(2024, 6, 1),
+        )
 
 
 # ============================================================
@@ -991,13 +1093,21 @@ def _write_lot_sizes_parquet(
 ):
     """Write a minimal unified lot-sizes parquet with (sym, year,
     month, lot_size) tuples — mimics what build_lot_size_parquet
-    would produce."""
+    would produce. The ``expiry_date`` column (added 2026-06-04) is
+    auto-derived as the algorithmic last-Thursday of (year, month)
+    so tests that don't care about expiry_date continue to round-trip
+    against the post-refactor schema."""
+    from scripts.build_lot_size_parquet import _last_thursday_of_month
     df = pd.DataFrame({
         "symbol": pd.Series([r[0] for r in rows], dtype="string"),
         "year":   pd.Series([r[1] for r in rows], dtype="int64"),
         "month":  pd.Series([r[2] for r in rows], dtype="int64"),
         "lot_size": pd.Series([r[3] for r in rows], dtype="int64"),
         "source": pd.Series(["sidecar"] * len(rows), dtype="string"),
+        "expiry_date": pd.Series(
+            [pd.Timestamp(_last_thursday_of_month(r[1], r[2])) for r in rows],
+            dtype="datetime64[us]",
+        ),
     })
     path = cache_root / "lot_sizes.parquet"
     df.to_parquet(path, index=False)

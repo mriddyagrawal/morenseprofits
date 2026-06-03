@@ -1,4 +1,4 @@
-"""Lookup helper over the unified ``data/cache/lot_sizes.parquet``.
+"""Lookup helpers over the unified ``data/cache/lot_sizes.parquet``.
 
 The unified cache is built by ``scripts/build_lot_size_parquet.py``
 (P0.2) from BOTH committed sidecars (regime B) AND the sibling
@@ -12,10 +12,19 @@ Public API:
       the pair is excluded (cross-source mismatch) / the cache
       doesn't exist yet (prefetch hasn't run).
 
-Consumers (the bhavcopy-to-contract transform in P1.3; future
-MCP tools that want operator-facing lot_size data) treat None as a
-structural skip signal — the cell is unbacktestable per the
-per-pair-exclude policy.
+  ``expiries_for_symbols(symbols, from_date, to_date) -> list[date]``
+      Sorted unique list of OPTSTK expiry dates for the given
+      symbol set in the inclusive date range. Reads from
+      ``expiry_date`` column added 2026-06-04 — replaces the
+      per-symbol bhavcopy scan that ``expiry_calendar.monthly_expiries``
+      does. Per-pair lot-size exclusions automatically propagate
+      (excluded pairs are absent from the parquet → never iterated
+      by the sweep).
+
+Consumers (the bhavcopy-to-contract transform in P1.3; the sweep's
+expiry-list builder; future MCP tools that want operator-facing
+lot_size data) treat None / empty-list as a structural skip signal —
+the cell is unbacktestable per the per-pair-exclude policy.
 
 Cache-read is module-level memoized via lru_cache(maxsize=1) — the
 parquet is read ONCE per process and held for the worker's lifetime.
@@ -27,6 +36,7 @@ process invocation, so each gets its own fresh read.
 from __future__ import annotations
 
 import functools
+from collections.abc import Iterable
 from datetime import date
 
 import pandas as pd
@@ -88,6 +98,42 @@ def lot_size_lookup(symbol: str, expiry: date) -> int | None:
     if len(match) == 0:
         return None
     return int(match.iloc[0]["lot_size"])
+
+
+def expiries_for_symbols(
+    symbols: Iterable[str], from_date: date, to_date: date,
+) -> list[date]:
+    """Sorted unique list of OPTSTK expiry dates for ``symbols`` whose
+    ``expiry_date`` falls in ``[from_date, to_date]`` inclusive.
+
+    Reads from the ``expiry_date`` column on
+    ``data/cache/lot_sizes.parquet``. (sym, expiry-month) pairs that
+    were excluded by lot-size mismatch during the build are absent from
+    the parquet, so the returned list automatically respects exclusions
+    — no `OfflineCacheMiss` skip rows from sweeping an excluded pair.
+
+    Cold-cache (parquet missing / empty) returns ``[]``. The sweep
+    treats this as "no work to do" and prints a no-op message; the
+    operator runs the prefetch (which builds the parquet) and re-runs.
+
+    Symbol matching is case-insensitive on the input list (stored
+    parquet symbols are always upper).
+    """
+    if from_date > to_date:
+        raise ValueError(f"from_date {from_date} > to_date {to_date}")
+    df = _load_lot_sizes_parquet()
+    if df.empty:
+        return []
+    sym_set = {s.upper() for s in symbols}
+    mask = (
+        df["symbol"].isin(sym_set)
+        & (df["expiry_date"] >= pd.Timestamp(from_date))
+        & (df["expiry_date"] <= pd.Timestamp(to_date))
+    )
+    if not mask.any():
+        return []
+    out = df.loc[mask, "expiry_date"].dt.date.unique().tolist()
+    return sorted(out)
 
 
 def reset_lookup_cache() -> None:
