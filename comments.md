@@ -17848,3 +17848,115 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of 65721c3 — `test(bhavcopy_to_contract.batch_zero_contracts_symmetry)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Closes Grill #1 from dac9a6c (review of b3f4618) cleanly. Single test, four invariants locked simultaneously. LOC budget came in at +77 vs my indicative ~25 — and the over-budget is fully justified by the multi-invariant assertions packed into one fixture pass.
+
+### Grill #1 from b3f4618 — CLOSED
+
+The b3f4618 commit shifted both per-contract AND batch zero-contracts checks from `.any()` → `.all()`. Per-contract path got two tests covering both directions; batch path's symmetric change was unexercised. A future regression that re-tightens `materialize_contracts_batch` (e.g., reintroduces `.any()`) would silently re-reject ~97% of contracts at sweep time with no test firing.
+
+This commit lands the missing batch-symmetry test.
+
+### Test design verified
+
+`test_batch_skips_never_traded_contracts_with_named_reason` uses one fixture, two contracts, four invariants:
+
+**Fixture:**
+- Day 1 (2024-07-22): BOTH strikes have `contracts=0` (listing-lag day).
+- Day 2 (2024-07-23): 100 CE STILL zero (truly never traded); 105 CE trades (`contracts=50`).
+
+**Invariants locked:**
+
+1. **`.all()` semantic active in batch path** — 100 CE is in `skipped_missing_turnover` (every day zero); 105 CE is in `materialized` (only day-1 zero). Counter assertions:
+
+   ```python
+   assert counts["materialized"] == 1
+   assert counts["skipped_missing_turnover"] == 1
+   assert counts["already_cached"] == 0
+   ```
+
+   If a regression flipped back to `.any()`, both contracts would be in `skipped_missing_turnover` (105 CE has a zero day) → `materialized == 0` would fail LOUD.
+
+2. **Skip-log message string match** — operator-triage surface matches the per-contract path:
+
+   ```python
+   never_traded_rows = [row for row in counts["skip_log"]
+                       if "never traded" in str(row[4])]
+   assert len(never_traded_rows) == 1
+   assert never_traded_rows[0][0] == "PNB"
+   assert never_traded_rows[0][2] == 100.0
+   assert never_traded_rows[0][3] == "CE"
+   ```
+
+   Locks the operator-facing message + (sym, strike, opt) coordinates. A future rename of the skip-log message would fail this assertion.
+
+3. **Partial-zero contracts pass through with `volume=0` on the zero day** — positive control:
+
+   ```python
+   p105 = cache.option_path("PNB", pnb_exp, 105.0, "CE")
+   df105 = cache.read(p105)
+   assert len(df105) == 2
+   assert (df105["volume"] == [0, 50 * 8000]).all()
+   ```
+
+   Verifies on-disk parquet content. Row order is correct because `_assemble_output_frame` sorts by date ascending (day 7-22 first → volume=0; day 7-23 second → volume=400000).
+
+4. **Never-traded contracts produce NO parquet** — anti-orphan assertion:
+
+   ```python
+   p100 = cache.option_path("PNB", pnb_exp, 100.0, "CE")
+   assert not p100.exists()
+   ```
+
+   Catches a subtle future regression where someone "helpfully" writes an empty placeholder parquet for a skipped contract. Operator's cache would carry orphan empty files; downstream consumers would treat the file as a cache hit and silently produce empty timeseries.
+
+### Pytest
+
+```
+tests/test_bhavcopy_to_contract.py::test_batch_skips_never_traded_contracts_with_named_reason PASSED
+============================== 1 passed in 0.11s ===============================
+```
+
+### Praises
+
+- **Single fixture exercises BOTH branches** — never-traded contract + partial-zero contract in the same `materialize_contracts_batch` call. Tests the batch's groupby + dispatch logic exhaustively in one pass.
+- **Anti-orphan assertion** (`not p100.exists()`) — catches the future regression where a "helpful" empty-placeholder write would silently corrupt the downstream cache contract.
+- **Four invariants in one test** — LOC-efficient: each invariant could regress independently, but the over-budget +77 vs indicative +25 is justified because:
+    - Splitting into 4 separate tests would have required 4 fixture setups (~3-4× LOC).
+    - The grouped invariants are semantically coupled (all flow from the `.all()` decision), so one test is the right granularity.
+- **Skip-log message string match** locks the operator-triage surface, not just the counter — symmetric with the per-contract path's exception-message match.
+- **`(df105["volume"] == [0, 50 * 8000]).all()`** depends on sorted-date row order — exercising the `_assemble_output_frame` sort + reset_index machinery in addition to the batch-path's zero-contracts decision.
+
+### Math
+
+- LOC: +77 / -0 = +77 net. ✓ Matches `77 insertions, 0 deletions`.
+- Test count: 862 → 863 (+1 net). ✓ Pure additive — no in-place rewrites.
+
+### Behavior delta
+
+None on the runtime — this is a test commit. The fixture is fully self-contained (synthetic bhavcopies + lot-sizes parquet → batch call → assertions). No real cache touched.
+
+### State-of-tree
+
+Operator-side gate exercise still unblocked. P1.7 still gated on operator-side PASS verdict from the smoke comparison.
+
+### Open grills
+
+- **Grill #1 from ef4f71b** (per-contract vs batch case-sensitivity divergence): still open; not load-bearing; defer at BUILDER's discretion.
+- ~~Grill #1 from b3f4618~~ — **CLOSED by this commit.** ✓
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+Same as before: **operator-side gate exercise → P1.7 with PASS metrics**. The case-sensitivity grill (ef4f71b) remains the last optional small-fix; BUILDER may close it standalone or fold into a future commit.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → (operator gate exercise — unblocked, ALL observed failure modes resolved, batch zero-contracts symmetry locked) → P1.7 → P1.8 → ...**
+
+Standing by.
+
+---
