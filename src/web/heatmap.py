@@ -1218,16 +1218,24 @@ def _build_cell_csv(rows: pd.DataFrame) -> bytes:
             exit_turn = leg.get("exit_turnover")
             entry_px = leg.get("entry_px")
             exit_px = leg.get("exit_px")
-            # Post-F1: turnover is rupees, pnl.TURNOVER_SCALE_FACTOR=1.0,
-            # so notional/share = turnover / volume (no ×1e5 scaling).
+            strike_val = leg.get("strike")
+            # Post-F1: turnover is rupees, pnl.TURNOVER_SCALE_FACTOR=1.0.
+            # The column name ``*_vwap_implied`` advertises the engine's
+            # premium VWAP (the actual fill price), NOT the underlying-
+            # notional flow. Recovered premium = turnover/volume − strike
+            # — matches src/engine/pnl._compute_vwap exactly so the
+            # operator's CSV audit lines up with the engine's own VWAP
+            # decision. Returns None when any input is missing or when
+            # the strike isn't carried on the leg (back-compat with
+            # legacy legs_json that pre-dated the strike field).
             entry_vwap_implied = (
-                float(entry_turn) / float(entry_vol)
-                if (entry_turn is not None and entry_vol)
+                float(entry_turn) / float(entry_vol) - float(strike_val)
+                if (entry_turn is not None and entry_vol and strike_val is not None)
                 else None
             )
             exit_vwap_implied = (
-                float(exit_turn) / float(exit_vol)
-                if (exit_turn is not None and exit_vol)
+                float(exit_turn) / float(exit_vol) - float(strike_val)
+                if (exit_turn is not None and exit_vol and strike_val is not None)
                 else None
             )
             out_rows.append({

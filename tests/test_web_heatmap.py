@@ -1216,17 +1216,28 @@ def test_classify_fill_source_unknown_for_nan_entry_px():
 
 def test_build_cell_csv_emits_one_row_per_leg_per_trade():
     """CSV export flattens trades-by-leg. A 2-trade cell with 2 legs
-    per trade → 4 rows."""
+    per trade → 4 rows. Fixture pins the F5 fix
+    (heatmap.py:_build_cell_csv) that recovered-premium VWAP must
+    subtract strike — pre-F5 ``entry_vwap_implied`` returned
+    notional/share (≈ strike + premium) producing CSV rows where
+    entry_px=20.0 sat next to vwap_implied=3024.78 + fill_source='vwap'
+    (spurious 15× divergence, operator-confusing). Post-F5 the column
+    is the engine's premium VWAP — same value the engine fills at."""
     import json
     import pandas as pd
     from src.web.heatmap import _build_cell_csv
+    # Post-F1 (rupees, SCALE=1.0) AND post-F5 (premium = notional - strike):
+    # strike=2600, entry_premium=20, entry_volume=50000 →
+    # entry_turnover = (2600+20) × 50000 = 131,000,000 rupees.
+    # vwap_implied = 131_000_000 / 50_000 - 2600 = 2620 - 2600 = 20. ✓
+    # exit_premium=5 → exit_turnover = (2600+5) × 50000 = 130,250,000 rupees.
     leg = {
         "strike": 2600.0, "option_type": "CE", "side": "SELL",
         "qty_lots": 1, "lot_size": 250,
         "entry_px": 20.0, "entry_volume": 50000, "entry_oi": 1000,
-        "entry_turnover": 10.0,  # vwap_implied = 20.0 → vwap
+        "entry_turnover": 131_000_000.0,
         "exit_px": 5.0, "exit_volume": 50000, "exit_oi": 800,
-        "exit_turnover": 2.5,
+        "exit_turnover": 130_250_000.0,
         "entry_px_realized": 19.8, "exit_px_realized": 5.05,
         "gross_pnl": 3700.0,
     }
@@ -1244,8 +1255,29 @@ def test_build_cell_csv_emits_one_row_per_leg_per_trade():
     # Header + 4 data rows (2 trades × 2 legs each)
     lines = [line for line in decoded.split("\n") if line.strip()]
     assert len(lines) == 5  # 1 header + 4 data rows
-    # entry_fill_source for this fixture should be 'vwap' (matches)
-    assert "vwap" in decoded
+
+    # Parse the CSV properly so the assertions target the right cells
+    # — earlier "vwap" in decoded would match the header substring
+    # alone and could never catch a fill_source bug.
+    import io as _io
+    df = pd.read_csv(_io.BytesIO(csv_bytes))
+    assert list(df["entry_fill_source"]) == ["vwap"] * 4, (
+        f"entry_fill_source classification regressed; got "
+        f"{list(df['entry_fill_source'])}"
+    )
+    assert list(df["exit_fill_source"]) == ["vwap"] * 4, (
+        f"exit_fill_source classification regressed; got "
+        f"{list(df['exit_fill_source'])}"
+    )
+    # F5 anchor: entry_vwap_implied is the recovered PREMIUM (matches
+    # entry_px), not notional/share. Pre-F5 this was 2620.0 (notional/
+    # share = strike + premium) and the test silently passed because
+    # the weak `"vwap" in decoded` assertion matched the header.
+    assert df["entry_vwap_implied"].iloc[0] == pytest.approx(20.0)
+    assert df["exit_vwap_implied"].iloc[0] == pytest.approx(5.0)
+    # Operator-facing column name post-F1-B: rupees, not lakhs.
+    assert "entry_turnover_rupees" in df.columns
+    assert "entry_turnover_lakhs" not in df.columns
 
 
 def test_build_cell_csv_empty_cell_returns_header_only():
