@@ -21242,3 +21242,88 @@ Migration cadence: **... → expiry_date column ✓ → 1B (sweep wiring; test B
 Standing by for the test fix.
 
 ---
+
+## 🚨 SELF-CORRECTION on 19e4ec9 (my 37b2f75 review) + Review of 8c8a625 — `fix(prefetch.lot_sizes_rebuild_predicate.schema_staleness)` — ✅ ACCEPT
+
+### Self-correction: my REQUEST CHANGES on 37b2f75 was WRONG
+
+**At 37b2f75 HEAD, the predicate test PASSES** (independently verified via `git checkout 37b2f75 && pytest`: 1 passed). 37b2f75 doesn't touch `scripts/prefetch_universe.py` (empty diff on that path). **The schema-sniff that broke the test was added in 8c8a625**, not 37b2f75.
+
+My pytest result "1 failed, 869 passed" was on a transient working-tree state caused by 8c8a625's intermediate landing (predicate change visible before its fixture-update commit synced to my disk). When I now re-run at HEAD (`19e4ec9`): **872 passed, 8 skipped**.
+
+**I saw the 8c8a625 notification before committing my 19e4ec9 review but didn't re-verify pytest.** Classic [[feedback_check_log_between_reviews]] failure mode — "watcher firing on my own review commit doesn't mean nothing else landed; re-grep `git log --oneline -5` before acknowledging." I should have re-grepped after the 8c8a625 notification and re-run pytest.
+
+**Updated verdict on 37b2f75 (1B sweep wiring)**: ✅ ACCEPT. Clean perf refactor that retires the 50× per-symbol bhavcopy scan; 7 new tests for `expiries_for_symbols` all pass; the load-bearing `excluded_pairs_absent` test pins per-pair exclusion flow. BUILDER's claim "Full suite: 870 passed" was correct at 37b2f75 HEAD.
+
+### 🟢 Review of 8c8a625 — Grill #5 closure done right + cleanup
+
+**Verdict: ✅ ACCEPT.** Closes Grill #5 from 50b6a84 with the centralized-constant pattern I praised in my (now-misdirected) 19e4ec9 review:
+
+```python
+_LOT_SIZES_REQUIRED_COLUMNS = (
+    "symbol", "year", "month", "lot_size", "source", "expiry_date",
+)
+```
+
+Schema-sniff via `pyarrow.parquet.read_schema` (~ms, no data read). Triggers rebuild if any required column missing. Future contributors adding columns to `build_lot_size_parquet` must also update this constant — structural drift-prevention.
+
+### Defensive corollary verified
+
+Corrupt parquet (unreadable bytes) → `pq.read_schema` raises → predicate returns `(True, "failed to read schema ...")` instead of crashing the prefetch. **On-disk corruption is self-healing.** The rebuild from sidecars + bhavcopy siblings restores correctness.
+
+This is also why my transient pytest failure surfaced — the placeholder `b"placeholder"` in the pre-update test fixture is "corrupt parquet" from the predicate's POV, so the new behavior is to rebuild. The fixture update + predicate change had to land together; landing them in one commit was correct.
+
+### Test coverage verified
+
+- `test_lot_sizes_needs_rebuild_detects_schema_staleness` (NEW, load-bearing): pre-fbb8e35-shape parquet (no `expiry_date`) MUST trigger rebuild. Reason names the missing column for operator visibility. ✓
+- `test_lot_sizes_needs_rebuild_detects_corrupt_parquet` (NEW): unreadable bytes → rebuild rather than crash; self-healing. ✓
+- `test_lot_sizes_needs_rebuild_predicate_pins_three_cases` UPDATED: uses `_write_current_schema_parquet` helper to produce valid current-schema parquet → existing branches exercised independently of the new schema check. ✓
+
+### Pytest
+
+```
+Full suite: 872 passed + 8 skipped + 2 deselected
+```
+
+Matches BUILDER's claim. +2 net vs the (theoretical) 870 at 37b2f75 (BUILDER added 2 new tests + replaced fixture content in existing one).
+
+### Praises
+
+- **Closes Grill #5 the right way** — `_LOT_SIZES_REQUIRED_COLUMNS` constant in lockstep with build script's emitted columns; future-proof against schema drift.
+- **Schema-sniff via pyarrow** — cheap (~ms), no data load, defensible cost.
+- **Defensive corollary** — corrupt parquet self-heals via rebuild rather than crashing prefetch.
+- **Load-bearing test** for the staleness branch + dedicated test for corruption branch + updated existing test to use valid fixture. Three-way coverage.
+- **Cross-references all the right commits** — 50b6a84 (Grill #5 raise), fbb8e35 (column add), 37b2f75 (consumer), 6bc95e9 (predicate origin).
+- **Explicitly notes the relationship to Grill #1 from 12893ea** — same family, can be folded into a single cache-version-stamping commit for per-contract caches.
+
+### Math
+
+- LOC: +39 (src) + +81 (test) = +120 / -4 net. ✓ Matches.
+- Test count: +2 new + 1 fixture-update in place = +2 net (870 → 872). ✓
+
+### Behavior delta
+
+- Operator with pre-fbb8e35 lot_sizes.parquet + post-37b2f75 code: auto-rebuild now triggered. No KeyError on `expiries_for_symbols`.
+- Corrupt parquet self-heals.
+- Operator's immediate state unchanged (parquet wiped → cold-cache branch).
+
+### State-of-tree
+
+- **Grill #5** — CLOSED. ✓
+- 37b2f75 — ✅ ACCEPT (corrected verdict).
+- 8c8a625 — ✅ ACCEPT.
+- All open follow-ups remain: smoke-gate replacement (P1.8b), MCP legacy-LTP caveat, Phase 2b cross-boundary smoke test, F3, Grill #1 from 12893ea (per-contract cache-version stamping — could fold with the schema-version pattern BUILDER established here), Grill #1 from 6bc95e9 (iterdir order, MINOR).
+
+### MCP arc state
+
+16/16.
+
+### Lesson logged (no new memory; existing entry covers it)
+
+The chronology error reinforces [[feedback_check_log_between_reviews]]: even when I see a notification mid-review-write, I should re-grep `git log` AND re-run pytest before committing the review. The cost (2 extra commands) is much lower than the cost of a misdirected REQUEST CHANGES that BUILDER then has to publicly acknowledge.
+
+Migration cadence: **... → expiry_date column ✓ → 1B (sweep wiring) ✓ → Grill #5 closure ✓ → 🚩 operator re-sweep → P1.8b → ...**
+
+Standing by.
+
+---
