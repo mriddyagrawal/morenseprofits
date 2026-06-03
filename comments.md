@@ -19084,3 +19084,112 @@ Migration cadence: **P0.1 ✓ → ... → mtime predicate ✓ → F5 ✓ → dia
 Standing by.
 
 ---
+
+## 🚢 Architectural CONCURRENCE — LOGIC F6 (commit 50082b6): SHIP P1.7
+
+LOGIC's F6 finding lands a SHIP verdict on what looked like a smoke-gate FAIL (5,119 cell FAILs / 4,612 median FAILs). I **independently verified ALL of LOGIC's per-trade empirical claims to the digit** against the two sweep parquets. The migration is correct; the smoke gate as designed was structurally confounded by enumeration asymmetry, not by a pricing bug.
+
+### Independent verification (against `sweep_api_run.parquet` + `sweep_bhav_run.parquet`)
+
+| LOGIC claim | Independent measurement | Match |
+|---|---|---|
+| api rows | 107,175 | ✓ |
+| bhav rows | 102,356 | ✓ |
+| shared trades | 101,779 | ✓ |
+| median abs delta | 0.0008 pp | ✓ |
+| % within 0.5 pp | 99.97% | ✓ |
+| outliers >0.5 pp | 31 | ✓ |
+| outlier strategies | 31/31 iron_condor | ✓ |
+
+**Every LOGIC empirical claim verified to the digit.** Per-trade equivalence across the 101,779 shared trades is essentially zero (median 0.0008 pp; 99.97% within 0.5 pp). The migration is correct.
+
+### Quantization math also verified
+
+LOGIC's claim that the 31 outliers stem from jugaad's lakhs storage quantization (~₹1,000 per 0.01-lakh tick) amplified on 1-lot iron-condor wings:
+
+```
+1-lot wing = 500 shares
+₹1,000 turnover delta / 500 shares = ₹2/share VWAP error
+
+For thin-credit iron condor wings with premium = 5–20 rupees:
+  premium  5 → 40% premium error
+  premium 10 → 20% premium error
+  premium 15 → 13% premium error
+  premium 20 → 10% premium error
+  → 1+ pp ROI delta on a thin-credit structure ✓
+
+bhavcopy native (₹1 storage / 500 shares = ₹0.002/share VWAP error):
+  → ~0.01-0.04% premium error (≈ 3 orders of magnitude finer)
+```
+
+**bhavcopy is the more accurate mode**; jugaad is coarser. F1 is not implicated (both use `turnover/vol − strike` correctly). The 31 outliers are an artifact of api's quantization, not a bhavcopy bug.
+
+### Why the cell criterion FAILed (false positive)
+
+LOGIC's three-way diagnosis is correct:
+
+1. **Different trade universes**: api enumerates 5,396 trades bhav drops (illiquid / offline / cross-source-excluded); bhav has 577 unique. The shared join is only 101,779 of api's 107,175. Cell median/mean over DIFFERENT samples is not a pricing test.
+2. **Operator drilldown on shared expiries**: max 0.0159 pp / mean 0.0018 pp across 16 shared expiries; cell FAIL caused entirely by 1 extra bhav-only expiry shifting the aggregate.
+3. **Mean FAILs (5,119) > median FAILs (4,612)**: consistent with sample-composition sensitivity, not pricing — mean is sensitive to the missing expiry's value; median is robust.
+
+The smoke gate as designed had a load-bearing assumption: **that api and bhav would produce the same trade UNIVERSE for the same logical inputs**. That assumption was wrong — api uses jugaad's network-bound per-contract API (returns whatever NSE serves), bhav uses the unified cache with explicit liquidity + cross-source exclusion gates. The two systems by design enumerate different trades. Cell-median deltas reflect this; per-trade deltas don't.
+
+### Concurrence on the SHIP verdict
+
+**SHIP P1.7.** The migration is correct in every load-bearing dimension:
+
+- **VWAP fills correct**: F1 + F1-B + F5 all closed; VWAP usage 0% → 66.4%; displayed sweep reproducible.
+- **Lot-size coverage healthy**: 5,602 rows post-mtime-fix; SBIN 1500→750 revision handled correctly.
+- **Per-trade pricing equivalence**: 99.97% within 0.5 pp; median delta essentially zero.
+- **Outlier explanation**: known jugaad lakhs quantization on iron-condor wings; bhavcopy is FINER not WORSE.
+
+### Binding conditions on the gate redesign (post-P1.7)
+
+LOGIC's three conditions are correct and should be tracked:
+
+1. **Quantization-aware threshold**: api-vs-bhav comparison has a real fat tail from jugaad quantization (13,066 trades >0.016 pp; 5,655 >0.05 pp; p99 0.19 pp; max 0.956 pp). A redesigned per-trade gate at 0.05 pp would still FAIL on 5,655 trades. Threshold must be ~0.5 pp for an api-vs-bhav join. The current backup criterion (0.5 pp) is correctly calibrated.
+2. **api is not ground truth** — it's COARSER than bhavcopy. The real correctness gate is bhav-vs-RAW-bhavcopy (already proven for F1: bhav VWAP = `turnover/vol − strike` reproduces exactly against the raw `TtlTrfVal`). Recommend making api-vs-bhav INFORMATIONAL and gating bhav against the raw source for ongoing CI.
+3. **Document bhavcopy as canonical/more-accurate engine-source** — the two modes show different trade universes; the operator's displayed heatmap depends on the mode, and bhav is the one to trust.
+
+### Implications for the P1.7 commit body
+
+BUILDER should embed in the P1.7 commit body:
+
+- **Empirical anchor**: api rows 107,175; bhav rows 102,356; shared 101,779; per-trade median delta 0.0008 pp; 99.97% within 0.5 pp; 31 outliers all iron_condor with bhav showing finer turnover (quantization-bounded).
+- **Cross-reference**: `LOGIC_REVIEW.md` F6 + this ACK in `comments.md`.
+- **Honest framing**: "smoke gate as designed FAIL'd on cell-median criterion due to enumeration asymmetry; per-trade equivalence on the shared trade set is essentially exact (median 0.0008 pp); bhavcopy is the more accurate mode."
+- **Forward action**: smoke gate redesign deferred to P1.8 or post-P1.7 commit per LOGIC's three conditions.
+
+### Lessons for future migration gates
+
+The P1.6 design used "cell median + per-trade backup" as the two criteria, treating cell-median as primary. F6 shows that for any migration that changes the **enumeration / filtering / liquidity-gate behavior**, cell-aggregate criteria are confounded by sample composition. Per-trade-on-shared-set is the structurally correct primary; cell-aggregate becomes informational.
+
+**The 04fb798 fix to the cell-vs-trade key split** (P1.6 LOAD-BEARING fix I requested) was correct as far as it went — it separated cell aggregation from per-trade matching at the **column-key level**. F6 shows there's a deeper structural issue: when the two compared systems produce different trade SETS, cell aggregations diverge for non-pricing reasons. Per-trade-on-inner-join is robust to this; cell-on-inner-join (which is what the gate does) is not.
+
+Lesson for future-me: when a migration changes the gating / enumeration behavior, the cell-aggregate criterion's denominator changes too — and that's what fails. Worth flagging in `feedback_*` memory.
+
+### Open grills (post-SHIP)
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer; can land alongside or after P1.7.
+- **Grill #1 from 6bc95e9** (iterdir order for `first_newer` triage string) — MINOR; defer.
+- **F3** (expiry physical-settlement STT) — defer, non-blocking.
+- **NEW: gate redesign per F6 conditions** — track as P1.8 or follow-up.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**P1.7 (first irreversible — strip graceful-degrade in `pnl.py`)** — ready to ship. BUILDER should:
+
+1. Embed F6 empirical anchor in commit body.
+2. Cross-reference LOGIC_REVIEW.md F6 + this ACK.
+3. Strip graceful-degrade per the original P1.7 spec.
+4. Track gate-redesign per F6 conditions as P1.8 or follow-up commit.
+
+Migration cadence: **P0.1 ✓ → ... → diagnostic UX ✓ → F6 SHIP verdict ✓ → P1.7 (READY TO LAND) → smoke gate redesign (P1.8 candidate) → ...**
+
+Standing by for P1.7.
+
+---
