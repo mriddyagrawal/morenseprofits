@@ -346,6 +346,28 @@ On re-examination (operator pushed back on my too-easy "it's decided"), I do **n
 
 Verdict: **accept P1.7 to ship** (0.14% impact), but **F7 stays OPEN** as a correctness-principle follow-up — the rationale as written should not stand, and the safe-direction fix is ~20 LOC.
 
+## F8 — column/units dossier VERIFIED against freshly-downloaded NSE bhavcopies (both regimes)
+
+Operator authorized live download. Fetched raw **regime C** (UDiff, 2024-08-29) and **regime B** (legacy, 2024-05-15) directly from NSE and checked units/columns against ground truth — this closes the §METHODOLOGY gap that legacy `VAL_INLAKH` units were inference-only.
+
+| Assertion | Downloaded-data result | Verdict |
+|---|---|---|
+| **Regime C `TtlTrfVal` = RUPEES** | RELIANCE 2840CE: 19,661,050 / (26 × 250) = **3024.78** ≈ strike 2840 + prem 184.78 ≈ UndrlygPric 3041.85 | ✓ rupees |
+| **Regime B `VAL_INLAKH` = LAKHS** (F1 ×1e5 hinges on this) | RELIANCE 2860CE 2024-05-15: 131,327.52 ×1e5 / (18,114 × 250) = **2900.02** = strike 2860 + **premium-VWAP 40.02**. As rupees it'd be ₹0.029 (absurd). | ✓ **lakhs → F1 ×1e5 CORRECT** |
+
+*Note on the recovered residual (operator caught the ~3 gap vs strike+close):* `notional/share − strike` is the day's **premium VWAP (40.02)**, NOT premium *close* (36.9). The +3.12 gap is genuine VWAP-vs-close divergence — that day the option OPENED 43.25, CLOSED 36.9 (drifted down), and the volume-weighted ~40.02 sits naturally mid-range (∈ [LOW 35.25, HIGH 47.5], between OPEN and CLOSE). It *validates* the recovery (a sensible intraday VWAP bracketed by OHLC) and is exactly the close-is-a-stale-last-print signal the engine uses VWAP for. (Same in regime C: 2840CE VWAP 184.78 vs close 201.70.) `VAL_INLAKH`'s 0.01-lakh rounding over 4.5M shares = ₹0.0002/share — not the source.
+| `TtlTradgVol`/`CONTRACTS` = contracts (not shares) | /(qty×lot) ≈ strike+prem; /qty alone = 756,194 (absurd) — both regimes | ✓ contracts |
+| Legacy has NO ltp | 2024-05-15 columns: no `LTP`/`LAST` present | ✓ (NaN-filled downstream) |
+| Parser markers present | C: all 8 `_UDIFF_MARKERS` present; B: all 7 `_LEGACY_MARKERS` present | ✓ |
+| UDiff instrument codes | `FinInstrmTp ∈ {STO, IDO, STF, IDF}` → `_UDIFF_TO_LEGACY_INSTR` | ✓ |
+| `XpryDt` + `FininstrmActlXpryDt` both present (C) | confirmed | ✓ |
+
+**🚩 ONE DOSSIER ERROR (prose, not code):** the dossier lists regime B `INSTRUMENT` values as **`STKOPT / IDXOPT / STKFUT / IDXFUT`**. Downloaded legacy data shows the real values are **`OPTSTK / OPTIDX / FUTSTK / FUTIDX`**. The **code is correct** (`parse_legacy` keys on `instrument.isin(["OPTSTK","OPTIDX"])`); only the dossier's morphemes are transposed. Fix the dossier before sending it to a validator — as written it contradicts the very parser it claims to match (and would imply every legacy option gets a NaN strike, which is *not* what happens). The `.xlsx` NSE spec also confirms old-format `INSTRUMENT` ← `FinInstrmTp` STO/STF mapping (OPTSTK family).
+
+**Net: all CRITICAL UNIT ASSERTIONS in the dossier are TRUE and now downloaded-data-confirmed for both regimes.** `turnover` is rupees engine-side (B ×1e5, C native); prices/strike rupees; contracts are contracts. OI/oi_change units (dossier claims "contracts"): plausible + NSE convention, but **immaterial to correctness** — no formula scales OI (only the now-dropped `oi==0` boolean + raw display used it).
+
+**Phase-2 (regime B) implication:** with both regimes normalizing turnover → rupees (verified), a contract whose life spans the 2024-07-08 cutover yields a **contiguous rupee `turnover` series with no unit step** — so BUILDER's planned cross-boundary materialization test (Phase 2b) should pass, and it's the right anti-regression to lock the legacy↔UDiff handoff. Legacy `ltp=NaN` is non-pricing (fills use close/VWAP, never ltp), so the MCP LTP caveat (2a) is honest-signal polish, not a correctness fix. BUILDER's "regime B mostly already works post-F1" assessment is **empirically supported**.
+
 ### STATUS (as of `46cbb4f`, P1.7 shipped)
 **Correctness: all clear.** F1/F1-B/F2/F5/F6 closed; coverage bug (`6bc95e9`) fixed; P1.7 VWAP-or-skip shipped + verified; both reviewer streams converged. **Operator action required for the webapp to be "true & best" under P1.7: re-prefetch + re-sweep** (current displayed parquet is pre-P1.7). ### 🚩 PRE-RE-SWEEP GOTCHA (operator about to wipe cache + re-prefetch + re-sweep)
 - **`run_id` is a deterministic hash of the grid; `sweep_grid` returns the cached parquet when `path.exists() and not force` ([sweeper.py:297](src/engine/sweeper.py#L297)); `p7_wide_sweep.py` runs `force=False`; and `data/results/` is NOT under `data/cache/`.** ⟹ wiping the cache does NOT remove `data/results/sweep_*.parquet`, so a same-grid re-run **silently returns the stale pre-P1.7 parquet** instead of re-pricing. **Operator MUST `rm data/results/sweep_*.parquet` (main + `_skipped`) or pass `force=True`** or the entire re-sweep is a no-op returning old data.
