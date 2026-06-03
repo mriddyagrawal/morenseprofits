@@ -101,7 +101,8 @@ DEFAULT_ENTRY_WINDOW_DAYS = 70    # calendar days back from expiry to scan spot
                                   # (~45 trading days; the sweep's T-45..T-1 grid
                                   # depth — strikes the strategy could pick across
                                   # any entry in that window must be cached)
-DEFAULT_START = date(2024, 5, 1)
+DEFAULT_START = date(2024, 4, 15)  # Regime B start (legacy bhavcopy format, parser F1-normalized to rupees).
+                                    # Earlier than this is regime A — out of scope per MIGRATION.md §Goals (4-year window).
 DEFAULT_END = date(2026, 5, 31)
 TODAY_FN = lambda: date(2026, 5, 25)
 
