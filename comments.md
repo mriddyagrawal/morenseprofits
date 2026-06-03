@@ -18801,3 +18801,135 @@ Migration cadence: **P0.1 ✓ → ... → lot_sizes mtime predicate ✓ → F5 f
 Standing by.
 
 ---
+
+## Review of 50de591 — `fix(web.heatmap.drilldown_csv_vwap_implied_subtracts_strike)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** F5 closed cleanly via Option C from my suggestion list (inline `−strike` with strike-availability guard). Anti-regression test rewritten to catch the original silent-pass failure mode I had not noticed. Landed in parallel with my Grill #3 promotion ACK — BUILDER picked up F5 directly from LOGIC's 90c2969 + the operator-confusion empirical anchor.
+
+### Fix verified — Option C with proper guard
+
+`src/web/heatmap.py:1218-1238`:
+
+```python
+strike_val = leg.get("strike")
+# ...comment cross-referencing _compute_vwap for parity...
+entry_vwap_implied = (
+    float(entry_turn) / float(entry_vol) - float(strike_val)
+    if (entry_turn is not None and entry_vol and strike_val is not None)
+    else None
+)
+exit_vwap_implied = (
+    float(exit_turn) / float(exit_vol) - float(strike_val)
+    if (exit_turn is not None and exit_vol and strike_val is not None)
+    else None
+)
+```
+
+- `strike_val` guard mirrors `_classify_fill_source` — consistency win across the display layer.
+- Recovery formula matches `pnl._compute_vwap`: `turnover / volume − strike`.
+- Empirical: for the RELIANCE 2840-CE fixture, `entry_vwap_implied` now produces 184.78 (matches `entry_px`), not 3024.78 (notional/share).
+
+### Test rewrite — caught a silent-pass I had not noticed
+
+Previously `assert "vwap" in decoded` matched the **header substring** `entry_vwap_implied` — so the test passed even if `entry_fill_source` was actually `'close'`. BUILDER explicitly calls this out: "could never catch a fill_source bug." **Now**:
+
+```python
+df = pd.read_csv(io.StringIO(decoded))
+assert df["entry_fill_source"].tolist() == ["vwap"] * 4   # data rows, not header
+assert df["entry_vwap_implied"].iloc[0] == pytest.approx(20.0)
+# Pre-F5 this was 2620.0 and the test silently passed
+assert "entry_turnover_rupees" in df.columns
+assert "entry_turnover_lakhs" not in df.columns
+```
+
+Fixture math verification:
+- strike=2600, premium=20, volume=50,000 → turnover = (2600 + 20) × 50,000 = **131,000,000 rupees**.
+- Recovery: 131,000,000 / 50,000 − 2,600 = 2,620 − 2,600 = **20** = entry_px ✓.
+
+Pre-F5 the test would have asserted 2620.0 (notional/share) and quietly passed. Now it asserts 20 (premium) — the load-bearing invariant. The header-substring trap is closed by `pd.read_csv` parsing.
+
+**Bonus**: the same test pins F1-B's column rename (`entry_turnover_rupees in` / `entry_turnover_lakhs not in`). One test now locks F1, F1-B, AND F5 simultaneously — high-leverage anti-regression.
+
+### Pytest
+
+```
+tests/test_web_heatmap.py: 41 passed in 1.14s
+```
+
+41/41 pass. BUILDER's full-suite claim (858 + 8 skipped + 2 deselected) matches.
+
+### Note (not a grill): Option C carries a small future-drift risk vs Option A (DRY)
+
+`pnl._compute_vwap` includes a guard that returns `None` when `recovered_premium ≤ 0` (deep-OTM ill-conditioning). The inline computation here does NOT replicate this guard — it would return a negative value instead of None.
+
+**Operator-side impact: small.** A negative `vwap_implied` next to `entry_px = 0.05` and `fill_source = 'close'` is correctly interpretable as "engine band-rejected this; the formula's residual flipped negative." The CSV is still meaningful.
+
+**Future-drift concern: real but minor.** If `_compute_vwap` adds new guards (e.g., NaN-clamping, additional bounds), the inline computation in `_build_cell_csv` won't track. Option A (call `pnl._compute_vwap` directly) would eliminate this drift class — same DRY principle that F1 + F1-B + F5 all targeted.
+
+**Not flagging as a grill.** The current fix matches the anti-regression test's expectation; future drift is a known-and-mitigable risk; Option A could land as a small follow-up if the operator finds the engine guards meaningfully diverge in practice. The inline `# matches src/engine/pnl._compute_vwap exactly` comment also signals to future contributors that they should keep the two in sync.
+
+If BUILDER wants to harden this further, a one-commit Option A migration would close the future-drift door:
+
+```python
+from src.engine.pnl import _compute_vwap
+# ...
+entry_vwap_implied = _compute_vwap(
+    turnover=entry_turn, volume=entry_vol, strike=strike_val,
+) if (entry_turn is not None and entry_vol and strike_val is not None) else None
+```
+
+Optional. Defer at discretion.
+
+### Praises
+
+- **Strike-availability guard mirrors `_classify_fill_source`** — consistency across the display layer.
+- **Test rewrite caught a silent-pass failure mode** BUILDER could have left in — explicit "could never catch a fill_source bug" call-out + replacement with `pd.read_csv` parsing.
+- **One test pins three commits' invariants** (F1 + F1-B + F5) — high leverage.
+- **Inline cross-reference comment** (`# matches src/engine/pnl._compute_vwap exactly`) signals the parity-with-engine contract to future contributors. Mitigates the Option-C-vs-A drift risk via documentation.
+- **Hand-checkable fixture math** (strike + premium = 2,620; turnover = 2,620 × 50,000 = 131,000,000) — anchors the new convention with a number an operator can verify on a calculator.
+- **Scope discipline**: Grill #1 (cache-version stamping) explicitly deferred to keep this commit focused on F5.
+
+### Math
+
+- LOC: +20 / -6 (src) + +42 / -5 (test) = +62 / -11 = +51 net. ✓ Matches.
+- Test count: 858 passed + 8 skipped + 2 deselected (unchanged net vs 6bc95e9). ✓ Matches (test rewritten in place; no count change).
+
+### Behavior delta
+
+- Operator-facing CSV download (`render_cell_drilldown` → `_build_cell_csv`) now reports `entry_vwap_implied = entry_turn / entry_vol − strike` (recovered premium VWAP), matching `entry_px` for VWAP-classified fills. **Closes the 1537% spurious-divergence operator-confusion mode LOGIC empirically demonstrated.**
+- Test no longer silently passes on `fill_source = 'close'` regressions.
+
+### State-of-tree
+
+All display-layer F1-class drift closed:
+
+- F1 (engine): closed by 12893ea. ✓
+- F1-B (docstrings + heatmap CSV ×1e5): closed by 029d175. ✓
+- F5 (drill-down `vwap_implied` missing `−strike`): closed by THIS commit. ✓
+
+The operator's drill-down CSV is now safe to use for gate-exercise verification.
+
+### Open grills
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; still open; defer per priority.
+- **Grill #1 from 6bc95e9** (iterdir order for `first_newer` triage string) — MINOR; defer.
+- ~~Grill #3 from 3da7124~~ (LOGIC's F5) — **CLOSED by THIS commit.** ✓
+- **F3** (expiry physical-settlement STT) — defer, non-blocking.
+
+### MCP arc state
+
+Unchanged at 16/16. F5 was in the web display layer; closed without touching MCP.
+
+### Next-commit suggestion
+
+Unchanged:
+
+1. **Operator gate exercise → P1.7** (now genuinely unblocked across F1 + F1-B + F5 + lot_sizes staleness + d276419's stale-cache hook; drill-down CSV is operator-trustable).
+2. **Optional small-fixes commit**: Grill #1 (cache-version stamping) + iterdir-order grill from 6bc95e9. ~25 LOC combined.
+3. **F3 STT caveat** — defer further.
+
+Migration cadence: **P0.1 ✓ → ... → lot_sizes mtime ✓ → F5 drill-down fix ✓ → (operator gate exercise — all display drift closed) → P1.7 → ...**
+
+Standing by.
+
+---
