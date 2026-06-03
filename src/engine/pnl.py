@@ -206,11 +206,25 @@ def _pick_fill_price(
          use VWAP UNCONDITIONALLY. Skip the band check — at this
          trade count the VWAP integrates over enough distinct
          clears to be structurally more stable than the single
-         closing print, and the band's "thin-contract single-trade
-         outlier" concern doesn't apply. Symbol-invariant by
-         construction.
-      4. Otherwise (thin contract: contracts_traded < threshold),
-         check the band:
+         closing print. Symbol-invariant by construction. On
+         liquid contracts the OI check below also doesn't apply —
+         a contract clearing ≥20 trades a day is a real fill
+         regardless of overnight OI.
+      4. ``oi == 0`` AND ``contracts_traded < bypass`` (thin
+         contract that nobody held overnight): raise
+         ``MissingTurnoverError`` per F7 (logic-review 1597aec +
+         arch self-correction 5fab6e6, 2026-06-03). The fill is
+         priceable on paper (volume > 0 → trades cleared) but the
+         backtest models holding the leg N days — and OI=0 means
+         empirically nobody DID hold this contract overnight. So
+         the trade we're modelling never actually happened in the
+         market. Skip honestly per the P1.7 skip-don't-fudge
+         principle. Empirical anchor (logic-review 76ac14d):
+         100% of the pre-fix oi==0+thin trades were far-dated
+         entries (T-30 to T-42) into "dead far-dated contracts"
+         — the textbook pattern this gate is built for.
+      5. Otherwise (thin contract with non-zero OI), check the
+         VWAP-vs-close band:
          - VWAP-vs-close ratio ∈ [0.5×, 2.0×] → use VWAP.
          - Out of band → raise ``MissingTurnoverError``. On a thin
            contract the band reject signals genuine arithmetic
@@ -298,11 +312,33 @@ def _pick_fill_price(
     # integrates over genuine price discovery; trust VWAP
     # unconditionally and skip the band check. Symbol-invariant —
     # the threshold is the same whether the lot_size is 75 (NIFTY)
-    # or 8000 (PNB).
+    # or 8000 (PNB). On liquid contracts the OI check below also
+    # doesn't apply: a contract clearing ≥20 trades/day is a real
+    # fill regardless of overnight OI.
     if contracts_traded >= _VWAP_LIQUIDITY_BYPASS_CONTRACTS:
         return premium_vwap, lot_size, volume, oi, turnover
 
-    # (4) Thin contract: band-reject → skip.
+    # (4) F7 (logic-review 1597aec + arch self-correction 5fab6e6):
+    # thin contract that NOBODY HELD OVERNIGHT → skip per P1.7's
+    # skip-don't-fudge principle. The fill is priceable on paper
+    # (volume > 0) but the backtest models holding the leg N days
+    # and oi=0 empirically means no one did. Skipping aligns with
+    # the same intuition that strips close-fallback elsewhere in
+    # P1.7 — refuse to book fictional fills. Empirical anchor
+    # (logic-review 76ac14d): 100% of the 160 pre-F7 oi==0+thin
+    # cells were far-dated entries (entry_offset_td 30-42) into
+    # dead far-dated contracts — exactly the dead-contract pattern
+    # this gate is built for, never a near-expiry winddown.
+    if oi == 0:
+        raise MissingTurnoverError(
+            f"{context}: thin contract held by nobody overnight on "
+            f"{target} (oi=0, contracts_traded={contracts_traded} < "
+            f"{_VWAP_LIQUIDITY_BYPASS_CONTRACTS}); F7 — backtest "
+            f"would model holding a leg empirically never held. "
+            f"Cell unpriceable, skipping."
+        )
+
+    # (5) Thin contract with non-zero OI: band-reject → skip.
     ratio = premium_vwap / close if close != 0 else float("inf")
     if not (_VWAP_CLOSE_RATIO_MIN <= ratio <= _VWAP_CLOSE_RATIO_MAX):
         raise MissingTurnoverError(

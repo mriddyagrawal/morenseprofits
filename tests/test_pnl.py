@@ -325,21 +325,25 @@ def test_zero_exit_volume_raises_missing_turnover():
                     slippage_model=_NO_SLIPPAGE)
 
 
-def test_zero_oi_prices_normally_under_p1_7():
-    """Pre-P1.7: oi=0 raised IlliquidLegError on the theory that
-    "no live positions = no counterparty". Under the P1.7 unified
-    spec that gate is dropped — if volume>0 the contract demonstrably
-    cleared trades, so the published OI=0 is at best an anomaly /
-    data-quality issue, not a reason to refuse to price.
+def test_zero_oi_on_thin_contract_raises_missing_turnover_f7():
+    """F7 (logic-review 1597aec + arch self-correction 5fab6e6,
+    2026-06-03): thin contract that nobody held overnight → skip.
+    The fill is priceable on paper (volume > 0 → trades cleared)
+    but the backtest models holding the leg for N days and oi==0
+    means empirically nobody DID hold it overnight. Per P1.7's
+    skip-don't-fudge principle, refuse to book a fictional fill.
 
-    Engine now prices the trade normally; if a future analysis wants
-    to filter on OI it can do so post-hoc against the leg telemetry
-    in legs_json."""
+    Empirical anchor (logic-review 76ac14d): pre-F7 the engine
+    surfaced 160 such cells, all entry_offset_td 30-42 (textbook
+    far-dated dead contracts) — exactly what this gate catches.
+
+    Fixture: volume=2000 / lot=250 → 8 contracts (< 20 bypass),
+    entry oi=0, exit oi>0 (entry is the gate)."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_liquidity([
-        (entry, 100.0, 250, 8000, 0),    # entry: oi=0 — used to fire
-        (exit_, 10.0, 250, 8000, 4500),
+        (entry, 100.0, 250, 2000, 0),    # 8 contracts (thin) + oi=0
+        (exit_, 10.0, 250, 2000, 4500),
     ])
     load = _stub_load_option({(2600.0, "CE"): df})
     trade = Trade(
@@ -348,10 +352,65 @@ def test_zero_oi_prices_normally_under_p1_7():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    # No raise — trade prices through. The stub's synthesized VWAP
-    # equals close so gross_pnl matches the close-fallback value
-    # that the pre-P1.7 test would have produced if the oi gate had
-    # been removed.
+    with pytest.raises(MissingTurnoverError, match="oi=0"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
+
+
+def test_zero_oi_on_liquid_contract_prices_normally_f7():
+    """F7 positive-control: the gate ONLY fires on thin contracts.
+    A liquid contract (contracts_traded ≥ 20) prices through
+    regardless of OI — at that trade volume the contract has
+    demonstrably been actively traded, and the published OI=0 is
+    a data anomaly rather than a true "nobody holds it" signal.
+
+    Empirical anchor: 0 of the 160 pre-F7 oi==0 cells were liquid
+    (none hit Option C bypass), so this branch is hypothetical
+    today but defensive against future NSE data quirks.
+
+    Fixture: volume=5000 / lot=250 → 20 contracts (≥ bypass),
+    entry oi=0 — Option C wins, no raise."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_liquidity([
+        (entry, 100.0, 250, 5000, 0),    # 20 contracts (liquid) + oi=0
+        (exit_, 10.0, 250, 5000, 4500),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # SELL CE @ entry close=100, BUY back @ exit close=10 →
+    # gross = (100 - 10) * 250 = 22500.
+    assert out["gross_pnl"] == pytest.approx(22500.0, abs=1e-6)
+
+
+def test_thin_contract_with_nonzero_oi_in_band_prices_normally_f7():
+    """F7 anti-regression: thin contracts with NON-zero OI must
+    continue to price normally through the band check. The OI gate
+    is surgical (oi==0 AND thin), not a blanket thin-contract
+    skip — without this anti-regression a future contributor could
+    accidentally over-skip thin-but-held contracts."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_liquidity([
+        (entry, 100.0, 250, 2000, 5000),    # thin (8 contracts) but oi>0
+        (exit_, 10.0, 250, 2000, 4500),
+    ])
+    load = _stub_load_option({(2600.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 2600, "SELL", 1),),
+        strategy="test",
+    )
     out = price_trade(trade, load_option_fn=load,
                       today_fn=lambda: date(2026, 5, 24),
                       slippage_model=_NO_SLIPPAGE)
