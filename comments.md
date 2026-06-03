@@ -17272,3 +17272,62 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of d69c3e5 — `fix(docs.smoke_post_migration.docstring_escaping)` ✅
+
+**Verdict: ✅ ACCEPT.** Tiny clean fix (+6 / −11 = −5 net LOC), all docstring-only. Operator-driven — BUILDER caught a real copy-paste failure mode while operator was actually exercising the smoke gate. Diagnosis is precise; fix is minimal; trade-off is acknowledged.
+
+### Diagnosis verified
+
+The shell-error reproduction in the commit body is exactly right. In zsh interactive mode:
+
+- Source contains `\\` (2 chars). Python's regular `"""..."""` parser converts this to `\` (1 char) in the rendered `__doc__`.
+- Operator copying from `--help` output (rendered `__doc__`) sees `\` — proper shell line-continuation.
+- Operator copying from `cat scripts/smoke_post_migration.py` (source file) sees `\\` — zsh interprets this as `\` (escaped backslash → literal `\` argument) at end of line, NOT line continuation. Shell hits enter, executes prefetch with argv `["...", "\\"]` → prefetch's argparse rejects `\` as unrecognized arg. Next line `--symbols PNB SBIN BHEL RELIANCE` becomes a NEW shell command → `command not found: --symbols`. ✓ Matches the error.
+
+### Fix verified
+
+- Module docstring converted to r-string (`r"""...`). Necessary IF future content has backslashes; defensive prefix for current content (no remaining `\` in body). Acceptable Chesterton-fence-prevention against the same trap.
+- All 3 multi-line shell commands (steps 3, 4, 5 of the operator procedure) collapsed to single-line — no backslash continuations. Lines are ~140 chars on the prefetch step but shell-line-wrap is standard and unambiguous at copy-paste.
+
+Same argv exactly:
+- Step 3: `prefetch_universe.py --symbols PNB SBIN BHEL RELIANCE --workers 4 --engine-source bhavcopy --start 2024-07-08 --end 2026-06-02` ✓
+- Step 4: `p7_wide_sweep.py --symbols PNB SBIN BHEL RELIANCE --workers 4` ✓
+- Step 5: `smoke_post_migration.py --api-run-id <existing run_id> --bhavcopy-run-id <new run_id>` ✓
+
+### Pytest
+
+`tests/test_smoke_post_migration.py`: 10/10 PASS. Docstring is operator-facing prose; no test impact expected and none observed.
+
+### Praises
+
+- **Concrete error in the commit body** (the actual zsh output) — future code archaeologist can grep `unrecognized arguments: \` and land here.
+- **Trade-off ack** ("Slightly less readable in the docstring, but unambiguously correct at copy-paste time") — shows the choice was deliberate.
+- **r-string defensive prefix** — no current backslashes in body but protects future operator-procedure additions from re-tripping the same trap.
+- **Tight scope** — pure docstring fix, no behavior change, no test churn.
+
+### State-of-tree
+
+Smoke gate operator procedure is now copy-paste-safe from any view (source file, `--help` output, IDE preview). Operator can re-exercise the 6-step procedure. Gate remains mechanically ready.
+
+P1.7 still gated on operator-side PASS verdict.
+
+### Open grills
+
+None.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+Same as before the d69c3e5 hiccup: **operator-side gate exercise (now copy-paste-safe) → P1.7 commit with operator-side PASS embedded in commit body (run_id pair + cells-checked count + max-delta-observed metrics)**. The docstring fix doesn't change the cadence; it removed the speed bump that interrupted the operator mid-procedure.
+
+If BUILDER is being maximally cautious: consider one more sanity check before P1.7 — `.venv/bin/python -c "import scripts.smoke_post_migration as m; assert '\\\\' not in m.__doc__"` as a one-line confirmation that the rendered docstring has no double-backslash residue. Optional; eyeball-verification of the diff is sufficient.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → P1.7 (operator-gate-ready, copy-paste-safe) → P1.8 → ...**.
+
+Standing by.
+
+---
