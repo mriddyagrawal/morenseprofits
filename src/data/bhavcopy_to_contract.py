@@ -159,15 +159,21 @@ def bhavcopy_to_contract_timeseries(
             f"lot-size policy). Contract is structurally unbacktestable."
         )
 
-    # Derive volume = contracts × lot_size. Both factors must be
-    # present + positive; a single bad row trips the loud-fail since
-    # the contract's history can't be partially priced.
-    if (raw["contracts"] <= 0).any():
-        bad = raw[raw["contracts"] <= 0]["trade_date"].iloc[0]
+    # Reject the contract ONLY when it was never traded across the
+    # entire window (every row has contracts == 0). Partial-zero
+    # rows are normal in an active contract's life — listing day
+    # to first-trade lag, quiet weeks, the day before expiry — and
+    # are KEPT here (with volume = contracts × lot_size = 0). The
+    # engine's per-row IlliquidLegError gate in pnl._price_one_leg
+    # handles zero-volume rows at sweep time, matching the
+    # options_loader.load_option behaviour we're replacing.
+    if (raw["contracts"] <= 0).all():
         raise MissingTurnoverError(
-            f"contracts <= 0 for {symbol} {expiry.strftime('%Y-%m-%d')} "
-            f"{int(strike)}{option_type} on trade_date={bad}; cannot "
-            f"derive volume in shares."
+            f"contracts == 0 on every trade day in window for "
+            f"{symbol} {expiry.strftime('%Y-%m-%d')} "
+            f"{cache._strike_path_segment(strike)}{option_type}; "
+            f"contract was never actually traded — nothing to "
+            f"materialize."
         )
 
     return _assemble_output_frame(raw, lot_size)
@@ -405,12 +411,12 @@ def materialize_contracts_batch(
                 ))
             continue
 
-        if (sub["contracts"] <= 0).any():
+        if (sub["contracts"] <= 0).all():
             counts["skipped_missing_turnover"] += 1
             if len(counts["skip_log"]) < 100:
                 counts["skip_log"].append((
                     str(symbol), expiry_date, float(strike), str(opt_type),
-                    "contracts ≤ 0 on at least one trade day",
+                    "never traded (contracts == 0 on every cached day)",
                 ))
             continue
 

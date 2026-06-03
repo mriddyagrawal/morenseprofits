@@ -227,25 +227,73 @@ def test_missing_turnover_error_is_skippable_via_sweeper_errors():
     assert MissingDataError in _SKIPPABLE_ERRORS
 
 
-def test_transform_raises_on_zero_contracts(tmp_path):
-    """A row with contracts=0 means NSE recorded the row but no
-    actual trades happened. The transform refuses to derive volume
-    from such a row — picking volume=0 would silently mislead the
-    engine's IlliquidLegError gate."""
+def test_transform_raises_only_when_contract_never_traded(tmp_path):
+    """Reject the contract ONLY if EVERY cached day in the window has
+    ``contracts == 0`` — i.e. it was never actually traded. Listing-
+    day-to-first-trade lag, quiet weeks, and the day before expiry
+    routinely produce single zero-contracts rows in an otherwise
+    active contract's life; rejecting on ANY-zero would discard
+    nearly every real contract (≈9098/9392 in a 2-symbol smoke run
+    — the bug that motivated this test).
+    """
     pnb_exp = date(2024, 7, 25)
     _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Two cached days, both zero-contracts → contract was never
+    # actually traded → loud-fail with MissingTurnoverError.
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 22),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+               0, 0.0, 0, 0)],
+        is_udiff=True,
+    )
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 23),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+               0, 0.0, 0, 0)],
+        is_udiff=True,
+    )
+    with pytest.raises(MissingTurnoverError, match="never actually traded"):
+        bhavcopy_to_contract_timeseries(
+            "PNB", pnb_exp, 100.0, "CE",
+            from_date=date(2024, 7, 22), to_date=date(2024, 7, 23),
+        )
+
+
+def test_transform_keeps_partial_zero_contract(tmp_path):
+    """Positive-control for the ANY → ALL semantics shift: a real
+    NSE contract with ONE zero-contracts day (listing lag, quiet
+    day) flanked by traded days must be KEPT, not rejected. Zero-
+    contracts rows pass through with volume=0; the engine's per-row
+    IlliquidLegError gate handles them at sweep time (matches
+    options_loader.load_option's behaviour)."""
+    pnb_exp = date(2024, 7, 25)
+    _write_lot_sizes_parquet(tmp_path, [("PNB", 2024, 7, 8000)])
+    # Day 1: zero contracts (listing-lag).
+    _write_synthetic_bhavcopy_day(
+        tmp_path, date(2024, 7, 22),
+        rows=[("PNB", pnb_exp, 100.0, "CE",
+               0.0, 0.0, 0.0, 0.0, 0.0, 5.05,
+               0, 0.0, 0, 0)],
+        is_udiff=True,
+    )
+    # Day 2: real trades.
     _write_synthetic_bhavcopy_day(
         tmp_path, date(2024, 7, 23),
         rows=[("PNB", pnb_exp, 100.0, "CE",
                4.8, 5.5, 4.5, 5.0, 5.10, 5.05,
-               0, 0.0, 1100, 100)],   # contracts=0
+               100, 84000.0, 1100, 100)],
         is_udiff=True,
     )
-    with pytest.raises(MissingTurnoverError, match="contracts"):
-        bhavcopy_to_contract_timeseries(
-            "PNB", pnb_exp, 100.0, "CE",
-            from_date=date(2024, 7, 23), to_date=date(2024, 7, 23),
-        )
+    df = bhavcopy_to_contract_timeseries(
+        "PNB", pnb_exp, 100.0, "CE",
+        from_date=date(2024, 7, 22), to_date=date(2024, 7, 23),
+    )
+    # Both days survive; the zero-contracts day has volume = 0.
+    assert len(df) == 2
+    assert df.iloc[0]["volume"] == 0
+    assert df.iloc[1]["volume"] == 100 * 8000
 
 
 # ============================================================
