@@ -194,3 +194,23 @@ All reproductions run against `sweep_5f199d6984f2.parquet` + the live caches.
 - **Displayed data (current sweep parquet): TRUE and faithfully derived.** ✅ Correct premium VWAP fills; all downstream math reproduces 100%.
 - **Current code + current cache: a live unit-mismatch regression (F1)** that silently disables VWAP (100% close fallback), makes the displayed sweep non-reproducible, and produces wrong `data_quality` diagnostics (F2). One conservative-direction cost caveat (F3).
 - **One fix (normalize turnover units / correct `TURNOVER_SCALE_FACTOR`) closes F1 and F2 together.**
+
+---
+
+## ADDENDUM 1 (2026-06-03) — closes the F1 "could not verify jugaad regime" gap; resolves the smoke-gate risk
+
+Triggered by the architectural reviewer's independent concurrence with F1 (commit `3aefddb`, `comments.md` only — no source change, so nothing code-level to logic-review there). They raised one load-bearing open question that maps exactly to the gap I flagged in §METHODOLOGY: **is jugaad's `FH_TOT_TRADED_VAL` actually lakhs?** If it were *rupees*, both `--engine-source` paths would fall back to `close` identically and the migration smoke gate would **vacuously pass**, shipping the broken VWAP to P1.7. I resolved it two independent ways:
+
+**(a) Analytic proof — jugaad turnover at sweep time WAS lakhs (airtight).**
+- `TURNOVER_SCALE_FACTOR = 100_000` was introduced in `6356b90` (2026-05-28) and never changed; it is an ancestor of HEAD and predates the displayed sweep (`sweep_5f199d6984f2.parquet`, mtime 2026-05-31). So the engine used `×10⁵` when the sweep ran.
+- I measured: displayed `entry_px`/`exit_px` = `turnover_now/volume − strike` (93% of legs), where `turnover_now` is today's **rupee** value.
+- For the `×10⁵` engine to have produced that under the jugaad cache: `jugaad_turnover × 10⁵ / vol − strike = turnover_now/vol − strike` ⟹ `jugaad_turnover = turnover_now / 10⁵` = **lakhs**. ∎
+
+**(b) Corroboration — NSE historical API reports traded value in lakhs.** In the jugaad reference repo (`/Users/mriddy/Documents/GitHub/jugaad-data`), the equity-historical sibling column is literally named `TURNOVER_LACS` (`tests/test_bhav.py:14`); `FH_TOT_TRADED_VAL` follows the same NSE-historical-API lakhs convention. This is a *different* NSE product from the daily UDiff full bhavcopy, whose `TtlTrfVal` is in **rupees** (proven directly in F1).
+
+**Conclusions:**
+1. **The displayed sweep's VWAP is definitively CORRECT** — jugaad lakhs `× 10⁵` = rupees → correct premium (~185 for the RELIANCE 2840-CE example). The data the operator sees today is true and best. ✅
+2. **The smoke-gate "both-paths-wrong" risk does NOT materialize.** Because jugaad = lakhs (correct VWAP ≈ 185) and UDiff = rupees (silent `close` fallback ≈ 201.70), `--engine-source api` vs `bhavcopy` will **diverge ~9% per fill** → the gate's 0.5-pp ROI criterion **fails loud**. The migration gate is a genuine safety net for F1, not a vacuous pass.
+3. **The two regimes have genuinely different units** (jugaad/legacy = lakhs; UDiff = rupees). This is the root of F1 and confirms the fix must normalize units at parse time, not just tweak one constant. (I concur with the architectural reviewer's recommendation #3 and the anti-regression test in #4.)
+
+Net effect on the §METHODOLOGY limits: the jugaad-regime item is now **resolved** (lakhs, proven). The legacy-bhavcopy regime remains inference-only (current legacy caches are 14-col, no `turnover`), but it is *not* the regime the displayed data or current sweeps run under, so it is not operator-facing today.
