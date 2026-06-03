@@ -1,4 +1,4 @@
-"""Smoke-test runner for the bhavcopy-only migration cutover gate
+r"""Smoke-test runner for the bhavcopy-only migration cutover gate
 (MIGRATION.md §Phase 1 P1.6).
 
 Operator-driven comparison tool: takes TWO sweep run_ids (one
@@ -30,25 +30,20 @@ Operator-side smoke procedure
 
    $ rm -rf data/cache/options/{PNB,SBIN,BHEL,RELIANCE}
 
-3. Run prefetch in bhavcopy mode:
+3. Run prefetch in bhavcopy mode (single-line — no shell line-
+   continuation backslashes to avoid copy-paste escaping issues):
 
-   $ .venv/bin/python scripts/prefetch_universe.py \\
-       --symbols PNB SBIN BHEL RELIANCE \\
-       --workers 4 --engine-source bhavcopy \\
-       --start 2024-07-08 --end 2026-06-02
+   $ .venv/bin/python scripts/prefetch_universe.py --symbols PNB SBIN BHEL RELIANCE --workers 4 --engine-source bhavcopy --start 2024-07-08 --end 2026-06-02
 
 4. Re-run the sweep against the bhavcopy-materialized contracts:
 
-   $ .venv/bin/python scripts/p7_wide_sweep.py \\
-       --symbols PNB SBIN BHEL RELIANCE --workers 4
+   $ .venv/bin/python scripts/p7_wide_sweep.py --symbols PNB SBIN BHEL RELIANCE --workers 4
 
    # → note the new run_id
 
 5. Run this comparison:
 
-   $ .venv/bin/python scripts/smoke_post_migration.py \\
-       --api-run-id   <existing run_id> \\
-       --bhavcopy-run-id <new run_id>
+   $ .venv/bin/python scripts/smoke_post_migration.py --api-run-id <existing run_id> --bhavcopy-run-id <new run_id>
 
 6. If PASS: green-light P1.7. If FAIL: halt and investigate before
    stripping graceful-degrade.
