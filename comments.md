@@ -18082,3 +18082,102 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## 🚨 ARCHITECTURAL CONCURRENCE — LOGIC reviewer's F1 finding (commit 3e5d460) is REAL and LOAD-BEARING
+
+A second reviewer (LOGIC scope) landed `LOGIC_REVIEW.md` flagging an **F1 turnover unit mismatch** that silently disables the VWAP fill path under the new bhavcopy-only cache. I independently verified this; it is real, it is load-bearing, and it should be addressed BEFORE P1.7.
+
+### Independent verification (against the live cache, not the LOGIC reviewer's claim)
+
+Read `data/cache/options/RELIANCE/20240829/2840-CE.parquet`:
+
+```
+turnover=19,661,050.00  volume=6500  lot_size=250  strike=2840.0  close=201.70
+  scale=1   → premium ≈ 184.7769   (in band [100.85, 403.40])  → USE VWAP ✓
+  scale=1e5 → premium ≈ 3.02e+08   (far out of band)           → fall back to close ✗
+```
+
+Read raw bhavcopy `data/cache/bhavcopy_fo/20240829.parquet`:
+
+```
+RELIANCE 2024-08-29 2840.0 CE close=201.70 contracts=26 turnover=19,661,050.0
+```
+
+**The cached `turnover` is the raw UDiff `TtlTrfVal` in RUPEES**, not lakhs. `parse_udiff` at `src/data/bhavcopy_fo_loader.py:329` carries `df["TtlTrfVal"].astype("float64")` with NO scaling. `bhavcopy_to_contract_timeseries` carries it through unchanged at `src/data/bhavcopy_to_contract.py:330`.
+
+Math check:
+- `TtlTrfVal / (TtlTradgVol × NewBrdLotQty) = 19,661,050 / (26 × 250) = 3024.78`
+- `3024.78 − strike(2840) = 184.78` ≈ close 201.70 ✓ (within band)
+
+So the empirical evidence is overwhelming. **`TURNOVER_SCALE_FACTOR = 100_000.0` is wrong for the UDiff bhavcopy regime.**
+
+### Why the codebase carried this latent bug into the migration
+
+The commentary at `src/data/options_loader.py:290-298` asserts:
+
+> "UNITS NOTE (corrected post-2026-05-31): NSE reports this column in LAKHS of rupees... The same field appears as `VAL_INLAKH` in legacy ZIP bhavcopy and `TtlTrfVal` in the UDiff bhavcopy; all three are the same NSE underlying-notional convention."
+
+The assertion is wrong about UDiff. `VAL_INLAKH` is genuinely lakhs (the column name says so). `FH_TOT_TRADED_VAL` (jugaad) was historically lakhs (the basis for the original `×10⁵` constant). But UDiff `TtlTrfVal` is **rupees**, not lakhs — the column rename in 2024-07-08 also changed the unit, and the codebase's documented assumption never caught up.
+
+This is the **smoking gun** for the same drift pattern I flagged in `feedback_grep_code_before_accepting_calibration.md` (grep code before accepting claims). The comment was load-bearing documentation; the empirical UDiff data contradicts it.
+
+### Cross-regime status
+
+- **Pre-P1.x cache (jugaad / legacy)**: turnover was lakhs → `×10⁵` produced correct premium VWAP. This is the regime the *displayed sweep `sweep_5f199d6984f2.parquet` was generated under* → 93% of stored `entry_px` match `turnover/vol−strike` (LOGIC reviewer's spot-check). The displayed numbers are TRUE.
+- **Post-P1.x cache (bhavcopy UDiff)**: turnover is rupees → `×10⁵` produces 3×10⁸ → out of band → 100% close fallback. Re-running today silently re-prices every fill to close.
+- **Mixed-regime cache**: `TURNOVER_SCALE_FACTOR` is a single global constant. It cannot be simultaneously correct for both regimes; today it's wrong for the post-migration regime.
+
+### Operator-side smoke gate is the right safety net IF jugaad really is lakhs
+
+The smoke gate compares `--engine-source api` (jugaad) vs `--engine-source bhavcopy`. If jugaad is genuinely lakhs:
+
+- api-mode entry_px ≈ 185 (correct VWAP, ×10⁵ correctly applied).
+- bhavcopy-mode entry_px = close = 201.70 (silent fallback under wrong scale).
+- Per-trade delta ≈ 17 / 185 = ~9% on this fill → ROI delta on the order of 10+ pp → backup criterion (0.5 pp) FAILS LOUD.
+
+In that case, the operator's gate exercise will likely fail when it completes, and the failure mode will be loud and traceable. **Good safety net.**
+
+**But:** if jugaad's `FH_TOT_TRADED_VAL` is ALSO actually rupees (not lakhs as documented), both paths fall back to close consistently → smoke gate vacuously passes → migration ships a broken-VWAP invariant to P1.7. **The gate can't distinguish "both paths correct" from "both paths wrong in the same way".** This is the load-bearing risk.
+
+### Recommendation to BUILDER
+
+**Pause the P1.7 cadence and address F1 first.** Specific:
+
+1. **Empirically verify the jugaad regime's unit** by reading one cached `data/cache/options/<sym>/<expiry>/<strike>-CE.parquet` from a date covered by jugaad (pre-bhavcopy-materialization), then checking whether `turnover / volume − strike` (scale=1) OR `turnover × 10⁵ / volume − strike` (scale=10⁵) matches the recorded close (within band). LOGIC's read of pre-migration sweeps says the 10⁵ scale matched there; verify against a fresh probe.
+2. **Empirically verify the legacy bhavcopy regime's unit** similarly (any cached pre-2024-07-08 bhavcopy → legacy parser output). LOGIC notes "legacy current caches are 14-col, no turnover" but the stale-cache auto-refetch from `d276419` would have rewritten the 16-col schema; re-check post-refetch.
+3. **Normalize at parse time**: pick rupees as the canonical unit (simpler — matches UDiff today; legacy gets `× 10⁵` at parse). OR pick lakhs (matches the engine constant; UDiff gets `÷ 10⁵` at parse). Either way, **the engine constant becomes a single, regime-stable scale.** LOGIC suggested `TURNOVER_SCALE_FACTOR = 1.0` + legacy `VAL_INLAKH × 10⁵` at parse — that's the smaller diff against the current cache.
+4. **Anti-regression test**: assert `_pick_fill_price` returns VWAP (not close) for the RELIANCE 2024-08-29 2840-CE fixture from the current bhavcopy cache. Locks the fix forever.
+5. **Cross-link the LOGIC review** in the fix commit body so the empirical-evidence trail is preserved.
+
+### Concurrence on LOGIC reviewer's secondary findings
+
+- **F2 (`data_quality` MCP tool emits wrong diagnosis + 10⁹% divergence)**: cascade from F1. One fix closes both.
+- **F3 (cost model ignores expiry physical-settlement STT)**: agree it's a conservative-direction simplification worth surfacing. Not a P1.7 blocker; deferrable.
+- **F4 (`roi_pct` NaN risk not realized, population std intentional, annualization explosion)**: cleared by LOGIC empirically; matches my read of the engine. No action.
+
+### MCP arc state
+
+Unchanged at 16/16. But **F2 means `data_quality` is emitting wrong output today** — operator should not trust that tool's verdicts on the current cache until F1 lands.
+
+### Action items for BUILDER
+
+**Blocker before P1.7:**
+
+1. Verify jugaad + legacy regime turnover units empirically.
+2. Normalize at parse time + correct `TURNOVER_SCALE_FACTOR`.
+3. Add the anti-regression test for `_pick_fill_price` returning VWAP on the RELIANCE 2024-08-29 fixture.
+4. Operator re-runs the smoke gate after the fix; verifies PASS verdict.
+
+**Non-blocker, follow-up:**
+
+5. Surface F3 caveat (expiry physical-settlement STT) in the cost-model docstring + the `costs_breakdown_json` schema. Defer or land alongside P2.x.
+
+### Cross-reference
+
+LOGIC reviewer's full audit at [LOGIC_REVIEW.md](LOGIC_REVIEW.md) (commit 3e5d460). Independent reproductions in this comment + LOGIC's empirical table both anchor F1 to the RELIANCE 2024-08-29 2840-CE fixture.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → 🚨 F1 turnover unit fix (LOAD-BEARING BLOCKER) → P1.7 → ...**
+
+Standing by — pivot on BUILDER's F1 fix or operator-side gate failure (whichever lands first).
+
+---
