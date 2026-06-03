@@ -17960,3 +17960,125 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of dd141cc — `fix(bhavcopy_to_contract.case_normalize_public_boundary)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Closes Grill #1 from ef4f71b (case-sensitivity divergence) exactly as suggested. Tight +72 LOC (17 src + 55 test), clean public-boundary normalization, three-way fixture coverage (upper / lower / mixed-case). All open grills now closed.
+
+### Grill #1 from ef4f71b — CLOSED
+
+I empirically reproduced the divergence in my ef4f71b review with the BUILDER's own equivalence fixture flipped to lowercase:
+
+```
+per-contract lower-case: 0 rows  (silent empty frame)
+batch lower-case:        materialized=1
+```
+
+Same probe POST-FIX, independently re-run against this commit:
+
+```
+POST-FIX per-contract lower-case: 1 rows
+POST-FIX batch lower-case:        materialized=1
+```
+
+**Divergence closed.** Both paths now produce the same result for lowercase input.
+
+### Fix verified — public-boundary normalization
+
+`src/data/bhavcopy_to_contract.py:138-146`:
+
+```python
+# Public-boundary normalization: bhavcopies store upper-case
+# symbol + "CE"/"PE". A lower-case caller would otherwise hit
+# the equality filter inside ``_load_one_day_filtered`` and
+# silently return an empty frame — invisible at the operator
+# API surface today (all callers happen to pass upper) but a
+# latent footgun for any future caller (REPL, paper-trading,
+# an MCP tool). Symmetric with the batch path.
+symbol = symbol.upper()
+option_type = option_type.upper()
+```
+
+This is the public-boundary pattern I suggested. Why public boundary not inner `_load_one_day_filtered`:
+
+- Public entry is called ONCE per contract.
+- `_load_one_day_filtered` is called N times per contract (one per day in the window — up to 466 for a 2-year window).
+- Same end-state; public-boundary is cheaper AND symmetric with the batch path's `sym_upper = {s.upper() for s in symbols}` pattern.
+
+**Coverage of public entry points:**
+
+- `bhavcopy_to_contract_timeseries` — normalized at entry by THIS fix. ✓
+- `materialize_contract_from_bhavcopy` — delegates to the transform, inherits normalization transitively. ✓
+- `enumerate_contracts_from_bhavcopies` — already normalized at entry (line 198: `sym_upper = {s.upper() for s in symbols}`). ✓
+- `materialize_contracts_batch` — already normalized at entry (line 345). ✓
+- `cache.option_path` — already upper-cases internally. ✓
+
+All five public surfaces now normalize consistently.
+
+### Test verified — three-way coverage
+
+`test_transform_accepts_lowercase_symbol_and_option_type` covers:
+
+1. **Upper-case reference** (`"PNB"` + `"CE"`) → produces the canonical output.
+2. **Lower-case input** (`"pnb"` + `"ce"`) → `assert_frame_equal` against the upper-case reference. **Explicit error message** on empty-frame regression catches the exact pre-fix bug. ✓
+3. **Mixed-case** (`"Pnb"` + `"Ce"`) → defensive against typos; `assert_frame_equal` against the upper-case reference.
+
+The explicit error message on the lowercase assertion (`"lowercase input returned empty frame — case normalization regressed"`) ensures a future regression that removes the `.upper()` calls fails LOUD with the actionable message, not just a generic `assert_frame_equal` mismatch.
+
+### Pytest
+
+```
+tests/test_bhavcopy_to_contract.py::test_transform_accepts_lowercase_symbol_and_option_type PASSED
+============================== 1 passed in 0.11s ===============================
+```
+
+Full suite claim 864 (per commit body): consistent with 863 → 864 (+1 net), pure additive.
+
+### Praises
+
+- **Implementation pattern matches my suggestion exactly** — public-boundary normalization, not inner helper. BUILDER also added explicit symmetry note ("matches the batch path's `sym_upper = {s.upper() for s in symbols}`").
+- **Both `symbol` AND `option_type` normalized** — I called out symbol; BUILDER caught the parallel `option_type == "CE"` filter at line 97 of `_load_one_day_filtered` would have the same divergence. Defensive about the silent partner.
+- **Explicit "lowercase regressed" error message** in the test — future regression is one-line-of-actionable-text away from understanding.
+- **Mixed-case fixture** (`"Pnb"`, `"Ce"`) is bonus defensive coverage against typos.
+- **Why-public-not-helper explained inline** — same reasoning I gave (perf + symmetry); code comment captures the rationale.
+- **All five public surfaces audited for consistency** in the commit body — `materialize_contract_from_bhavcopy` (delegates), `enumerate_contracts_from_bhavcopies` (already done), `materialize_contracts_batch` (already done), `cache.option_path` (already does internally), and `bhavcopy_to_contract_timeseries` (THIS fix). No silent partners left.
+- **Operator-flow impact correctly characterized as "nil"** — closes a latent footgun for REPL / paper-trading / future MCP tools, not a live bug.
+
+### Math
+
+- LOC: +17 (src) + +55 (test) = +72 / -0 net. ✓ Matches `72 insertions, 0 deletions`.
+- Test count: 863 → 864 (+1 net). ✓
+
+### Behavior delta
+
+- `bhavcopy_to_contract_timeseries(symbol, ...)` and `bhavcopy_to_contract_timeseries(symbol.lower(), ...)` now produce byte-identical output.
+- `materialize_contract_from_bhavcopy` inherits the same property (delegates to transform).
+- No change for any current caller (all pass upper-case today).
+
+### State-of-tree
+
+Operator-side gate exercise is fully unblocked. P1.7 still gated on the operator-side PASS verdict. **All open architectural-review grills are now closed.**
+
+### Open grills
+
+**None.** All standing grills from the perf-pipeline reviews resolved:
+
+- ~~Grill #1 from ef4f71b~~ (case-sensitivity divergence) — **CLOSED by this commit.** ✓
+- ~~Grill #1 from b3f4618~~ (batch zero-contracts symmetry test) — closed by 65721c3. ✓
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**Operator-side: complete the gate exercise → P1.7.** No more architectural-side blockers from my queue. BUILDER should drive the next move based on operator-side progress:
+
+- If operator's smoke-gate prefetch is running cleanly post-d276419 + 5631f18 + b3f4618 + ef4f71b: stand by for sweep + comparison → P1.7 commit with PASS metrics in body.
+- If operator hits a new failure surface: BUILDER opens the corresponding fix; I review.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → (operator gate exercise — fully unblocked, ALL grills closed) → P1.7 → P1.8 → ...**
+
+Standing by.
+
+---
