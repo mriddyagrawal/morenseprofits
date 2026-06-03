@@ -40,7 +40,11 @@ from typing import Callable
 import pandas as pd
 
 from src.data import options_loader
-from src.data.errors import IlliquidLegError, LookaheadError, MissingDataError
+from src.data.errors import (
+    LookaheadError,
+    MissingDataError,
+    MissingTurnoverError,
+)
 from src.engine.costs import COST_MODEL_V1, CostModelV1
 from src.engine.margin import MARGIN_MODEL_V1, MarginModelV1
 from src.engine.slippage import SLIPPAGE_MODEL_V1, SlippageModelV1
@@ -96,13 +100,28 @@ TURNOVER_SCALE_FACTOR = 1.0
 # the formula is arithmetically sound, so the band-check is no longer
 # a units-sanity assertion; it's a numerical-ill-conditioning safety
 # valve. Deep-OTM contracts (premium ≪ strike) push us into subtracting
-# two large nearly-equal numbers, and turnover's 0.01-lakh rounding gets
+# two large nearly-equal numbers, and turnover's rounding gets
 # amplified into a residual that can swing far from close (or go
-# negative). When the band trips we fall through to ``close`` rather
-# than raising — the band reject is now an arithmetic-quality signal,
-# not a data-bug signal.
+# negative). Under P1.7 (operator 2026-06-03 + reviewer F6 ship verdict),
+# a band-reject on a thin contract RAISES MissingTurnoverError so the
+# sweeper skips the cell honestly — the prior close-fallback fudged
+# the fill with a tick-floor close print that misled backtest analysis.
+# On LIQUID contracts (volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME) the band
+# check is bypassed entirely and VWAP is used unconditionally — the
+# band's "VWAP could be a thin-trade outlier" concern doesn't apply
+# when N trades is large.
 _VWAP_CLOSE_RATIO_MIN = 0.5
 _VWAP_CLOSE_RATIO_MAX = 2.0
+
+# Volume threshold for trusting VWAP unconditionally without the
+# band check. Empirical basis (LOGIC_REVIEW.md F-band analysis,
+# 2026-06-03): of 8,168 close-fallback cases in the F1-verified
+# post-fix sweep, 99.3% had volume > 100k shares — those were
+# liquid contracts where VWAP integrated over many real trades and
+# was structurally more accurate than the tick-floor close clamp.
+# At this threshold and above, the band's "thin-contract VWAP could
+# be noisy" concern doesn't apply.
+_VWAP_LIQUIDITY_BYPASS_VOLUME = 100_000  # shares
 
 
 def _compute_vwap(
@@ -151,28 +170,41 @@ def _pick_fill_price(
     df: pd.DataFrame, target: date, *, context: str,
 ) -> tuple[float, int, int | None, int | None, float | None]:
     """Return (fill_px, lot_size, volume, oi, turnover) for the row
-    whose date equals ``target``. ``fill_px`` is VWAP (turnover *
-    scale / volume) when turnover + volume are both present and the
-    VWAP-vs-close ratio passes a sanity check; falls back to ``close``
-    otherwise.
+    whose date equals ``target``. Under P1.7 (operator 2026-06-03 +
+    reviewer F6 ship verdict), ``fill_px`` is ALWAYS the recovered
+    premium VWAP (``turnover * SCALE / volume − strike``); the
+    pre-P1.7 close-fallback paths now RAISE ``MissingTurnoverError``
+    so the sweeper skips the cell with an honest skip_reason rather
+    than fudging a fill with the tick-floor close print.
 
-    Why VWAP over close: close is the day's last trade, which on a
-    thin-volume day can be a small print far from where the bulk of
-    volume cleared. VWAP represents the volume-weighted centre of mass
-    of the day's trading — materially closer to a real fill price
-    than close for thin strikes.
+    Decision tree:
 
-    Sanity check: if a row has turnover + volume but the computed VWAP
-    lands outside [0.5×, 2.0×] of close, raises ``MissingDataError``
-    pointing at a likely units bug (NSE shifted convention, or a
-    parser regression). This is a research-honesty trip-wire: silently
-    producing a fill price 100,000× off close would be the worst
-    failure mode the units risk can produce; failing loudly is the
-    right behavior.
+      1. ``turnover`` is None / NaN, OR ``volume`` is None / 0, OR
+         ``strike`` is missing (minimal test fixture): raise
+         ``MissingTurnoverError`` — no VWAP path is possible.
+      2. Recovered ``premium_vwap = turnover/volume − strike`` is
+         ≤ 0 (case 3 deep-OTM ill-conditioning — turnover rounding
+         flips the residual on contracts where premium ≪ strike):
+         raise ``MissingTurnoverError``. Per the P1.7 unified spec,
+         this no longer falls through to close — the cell is
+         unpriceable, and a close fill at the tick floor would
+         systematically bias backtest analysis of deep-OTM legs.
+      3. ``volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME`` (default 100k
+         shares): use VWAP UNCONDITIONALLY. Skip the band check —
+         a liquid contract's VWAP integrates over many trades and
+         is structurally more accurate than close on band-reject
+         (empirically: 99.3% of pre-P1.7 close-fallback cases were
+         liquid contracts where close was a tick-floor artefact).
+      4. Otherwise (thin contract), check the band:
+         - VWAP-vs-close ratio ∈ [0.5×, 2.0×] → use VWAP.
+         - Out of band → raise ``MissingTurnoverError``. On a thin
+           contract the band reject signals genuine arithmetic
+           ill-conditioning; the cell is unpriceable.
 
-    ``volume`` / ``oi`` / ``turnover`` are returned as ``None`` if
-    those columns are absent (legacy minimal test fixtures); production
-    loader frames always carry them per §2.3.
+    ``volume`` / ``oi`` / ``turnover`` are returned as ``None`` only
+    when the row's column is absent (legacy minimal test fixtures);
+    production loader frames carry all three per SPECS §2.3 — those
+    cases bail to (1) above before returning.
 
     Raises ``MissingDataError`` if no row matches ``target``, or
     ``LookaheadError`` if multiple rows share the date (parser bug).
@@ -196,10 +228,6 @@ def _pick_fill_price(
         )
     r = row.iloc[0]
     close = float(r["close"])
-    # Strike is required for VWAP recovery (see ``_compute_vwap``);
-    # production loader frames carry it per SPECS §2.2. Test fixtures
-    # without ``strike`` get the close-fallback path (turnover/volume
-    # also typically absent in those).
     strike: float | None = None
     if "strike" in row.columns and pd.notna(r["strike"]):
         strike = float(r["strike"])
@@ -213,26 +241,54 @@ def _pick_fill_price(
     if "turnover" in row.columns and pd.notna(r["turnover"]):
         turnover = float(r["turnover"])
 
-    vwap = _compute_vwap(turnover, volume, strike) if strike is not None else None
-    if vwap is None:
-        # No turnover available (legacy cache, NaN turnover, zero
-        # volume), no strike (minimal test fixture), OR recovered
-        # premium ≤ 0 (deep-OTM ill-conditioning). All three fall
-        # through to close — pre-VWAP behavior, no error.
-        fill_px = close
-    else:
-        # Numerical-ill-conditioning safety valve: at deep-OTM the
-        # recovered premium can wobble far from close because turnover's
-        # lakh-rounding is comparable to the residual. Out-of-band →
-        # fall through to close. This is no longer a units-sanity
-        # assertion (the strike correction makes the formula
-        # arithmetically sound); it's an arithmetic-quality guard.
-        ratio = vwap / close if close != 0 else float("inf")
-        if not (_VWAP_CLOSE_RATIO_MIN <= ratio <= _VWAP_CLOSE_RATIO_MAX):
-            fill_px = close
-        else:
-            fill_px = vwap
-    return fill_px, int(r["lot_size"]), volume, oi, turnover
+    # (1+2) Cases 1+2: missing turnover, volume, or strike → no VWAP
+    # path. Under the P1.7 unified spec (operator 2026-06-03) the
+    # taxonomy is collapsed: every "can't compute VWAP fill" case
+    # surfaces as MissingTurnoverError. IlliquidLegError is no
+    # longer raised by the engine — it was a holdover from the
+    # pre-VWAP era where "volume=0 means no real fill" was a
+    # distinct concept; under VWAP-or-skip it's just one of the
+    # missing-data shapes.
+    if turnover is None or volume is None or volume == 0 or strike is None:
+        raise MissingTurnoverError(
+            f"{context}: cannot compute VWAP fill on {target} "
+            f"(turnover={turnover!r}, volume={volume!r}, strike={strike!r}); "
+            f"P1.7 strip — cell unpriceable, skipping."
+        )
+
+    notional_per_share = float(turnover) * TURNOVER_SCALE_FACTOR / float(volume)
+    premium_vwap = notional_per_share - float(strike)
+
+    # (2) Case 3: deep-OTM ill-conditioning. Turnover precision is
+    # comparable to the actual residual; recovered premium goes
+    # nonsensical. Under P1.7 we skip the cell rather than booking a
+    # close-fallback fill that would bias analysis.
+    if premium_vwap <= 0:
+        raise MissingTurnoverError(
+            f"{context}: recovered VWAP premium ≤ 0 on {target} "
+            f"(notional/share={notional_per_share:.4f}, strike={strike}, "
+            f"residual={premium_vwap:.6f}); deep-OTM ill-conditioning, "
+            f"P1.7 strip — cell unpriceable, skipping."
+        )
+
+    # (3) Option C: liquidity-gated VWAP-band bypass. On contracts
+    # with volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME, trust VWAP
+    # unconditionally — the band's thin-trade-outlier concern doesn't
+    # apply when N trades is large.
+    if volume >= _VWAP_LIQUIDITY_BYPASS_VOLUME:
+        return premium_vwap, int(r["lot_size"]), volume, oi, turnover
+
+    # (4) Thin contract: band-reject → skip.
+    ratio = premium_vwap / close if close != 0 else float("inf")
+    if not (_VWAP_CLOSE_RATIO_MIN <= ratio <= _VWAP_CLOSE_RATIO_MAX):
+        raise MissingTurnoverError(
+            f"{context}: VWAP-vs-close band reject on thin contract on "
+            f"{target} (vwap={premium_vwap:.4f}, close={close:.4f}, "
+            f"ratio={ratio:.4f}, volume={volume} < "
+            f"{_VWAP_LIQUIDITY_BYPASS_VOLUME} shares); P1.7 strip — "
+            f"cell unpriceable, skipping."
+        )
+    return premium_vwap, int(r["lot_size"]), volume, oi, turnover
 
 
 # ============================================================
@@ -394,24 +450,17 @@ def _price_one_leg(
             f"adjustment requires strike+qty ratio'ing we don't model yet."
         )
 
-    # Liquidity gate (p7.pricing.liquidity_gate): refuse to book a trade
-    # whose entry or exit leg had ZERO traded contracts, or whose entry
-    # day had ZERO open interest. NSE often publishes a close even when
-    # nothing traded (theoretical fallback baked into the close field);
-    # without this gate, the engine books a P&L on a price no participant
-    # transacted at. The gate uses fields the loader already surfaces
-    # (volume, oi) — no new data, no new fetches.
-    #
-    # Single skip reason (IlliquidLegError) for both volume=0 and oi=0
-    # cases; the per-leg numbers are captured in the message for audit.
-    # See errors.py::IlliquidLegError for the research-honesty-vs-deploy-
-    # readiness caveat.
-    if entry_vol == 0 or exit_vol == 0 or entry_oi == 0:
-        raise IlliquidLegError(
-            f"{context}: leg illiquid — "
-            f"entry_volume={entry_vol}, exit_volume={exit_vol}, "
-            f"entry_oi={entry_oi}. No real fill possible; skipping."
-        )
+    # Pre-P1.7 had a separate IlliquidLegError gate here for
+    # volume=0 / oi=0 cases. Under the unified P1.7 spec (operator
+    # 2026-06-03) that taxonomy is collapsed into
+    # MissingTurnoverError, raised one level up in _pick_fill_price
+    # the moment volume=0 is seen. The oi=0 path is dropped entirely
+    # — under VWAP-or-skip a contract with volume>0 has by
+    # definition cleared trades, so the "no live OI to transact
+    # against" concern was always at odds with the published volume.
+    # See errors.py::IlliquidLegError for the back-compat note about
+    # historical sweep parquets that still carry "IlliquidLegError"
+    # as a skip_reason string.
 
     # Apply slippage to raw closes (SPECS §4b): the engine transacts at
     # entry_px_realized / exit_px_realized, not at the raw close.

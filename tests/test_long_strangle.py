@@ -93,13 +93,27 @@ def _option_frame(entry, exit_, entry_close, exit_close, lot=250):
 
 
 def _stub_load_option(per_leg: dict):
+    """Synthesize strike/volume/turnover/oi columns so the post-P1.7
+    VWAP-or-skip engine has VWAP fills numerically equal to close on
+    the minimal _option_frame. See tests/test_pnl.py::_stub_load_option
+    for the full rationale."""
     def fake(symbol, expiry, strike, option_type, from_date, to_date,
              *, today_fn=date.today, offline=False):
         key = (float(strike), option_type)
         if key not in per_leg:
             from src.data.errors import MissingDataError
             raise MissingDataError(f"no fixture for {key}")
-        df = per_leg[key]
+        df = per_leg[key].copy()
+        if "strike" not in df.columns:
+            df["strike"] = float(strike)
+        if "volume" not in df.columns:
+            df["volume"] = (df["lot_size"] * 100).astype("int64")
+        if "turnover" not in df.columns:
+            df["turnover"] = (
+                (df["strike"] + df["close"]) * df["volume"]
+            ).astype("float64")
+        if "oi" not in df.columns:
+            df["oi"] = pd.array([1000] * len(df), dtype="Int64")
         mask = (df["date"] >= pd.Timestamp(from_date)) & (df["date"] <= pd.Timestamp(to_date))
         return df.loc[mask].reset_index(drop=True)
     return fake

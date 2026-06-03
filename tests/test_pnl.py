@@ -12,7 +12,12 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from src.data.errors import IlliquidLegError, LookaheadError, MissingDataError
+from src.data.errors import (
+    IlliquidLegError,
+    LookaheadError,
+    MissingDataError,
+    MissingTurnoverError,
+)
 from src.engine.pnl import (
     TURNOVER_SCALE_FACTOR,
     _compute_vwap,
@@ -42,12 +47,44 @@ def _option_frame(dates_closes_lots: list[tuple[date, float, int]]) -> pd.DataFr
 
 
 def _stub_load_option(per_leg: dict[tuple[float, str], pd.DataFrame]):
-    """Build a load_option_fn whose return depends on (strike, option_type)."""
+    """Build a load_option_fn whose return depends on (strike, option_type).
+
+    P1.7 (operator 2026-06-03) strips close-fallback from
+    ``_pick_fill_price`` — every priced cell now flows through the
+    VWAP path. The minimal ``_option_frame`` fixture only carries
+    (date, close, lot_size), so this stub synthesizes the columns
+    the engine needs:
+
+      - ``strike`` injected from the per_leg key.
+      - ``volume`` defaults to ``lot_size × 100`` (well below the
+        100k liquidity bypass so fixtures still exercise the band
+        check path; >0 so the IlliquidLegError gate doesn't trip).
+      - ``turnover`` synthesized as ``(strike + close) × volume``
+        so ``turnover / volume - strike = close``: VWAP fill ends
+        up numerically equal to the close the legacy assertions
+        expect, leaving the rest of the test untouched.
+
+    Fixtures that explicitly populate volume/turnover/oi (e.g. via
+    ``_option_frame_with_liquidity`` for zero-volume tests, or
+    ``_option_frame_with_vwap`` for genuine VWAP-vs-close divergence
+    tests) override these defaults — the injection only fills
+    absent columns.
+    """
     def fake(symbol, expiry, strike, option_type, from_date, to_date, *, today_fn=date.today, offline=False):
         key = (float(strike), option_type)
         if key not in per_leg:
             raise MissingDataError(f"no fixture for {key}")
-        df = per_leg[key]
+        df = per_leg[key].copy()
+        if "strike" not in df.columns:
+            df["strike"] = float(strike)
+        if "volume" not in df.columns:
+            df["volume"] = (df["lot_size"] * 100).astype("int64")
+        if "turnover" not in df.columns:
+            df["turnover"] = (
+                (df["strike"] + df["close"]) * df["volume"]
+            ).astype("float64")
+        if "oi" not in df.columns:
+            df["oi"] = pd.array([1000] * len(df), dtype="Int64")
         # Filter to the loader's promised window so the kernel sees
         # exactly [from_date, to_date] like the real loader.
         mask = (df["date"] >= pd.Timestamp(from_date)) & (df["date"] <= pd.Timestamp(to_date))
@@ -243,14 +280,14 @@ def _option_frame_with_liquidity(
     })
 
 
-def test_illiquid_entry_volume_raises():
-    """Entry day with volume=0 → IlliquidLegError. The published close
-    on a zero-volume day is NSE's theoretical fallback, not a price any
-    participant transacted at. Engine refuses to book the trade."""
+def test_zero_entry_volume_raises_missing_turnover():
+    """Entry day with volume=0 → MissingTurnoverError. Pre-P1.7 this
+    was IlliquidLegError; under the unified spec all "no real fill
+    possible" cases collapse to MissingTurnoverError."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_liquidity([
-        (entry, 100.0, 250, 0, 5000),    # entry: volume=0 → illiquid
+        (entry, 100.0, 250, 0, 5000),    # entry: volume=0
         (exit_, 10.0, 250, 8000, 4500),
     ])
     load = _stub_load_option({(2600.0, "CE"): df})
@@ -260,20 +297,20 @@ def test_illiquid_entry_volume_raises():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    with pytest.raises(IlliquidLegError, match="entry_volume=0"):
+    with pytest.raises(MissingTurnoverError, match="volume=0"):
         price_trade(trade, load_option_fn=load,
                     today_fn=lambda: date(2026, 5, 24),
                     slippage_model=_NO_SLIPPAGE)
 
 
-def test_illiquid_exit_volume_raises():
-    """Exit day with volume=0 → IlliquidLegError. Same reasoning as
-    entry — exit close on a zero-volume day is theoretical."""
+def test_zero_exit_volume_raises_missing_turnover():
+    """Exit day with volume=0 → MissingTurnoverError (same collapse
+    as entry-side under P1.7)."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_liquidity([
         (entry, 100.0, 250, 8000, 5000),
-        (exit_, 10.0, 250, 0, 4500),    # exit: volume=0 → illiquid
+        (exit_, 10.0, 250, 0, 4500),    # exit: volume=0
     ])
     load = _stub_load_option({(2600.0, "CE"): df})
     trade = Trade(
@@ -282,20 +319,26 @@ def test_illiquid_exit_volume_raises():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    with pytest.raises(IlliquidLegError, match="exit_volume=0"):
+    with pytest.raises(MissingTurnoverError, match="volume=0"):
         price_trade(trade, load_option_fn=load,
                     today_fn=lambda: date(2026, 5, 24),
                     slippage_model=_NO_SLIPPAGE)
 
 
-def test_illiquid_entry_oi_raises():
-    """Entry day with oi=0 → IlliquidLegError. Zero open interest
-    means no live positions in this strike — no counterparty to
-    transact against, even if a small volume technically traded."""
+def test_zero_oi_prices_normally_under_p1_7():
+    """Pre-P1.7: oi=0 raised IlliquidLegError on the theory that
+    "no live positions = no counterparty". Under the P1.7 unified
+    spec that gate is dropped — if volume>0 the contract demonstrably
+    cleared trades, so the published OI=0 is at best an anomaly /
+    data-quality issue, not a reason to refuse to price.
+
+    Engine now prices the trade normally; if a future analysis wants
+    to filter on OI it can do so post-hoc against the leg telemetry
+    in legs_json."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_liquidity([
-        (entry, 100.0, 250, 8000, 0),    # entry: oi=0 → illiquid
+        (entry, 100.0, 250, 8000, 0),    # entry: oi=0 — used to fire
         (exit_, 10.0, 250, 8000, 4500),
     ])
     load = _stub_load_option({(2600.0, "CE"): df})
@@ -305,10 +348,16 @@ def test_illiquid_entry_oi_raises():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    with pytest.raises(IlliquidLegError, match="entry_oi=0"):
-        price_trade(trade, load_option_fn=load,
-                    today_fn=lambda: date(2026, 5, 24),
-                    slippage_model=_NO_SLIPPAGE)
+    # No raise — trade prices through. The stub's synthesized VWAP
+    # equals close so gross_pnl matches the close-fallback value
+    # that the pre-P1.7 test would have produced if the oi gate had
+    # been removed.
+    out = price_trade(trade, load_option_fn=load,
+                      today_fn=lambda: date(2026, 5, 24),
+                      slippage_model=_NO_SLIPPAGE)
+    # SELL CE @ entry close=100, BUY back @ exit close=10 →
+    # gross = (100 - 10) * 250 = 22500.
+    assert out["gross_pnl"] == pytest.approx(22500.0, abs=1e-6)
 
 
 def test_liquid_leg_prices_normally():
@@ -339,8 +388,23 @@ def test_illiquid_leg_error_is_a_missing_data_error():
     """IlliquidLegError extends MissingDataError so the sweeper's
     existing `except MissingDataError` skip-loop catches it without
     any sweeper-side changes. Pinned because flipping the inheritance
-    would silently turn skipped cells into propagating exceptions."""
+    would silently turn skipped cells into propagating exceptions.
+
+    Under P1.7 the engine no longer raises this class (the volume=0
+    and oi=0 cases collapsed into MissingTurnoverError) but the class
+    is retained so historical sweep_*_skipped.parquet files carrying
+    "IlliquidLegError" as a skip_reason string remain interpretable.
+    The inheritance test is preserved as a back-compat anchor."""
     assert issubclass(IlliquidLegError, MissingDataError)
+
+
+def test_missing_turnover_error_is_a_missing_data_error():
+    """MissingTurnoverError extends MissingDataError so the sweeper's
+    existing `except MissingDataError` skip-loop catches it without
+    sweeper-side changes. Anti-regression on the inheritance — under
+    P1.7 this class is the dominant skip_reason for cells that
+    pre-fix would have used close-fallback."""
+    assert issubclass(MissingTurnoverError, MissingDataError)
 
 
 # ============================================================
@@ -420,10 +484,11 @@ def test_vwap_fill_used_when_turnover_present():
     assert out["gross_pnl"] == pytest.approx(19500.0, abs=1e-6)
 
 
-def test_vwap_falls_back_to_close_when_turnover_nan():
-    """Legacy parquets ingested before the turnover column landed have
-    NaN in that column. VWAP fill must fall back to close in that case
-    so legacy cache keeps producing the pre-VWAP P&L numbers."""
+def test_nan_turnover_raises_missing_turnover_under_p1_7():
+    """Pre-P1.7 NaN turnover fell through to close (legacy parquet
+    compatibility). Under the unified P1.7 spec there is no close
+    fallback — NaN turnover means we can't compute VWAP and the
+    cell is skipped honestly with MissingTurnoverError."""
     import math
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
@@ -441,30 +506,29 @@ def test_vwap_falls_back_to_close_when_turnover_nan():
         legs=(Leg("CE", 2600, "SELL", 1),),
         strategy="test",
     )
-    out = price_trade(trade, load_option_fn=load,
-                      today_fn=lambda: date(2026, 5, 24),
-                      slippage_model=_NO_SLIPPAGE)
-    # Fallback to close: SELL @100, BUY back @20 → gross = (100-20)×250 = 20,000
-    assert out["gross_pnl"] == pytest.approx(20000.0, abs=1e-6)
+    with pytest.raises(MissingTurnoverError, match="turnover=None"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
 
 
-def test_vwap_falls_back_to_close_when_out_of_band():
-    """Replaces the prior ``test_vwap_units_sanity_assertion_fires_…``:
-    after the strike correction the band-check semantics shifted from
-    "units-sanity assertion (raises MissingDataError)" to "numerical-
-    ill-conditioning safety valve (falls through to close)".
+def test_band_reject_on_thin_contract_raises_missing_turnover():
+    """Under P1.7 a band-reject (recovered VWAP outside [0.5×, 2.0×]
+    of close) on a THIN contract (volume < 100k bypass) raises
+    MissingTurnoverError. Pre-P1.7 this fell through to close —
+    that fudged the fill with a tick-floor close print that
+    misled backtest analysis (per the empirical close-fallback
+    audit 2026-06-03).
 
-    Simulating an out-of-band recovered premium: strike=100, close=100,
-    fixture computes turnover for ``vwap_premium=300`` → recovered
-    premium = 300 vs close 100 → ratio 3.0 (above 2.0 ceiling) →
-    engine falls back to close instead of raising."""
+    Fixture: strike=100, close=100, vwap_premium=300 → ratio 3.0
+    (out of band), volume=10000 (well under the 100k bypass)."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_vwap(
         strike=100.0,
         rows=[
             (entry, 100.0, 250, 10000, 5000, 300.0),  # vwap=300 vs close=100 → out of band
-            (exit_,  20.0, 250,  5000, 4500,  20.0),  # exit healthy
+            (exit_,  20.0, 250,  5000, 4500,  20.0),
         ],
     )
     load = _stub_load_option({(100.0, "CE"): df})
@@ -474,19 +538,54 @@ def test_vwap_falls_back_to_close_when_out_of_band():
         legs=(Leg("CE", 100, "SELL", 1),),
         strategy="test",
     )
-    # No raise — entry falls back to close=100, exit uses VWAP=20
+    with pytest.raises(MissingTurnoverError, match="band reject"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
+
+
+def test_band_reject_bypassed_when_volume_above_liquidity_threshold():
+    """Option C (P1.7): the VWAP-vs-close band check is BYPASSED on
+    contracts with volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME (100k
+    shares). A liquid contract's VWAP integrates over many trades
+    and is structurally more accurate than close even when the
+    ratio is wide (e.g., close is a tick-floor artefact while VWAP
+    averages morning trades at higher prices). Anti-regression on
+    the 100k bypass.
+
+    Fixture: same shape as the band-reject test but with volume
+    raised to 200k (above the bypass). Engine uses VWAP=300 instead
+    of close=100, even though the ratio is 3.0."""
+    entry = date(2024, 1, 4)
+    exit_ = date(2024, 1, 24)
+    df = _option_frame_with_vwap(
+        strike=100.0,
+        rows=[
+            (entry, 100.0, 250, 200_000, 5000, 300.0),  # vwap=300 vs close=100, but volume liquid
+            (exit_,  20.0, 250, 200_000, 4500,  20.0),
+        ],
+    )
+    load = _stub_load_option({(100.0, "CE"): df})
+    trade = Trade(
+        symbol="X", expiry=date(2024, 1, 25),
+        entry_date=entry, exit_date=exit_,
+        legs=(Leg("CE", 100, "SELL", 1),),
+        strategy="test",
+    )
     out = price_trade(trade, load_option_fn=load,
                       today_fn=lambda: date(2026, 5, 24),
                       slippage_model=_NO_SLIPPAGE)
-    # SELL @ close=100 (band reject), BUY back @ VWAP=20 → (100-20)×250 = 20,000
-    assert out["gross_pnl"] == pytest.approx(20000.0, abs=1e-6)
+    # SELL @ VWAP=300 (band bypassed), BUY back @ VWAP=20 →
+    # gross = (300 - 20) × 250 = 70,000.
+    # Pre-P1.7 would have hit close=100 → (100 - 20) × 250 = 20,000.
+    assert out["gross_pnl"] == pytest.approx(70000.0, abs=1e-6)
 
 
-def test_vwap_falls_back_to_close_when_recovered_premium_negative():
-    """Deep-OTM ill-conditioning: at premium ≪ strike, turnover's
-    rounding can push the recovered residual negative. ``_compute_vwap``
-    returns None in that case; ``_pick_fill_price`` falls through to
-    close. No raise."""
+def test_recovered_premium_negative_raises_missing_turnover():
+    """Pre-P1.7: deep-OTM ill-conditioning (turnover/volume - strike ≤ 0)
+    fell through to close. Under the P1.7 unified spec it raises
+    MissingTurnoverError — the cell is unpriceable, and a tick-floor
+    close fill would systematically bias deep-OTM analysis."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     # Construct turnover (rupees, post-F1 convention) that gives
@@ -510,11 +609,10 @@ def test_vwap_falls_back_to_close_when_recovered_premium_negative():
         legs=(Leg("CE", 1000, "SELL", 1),),
         strategy="test",
     )
-    out = price_trade(trade, load_option_fn=load,
-                      today_fn=lambda: date(2026, 5, 24),
-                      slippage_model=_NO_SLIPPAGE)
-    # Both legs fall back to close=0.05 → gross = (0.05 - 0.05) × 250 = 0
-    assert out["gross_pnl"] == pytest.approx(0.0, abs=1e-6)
+    with pytest.raises(MissingTurnoverError, match="VWAP premium ≤ 0"):
+        price_trade(trade, load_option_fn=load,
+                    today_fn=lambda: date(2026, 5, 24),
+                    slippage_model=_NO_SLIPPAGE)
 
 
 def test_compute_vwap_returns_none_when_inputs_missing():
@@ -1041,9 +1139,18 @@ def test_offline_flag_propagates_to_load_option():
     exit_ = date(2024, 1, 25)
     captured = {}
 
+    # Inline-stub the columns the post-P1.7 _pick_fill_price requires
+    # (strike/volume/turnover/oi). Without these the engine raises
+    # MissingTurnoverError before the assertion gets to inspect what
+    # offline value was captured.
     def watching_load(symbol, expiry, strike, option_type, from_date, to_date, *, today_fn, offline=False):
         captured["offline"] = offline
-        return _option_frame([(entry, 100.0, 250), (exit_, 10.0, 250)])
+        df = _option_frame([(entry, 100.0, 250), (exit_, 10.0, 250)]).copy()
+        df["strike"] = float(strike)
+        df["volume"] = (df["lot_size"] * 100).astype("int64")
+        df["turnover"] = ((df["strike"] + df["close"]) * df["volume"]).astype("float64")
+        df["oi"] = pd.array([1000] * len(df), dtype="Int64")
+        return df
 
     trade = Trade(
         symbol="X", expiry=date(2024, 1, 25),

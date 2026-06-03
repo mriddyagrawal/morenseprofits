@@ -84,12 +84,22 @@ def _wire_mocks(monkeypatch, *, entry_date=date(2024, 1, 4), exit_date=date(2024
 
     # options_loader.load_option (CE went up, PE decayed). Use the
     # caller's from_date/to_date (not the wired defaults) so trades
-    # with different entry offsets find their entry row.
+    # with different entry offsets find their entry row. Inject
+    # strike/volume/turnover/oi so the post-P1.7 VWAP-or-skip engine
+    # has fills numerically equal to close (engineered turnover such
+    # that turnover/volume − strike = close).
     def fake_load_option(symbol, expiry, strike, option_type, fd, td, *,
                         force_refresh=False, today_fn=date.today, offline=False):
         if option_type == "CE":
-            return _option_frame(fd, td, 60.0, 95.0)
-        return _option_frame(fd, td, 50.0, 5.0)
+            df = _option_frame(fd, td, 60.0, 95.0)
+        else:
+            df = _option_frame(fd, td, 50.0, 5.0)
+        df = df.copy()
+        df["strike"] = float(strike)
+        df["volume"] = (df["lot_size"] * 100).astype("int64")
+        df["turnover"] = ((df["strike"] + df["close"]) * df["volume"]).astype("float64")
+        df["oi"] = pd.array([1000] * len(df), dtype="Int64")
+        return df
     from src.data import options_loader
     monkeypatch.setattr(options_loader, "load_option", fake_load_option)
 
@@ -334,7 +344,15 @@ def test_sweep_grid_cache_only_treats_offline_miss_as_skip(monkeypatch, tmp_path
             raise OfflineCacheMiss(
                 f"option {symbol} {expiry} {int(strike)}-PE not in cache"
             )
-        return _option_frame(fd, td, 60.0, 95.0)
+        # CE leg: inject post-P1.7 columns so the engine can price it
+        # (the test's intent is that the PE-side cache miss is what
+        # causes the skip, not a missing-VWAP issue on the CE).
+        df = _option_frame(fd, td, 60.0, 95.0).copy()
+        df["strike"] = float(strike)
+        df["volume"] = (df["lot_size"] * 100).astype("int64")
+        df["turnover"] = ((df["strike"] + df["close"]) * df["volume"]).astype("float64")
+        df["oi"] = pd.array([1000] * len(df), dtype="Int64")
+        return df
     monkeypatch.setattr(options_loader, "load_option", half_missing)
 
     kwargs = dict(
@@ -443,17 +461,25 @@ def test_notional_at_entry_uses_per_leg_lot_size_not_constant(monkeypatch, tmp_p
         })
     monkeypatch.setattr(bhavcopy_fo_loader, "load_bhavcopy_fo", fake_bhavcopy)
 
-    # Different lot per symbol
+    # Different lot per symbol. Includes strike/volume/turnover/oi
+    # so the post-P1.7 VWAP-or-skip engine has fills numerically
+    # equal to close.
     def fake_load_option(symbol, expiry, strike, option_type, fd, td, *,
                         force_refresh=False, today_fn=date.today, offline=False):
         lot = 550 if symbol == "BIGLOT" else 250
+        closes = [100.0, 50.0]
+        vol = lot * 100
         return pd.DataFrame({
             "date": pd.Series(
                 [pd.Timestamp(date(2024, 1, 4)), pd.Timestamp(date(2024, 1, 24))],
                 dtype="datetime64[us]",
             ),
-            "close": [100.0, 50.0],
+            "close": closes,
             "lot_size": pd.array([lot, lot], dtype="int64"),
+            "strike": pd.array([float(strike), float(strike)], dtype="float64"),
+            "volume": pd.array([vol, vol], dtype="int64"),
+            "turnover": [(strike + c) * vol for c in closes],
+            "oi": pd.array([1000, 1000], dtype="Int64"),
         })
     from src.data import options_loader
     monkeypatch.setattr(options_loader, "load_option", fake_load_option)

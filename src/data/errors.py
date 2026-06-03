@@ -77,20 +77,36 @@ class CrossSourceLotSizeMismatchError(DataError):
 
 class MissingTurnoverError(MissingDataError):
     """Raised by the bhavcopy-to-contract transform (P1.3) and by
-    ``src.engine.pnl._pick_fill_price`` (P1.7) when the engine cannot
-    derive ``volume = contracts × lot_size`` or compute the per-share
-    premium VWAP because lot_size / turnover / volume is missing.
+    ``src.engine.pnl._pick_fill_price`` (P1.7 unified spec, operator
+    2026-06-03) when the engine cannot derive a trustworthy premium
+    VWAP fill. Under P1.7 there is NO close-fallback — the fill path
+    is ALWAYS VWAP-or-skip.
 
-    Three trigger paths converge here:
+    Four trigger paths converge here:
+
     1. Lot-size unified cache miss — the ``(symbol, expiry-month)``
        pair was EXCLUDED from ``data/cache/lot_sizes.parquet`` due to
        a cross-source lot_size mismatch (per MIGRATION.md §Cross-
        source lot-size policy).
-    2. Bhavcopy row has missing / NaN / zero turnover or volume
-       (rare; typically NSE settlement-only rows with no actual
-       trading).
-    3. Deep-OTM ill-conditioning (P1.7 case (3) preservation) is
-       handled SEPARATELY — falls through to close, does NOT raise.
+
+    2. Per-row turnover / volume missing or NaN, or volume = 0
+       (typically NSE settlement-only rows with no actual trading,
+       or contracts that listed but never cleared).
+
+    3. Deep-OTM ill-conditioning: ``turnover/volume − strike ≤ 0``
+       because turnover's quantization is comparable to the actual
+       residual. Pre-P1.7 this fell through to close; under the
+       unified P1.7 spec it RAISES. Booking a tick-floor close fill
+       on a contract with negative recovered premium would
+       systematically bias backtest analysis of deep-OTM legs.
+
+    4. VWAP-vs-close band reject on a thin contract (volume <
+       ``_VWAP_LIQUIDITY_BYPASS_VOLUME``). On liquid contracts (volume
+       ≥ threshold, currently 100k shares) the band check is bypassed
+       and VWAP is used unconditionally — empirically the band fires
+       almost exclusively on liquid contracts where close is a
+       tick-floor artefact, so band-reject is a thin-contract-only
+       guard under P1.7.
 
     Subclass of ``MissingDataError`` so the sweeper's existing
     ``_SKIPPABLE_ERRORS = (MissingDataError, NoLiquidStrikeError)``
@@ -99,21 +115,36 @@ class MissingTurnoverError(MissingDataError):
     ``_handle`` extraction at line 322-326).
 
     See MIGRATION.md §Phase 1 P1.7 + the dce9a87 case-disambiguation
-    commit body for the full pricing-path design."""
+    commit body for the historical pricing-path design (pre-unified
+    spec, before close-fallback was stripped on 2026-06-03)."""
 
 
 class IlliquidLegError(MissingDataError):
-    """Raised by ``src.engine.pnl._price_one_leg`` when a leg's entry or
-    exit row had ZERO traded contracts that day, or when the entry's
-    open interest was zero. The engine refuses to book a trade against
-    a "fill" that never happened — a published close with volume=0 is
-    NSE's theoretical fallback, not a price any participant transacted
-    at. Surfaces as a clean skip in ``sweep_*_skipped.parquet`` with
-    skip_reason="IlliquidLegError" via the existing sweeper machinery
-    that already catches ``MissingDataError``.
+    """**Deprecated 2026-06-03 (P1.7 unified spec).** The engine no
+    longer raises this class — the volume=0 and oi=0 cases that used
+    to fire it now surface as ``MissingTurnoverError`` (the unified
+    P1.7 fill-failure taxonomy). Class is RETAINED in the taxonomy
+    for back-compat:
 
-    NOTE: this is a research-honesty improvement, not a deploy-
-    readiness signal. "Backtest skips a zero-volume cell" ≠ "a real
-    broker can fill at the surviving cells' assumed prices" — the
-    latter requires broker-API smoke tests before any rule is run with
-    real capital."""
+      - Historical ``sweep_*_skipped.parquet`` files carry the literal
+        string ``"IlliquidLegError"`` as ``skip_reason`` for cells
+        skipped under the pre-P1.7 engine. MCP analytics + the sweep
+        skip-summary path query by that string and must keep working
+        against historical sweeps.
+      - The class import path stays stable so any external consumer
+        that catches ``IlliquidLegError`` doesn't break — it just
+        won't fire on new sweeps.
+
+    Pre-P1.7 raison-d'être (preserved for historical context): raised
+    by ``src.engine.pnl._price_one_leg`` when a leg's entry or exit
+    row had ZERO traded contracts that day, or when the entry's open
+    interest was zero. The engine refused to book a trade against a
+    "fill" that never happened — a published close with volume=0 is
+    NSE's theoretical fallback, not a price any participant transacted
+    at.
+
+    Under P1.7 the same intuition is enforced more uniformly: every
+    "we can't compute a real VWAP fill" case (turnover missing,
+    volume=0, strike missing, deep-OTM ill-conditioning, band reject)
+    flows through ``MissingTurnoverError`` so the skip taxonomy stays
+    flat rather than carrying parallel rare cases."""

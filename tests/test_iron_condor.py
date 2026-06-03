@@ -166,13 +166,27 @@ def _option_frame(entry, exit_, entry_close, exit_close, lot=250):
 
 
 def _stub_load_option(per_leg: dict):
+    """Synthesize strike/volume/turnover/oi columns on the minimal
+    _option_frame so the post-P1.7 VWAP-or-skip engine has the data
+    it needs (turnover/volume engineered so VWAP fill = close — see
+    tests/test_pnl.py::_stub_load_option for the full rationale)."""
     def fake(symbol, expiry, strike, option_type, from_date, to_date,
              *, today_fn=date.today, offline=False):
         key = (float(strike), option_type)
         if key not in per_leg:
             from src.data.errors import MissingDataError
             raise MissingDataError(f"no fixture for {key}")
-        df = per_leg[key]
+        df = per_leg[key].copy()
+        if "strike" not in df.columns:
+            df["strike"] = float(strike)
+        if "volume" not in df.columns:
+            df["volume"] = (df["lot_size"] * 100).astype("int64")
+        if "turnover" not in df.columns:
+            df["turnover"] = (
+                (df["strike"] + df["close"]) * df["volume"]
+            ).astype("float64")
+        if "oi" not in df.columns:
+            df["oi"] = pd.array([1000] * len(df), dtype="Int64")
         mask = (df["date"] >= pd.Timestamp(from_date)) & (df["date"] <= pd.Timestamp(to_date))
         return df.loc[mask].reset_index(drop=True)
     return fake
@@ -390,13 +404,21 @@ def test_sweep_one_iron_condor_uses_spot_based_margin(monkeypatch, tmp_path):
 
     def fake_load_option(symbol, expiry, strike, option_type, from_date, to_date,
                          *, today_fn=date.today, offline=False):
+        # Include strike/volume/turnover/oi so the post-P1.7
+        # VWAP-or-skip engine prices fills equal to close.
+        closes = [30.0, 5.0]
+        vol = 25_000
         return pd.DataFrame({
             "date": pd.Series(
                 [pd.Timestamp(from_date), pd.Timestamp(to_date)],
                 dtype="datetime64[us]",
             ),
-            "close": [30.0, 5.0],
+            "close": closes,
             "lot_size": pd.array([250, 250], dtype="int64"),
+            "strike": pd.array([float(strike), float(strike)], dtype="float64"),
+            "volume": pd.array([vol, vol], dtype="int64"),
+            "turnover": [(strike + c) * vol for c in closes],
+            "oi": pd.array([1000, 1000], dtype="Int64"),
         })
     monkeypatch.setattr(options_loader, "load_option", fake_load_option)
     # Both modules import RESULTS_DIR independently from src.config —
