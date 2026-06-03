@@ -357,9 +357,11 @@ def _option_frame_with_vwap(
 
     ``rows`` = list of ``(date, close, lot, volume_shares, oi, vwap_premium)``.
     For each row the fixture computes the turnover NSE would report
-    under the (strike + premium) × shares / 10⁵ convention:
+    under the (strike + premium) × shares convention (rupees, post-F1
+    parser normalization — see pnl.TURNOVER_SCALE_FACTOR comment +
+    LOGIC_REVIEW.md F1):
 
-        turnover_lakhs = (strike + vwap_premium) * volume_shares / 10⁵
+        turnover_rupees = (strike + vwap_premium) * volume_shares
 
     Tests pick the vwap_premium they want; the fixture builds the
     turnover that drives ``_pick_fill_price`` to that recovered value.
@@ -367,7 +369,7 @@ def _option_frame_with_vwap(
     legacy-cache fall-through-to-close path)."""
     import math
     turnovers = [
-        ((strike + vwap) * v / 100_000) if not math.isnan(vwap) else math.nan
+        ((strike + vwap) * v) if not math.isnan(vwap) else math.nan
         for _, _, _, v, _, vwap in rows
     ]
     n = len(rows)
@@ -392,7 +394,8 @@ def test_vwap_fill_used_when_turnover_present():
 
     Fixture: strike=2600, close=100, vwap_premium=98 (entry) / 20 (exit).
     Fills at 98 (entry) / 20 (exit). Cross-check the turnover the
-    fixture would have produced: (2600+98)×10000/10⁵ = 269.8 lakhs."""
+    fixture would have produced: (2600+98)×10000 = 26,980,000 rupees
+    (post-F1 parser-normalized rupees convention)."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_vwap(
@@ -480,15 +483,16 @@ def test_vwap_falls_back_to_close_when_out_of_band():
 
 
 def test_vwap_falls_back_to_close_when_recovered_premium_negative():
-    """Deep-OTM ill-conditioning: at premium ≪ strike, turnover's lakh-
+    """Deep-OTM ill-conditioning: at premium ≪ strike, turnover's
     rounding can push the recovered residual negative. ``_compute_vwap``
     returns None in that case; ``_pick_fill_price`` falls through to
     close. No raise."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
-    # Construct turnover_lakhs that gives notional/share = strike - 1
-    # (i.e. recovered premium would be -1). Strike = 1000, volume = 10000.
-    # notional_per_share target = 999 → turnover = 999 × 10000 / 10⁵ = 99.9
+    # Construct turnover (rupees, post-F1 convention) that gives
+    # notional/share = strike - 1 (i.e. recovered premium would be -1).
+    # Strike = 1000, volume = 10000. notional_per_share target = 999
+    # → turnover = 999 × 10000 = 9_990_000 rupees.
     df = pd.DataFrame({
         "date": pd.Series([pd.Timestamp(entry), pd.Timestamp(exit_)],
                           dtype="datetime64[us]"),
@@ -497,7 +501,7 @@ def test_vwap_falls_back_to_close_when_recovered_premium_negative():
         "lot_size": pd.array([250, 250], dtype="int64"),
         "volume": pd.array([10000, 10000], dtype="int64"),
         "oi": pd.array([5000, 4500], dtype="Int64"),
-        "turnover": [99.9, 99.9],   # notional/share = 999, recov_prem = -1
+        "turnover": [9_990_000.0, 9_990_000.0],   # notional/share = 999, recov_prem = -1
     })
     load = _stub_load_option({(1000.0, "CE"): df})
     trade = Trade(
@@ -524,22 +528,52 @@ def test_compute_vwap_returns_none_when_inputs_missing():
 
 
 def test_compute_vwap_recovers_premium_via_strike_subtraction():
-    """Pin the formula: notional_per_share = turnover × 10⁵ / volume,
-    recovered premium = notional_per_share − strike.
+    """Pin the formula: notional_per_share = turnover * SCALE / volume,
+    recovered premium = notional_per_share − strike. Post-F1 the
+    parser-layer normalization moves the units conversion out of the
+    engine; SCALE = 1.0 so the formula reads cleanly as
+    ``turnover / volume − strike`` with turnover in rupees.
 
-    Worked example: strike=100, turnover=12 lakhs, volume=10,000
-        notional/share = 12 × 100,000 / 10,000 = 120
+    Worked example: strike=100, turnover=1,200,000 rupees, volume=10,000
+        notional/share = 1,200,000 / 10,000 = 120
         premium_vwap   = 120 − 100 = 20
 
     Anti-regression for both ``TURNOVER_SCALE_FACTOR`` and the strike
     subtraction. If a future contributor drops the subtraction (the
     pre-correction bug), the recovered value here would be 120 not 20
-    and this test fires."""
-    assert _compute_vwap(turnover=12.0, volume=10_000, strike=100.0) == pytest.approx(20.0)
+    and this test fires. If TURNOVER_SCALE_FACTOR is bumped away from
+    1.0 without the parsers being denormalized in lockstep, the
+    1,200,000 input would no longer produce 20 and this test fires."""
+    assert _compute_vwap(turnover=1_200_000.0, volume=10_000, strike=100.0) == pytest.approx(20.0)
     # Strike=0 → behaves like the pre-correction formula (useful for
     # synthetic tests where the caller has already absorbed the strike).
-    assert _compute_vwap(turnover=10.0, volume=50_000, strike=0.0) == pytest.approx(20.0)
-    assert TURNOVER_SCALE_FACTOR == 100_000.0
+    assert _compute_vwap(turnover=1_000_000.0, volume=50_000, strike=0.0) == pytest.approx(20.0)
+    assert TURNOVER_SCALE_FACTOR == 1.0
+
+
+def test_f1_recovers_premium_for_reliance_2840_ce_under_rupees_convention():
+    """F1 regression: anchored against the LOGIC_REVIEW.md empirical
+    fixture (RELIANCE 2024-08-29 2840-CE). Pre-F1 the engine assumed
+    UDiff TtlTrfVal was in lakhs (TURNOVER_SCALE_FACTOR=1e5) so a row
+    with turnover=19,661,050 rupees overshot notional by ×1e5 → the
+    band-reject safety valve fired → engine silently fell back to
+    close on every fill (0/24,019 VWAPs across the smoke universe).
+
+    Post-F1 (parsers normalize to rupees + SCALE=1.0):
+        notional_per_share = 19,661,050 / 6,500 = 3,024.7769...
+        premium_vwap       = 3,024.78 - 2,840   = 184.7769...
+
+    Matches the empirical premium recovered by the displayed
+    sweep_5f199d6984f2.parquet (~184.78). If this test regresses, F1
+    has either been undone OR a future contributor has put the ×1e5
+    back into pnl.py while leaving the parsers normalized — either
+    way the smoke gate would diverge from api mode and the operator
+    would see 100% close fallback again. Anti-regression on the
+    load-bearing units invariant."""
+    recovered = _compute_vwap(
+        turnover=19_661_050.0, volume=6_500, strike=2840.0,
+    )
+    assert recovered == pytest.approx(184.7769, abs=0.001)
 
 
 def test_compute_vwap_recovered_premium_negative_returns_none():
@@ -566,9 +600,9 @@ def test_compute_vwap_time_decay_structural():
     track that decay. Strike=1300, volume=10_000 each day."""
     strike = 1300.0
     # Synthetic NSE turnover for each (premium, vol) under the
-    # (strike + premium) × shares / 10⁵ formula:
+    # post-F1 (strike + premium) × shares formula (rupees):
     for premium in (10.0, 5.0, 1.0, 0.05):
-        turnover = (strike + premium) * 10_000 / 100_000
+        turnover = (strike + premium) * 10_000
         recovered = _compute_vwap(turnover=turnover, volume=10_000, strike=strike)
         assert recovered == pytest.approx(premium, abs=1e-9), (
             f"premium={premium} should recover exactly; got {recovered}"
@@ -583,8 +617,8 @@ def test_vwap_legs_json_carries_entry_turnover_and_exit_turnover():
     import json
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
-    # vwap_premium=98 → turnover = (2600+98)*10000/10⁵ = 269.8
-    # vwap_premium=20 → turnover = (2600+20)*5000/10⁵ = 131.0
+    # vwap_premium=98 → turnover = (2600+98)*10000 = 26,980,000 rupees
+    # vwap_premium=20 → turnover = (2600+20)*5000 = 13,100,000 rupees
     df = _option_frame_with_vwap(
         strike=2600.0,
         rows=[
@@ -604,8 +638,8 @@ def test_vwap_legs_json_carries_entry_turnover_and_exit_turnover():
                       slippage_model=_NO_SLIPPAGE)
     legs = json.loads(out["legs_json"])
     assert len(legs) == 1
-    assert legs[0]["entry_turnover"] == pytest.approx(269.8)
-    assert legs[0]["exit_turnover"] == pytest.approx(131.0)
+    assert legs[0]["entry_turnover"] == pytest.approx(26_980_000.0)
+    assert legs[0]["exit_turnover"] == pytest.approx(13_100_000.0)
 
 
 def test_gate_silent_when_volume_oi_columns_absent():
@@ -1037,23 +1071,25 @@ def test_offline_flag_propagates_to_load_option():
 
 def test_classify_fill_source_vwap_match_atm_price():
     """₹100 ATM-ish premium, exact VWAP match → 'vwap'. Under the
-    strike-corrected formula the synthetic turnover must encode
-    (strike + premium) × shares / 10⁵, so for strike=2500, premium=100,
-    volume=10_000 → turnover = 2600 × 10_000 / 10⁵ = 260 lakhs."""
+    post-F1 (rupees) convention the synthetic turnover encodes
+    (strike + premium) × shares directly, so for strike=2500,
+    premium=100, volume=10_000 → turnover = 2600 × 10_000 = 26,000,000
+    rupees."""
     from src.engine.pnl import classify_fill_source
-    # recovered = 2600×10⁵/10⁵/10⁴×10⁴ - 2500 = 2600 - 2500 = 100
-    assert classify_fill_source(100.0, 10_000, 260.0, strike=2500.0) == "vwap"
+    # recovered = 26,000,000 / 10,000 - 2500 = 2600 - 2500 = 100
+    assert classify_fill_source(100.0, 10_000, 26_000_000.0, strike=2500.0) == "vwap"
 
 
 def test_classify_fill_source_vwap_match_with_turnover_precision_noise():
-    """Real turnover values are quantised at 2 decimal places (lakhs).
-    A computed recovered-premium of 100.005 vs entry_px=100.00 should
+    """Real turnover values are quantised at the rupee scale; tiny
+    rounding deltas shouldn't break the 'vwap' classification. A
+    computed recovered-premium of 100.005 vs entry_px=100.00 should
     still classify as 'vwap' — the centralized tolerance is generous
     enough to absorb the quantisation noise."""
     from src.engine.pnl import classify_fill_source
-    # notional/share = 260.0005 × 100_000 / 10_000 = 2600.005
+    # turnover = 26,000,050 → notional/share = 2600.005,
     # recovered = 2600.005 - 2500 = 100.005
-    assert classify_fill_source(100.0, 10_000, 260.0005, strike=2500.0) == "vwap"
+    assert classify_fill_source(100.0, 10_000, 26_000_050.0, strike=2500.0) == "vwap"
 
 
 def test_classify_fill_source_vwap_match_deep_otm():
@@ -1062,12 +1098,14 @@ def test_classify_fill_source_vwap_match_deep_otm():
     fail-match on turnover quantisation. The absolute tolerance floor
     (~₹0.001) is what carries this — relative tolerance alone at 0.1%
     would demand byte-perfect agreement on ₹0.05 which turnover precision
-    can't deliver."""
+    can't deliver.
+
+    Post-F1 (rupees): strike=2500, premium=0.05, volume=100_000;
+    turnover = 2500.05 × 100_000 = 250,005,000 rupees. Perturb
+    turnover by 10 rupees → notional/share = 2500.0510, recovered =
+    0.0510. Tolerance absorbs the 0.001 absolute delta."""
     from src.engine.pnl import classify_fill_source
-    # strike=2500, premium=0.05; turnover = 2500.05 × 100_000 / 10⁵ = 2500.05
-    # Perturb turnover by 0.0001 lakhs → notional/share = 2500.0510,
-    # recovered = 0.0510. Tolerance absorbs the 0.001 absolute delta.
-    assert classify_fill_source(0.05, 100_000, 2500.0510, strike=2500.0) == "vwap"
+    assert classify_fill_source(0.05, 100_000, 250_005_100.0, strike=2500.0) == "vwap"
 
 
 def test_classify_fill_source_close_when_turnover_absent():
@@ -1095,8 +1133,8 @@ def test_classify_fill_source_close_when_diverges_outside_tolerance():
     but the recorded entry_px diverges from the implied — engine fell
     back to close, probably via the band-reject safety valve. ``close``."""
     from src.engine.pnl import classify_fill_source
-    # recovered = 260×10⁵/10⁴ - 2500 = 100; entry_px = 50 → 50% off
-    assert classify_fill_source(50.0, 10_000, 260.0, strike=2500.0) == "close"
+    # recovered = 26,000,000 / 10,000 - 2500 = 100; entry_px = 50 → 50% off
+    assert classify_fill_source(50.0, 10_000, 26_000_000.0, strike=2500.0) == "close"
 
 
 def test_classify_fill_source_close_when_recovered_premium_nonpositive():

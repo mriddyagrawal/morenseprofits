@@ -29,10 +29,10 @@ from src.mcp.backtest_one import (
 # ============================================================
 
 def test_classify_fill_source_vwap_match():
-    # Under the strike-corrected formula: notional/share - strike
-    # turnover=110 lakhs, vol=50_000 → notional/share = 220
+    # Post-F1 (rupees, SCALE=1.0): notional/share - strike
+    # turnover=11,000,000 rupees, vol=50_000 → notional/share = 220
     # strike=200 → recovered premium = 20.0 = entry_px → vwap
-    assert _classify_fill_source(20.0, 50000, 110.0, strike=200.0) == "vwap"
+    assert _classify_fill_source(20.0, 50000, 11_000_000.0, strike=200.0) == "vwap"
 
 
 def test_classify_fill_source_close_when_turnover_missing():
@@ -45,7 +45,8 @@ def test_classify_fill_source_close_when_volume_zero():
 
 def test_classify_fill_source_close_when_divergent():
     # turnover/volume gives VWAP=20 but entry_px=100 → engine used close
-    assert _classify_fill_source(100.0, 50000, 10.0) == "close"
+    # (post-F1: 1,000,000 rupees / 50000 vol = 20)
+    assert _classify_fill_source(100.0, 50000, 1_000_000.0) == "close"
 
 
 def test_classify_fill_source_unknown_for_none_or_nan():
@@ -127,13 +128,14 @@ def test_backtest_one_priced_trade_returns_full_breakdown(monkeypatch):
     )
 
     # 3. Option loader: return a frame with entry + exit rows where
-    # close, volume, oi, turnover, strike are all set. Under the
-    # strike-corrected formula:
-    #   recovered premium = turnover × 100_000 / volume − strike
+    # close, volume, oi, turnover, strike are all set. Post-F1 the
+    # parsers normalize turnover to rupees and the engine uses
+    # SCALE_FACTOR=1.0:
+    #   recovered premium = turnover / volume − strike
     # Entry: close=100, volume=10_000, strike=2600
-    #   → need turnover = (2600+100)×10000/10⁵ = 270 → recovered=100 ✓
+    #   → need turnover = (2600+100)×10000 = 27,000,000 → recovered=100 ✓
     # Exit: close=20, volume=8_000, strike=2600
-    #   → need turnover = (2600+20)×8000/10⁵ = 209.6 → recovered=20 ✓
+    #   → need turnover = (2600+20)×8000 = 20,960,000 → recovered=20 ✓
     entry_dt = date(2024, 1, 4)
     exit_dt = date(2024, 1, 24)
     def fake_load_option(symbol, expiry, strike, option_type,
@@ -151,8 +153,8 @@ def test_backtest_one_priced_trade_returns_full_breakdown(monkeypatch):
             "volume": [10000, 8000],
             "oi": [pd.NA, pd.NA],
             "turnover": [
-                (float(strike) + 100.0) * 10000 / 100_000,
-                (float(strike) + 20.0) * 8000 / 100_000,
+                (float(strike) + 100.0) * 10000,
+                (float(strike) + 20.0) * 8000,
             ],
         })
     # Patch options_loader.load_option at the module the engine uses.

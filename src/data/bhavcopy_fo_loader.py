@@ -229,11 +229,16 @@ def parse_legacy(raw: str, trade_date: date) -> pd.DataFrame:
 
     instrument = df["INSTRUMENT"].astype("string")
     # turnover extension (P1.2 — MIGRATION.md §Phase 1). Legacy carries
-    # VAL_INLAKH in the raw CSV (same underlying-notional convention as
-    # UDiff's TtlTrfVal per 8c2c517 — both are total traded value in
-    # lakhs of rupees including the underlying notional component).
-    # Engine recovers per-share premium VWAP via
-    # ``turnover × 10⁵ / volume − strike`` (see pnl._compute_vwap).
+    # VAL_INLAKH in the raw CSV — genuinely in LAKHS of rupees (per
+    # the column name + jugaad equity sibling TURNOVER_LACS — confirmed
+    # in LOGIC_REVIEW.md addendum 1). UDiff's TtlTrfVal is in RUPEES
+    # (NOT lakhs — empirically falsified per F1, also confirmed in the
+    # addendum). The two raw conventions diverge; we NORMALIZE HERE to
+    # the engine's single canonical convention: turnover is RUPEES
+    # everywhere downstream of the parsers. Multiplying VAL_INLAKH × 1e5
+    # is the parse-time normalization step. Engine then recovers per-
+    # share premium VWAP via ``turnover / volume − strike`` (see
+    # pnl._compute_vwap; TURNOVER_SCALE_FACTOR = 1.0 post-F1).
     #
     # Legacy does NOT carry ltp (no equivalent of UDiff's LastPric);
     # the regime A/B caveat surfacing in MCP's get_options_chain (P2.4)
@@ -250,7 +255,10 @@ def parse_legacy(raw: str, trade_date: date) -> pd.DataFrame:
         "close": df["CLOSE"].astype("float64"),
         "settle_price": df["SETTLE_PR"].astype("float64"),
         "contracts": df["CONTRACTS"].fillna(0).astype("int64"),
-        "turnover": df["VAL_INLAKH"].astype("float64"),
+        # F1 normalization: VAL_INLAKH is in lakhs of rupees → ×1e5 to
+        # match the engine's canonical rupees convention (see comment
+        # above + LOGIC_REVIEW.md F1 + pnl.TURNOVER_SCALE_FACTOR=1.0).
+        "turnover": df["VAL_INLAKH"].astype("float64") * 1e5,
         "oi": df["OPEN_INT"].astype("Int64"),
         "oi_change": df["CHG_IN_OI"].astype("Int64"),
     })
@@ -313,6 +321,13 @@ def parse_udiff(raw: str, trade_date: date) -> pd.DataFrame:
     # INTENTIONALLY NOT in this output — see module docstring +
     # MIGRATION.md §Cross-source lot-size policy + the sibling-cache
     # path written by _write_sibling_lot_sizes_cache.
+    #
+    # Turnover unit: TtlTrfVal is in RUPEES (verified empirically per
+    # LOGIC_REVIEW.md F1: RELIANCE 2024-08-29 2840-CE TtlTrfVal=19,661,050
+    # → 19,661,050 / 6,500 shares = 3,024.78 ≈ strike 2840 + premium
+    # 184.78 ≈ UndrlygPric 3041). NO scaling needed — UDiff carries the
+    # engine's canonical rupees convention natively. parse_legacy
+    # normalizes VAL_INLAKH × 1e5 to match this convention.
     out = pd.DataFrame({
         "instrument": instrument,
         "symbol": df["TckrSymb"].astype("string"),

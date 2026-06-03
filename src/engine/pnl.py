@@ -53,28 +53,38 @@ from src.strategies.base import Leg, Trade, side_sign
 LoadOptionFn = Callable[..., pd.DataFrame]
 
 
-# Units conversion for NSE F&O turnover.
+# Units convention for NSE F&O turnover (post-F1, see LOGIC_REVIEW.md).
 #
-# NSE's per-contract historical archive reports total traded value
-# (``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE" per jugaad rename) in LAKHS
-# of rupees. The "premium value" label is misleading: empirically the
-# value is the day's UNDERLYING NOTIONAL turnover — (strike + premium)
-# × shares / 10⁵ — NOT the premium turnover the name suggests. The
-# same column appears as ``VAL_INLAKH`` in the legacy ZIP bhavcopy and
-# ``TtlTrfVal`` in the UDiff bhavcopy; all three are the same NSE
-# convention. ``src/data/bhavcopy_fo_loader.py:274-278`` documented
-# this for the contract-count column independently.
+# The engine sees turnover in a SINGLE canonical convention: RUPEES.
+# Parser-layer normalization at the three ingest sites brings the
+# raw upstream conventions into this single shape:
 #
-# Empirical verification: across the RELIANCE 2025-02-27 expiry strike
-# grid (DTE 87 → 0), notional/share for OTM strikes converges to the
-# strike, not to spot. For ITM strikes it converges to spot only
-# because premium = intrinsic = spot - strike, so strike + intrinsic
-# = spot (a coincidence of moneyness, not a universal pattern). See
-# the commit body for the row-by-row test.
+#   - UDiff bhavcopy (``TtlTrfVal``): RUPEES natively — no scaling.
+#   - Legacy bhavcopy (``VAL_INLAKH``): LAKHS — multiplied × 1e5 in
+#     ``bhavcopy_fo_loader.parse_legacy`` at parse time.
+#   - jugaad API (``FH_TOT_TRADED_VAL`` → "PREMIUM VALUE"): LAKHS —
+#     multiplied × 1e5 in ``options_loader._normalize`` at parse time.
+#
+# Pre-F1 the engine carried a ×1e5 scale factor here on the assumption
+# all three raw conventions were the same (lakhs). They are NOT —
+# UDiff is rupees, while jugaad+legacy are lakhs. Treating UDiff as
+# lakhs overshot VWAP by five orders of magnitude → band-rejected →
+# 100% silent close fallback. The fix moves the unit normalization
+# to parse time so a single TURNOVER_SCALE_FACTOR=1.0 works for all
+# three regimes (see LOGIC_REVIEW.md F1 + addendum 1).
+#
+# Empirical anchor: RELIANCE 2024-08-29 2840-CE has TtlTrfVal=
+# 19,661,050 rupees, volume=6,500 shares, strike=2,840.
+#   notional/share = 19,661,050 / 6,500 = 3,024.78
+#   premium_vwap   = 3,024.78 − 2,840    = 184.78 ✓
+# matches spot 3,041 + premium 184.78 ≈ 3,225 (deep-OTM coincidence
+# of moneyness; see LOGIC_REVIEW.md for full RELIANCE 2025-02-27
+# DTE-grid analysis).
 #
 # To recover the per-share premium VWAP in rupees:
 #   premium_vwap = turnover * TURNOVER_SCALE_FACTOR / volume - strike
-TURNOVER_SCALE_FACTOR = 100_000.0
+#                = turnover / volume - strike   (since SCALE = 1.0)
+TURNOVER_SCALE_FACTOR = 1.0
 
 # Recovered-premium-vs-close ratio bounds. After the strike correction
 # the formula is arithmetically sound, so the band-check is no longer
@@ -96,24 +106,27 @@ def _compute_vwap(
 ) -> float | None:
     """Daily volume-weighted average PREMIUM from notional turnover.
 
-    NSE's per-contract turnover is the day's underlying-notional flow
-    (``(strike + premium) × shares / 10⁵`` in lakhs of rupees), not the
-    premium turnover the "PREMIUM VALUE" column label suggests. To
-    recover the per-share premium VWAP we subtract the strike:
+    NSE's per-contract turnover (post parser-layer normalization) is
+    the day's underlying-notional flow in RUPEES — empirically
+    ``(strike + premium) × shares``, NOT the premium turnover the
+    "PREMIUM VALUE" jugaad label suggests. To recover the per-share
+    premium VWAP we subtract the strike:
 
         premium_vwap = turnover * TURNOVER_SCALE_FACTOR / volume - strike
+                     = turnover / volume - strike   (since SCALE = 1.0)
 
     Returns None when:
       - turnover or volume is missing/NaN/zero (no VWAP path possible;
         caller falls back to ``close``); OR
       - the recovered premium is ≤ 0 (deep-OTM ill-conditioning: at
-        premium ≪ strike, lakh-rounding of turnover gets amplified
-        into a residual that can flip negative; caller falls back to
-        ``close`` in that case too).
+        premium ≪ strike, turnover rounding of the underlying-notional
+        gets amplified into a residual that can flip negative; caller
+        falls back to ``close`` in that case too).
 
-    Units: turnover is lakhs of rupees (see ``TURNOVER_SCALE_FACTOR``);
-    volume is shares; strike is rupees. Output is rupees per share —
-    directly comparable to ``close``."""
+    Units: turnover is rupees (parser-layer normalized — see comment
+    on TURNOVER_SCALE_FACTOR + LOGIC_REVIEW.md F1); volume is shares;
+    strike is rupees. Output is rupees per share — directly comparable
+    to ``close``."""
     if turnover is None or volume is None or volume == 0:
         return None
     if pd.isna(turnover):
@@ -249,8 +262,9 @@ def classify_fill_source(
     Returns one of:
       ``'vwap'``     — turnover + volume + strike present AND entry_px
                        matches the recovered premium VWAP
-                       ``turnover × TURNOVER_SCALE_FACTOR / volume − strike``
-                       within tolerance.
+                       ``turnover * TURNOVER_SCALE_FACTOR / volume − strike``
+                       ( = ``turnover / volume − strike`` since SCALE = 1.0
+                       post-F1) within tolerance.
       ``'close'``    — turnover/volume/strike unavailable (no VWAP path
                        possible), OR engine had VWAP available but the
                        result fell outside the safety band

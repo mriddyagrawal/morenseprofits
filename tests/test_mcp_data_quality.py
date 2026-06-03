@@ -34,10 +34,11 @@ def _redirect_results_dir(monkeypatch, tmp_path):
 # Sentinel: "_leg(entry_turnover=None)" should explicitly mean "no
 # turnover column" (legacy-cache test paths). A separate sentinel is
 # needed because the fixture auto-computes turnover from
-# (strike + premium) × shares / 10⁵ by default — the test author
-# specifies the VWAP they want, not raw turnover values. Without this
-# sentinel, "None" would mean both "leave it None" and "fill in the
-# default", which the no-turnover tests can't disambiguate.
+# (strike + premium) × shares by default (rupees, post-F1 parser-
+# normalized convention) — the test author specifies the VWAP they
+# want, not raw turnover values. Without this sentinel, "None" would
+# mean both "leave it None" and "fill in the default", which the
+# no-turnover tests can't disambiguate.
 _AUTO = object()
 
 
@@ -49,24 +50,26 @@ def _leg(
 ) -> dict:
     """Build a synthetic leg dict for tests. Defaults to a healthy VWAP
     fill: ``entry_turnover`` defaults (``_AUTO``) to the value NSE
-    would have reported under the (strike + premium) × shares / 10⁵
-    convention that recovers ``entry_px`` exactly (and likewise for
-    exit). Pass explicit ``entry_turnover=N`` to override (e.g.
-    divergence tests) or ``entry_turnover=None`` to model a legacy-
-    cache leg with no turnover at all.
+    would have reported under the (strike + premium) × shares
+    convention (rupees, post-F1 — see LOGIC_REVIEW.md F1 + addendum 1)
+    that recovers ``entry_px`` exactly (and likewise for exit). Pass
+    explicit ``entry_turnover=N`` to override (e.g. divergence tests)
+    or ``entry_turnover=None`` to model a legacy-cache leg with no
+    turnover at all.
 
-    Pre-strike-correction tests passed turnover values sized under the
-    old broken formula (raw notional/share = premium); the fixture
-    auto-recomputes them under the correct (strike-subtracted) formula
-    so test authors specify the VWAP they want, not raw turnover."""
+    Pre-F1 tests carried turnover values in lakhs and the engine
+    multiplied by 1e5; post-F1 the parsers normalize to rupees and the
+    engine multiplies by 1.0. The fixture math moves with the
+    convention so test authors continue to specify the VWAP they want,
+    not raw turnover."""
     if entry_turnover is _AUTO:
         entry_turnover = (
-            (strike + entry_px) * entry_volume / 100_000
+            (strike + entry_px) * entry_volume
             if entry_volume > 0 else None
         )
     if exit_turnover is _AUTO:
         exit_turnover = (
-            (strike + exit_px) * exit_volume / 100_000
+            (strike + exit_px) * exit_volume
             if exit_volume > 0 else None
         )
     return {
@@ -231,11 +234,12 @@ def test_data_quality_vwap_divergence_only_counts_close_with_turnover():
     measurable divergence."""
     # Build a leg where:
     # - entry_px = 100 (close used by engine)
-    # - turnover = 1310 lakhs / volume = 50_000, strike = 2600 →
+    # - turnover = 131,000,000 rupees / volume = 50,000, strike = 2600 →
     #   notional/share = 2620 → recovered premium = 20 → band-reject vs entry_px=100
     # - We CAN compute divergence: |20 - 100| / 100 = 80%
+    # (Post-F1 rupees convention — pre-F1 this was 1310 lakhs.)
     band_reject_leg = _leg(entry_px=100.0, entry_volume=50000,
-                            entry_turnover=1310.0)
+                            entry_turnover=131_000_000.0)
     # Build a leg where turnover is missing (no divergence measurable)
     pure_close_leg = _leg(entry_px=100.0, entry_volume=50000,
                            entry_turnover=None)

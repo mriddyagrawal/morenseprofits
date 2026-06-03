@@ -287,16 +287,25 @@ def derivatives_df(symbol, from_date, to_date, expiry_date,
 # materially better than ``close`` for thin strikes where a single late
 # print can be far from where the bulk of volume cleared.
 #
-# UNITS NOTE (corrected post-2026-05-31): NSE reports this column in
-# LAKHS of rupees but the value is the **underlying-notional turnover**
-# — empirically (strike + premium) × shares / 10⁵, NOT premium
-# turnover the column label suggests. The same field appears as
-# ``VAL_INLAKH`` in legacy ZIP bhavcopy and ``TtlTrfVal`` in the UDiff
-# bhavcopy; all three are the same NSE underlying-notional convention
-# (already documented for the bhavcopy at bhavcopy_fo_loader.py:274-278).
-# Engine recovers the per-share premium VWAP via
-# ``turnover × 10⁵ / volume − strike`` (see _compute_vwap + SPECS §2.2).
-# This _RENAMES step carries the raw column through unchanged.
+# UNITS NOTE (F1 fix — post-2026-06-03, see LOGIC_REVIEW.md addendum 1):
+# jugaad's FH_TOT_TRADED_VAL is in LAKHS of rupees — analytically
+# proven (TURNOVER_SCALE_FACTOR=1e5 predates the displayed sweep, the
+# displayed entry_px = turnover_now/volume - strike, ergo
+# jugaad_turnover = rupees/1e5 = lakhs) and corroborated by the jugaad
+# equity sibling column literally named TURNOVER_LACS. The value is
+# the day's **underlying-notional turnover** (strike + premium) ×
+# shares, NOT premium turnover as the column label "PREMIUM VALUE"
+# would suggest.
+#
+# Cross-regime: VAL_INLAKH (legacy ZIP bhavcopy) is ALSO lakhs;
+# TtlTrfVal (UDiff bhavcopy) is RUPEES. The three raw conventions are
+# NOT the same — the previous "all three same" assertion was the F1
+# bug. We NORMALIZE HERE so the engine sees a single canonical
+# convention: turnover is RUPEES everywhere downstream of the parsers.
+# Multiplying the jugaad rename × 1e5 in _normalize is the parse-time
+# step. Engine then computes ``turnover / volume − strike`` with
+# TURNOVER_SCALE_FACTOR = 1.0 (see pnl._compute_vwap).
+#
 # Legacy cached parquets pre-p7.pricing arc DO NOT carry turnover; the
 # loaded value is NaN and the VWAP path falls back to ``close``.
 _RENAMES = {
@@ -333,6 +342,11 @@ def _normalize(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     for col in ("strike", "open", "high", "low", "close", "ltp",
                 "settle_price", "turnover"):
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    # F1 normalization: jugaad's FH_TOT_TRADED_VAL is in lakhs of
+    # rupees → ×1e5 to match the engine's canonical rupees convention
+    # (see comment above + LOGIC_REVIEW.md F1 + addendum 1 +
+    # pnl.TURNOVER_SCALE_FACTOR=1.0). NaN rows pass through unchanged.
+    df["turnover"] = df["turnover"] * 1e5
     # Essential-row filter: rows missing lot_size or volume can't be
     # priced (no contract size = no P&L). NSE rarely emits such rows
     # — typically the last row of an expiry's lifetime when no actual

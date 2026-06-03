@@ -1178,14 +1178,14 @@ def test_export_rule_pre_arc_caveat_fires_when_read_run_metadata_raises(monkeypa
 # ============================================================
 
 def test_classify_fill_source_vwap_when_entry_px_matches_implied():
-    """When entry_px equals (turnover×100_000/volume) - strike, the
+    """When entry_px equals (turnover * SCALE / volume) - strike, the
     engine used VWAP. The classifier returns 'vwap'.
 
-    Under the strike-corrected formula:
-      turnover=110 lakhs, vol=50_000 → notional/share = 220
+    Post-F1 (rupees, SCALE=1.0):
+      turnover=11,000,000 rupees, vol=50_000 → notional/share = 220
       strike=200 → recovered premium = 20.0 = entry_px → vwap"""
     from src.web.heatmap import _classify_fill_source
-    assert _classify_fill_source(20.0, 50000, 110.0, strike=200.0) == "vwap"
+    assert _classify_fill_source(20.0, 50000, 11_000_000.0, strike=200.0) == "vwap"
 
 
 def test_classify_fill_source_close_when_turnover_missing():
