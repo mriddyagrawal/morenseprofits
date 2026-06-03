@@ -17477,3 +17477,112 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of 5631f18 — `fix(data.cache.fractional_strikes_supported)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Operator-driven bug fix; the prior "NSE OPTSTK strikes are always integer" assumption was empirically wrong (BHEL has had ₹2.5-tick strikes for years). Fix is tight (+59 net LOC), backwards-compatible for every existing per-contract cache, tests cover positive/negative/boundary cases. **Empirically verified against the operator's own cached bhavcopy.**
+
+### Empirical verification (independently reproduced)
+
+Read the cached BHEL bhavcopy parquet at `data/cache/bhavcopy_fo/20240104.parquet`:
+
+```
+BHEL 2024-01-04: 230 OPTSTK rows, 114 with fractional strike
+Unique fractional strikes: [97.5, 102.5, 107.5, 112.5, 117.5, 122.5, 127.5, 132.5, 137.5, 142.5]
+```
+
+**Exactly matches the commit body's enumeration** of 97.5 / 102.5 / 107.5 / 112.5 / 117.5. The 114-row count + the ₹5 gap between fractional strikes confirms NSE uses a ₹2.5 tick size for BHEL at this price range (₹95-145 zone, where ₹2.5 ticks make economic sense). The "integer-only" constraint was based on RELIANCE / PNB / SBIN / TCS observations that didn't generalize.
+
+### Fix verified
+
+`src/data/cache.py:83-99` — new `_strike_path_segment` helper:
+
+```python
+def _strike_path_segment(strike: float) -> str:
+    if float(strike) == int(strike):
+        return f"{int(strike)}"
+    return f"{strike:g}"
+```
+
+- **Integer strikes (or integer-valued floats)**: `100` → `"100"`; `100.0` → `"100"`. **Backwards-compatible with every existing per-contract parquet** written under the integer-only assumption — they remain cache hits.
+- **Fractional strikes**: `97.5` → `"97.5"`; `102.5` → `"102.5"`. Filesystem-safe (no `/`); `g` strips trailing zeros for canonical form.
+- **Collision-free**: integer `100` → `"100"` vs fractional `100.5` → `"100.5"` distinct filenames. Integer-valued float `100.0` collides with `100` by design — same contract.
+
+`StrikeNotIntegerError` class retained as deprecated for backwards-compat (external imports — logs, test fixtures); class docstring carries the BHEL counterexample.
+
+### Pytest
+
+```
+tests/test_cache.py  — 14 tests        PASSED
+tests/test_options_loader.py — 21 tests PASSED
+==================== 35 passed in 0.23s ====================
+```
+
+35/35 pass. Test count claim (859 → 860, +1 net) matches: 1 new test (`test_strike_not_integer_error_class_retained_for_backcompat`); 2 raise-asserting tests rewritten in place with positive encoding assertions.
+
+### `{:g}` precision sanity check (independently verified)
+
+```
+  50.5 → '50.5'        100.5 → '100.5'      2620.5 → '2620.5'
+  9999.5 → '9999.5'    25000.5 → '25000.5'  99999.5 → '99999.5'
+  100000.5 → '100000'  ← fractional lost (7 sig figs > default 6 precision)
+  100.0 → '100'        100 → '100'          (collide by design, same contract)
+```
+
+NSE OPTSTK strikes are never close to 100,000 (RELIANCE peaks ~3500, ADANIENT ~3000; even DIVISLAB / PAGEIND ~5000-6000). The `{:g}` precision boundary is **practically unreachable for the OPTSTK universe**. If OPTIDX (NIFTY) ever gets included AND emits fractional strikes — which NSE has never done at NIFTY's 50-strike tick — the encoder would need a switch to a precision-safe formatter (`f"{strike:.4f}".rstrip("0").rstrip(".")`). Filed as a future-proofing nuance, NOT a grill.
+
+### Backwards-compat verified
+
+- Existing `100-CE.parquet` (pre-fix integer encoding) → post-fix `_strike_path_segment(100)` → `"100"` → same filename → **cache hit**. ✓
+- Existing `2620-CE.parquet` → post-fix `_strike_path_segment(2620)` → `"2620"` → cache hit. ✓
+
+Operator re-runs prefetch without `--force`; integer-strike contracts hit cache-first; BHEL fractional contracts that previously failed loudly with `StrikeNotIntegerError` now materialize.
+
+### Praises
+
+- **Empirical verification cited in the commit body** — the specific 5-strike enumeration (97.5 / 102.5 / 107.5 / 112.5 / 117.5) lets a future archaeologist reproduce from the cached bhavcopy. (I independently confirmed the 114-row count + ₹5 gap pattern by reading the parquet.)
+- **Backwards-compat by construction** — integer strikes encode identically pre/post fix. No cache-invalidation step; no operator action beyond a re-run.
+- **Deprecation-but-retention of `StrikeNotIntegerError`** is the right call — external consumers keep working; class docstring documents the deprecation reason.
+- **Test re-orientation matches the new contract** — old `pytest.raises` assertions replaced with positive `assert p.name == "97.5-CE.parquet"` assertions. Future encoding regressions fail LOUD.
+- **`g`-format helper docstring explains the trailing-zero-stripping** (`97.5 → "97.5", 97.50 → "97.5" (canonical)`). Operator-grade.
+- **No collision** between integer-only-strike caches and fractional caches; verified by the test's `assert p_frac_2620p5 != p_int`.
+- **Single-line operator re-run instructions** in the commit body — lessons from d69c3e5 carried forward (copy-paste-safe; no `\\` continuations).
+
+### Math
+
+- LOC: +84 / -25 = +59 net. ✓ Matches `84 insertions, 25 deletions`.
+- Test count: 859 → 860 (+1 net). ✓
+
+### Behavior delta
+
+- `cache.option_path(symbol, expiry, strike, "CE")` no longer raises on fractional `strike`; produces a deterministic path via `g`-format encoding.
+- All existing per-contract integer-strike parquets remain cache hits.
+- BHEL fractional-strike contracts (and any other stock with ₹2.5-tick strikes — likely mid-cap names at similar price ranges) now materialize through the batch path.
+
+### State-of-tree
+
+Operator can resume the smoke-gate prefetch by re-running the same command. The previously-materialized integer-strike contracts hit cache-first; the BHEL 97.5-series + any other fractional-strike contracts complete. Next operator step: sweep → comparison.
+
+### Open grills
+
+None new. **Grill #1 from ef4f71b review** (case-sensitivity divergence between per-contract and batch paths) **remains open** — not addressed here and not advertised as load-bearing; BUILDER may defer or close at discretion.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**Operator-side: resume the gate exercise.** Re-run the prefetch (single-line copy-paste from this commit's body); 4-stock smoke universe should now complete the bhavcopy-mode batch materialize in seconds AND no longer halt on BHEL fractional strikes. After prefetch completes, run the sweep, run the smoke comparison, proceed to P1.7 with the PASS verdict embedded in the commit body.
+
+Optional follow-ups (any order, any commit):
+- Close Grill #1 from ef4f71b (case-sensitivity divergence) — ~3 LOC.
+- Future-proof `_strike_path_segment` for >99999.5 strikes if OPTIDX gets included — switch to fixed-precision format.
+
+Neither is blocking.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → (operator gate exercise — now unblocked at both the perf step AND the fractional-strike step) → P1.7 → P1.8 → ...**
+
+Standing by.
+
+---
