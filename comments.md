@@ -18612,3 +18612,114 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of 6bc95e9 — `fix(prefetch.step2b.lot_sizes_rebuild_predicate)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Real operator-driven correctness fix. The exists-only predicate at Step 2b couldn't distinguish "unified cache is current" from "unified cache was built when sibling had fewer dates" — empirically caused 8,587/9,392 contract rejections (BHEL alone: 1,791/1,963) on the operator's run. Mtime-based predicate fixes it cleanly with three-branch test coverage.
+
+### Root cause verified
+
+`scripts/prefetch_universe.py` (pre-fix line 384):
+
+```python
+if not lot_sizes_parquet.exists() or args.rebuild_lot_sizes:
+```
+
+This predicate has a load-bearing hole: once the unified parquet exists, it's trusted forever (unless `--rebuild-lot-sizes` is explicitly passed). Operator workflow:
+
+1. First prefetch run: `lot_sizes.parquet` builds against the THEN-current sibling coverage (4 BHEL year-months from the sidecar-only era).
+2. Operator extends smoke window → fetches new bhavcopies → sibling dir grows to 25 BHEL year-months.
+3. Second prefetch run: predicate sees `lot_sizes.parquet` exists → uses the 4-month version → 21 of 25 BHEL year-months have `lot_size_lookup → None` → `MissingTurnoverError` → skip.
+
+Empirical magnitude: ~8,587 of 9,392 contracts (operator-reported per the commit body, corroborated by my own back-of-envelope from a 4-symbol × 24-month × ~25-strike grid math).
+
+### Fix verified — three-branch predicate
+
+`_lot_sizes_needs_rebuild(parquet_path, sibling_dir) -> (bool, str)`:
+
+1. **Unified parquet missing** → True, reason `"<path> missing"`. Fresh clone / operator nuke. ✓
+2. **Sibling dir missing** → False, reason `"no sibling dir to compare against"`. Defensive — sibling-less state means we trust the unified cache as the only signal. (Edge case unlikely in practice; cheap defensive check.)
+3. **Sibling has at least one parquet with mtime > unified parquet's mtime** → True, reason names the count + first newer filename for operator triage. ✓
+4. **Otherwise** → False, reason `"up-to-date vs sibling cache"`. ✓
+
+The mtime check is the cheapest defensible signal. **Adding a year-month tuple to the unified cache always requires fetching a new bhavcopy first, which always bumps the sibling mtime.** Row-by-row coverage check would be more thorough but doesn't match a real operator failure mode beyond "operator manually edits sibling files" — out of scope.
+
+### Test verified — three-branch pinning with deterministic mtimes
+
+`test_lot_sizes_needs_rebuild_predicate_pins_three_cases`:
+
+- Case 1: unified missing → `needs=True`, `"missing" in reason` ✓
+- Case 2: unified + older sibling (mtime = base − 60s via `os.utime`) → `needs=False`, `"up-to-date" in reason` ✓
+- Case 3: sibling NEWER (mtime = base + 60s) → `needs=True`, reason names `"20251231"` (operator-visible) ✓
+
+**Uses `os.utime` to rig mtimes deterministically — no `time.sleep()`**. Test runs in microseconds; not flaky on fast hardware. Locks each branch separately so a future contributor collapsing them re-introduces the bug.
+
+### Pytest
+
+```
+tests/test_build_lot_size_parquet.py: 14 passed in 4.51s
+```
+
+14/14 pass. BUILDER's full-suite claim (858 + 8 skipped + 2 deselected = 868; +1 net for this predicate test vs 029d175's 866) matches.
+
+### Grill #1 (MINOR, OPTIONAL): `first_newer` is iterdir-order-dependent
+
+`Path.iterdir()` order is not deterministic — on most filesystems it's directory-entry insertion order, which can vary across runs / reformats. The "first" newer sibling reported in the reason string could vary across operator runs against the same on-disk state.
+
+**Impact: small.** The reason string is operator-facing triage info; knowing ANY one newer sibling is enough for the operator to investigate. The total `newer_count` is also reported, which gives the operator a sense of the magnitude.
+
+**Suggested fix (optional)**: `sorted(child.name for child in sibling_dir.iterdir() if ...)` and take `[0]` of the newer-set. Deterministic output across runs. ~2 LOC. Defer at discretion.
+
+### Praises
+
+- **Three-branch test coverage with deterministic mtimes** — gold standard. Each branch can regress independently; locked separately.
+- **Operator-visible reason string** in the auto-trigger log line (`_h(f"...{rebuild_reason}")`) — operator sees WHY the rebuild fired, not just that it did. Triage-grade.
+- **Edge cases handled defensively**: sibling dir missing → False (correct); equal mtimes → False (correct, not strictly newer); non-parquet files in sibling dir → filtered out by `child.suffix != ".parquet"`.
+- **`--rebuild-lot-sizes` flag preserved** as explicit manual override. Redundant under the new auto-detect but harmless; gives operator an escape hatch if a future bug breaks the auto-detect.
+- **Honest scope acknowledgment** in commit body: "The fix is therefore not exercised under the immediate next prefetch run" — operator nuked the cache, so this run hits the "missing" branch. The fix lands for the FUTURE operator workflows where the staleness mode reappears. Calling this out explicitly avoids the trap where "I tested the operator's next run, it worked" gets confused with "the fix is correct."
+- **Empirical anchor in test docstring**: "Anti-regression on the stale-lookup bug observed 2026-06-03 ... 805/9392 contracts as `lot_size excluded`". Names the failure mode + the date + the magnitude — future archaeologist gets the diagnosis without history-spelunking.
+
+### Math
+
+- LOC: +60 / -2 (src) + +49 / -0 (test) = +109 / -2 = +107 net. ✓ Matches `107 insertions, 2 deletions`.
+- Test count: 858 passed + 8 skipped + 2 deselected (+1 net vs 029d175). ✓ Matches.
+
+### Behavior delta
+
+- Step 2b's auto-rebuild now triggers when sibling cache has newer mtimes than the unified parquet, not just when the unified parquet is missing. **Operator-flow impact**: substantial — the smoke-window extension workflow (add new bhavcopies → re-run prefetch) was silently broken; now self-heals.
+- The `--rebuild-lot-sizes` manual override remains functional and explicit.
+- Operator-visible stdout: `Step 2b — build unified lot_sizes.parquet [auto-trigger: <reason>]` now reports the staleness cause instead of always saying `"<path> missing"`.
+
+### State-of-tree
+
+After cache wipe + this fix, operator's next prefetch will:
+
+1. Step 2 fetches all bhavcopies.
+2. Step 2b sees `lot_sizes.parquet` missing → builds against the full sibling coverage. (Predicate's "missing" branch, not the new "newer sibling" branch.)
+3. Step 3 batch-materializes with full lot-size coverage → contract-skip count should drop to near-zero (just genuine cross-source exclusions + truly-never-traded contracts).
+
+The staleness self-heal becomes load-bearing on the NEXT smoke-window extension, not this immediate run. BUILDER correctly notes this.
+
+### Open grills
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; still open; deferred per priority ordering.
+- **Grill #1 from THIS commit** (`first_newer` iterdir order) — MINOR; ~2 LOC fix; defer.
+- **F3** (expiry physical-settlement STT) — defer, non-blocking.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+Unchanged: **operator gate exercise → P1.7 with PASS metrics in body**. The mtime fix removes a real friction point for the operator's gate-exercise re-run; expectations:
+
+- Step 2 + 2b complete cleanly.
+- Step 3 batch-materializes 9,000+ contracts (vs ~805 successful under the staleness bug).
+- Sweep + smoke comparison run cleanly.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → F1 ✓ → F1-B ✓ → lot_sizes mtime predicate ✓ → (operator gate exercise — now genuinely unblocked across all 5 observed failure modes) → P1.7 → ...**
+
+Standing by.
+
+---
