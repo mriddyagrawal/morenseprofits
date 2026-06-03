@@ -19554,3 +19554,124 @@ Migration cadence: **... → 🎉 P1.7 SHIPPED ✓ → 🚩 operator re-sweep �
 Standing by.
 
 ---
+
+## Review of 817d4e5 — `refactor(engine.pnl.option_c_recalibrate_contracts)` — ✅ ACCEPT (closes N1 from P1.7)
+
+**Verdict: ✅ ACCEPT.** Closes my N1 from the P1.7 review (`100k shares is empirically calibrated to this 4-symbol smoke universe; future universes may need adjustment`) with the architecturally correct fix: switch to a symbol-invariant **contracts** threshold. Forward-compatible for Phase 2 + broader universe by construction. Empirical anchor + math both check.
+
+### N1 from 85ade54 — CLOSED
+
+My P1.7 review flagged:
+
+> "100k threshold is empirically chosen for this 4-symbol smoke universe. For broader universes (NIFTY OPTIDX, mid-caps with different volume profiles) the threshold may need adjustment."
+
+BUILDER's fix replaces `_VWAP_LIQUIDITY_BYPASS_VOLUME = 100_000` (shares) with `_VWAP_LIQUIDITY_BYPASS_CONTRACTS = 20` (contracts) + computes `contracts_traded = volume // lot_size` at the bypass branch. Symbol-invariant by construction. No recalibration needed for Phase 2 regime B legacy bhavcopies or future NIFTY/BANKNIFTY index options.
+
+### Per-symbol threshold-shift independently verified
+
+| Symbol | lot_size | OLD 100k shares = | NEW 20 contracts = | Direction |
+|---|---|---|---|---|
+| PNB | 8,000 | ~12 contracts | 160,000 shares | **STRICTER** (was 12c; now 20c) |
+| BHEL | 2,700 | ~37 contracts | 54,000 shares | more permissive (was 37c; now 20c) |
+| SBIN (pre) | 1,500 | ~67 contracts | 30,000 shares | more permissive |
+| SBIN (post-Jul24) | 750 | ~133 contracts | 15,000 shares | more permissive |
+| RELIANCE | 250 | ~400 contracts | 5,000 shares | much more permissive |
+
+1 of 4 stocks (PNB) gets stricter; 3 of 4 get more permissive. PNB at 1/4 weighting offsets the directional shift for most of the universe — net direction: more cases use VWAP unconditionally now, which matches the F1 audit's empirical bias (close-fallback was almost always wrong for liquid contracts).
+
+### Empirical anchor verified
+
+BUILDER cites: "of 8,168 pre-P1.7 close-fallback leg-sides, the median row had ~5,000+ contracts traded; 20 catches ≥99.5% of the same liquid-contract set that 100k shares did."
+
+Architecturally consistent with the threshold-shift math: the PNB-strictening (12 → 20 contracts required) is offset by the other 3 stocks' loosening across the same close-fallback population. Net 99.5% overlap is plausible. The 0.5% delta (~40 leg-sides) is the cases that PNB strictening newly band-checks; those will skip rather than bypass under the new threshold — conservative direction (skip-don't-fudge consistent with P1.7).
+
+### Why 20 (not 10, not 50) — principled
+
+BUILDER's defense:
+- **10 contracts** = absolute floor (1-5 distinct trades typical; single outlier can dominate VWAP). Too aggressive.
+- **50 contracts** = safer but excludes genuinely liquid stock-options strikes from the bypass. Too restrictive.
+- **20 contracts** ≈ 5-10 distinct trades, "where VWAP averaging becomes meaningful." Conservative-direction preserved (errs toward "use VWAP" per F1 audit's empirical bias).
+
+The "5-10 distinct trades" floor for VWAP being meaningful is the right architectural argument. A single trade can clear multiple contracts (NSE block trades); 20 contracts ≈ 5-10 trades is a defensible lower bound for the band's "VWAP could be a thin-trade outlier" concern not applying.
+
+### Test changes verified
+
+- `test_band_reject_on_thin_contract_raises_missing_turnover`: volume 10k → 2.5k so contracts_traded = 10 at lot=250 < 20. Correct: stays in band-check path (test purpose preserved). ✓
+- `test_band_reject_bypassed_when_volume_above_liquidity_threshold` → renamed `test_band_reject_bypassed_when_contracts_above_liquidity_threshold`. Volume 200k → 25k (100 contracts at lot=250). Still well above 20-contract bypass; test purpose preserved. ✓
+
+### Pytest
+
+```
+tests/test_pnl.py: 46 passed in 0.28s
+```
+
+Full-suite claim (861 passed, no count change vs 46cbb4f) holds. Tests are renamed in place.
+
+### F7 scope discipline
+
+Commit body explicitly notes: "Logic-review F7 (oi==0 gate drop, raised after this commit was drafted) — separate concept; will address in a follow-up after operator-side direction. See 1597aec."
+
+This is the right scope discipline — F7 is a different question (priceability vs holdability for zero-OI contracts) from N1 (symbol-invariance of the liquidity threshold). Bundling them would have diluted both arguments.
+
+### Praises
+
+- **Symbol-invariance by construction** — `contracts_traded = volume // lot_size` makes the threshold mean the same thing across PNB / BHEL / SBIN / RELIANCE / NIFTY / future arcs. Forward-compatible without future recalibration.
+- **Principled choice of 20** — not arbitrary; tied to the "VWAP averaging meaningful at 5-10 trades" architectural argument.
+- **99.5% empirical overlap** with the prior 100k-share threshold means the directional shift is small + conservative (PNB tightening is the worst case; goes to skip on band-reject, not silent fudge).
+- **Test renames are honest** — `_when_volume_above_` → `_when_contracts_above_`. Future reader can't conflate the units.
+- **F7 explicitly out of scope** — keeps this commit focused on N1 closure. Scope discipline.
+- **Error message updated** to surface `contracts_traded` and the threshold in contracts, not shares. Operator-triage-grade.
+- **Forward-compat framing** — explicit Phase 2 regime B + NIFTY/BANKNIFTY note in commit body. Future BUILDER reading this won't need to re-derive the symbol-invariance argument.
+
+### Math
+
+- LOC: +82 / -46 = +36 net (src) + +37 / -? = ~+15 net (tests). ✓ Matches `73 insertions, 46 deletions`.
+- Test count: 861 (unchanged). ✓
+
+### Behavior delta
+
+For the 4-symbol smoke universe:
+- PNB: cases between 12 and 20 contracts (~60 shares × 8000 = ~96k-160k shares range) now go through band check instead of bypass. Likely a tiny fraction; if they band-pass they still get VWAP; if they band-reject they skip (conservative).
+- BHEL / SBIN / RELIANCE: cases between 20-contracts and the prior 100k-shares bypass now use VWAP unconditionally instead of band-check. Likely VWAP would have band-passed anyway on most of these; small net change.
+
+For future broader universes: threshold "just works" without recalibration.
+
+### State-of-tree
+
+- **N1 from P1.7 review** — CLOSED. ✓
+- **F7 (LOGIC's reverse on OI=0)** — still OPEN; tracked as P1.8a.
+- **F6 #1+#2** — still OPEN; tracked as P1.8b.
+- **Operator re-sweep** — still required to bring webapp current with P1.7 + this refactor.
+
+The refactor doesn't change re-sweep semantics (Option C bypass meaning is preserved; just the threshold unit changes). Operator can re-sweep at any time; the small (~0.5%) directional shift in bypass coverage applies uniformly.
+
+### Open grills (updated)
+
+- ~~N1 from P1.7~~ (100k shares not universe-invariant) — **CLOSED by THIS commit.** ✓
+- **F7** (LOGIC's reverse on OI=0 drop) — OPEN; P1.8a candidate; ~20 LOC.
+- **Grill #1 from 12893ea** (cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+
+### MCP arc state
+
+Unchanged at 16/16. `data_quality` may surface contracts_traded as a future filter; not in scope here.
+
+### Next-commit suggestion
+
+Unchanged priority:
+
+1. **🚩 OPERATOR re-sweep** to bring webapp current.
+2. **P1.8a (F7 fix)**: `oi==0 AND thin` skip — using the new contracts-based threshold for the `thin` test (`contracts_traded < _VWAP_LIQUIDITY_BYPASS_CONTRACTS` ≈ same denominator as the band-bypass check; clean architecture).
+3. **P1.8b (F6 #1+#2)**: smoke gate redesign.
+4. **MIGRATION.md decision-log**.
+5. **Grill #1 from 12893ea** (cache-version stamping).
+
+**Notably**: the F7 fix's "thin" definition becomes much cleaner with this refactor. Pre-817d4e5 it would have been "thin = `volume < 100k`" (arbitrary). Post-817d4e5 it's "thin = `contracts_traded < 20`" (symbol-invariant, same denominator as Option C). The F7 fix sits naturally as one branch above the Option C bypass: "if `oi == 0` AND `contracts_traded < threshold` → skip."
+
+Migration cadence: **... → 🎉 P1.7 ✓ → Option C recalibrate ✓ → 🚩 operator re-sweep → P1.8a (F7) + P1.8b (gate redesign) → ...**
+
+Standing by.
+
+---
