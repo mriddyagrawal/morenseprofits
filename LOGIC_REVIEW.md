@@ -382,6 +382,35 @@ Sanity-checked `data/cache/spot/*` (50 symbols × 3 yrs). Schema/dtypes/units cl
 
 Net: "use spot vwap" = the **transaction reference** (ATM + margin), NOT the volatility estimator. Non-blocking consistency upgrade.
 
+## F11 — Anomaly audit + full skip-path taxonomy: sweep `16277b27e2a8` (Phase-7 baseline)
+
+Wide grid: 50 sym × 3 strat × 25 exp × 600 (entry>exit) pairs = 2,250,000 planned; **1,103,923 priced (49.1%) / 1,145,309 skipped (50.9%) / 768 silently dropped.** First sweep with full regime-C lot coverage (90,485 contracts). **Engine verified faithful** — 20/20 random `MissingTurnoverError` cells confirmed `contracts==0` (or row absent) in the **raw bhavcopy**; 10/10 `OfflineCacheMiss` confirmed absent from `data/cache/options/`. No code bug masking real data as zero.
+
+### Per-anomaly verdicts
+1. **WIPRO/TATASTEEL IC underrepresented (IC/SS 33%/54% vs INFY 88%) → ✅ EXPECTED.** *Not* a strategy cull: `iron_condor.py:132-149` `_pick_condor_strikes` uses `pick_nearest` and explicitly allows degenerate wings — it always forms a trade. The gap is **pricing/coverage**: IC's far-OTM ±5% wings often have **no materialized contract** (never traded → not enumerated). WIPRO IC skips = **70% OfflineCacheMiss** (e.g. `WIPRO 2024-07-25 425-PE`, spot ~507, −5% target ~482 = the put wing); INFY IC skips = **0% OfflineCacheMiss** (dense liquid grid). IC/SS ratio = a direct readout of OTM-wing materialization. *Caveat: low IC/SS = thin/unmaterialized wings, not a defect.*
+2. **50.9% skip → ✅ EXPECTED.** 95.9% of skips are MissingTurnover (verified zero-vol) + OfflineCacheMiss (verified absent) = "no real trade existed." The "99.6% VWAP fill rate" reference is a **different denominator** (share of *priced fills* using VWAP, not planned-cell coverage) — not comparable. A wide grid (far-back T-offsets × far-OTM strikes × 4-leg condors under VWAP-or-skip + cache_only) naturally skips ~half. Justified: ~96% of the 50.9% (≈48.8% of all planned cells). *Caveat: skip rate here is a coverage/liquidity-geography metric, not an error rate.*
+3. **Skip-reason mix → ✅ EXPECTED / faithful.** 20/20 + 10/10 verified (above). `MissingTurnoverError` collapses 3 `_pick_fill_price` branches but skip_detail shows the dominant case is literally `volume==0`.
+4. **IC 4.9× spread vs SS 2.1× → ✅ EXPECTED.** Same mechanism as #1: IC coverage is gated by the **weakest of 4 legs** (far-OTM wings, whose materialization varies hugely by symbol = liquidity geography); SS gated by 2 uniformly-liquid ATM legs → tight spread. 4.9× is the natural consequence of the 4-leg-AND requirement, not pathological over-skipping.
+5. **NESTLEIND SS min (5,686) → ✅ EXPECTED, but the stated mechanism is WRONG.** Skips = MissingTurnover 6,058 (65%) + OfflineCacheMiss 3,256 (35%), **ZERO NoLiquidStrikeError.** So it's *not* the ATM picker failing, and *not* wide strike steps — NESTLEIND **post-2024 1:10 split trades ~₹2,400 (not ~25k)** with a fine ~20 (0.8%) step. Real cause = your *second* option: ATM picker succeeds, but NESTLEIND is a **thin options name** → even ATM strikes have frequent zero-volume days → VWAP-or-skip. Min count = low options liquidity, not strike geometry.
+
+### 🔬 Comprehensive skip-path taxonomy (the full surface, per request — not just the 4 observed)
+**A. LOGGED skips** (`_skipped.parquet`, 1,145,309) — caught by `_SKIPPABLE_ERRORS(_CACHE_ONLY)` in `sweep_one`:
+| Reason | n | Code path | Distinct sub-causes (collapsed into one string) |
+|---|---|---|---|
+| `MissingTurnoverError` | 841,924 | `pnl._pick_fill_price` | (a) turnover None/NaN **or volume None/0** or strike None; (b) recovered premium ≤ 0 (deep-OTM ill-conditioning); (c) thin (<100k vol) VWAP-vs-close band-reject |
+| `OfflineCacheMiss` | 256,937 | `options_loader.load_option` (cache_only) | contract parquet absent — **also reachable** from `load_spot`/`load_bhavcopy_fo`/`offset_trading_days` cache-miss (same string). Upstream: contract never materialized (never-traded / lot-excluded / out-of-symbol-set) |
+| `MissingDataError` | 30,035 | `_pick_fill_price` | "no traded row on {date}" (29,932) + "empty frame" (103) + (latent, 0 here) `_price_one_leg` "lot_size changed mid-contract" = corporate action |
+| `NoLiquidStrikeError` | 16,413 | `_strikes.load_available_strikes` | entire OPTSTK chain absent for (sym,expiry) on the **entry-day** bhavcopy |
+
+**B. SILENT drops** — in NEITHER parquet — **768 cells (0.034%)**: `sweep_one` `return None` on `spot_df.empty` (`sweeper.py:193`) or `not trades` (`sweeper.py:207`). ⚠️ **NEEDS ATTENTION (minor):** these are unlogged, so `planned ≠ priced + skipped` by 768. Not a data-correctness issue, but a **taxonomy-completeness gap** — an operator auditing "where did cells go" can't see these. *Minimal fix:* raise/record a `MissingSpotError`/`NoTradesError` skip instead of bare `return None`, so the accounting closes exactly.
+
+**C. FATAL paths** (NOT in `_SKIPPABLE_ERRORS` → propagate → abort the worker/sweep; **none fired** — sweep completed): `LookaheadError` (loader frame has rows > exit_date, or duplicate date on a target) `pnl.py:349` + `_pick_fill_price`; `ValueError` (`entry_offset_td <= exit_offset_td`, or bad IC offsets) — guarded by the grid; any unexpected exception in `price_trade`/margin/cost. Their absence is itself a clean signal.
+
+**D. UPSTREAM (materialize-time) exclusions** — manifest *later* as sweep-time `OfflineCacheMiss`: `bhavcopy_to_contract` never writes the parquet when `lot_size` excluded (cross-source mismatch) or `contracts==0` on every cached day (never traded).
+
+### OVERALL VERDICT: ✅ TRUSTABLE as the Phase-7 baseline — no re-run needed.
+All four logged skip classes verified faithful (engine reads real data; zero masking bugs); the 50.9% skip rate and IC/SS spreads are liquidity-geography artifacts of a wide grid under VWAP-or-skip, not defects. Single blemish: 768 silently-dropped cells (0.034%) — a logging-completeness ⚠️ grill, not a correctness issue; downstream analytics on the priced rows are sound. Headline counts are **not comparable to sidecar-only baselines** (4.7× more contracts materialized) — operator caveat for any cross-sweep comparison.
+
 ### STATUS (as of `46cbb4f`, P1.7 shipped)
 **Correctness: all clear.** F1/F1-B/F2/F5/F6 closed; coverage bug (`6bc95e9`) fixed; P1.7 VWAP-or-skip shipped + verified; both reviewer streams converged. **Operator action required for the webapp to be "true & best" under P1.7: re-prefetch + re-sweep** (current displayed parquet is pre-P1.7). ### 🚩 PRE-RE-SWEEP GOTCHA (operator about to wipe cache + re-prefetch + re-sweep)
 - **`run_id` is a deterministic hash of the grid; `sweep_grid` returns the cached parquet when `path.exists() and not force` ([sweeper.py:297](src/engine/sweeper.py#L297)); `p7_wide_sweep.py` runs `force=False`; and `data/results/` is NOT under `data/cache/`.** ⟹ wiping the cache does NOT remove `data/results/sweep_*.parquet`, so a same-grid re-run **silently returns the stale pre-P1.7 parquet** instead of re-pricing. **Operator MUST `rm data/results/sweep_*.parquet` (main + `_skipped`) or pass `force=True`** or the entire re-sweep is a no-op returning old data.
