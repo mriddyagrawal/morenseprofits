@@ -170,28 +170,7 @@ def bhavcopy_to_contract_timeseries(
             f"derive volume in shares."
         )
 
-    # Assemble the options_loader-shape output.
-    out = pd.DataFrame({
-        "date": raw["trade_date"].astype("datetime64[us]"),
-        "symbol": raw["symbol"].astype("string"),
-        "expiry": raw["expiry"].astype("datetime64[us]"),
-        "option_type": raw["option_type"].astype("string"),
-        "strike": raw["strike"].astype("float64"),
-        "open": raw["open"].astype("float64"),
-        "high": raw["high"].astype("float64"),
-        "low": raw["low"].astype("float64"),
-        "close": raw["close"].astype("float64"),
-        "ltp": raw["ltp"].astype("float64"),
-        "settle_price": raw["settle_price"].astype("float64"),
-        "lot_size": pd.Series([lot_size] * len(raw), dtype="int64"),
-        "volume": (raw["contracts"] * lot_size).astype("int64"),
-        "turnover": raw["turnover"].astype("float64"),
-        "oi": raw["oi"].astype("Int64"),
-        "oi_change": raw["oi_change"].astype("Int64"),
-    })
-    return (
-        out.sort_values("date").reset_index(drop=True)[_OUTPUT_COLUMNS]
-    )
+    return _assemble_output_frame(raw, lot_size)
 
 
 def enumerate_contracts_from_bhavcopies(
@@ -290,6 +269,164 @@ def materialize_contract_from_bhavcopy(
     )
     cache.write(path, df, overwrite=True)
     return path
+
+
+def _assemble_output_frame(
+    sub: pd.DataFrame, lot_size: int,
+) -> pd.DataFrame:
+    """Build the 16-col options_loader-shape output from a per-
+    contract bhavcopy sub-frame + the resolved ``lot_size``.
+
+    Shared by the per-contract transform path
+    (``bhavcopy_to_contract_timeseries``) and the batch materialize
+    path (``materialize_contracts_batch``). Single source of truth
+    for the output dtype + column order.
+    """
+    # reset_index BEFORE constructing the output. Groupby sub-frames
+    # retain the parent's indices (e.g., [0, 2, 5]); a freshly-built
+    # ``lot_size`` Series has a 0-based RangeIndex. Without reset, the
+    # DataFrame constructor aligns by index and silently produces
+    # NaN-filled phantom rows where the indices don't overlap. This
+    # is the canonical pandas footgun for "I just want to attach a
+    # broadcast scalar column."
+    sub = sub.reset_index(drop=True)
+    return pd.DataFrame({
+        "date": sub["trade_date"].astype("datetime64[us]"),
+        "symbol": sub["symbol"].astype("string"),
+        "expiry": sub["expiry"].astype("datetime64[us]"),
+        "option_type": sub["option_type"].astype("string"),
+        "strike": sub["strike"].astype("float64"),
+        "open": sub["open"].astype("float64"),
+        "high": sub["high"].astype("float64"),
+        "low": sub["low"].astype("float64"),
+        "close": sub["close"].astype("float64"),
+        "ltp": sub["ltp"].astype("float64"),
+        "settle_price": sub["settle_price"].astype("float64"),
+        "lot_size": pd.Series([lot_size] * len(sub), dtype="int64"),
+        "volume": (sub["contracts"] * lot_size).astype("int64"),
+        "turnover": sub["turnover"].astype("float64"),
+        "oi": sub["oi"].astype("Int64"),
+        "oi_change": sub["oi_change"].astype("Int64"),
+    }).sort_values("date").reset_index(drop=True)[_OUTPUT_COLUMNS]
+
+
+def materialize_contracts_batch(
+    symbols: list[str] | set[str],
+    *,
+    from_date: date, to_date: date,
+    force: bool = False,
+    instrument_filter: tuple[str, ...] = ("OPTSTK",),
+    progress_callback=None,
+) -> dict:
+    """Batch materialize ALL per-contract parquets for the given
+    symbol set in a single pass over the cached bhavcopies.
+
+    Replaces the per-contract loop (which re-walks every cached day
+    for each contract) with a single-pass O(days + contracts) scan.
+    For a 4-symbol × 2-year window: ~466 file reads + ~10k group
+    ops instead of ~4.4M file reads.
+
+    Returns a dict with counts:
+
+      - ``materialized``: contracts written to disk this call.
+      - ``already_cached``: contracts whose parquet already existed
+        (skipped per cache-first idempotency unless ``force=True``).
+      - ``skipped_missing_turnover``: contracts where the unified
+        cache excludes the lot_size OR any row has contracts ≤ 0.
+      - ``skipped_other``: contracts that hit an unexpected error.
+      - ``skip_log``: list of ``(sym, expiry, strike, opt, reason)``
+        for the first 100 skipped contracts (operator-triage aid).
+
+    Errors are caught per-contract — one bad contract doesn't halt
+    the batch. The per-contract function
+    ``materialize_contract_from_bhavcopy`` is retained for single-
+    contract debug / Phase 2 paths.
+    """
+    sym_upper = {s.upper() for s in symbols}
+    instrument_set = set(instrument_filter)
+
+    # Single-pass bhavcopy load + symbol filter.
+    days = _iterate_trading_days(from_date, to_date)
+    frames: list[pd.DataFrame] = []
+    for d in days:
+        path = cache.bhavcopy_fo_path(d)
+        if not cache.exists(path):
+            continue
+        df = cache.read(path)
+        df = df[
+            df["symbol"].isin(sym_upper)
+            & df["instrument"].isin(instrument_set)
+        ]
+        if df.empty:
+            continue
+        frames.append(_normalize_legacy_columns(df))
+
+    counts = {
+        "materialized": 0,
+        "already_cached": 0,
+        "skipped_missing_turnover": 0,
+        "skipped_other": 0,
+        "skip_log": [],
+    }
+    if not frames:
+        return counts
+
+    big = pd.concat(frames, ignore_index=True)
+    # Drop futures defensively (instrument filter should have done it,
+    # but a NaN strike would break the groupby).
+    big = big.dropna(subset=["strike", "option_type"])
+
+    grouped = big.groupby(
+        ["symbol", "expiry", "strike", "option_type"], sort=True,
+    )
+    total_groups = len(grouped)
+    processed = 0
+    for (symbol, expiry_ts, strike, opt_type), sub in grouped:
+        processed += 1
+        if progress_callback is not None:
+            progress_callback(processed, total_groups)
+        expiry_date = (
+            expiry_ts.date() if isinstance(expiry_ts, pd.Timestamp) else expiry_ts
+        )
+        target = cache.option_path(
+            str(symbol), expiry_date, float(strike), str(opt_type),
+        )
+        if target.exists() and not force:
+            counts["already_cached"] += 1
+            continue
+
+        lot_size = lot_size_lookup(str(symbol), expiry_date)
+        if lot_size is None:
+            counts["skipped_missing_turnover"] += 1
+            if len(counts["skip_log"]) < 100:
+                counts["skip_log"].append((
+                    str(symbol), expiry_date, float(strike), str(opt_type),
+                    "lot_size excluded (cross-source mismatch)",
+                ))
+            continue
+
+        if (sub["contracts"] <= 0).any():
+            counts["skipped_missing_turnover"] += 1
+            if len(counts["skip_log"]) < 100:
+                counts["skip_log"].append((
+                    str(symbol), expiry_date, float(strike), str(opt_type),
+                    "contracts ≤ 0 on at least one trade day",
+                ))
+            continue
+
+        try:
+            out = _assemble_output_frame(sub, lot_size)
+            cache.write(target, out, overwrite=True)
+            counts["materialized"] += 1
+        except Exception as e:
+            counts["skipped_other"] += 1
+            if len(counts["skip_log"]) < 100:
+                counts["skip_log"].append((
+                    str(symbol), expiry_date, float(strike), str(opt_type),
+                    f"{type(e).__name__}: {str(e)[:200]}",
+                ))
+
+    return counts
 
 
 def _empty_output_frame() -> pd.DataFrame:

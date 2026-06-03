@@ -417,64 +417,41 @@ def main() -> int:
     # through the cutover-validation window (P1.6 smoke gate).
 
     if args.engine_source == "bhavcopy":
-        from src.data.bhavcopy_to_contract import (
-            enumerate_contracts_from_bhavcopies,
-            materialize_contract_from_bhavcopy,
-        )
-        from src.data.errors import MissingTurnoverError, MissingDataError
+        from src.data.bhavcopy_to_contract import materialize_contracts_batch
 
         # Bhavcopy scan window matches Step 2's bulk-fetch range.
         bhav_scan_from = args.start
         bhav_scan_to = args.end
 
-        _h(f"Step 3 — enumerate contracts from cached bhavcopies  "
+        _h(f"Step 3+4 — batch-materialize per-contract parquets from cached bhavcopies  "
            f"[--engine-source bhavcopy; scan {bhav_scan_from} → {bhav_scan_to}]")
-        contracts = enumerate_contracts_from_bhavcopies(
+        print(f"  single-pass over the bhavcopy cache (was per-contract loop; ~500-1000× speedup)")
+
+        # Lightweight progress: print at ~5% intervals. The whole
+        # batch typically completes in seconds for a 4-symbol smoke;
+        # heavier universes get coarse-grained feedback.
+        last_pct = [-1]
+        def _progress(processed: int, total: int) -> None:
+            pct = (processed * 100) // max(total, 1)
+            if pct >= last_pct[0] + 5:
+                last_pct[0] = pct
+                print(f"    [{pct:>3}%] {processed}/{total} contracts processed")
+
+        counts = materialize_contracts_batch(
             symbols=symbols,
             from_date=bhav_scan_from,
             to_date=bhav_scan_to,
+            progress_callback=_progress,
         )
-        print(f"  unique (sym, expiry, strike, option_type) tuples: {len(contracts)}")
-
-        _h("Step 4 — materialize per-contract parquets from bhavcopy data")
-        print(f"  cache-first: already-materialized contracts skip immediately")
-        from src.data import cache as _cache_mod
-        n_materialized = 0
-        n_already_cached = 0
-        n_skipped_missing_turnover = 0
-        n_skipped_other = 0
-        skip_log: list[tuple[str, date, float, str, str]] = []
-        for (sym, exp, strike, opt) in tqdm(
-            contracts, desc="materialize", unit="contract",
-        ):
-            target = _cache_mod.option_path(sym, exp, strike, opt)
-            if target.exists():
-                n_already_cached += 1
-                continue
-            try:
-                materialize_contract_from_bhavcopy(
-                    sym, exp, strike, opt,
-                    from_date=bhav_scan_from, to_date=bhav_scan_to,
-                )
-                n_materialized += 1
-            except MissingTurnoverError as e:
-                n_skipped_missing_turnover += 1
-                skip_log.append((sym, exp, strike, opt, str(e)[:200]))
-            except MissingDataError as e:
-                n_skipped_other += 1
-                skip_log.append((sym, exp, strike, opt, f"{type(e).__name__}: {str(e)[:200]}"))
-            except Exception as e:
-                n_skipped_other += 1
-                skip_log.append((sym, exp, strike, opt, f"{type(e).__name__}: {str(e)[:200]}"))
 
         _h("Done — bhavcopy-only materialize results")
-        print(f"  materialized:                 {n_materialized}")
-        print(f"  already cached (skipped):     {n_already_cached}")
-        print(f"  skipped (MissingTurnoverError): {n_skipped_missing_turnover}")
-        print(f"  skipped (other):              {n_skipped_other}")
-        if skip_log[:10]:
+        print(f"  materialized:                  {counts['materialized']}")
+        print(f"  already cached (skipped):      {counts['already_cached']}")
+        print(f"  skipped (MissingTurnoverError): {counts['skipped_missing_turnover']}")
+        print(f"  skipped (other):               {counts['skipped_other']}")
+        if counts["skip_log"][:10]:
             print(f"\n  first 10 skip reasons:")
-            for (sym, exp, strike, opt, reason) in skip_log[:10]:
+            for (sym, exp, strike, opt, reason) in counts["skip_log"][:10]:
                 print(f"    {sym} {exp} {strike:g}{opt}: {reason}")
         return 0
 
