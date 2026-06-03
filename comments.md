@@ -17586,3 +17586,139 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of b3f4618 — `fix(bhavcopy_to_contract.zero_contracts_semantics)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Real correctness fix; the `.any()` → `.all()` semantics shift is well-motivated, empirically grounded, symmetric across both code paths, and verified against the downstream engine gate + the legacy `options_loader` behavior. Operator's 9098/9392 = 97% rejection rate made the bug screamingly obvious in retrospect.
+
+### Empirical verification (independently reproduced)
+
+Sampled 20 cached bhavcopy days for {PNB, SBIN, BHEL, RELIANCE} OPTSTK:
+
+```
+Across 20 cached bhavcopy days for PNB/SBIN/BHEL/RELIANCE OPTSTK:
+  total rows: 15,445; zero-contract rows: 6,777 (43.9%)
+  unique contracts seen: 2,119
+  contracts with ANY zero-day: 1,481 (69.9%)
+  contracts with ALL zero-day:   874 (41.2%)
+```
+
+**The bug magnitude is empirically clear.** 43.9% of OPTSTK rows have `contracts == 0` — that's the steady-state baseline (listing-day lag, quiet weeks, expiry-day cleanup, mid-cycle days when a strike is far OTM and nobody trades it). Under the old `.any()` check, 70% of contracts in a 20-day window would be rejected. Extrapolating to the operator's 466-day window: nearly every contract has at least one zero-day across 2 years, explaining the 9098/9392 ≈ 97% rejection rate observed.
+
+Under the new `.all()` check, 41.2% of contracts in a 20-day slice would be (correctly) rejected as never-traded; the operator's 2-year window would see a smaller fraction because contracts naturally have some trading window during their ~2-year life. The new semantic matches reality.
+
+### Engine gate verified
+
+Claim: "the engine's per-row `IlliquidLegError` gate in `pnl._price_one_leg` handles zero-volume rows at sweep time."
+
+Verified at `src/engine/pnl.py:389-394`:
+
+```python
+if entry_vol == 0 or exit_vol == 0 or entry_oi == 0:
+    raise IlliquidLegError(
+        f"{context}: leg illiquid — "
+        f"entry_volume={entry_vol}, exit_volume={exit_vol}, "
+        f"entry_oi={entry_oi}. No real fill possible; skipping."
+    )
+```
+
+✓ Engine refuses any trade with zero-volume entry or exit leg. Zero-volume rows surviving in the per-contract parquet are filtered out at the actual pricing step, not silently mispriced.
+
+### `options_loader.load_option` parity verified
+
+Claim: "matching the `options_loader.load_option` behaviour we're replacing."
+
+Verified at `src/data/options_loader.py:341-353`: the loader filters rows where `lot_size`, `volume`, OR `close` is **NaN/missing**, but **KEEPS** rows where they're 0:
+
+```python
+df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+df = df.dropna(subset=["lot_size", "volume", "close"]).copy()
+```
+
+`dropna` removes NaN, not 0. So options_loader keeps zero-volume rows; the engine's `IlliquidLegError` gate handles them at sweep time. ✓ Bhavcopy-to-contract path now matches.
+
+### Symmetric application verified
+
+Both code paths updated identically:
+
+- `src/data/bhavcopy_to_contract.py:179` — per-contract `bhavcopy_to_contract_timeseries`: `.any()` → `.all()`. Loud-fail message updated to "never actually traded" semantic.
+- `src/data/bhavcopy_to_contract.py:414` — batch `materialize_contracts_batch`: `.any()` → `.all()`. Skip-log message updated to "never traded (contracts == 0 on every cached day)".
+
+The per-contract error message uses `cache._strike_path_segment(strike)` instead of `int(strike)` — **handles fractional strikes per the 5631f18 fix**. Nice cross-commit integration; would have been a regression if not addressed.
+
+### Tests verified
+
+- `test_transform_raises_only_when_contract_never_traded` (replaces `test_transform_raises_on_zero_contracts` in place): two zero-rows in the window → raises with the new "never actually traded" string. Anchors the loud-fail contract.
+- `test_transform_keeps_partial_zero_contract` (NEW positive-control): one zero-day + one traded-day → BOTH rows survive; zero-day has `volume=0`; traded-day has `volume=100×8000`. Anchors the new permissive semantic.
+
+`tests/test_bhavcopy_to_contract.py`: 29/29 pass. Test count claim 860 → 861 (+1 net) matches.
+
+### Grill #1 (MINOR, OPTIONAL): batch path's zero-contracts handling not separately tested
+
+The `.any()` → `.all()` shift was applied to BOTH the per-contract path AND the batch path. The two new tests exercise only the per-contract path:
+
+- `test_transform_raises_only_when_contract_never_traded` calls `bhavcopy_to_contract_timeseries` directly.
+- `test_transform_keeps_partial_zero_contract` calls `bhavcopy_to_contract_timeseries` directly.
+
+The batch path's symmetric change is unexercised by a dedicated test. The byte-equivalence test (`test_batch_output_matches_per_contract_path_for_same_inputs`) uses non-zero data so doesn't probe this. If a future commit accidentally diverges the batch path's check (e.g., reintroduces `.any()`), no test fires.
+
+**Suggested fix (tiny, optional)**: `test_batch_skips_never_traded_contracts_with_named_reason` — a batch fixture with one all-zero contract + one mixed contract; assert the all-zero contract is in `skipped_missing_turnover` with the new "never traded" log message, and the mixed contract is in `materialized`. ~25 LOC test. Could land alongside the closure of ef4f71b's open Grill #1 (case-sensitivity) in a single "small-fixes" sub-commit.
+
+Not blocking; defer at BUILDER's discretion. The byte-equivalence guarantee from shared `_assemble_output_frame` doesn't extend to the zero-contracts decision since that check happens BEFORE `_assemble_output_frame` is called.
+
+### Praises
+
+- **Empirical motivation cited concretely** — 9098/9392 = 97% rejection rate is the operator-driven evidence; I independently reproduced ~70% ANY-zero rate / 41% ALL-zero rate in a 20-day slice, confirming the direction.
+- **Symmetric update** across both code paths — bug fix is uniform, not patched in one place.
+- **Error message uses `cache._strike_path_segment`** — handles fractional strikes per the 5631f18 fix. Cross-commit integration without a regression.
+- **Positive-control test** explicitly validates the new permissive semantic (zero-day kept with volume=0). Future regression where someone re-tightens the check fails LOUD on this test.
+- **Skip-log message updated symmetrically in batch path** — operator-triage messages now reflect the new semantic.
+- **Engine + options_loader claims verified by reading the actual code** — both load-bearing claims (engine handles zero-volume at sweep time; options_loader keeps zero-volume rows). BUILDER's commit body argument matches reality.
+- **Loud-fail still fires on truly never-traded contracts** — the negative test fixture (2 zero-days) verifies the safety floor.
+
+### Math
+
+- LOC: +73 / -19 = +54 net. ✓ Matches `73 insertions, 19 deletions`.
+- Test count: 860 → 861 (+1 net). ✓ Matches.
+
+### Behavior delta
+
+- **Bhavcopy-mode prefetch**: previously rejected ~97% of contracts as "contracts ≤ 0 on at least one trade day" (over-strict). Now rejects only contracts with zero trades across the entire window (correct).
+- **Per-contract parquet contents**: zero-volume rows survive in the cache; the engine's `IlliquidLegError` gate filters them at sweep time. Matches the legacy `options_loader.load_option` behavior.
+- **Operator-side rerun**: ~9000 contracts that were wrongly rejected on the prior attempt now materialize successfully.
+
+### State-of-tree
+
+Operator can resume the smoke-gate prefetch by re-running. Three of the four common failure modes encountered so far (perf wall, fractional strikes, over-strict zero-contracts) are now resolved. Operator should see substantially fewer skip rows in the prefetch summary; the remaining skips should be genuine lot-size exclusions + truly-never-traded contracts.
+
+### Open grills
+
+- **Grill #1** (MINOR, optional, THIS commit): batch path's zero-contracts handling not separately tested. ~25 LOC test would lock symmetry.
+- **Grill #1 from ef4f71b** (case-sensitivity divergence per-contract vs batch): still open; not load-bearing.
+
+Both could close together in a single "small-fixes" commit; neither blocks P1.7.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**Operator-side: resume the gate exercise.** Re-run the prefetch (single-line command from 5631f18's commit body); expect:
+
+- Previously-materialized contracts hit cache-first.
+- BHEL fractional-strike contracts materialize.
+- ~9000 previously over-rejected contracts now materialize.
+- Skip log shows only genuine lot-size exclusions + truly-never-traded contracts (a much smaller number).
+
+After prefetch completes, run the sweep, run the smoke comparison, proceed to P1.7 with the PASS verdict embedded in the commit body.
+
+Optional small-fixes commit (BUILDER's discretion, any order, non-blocking):
+- Close Grill #1 from b3f4618 (~25 LOC batch zero-contracts test).
+- Close Grill #1 from ef4f71b (~3 LOC per-contract case-insensitive path).
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → (operator gate exercise — now unblocked at perf + fractional-strikes + zero-contracts) → P1.7 → P1.8 → ...**
+
+Standing by.
+
+---
