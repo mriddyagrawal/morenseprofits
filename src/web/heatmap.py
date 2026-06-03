@@ -1197,7 +1197,8 @@ def _build_cell_csv(rows: pd.DataFrame) -> bytes:
       - Per-leg key (strike, option_type, side, qty_lots, lot_size)
       - Per-leg cache telemetry on BOTH sides (volume, oi, turnover)
       - The engine's recorded fill (``entry_px`` / ``exit_px``) so the
-        operator can compare against ``turnover × 100_000 / volume``
+        operator can compare against ``turnover / volume`` (post-F1
+        turnover is rupees, pnl.TURNOVER_SCALE_FACTOR = 1.0)
       - Derived ``entry_fill_source`` / ``exit_fill_source`` per
         ``_classify_fill_source``
       - ``gross_pnl`` per leg from the engine's leg-result dict
@@ -1217,13 +1218,15 @@ def _build_cell_csv(rows: pd.DataFrame) -> bytes:
             exit_turn = leg.get("exit_turnover")
             entry_px = leg.get("entry_px")
             exit_px = leg.get("exit_px")
+            # Post-F1: turnover is rupees, pnl.TURNOVER_SCALE_FACTOR=1.0,
+            # so notional/share = turnover / volume (no ×1e5 scaling).
             entry_vwap_implied = (
-                float(entry_turn) * 100_000.0 / float(entry_vol)
+                float(entry_turn) / float(entry_vol)
                 if (entry_turn is not None and entry_vol)
                 else None
             )
             exit_vwap_implied = (
-                float(exit_turn) * 100_000.0 / float(exit_vol)
+                float(exit_turn) / float(exit_vol)
                 if (exit_turn is not None and exit_vol)
                 else None
             )
@@ -1243,7 +1246,7 @@ def _build_cell_csv(rows: pd.DataFrame) -> bytes:
                 "entry_px": entry_px,
                 "entry_volume": entry_vol,
                 "entry_oi": leg.get("entry_oi"),
-                "entry_turnover_lakhs": entry_turn,
+                "entry_turnover_rupees": entry_turn,
                 "entry_vwap_implied": entry_vwap_implied,
                 "entry_fill_source": _classify_fill_source(
                     entry_px, entry_vol, entry_turn,
@@ -1252,7 +1255,7 @@ def _build_cell_csv(rows: pd.DataFrame) -> bytes:
                 "exit_px": exit_px,
                 "exit_volume": exit_vol,
                 "exit_oi": leg.get("exit_oi"),
-                "exit_turnover_lakhs": exit_turn,
+                "exit_turnover_rupees": exit_turn,
                 "exit_vwap_implied": exit_vwap_implied,
                 "exit_fill_source": _classify_fill_source(
                     exit_px, exit_vol, exit_turn,
@@ -1556,7 +1559,9 @@ def render_cell_drilldown(
     # Operator diagnostic per 2026-05-30 chat: download per-leg data
     # so close (raw cache) can be compared against entry_px (engine-
     # recorded fill). If turnover is present AND entry_px ≈
-    # turnover×100_000/volume, the engine used VWAP. If entry_px
+    # turnover/volume - strike, the engine used VWAP (post-F1 the
+    # turnover-units lakhs vs rupees ambiguity was resolved at parse
+    # time — see pnl.TURNOVER_SCALE_FACTOR comment). If entry_px
     # matches close directly, the engine fell back. Surfacing both
     # makes the fill-source choice auditable per trade.
     csv_bytes = _build_cell_csv(rows)

@@ -131,9 +131,12 @@ class OptionRow(BaseModel):
     turnover: float | None = Field(
         default=None,
         description=(
-            "Total traded value (LAKHS of rupees per NSE convention). "
-            "Combined with ``volume`` yields per-row VWAP: "
-            "``turnover * 100_000 / volume``. NaN on legacy parquets "
+            "Total traded value in rupees (post-F1 parser "
+            "normalization — see pnl.TURNOVER_SCALE_FACTOR comment "
+            "and LOGIC_REVIEW.md F1; pre-F1 this was carried in lakhs "
+            "and the engine multiplied by 1e5). Combined with "
+            "``volume`` yields per-row notional-per-share: "
+            "``turnover / volume``. NaN on legacy parquets "
             "cached before the p7.pricing_arc — the response carries "
             "a caveat in that case."
         ),

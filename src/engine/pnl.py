@@ -73,13 +73,19 @@ LoadOptionFn = Callable[..., pd.DataFrame]
 # to parse time so a single TURNOVER_SCALE_FACTOR=1.0 works for all
 # three regimes (see LOGIC_REVIEW.md F1 + addendum 1).
 #
-# Empirical anchor: RELIANCE 2024-08-29 2840-CE has TtlTrfVal=
-# 19,661,050 rupees, volume=6,500 shares, strike=2,840.
-#   notional/share = 19,661,050 / 6,500 = 3,024.78
-#   premium_vwap   = 3,024.78 − 2,840    = 184.78 ✓
-# matches spot 3,041 + premium 184.78 ≈ 3,225 (deep-OTM coincidence
-# of moneyness; see LOGIC_REVIEW.md for full RELIANCE 2025-02-27
-# DTE-grid analysis).
+# Empirical anchor (RELIANCE 2024-08-29 2840-CE, post-F1 fix):
+#   TtlTrfVal      = 19,661,050 rupees       (UDiff bhavcopy)
+#   volume         = 6,500 shares            (26 contracts × 250 lot)
+#   strike         = 2,840
+#   notional/share = 19,661,050 / 6,500      = 3,024.78
+#   premium_vwap   = 3,024.78 − 2,840        =   184.78 ✓
+# The identity being verified is the underlying-notional convention
+# documented in LOGIC_REVIEW.md F1: notional/share == strike + premium
+# (3,024.78 = 2,840 + 184.78), not anything involving spot. This is
+# an ITM call (spot 3,041 > strike 2,840) — earlier framing as
+# "deep-OTM" was wrong on both moneyness AND identity. See
+# LOGIC_REVIEW.md §1a F1 table for the full 4-symbol cross-check
+# and the RELIANCE 2025-02-27 DTE-grid analysis.
 #
 # To recover the per-share premium VWAP in rupees:
 #   premium_vwap = turnover * TURNOVER_SCALE_FACTOR / volume - strike

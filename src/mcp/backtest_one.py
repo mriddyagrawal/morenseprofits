@@ -67,17 +67,21 @@ class LegBreakdown(BaseModel):
     entry_turnover: float | None = Field(
         ...,
         description=(
-            "Day's traded value in LAKHS of rupees (NSE convention). "
-            "Used to compute VWAP via turnover × 100_000 / volume."
+            "Day's traded value in rupees (post-F1 parser "
+            "normalization — see pnl.TURNOVER_SCALE_FACTOR comment "
+            "and LOGIC_REVIEW.md F1; pre-F1 this was carried in "
+            "lakhs). Used to compute VWAP via ``turnover / volume - "
+            "strike`` (recovered premium per share)."
         ),
     )
     exit_turnover: float | None
     entry_fill_source: str = Field(
         ...,
         description=(
-            "'vwap' if entry_px matches turnover × 100_000 / volume; "
-            "'close' if VWAP path unavailable OR engine rejected it "
-            "via the units-sanity band; 'unknown' if entry_px is "
+            "'vwap' if entry_px matches ``turnover / volume - strike``"
+            " (post-F1 rupees convention); 'close' if VWAP path "
+            "unavailable OR engine rejected it via the recovered-"
+            "premium-vs-close safety band; 'unknown' if entry_px is "
             "missing."
         ),
     )
