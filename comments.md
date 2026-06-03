@@ -17331,3 +17331,149 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by.
 
 ---
+
+## Review of ef4f71b — `perf(bhavcopy_to_contract.batch_materialize)` — ✅ ACCEPT with minor optional grill
+
+**Verdict: ✅ ACCEPT.** Substantive 413/-67 LOC perf commit (179 net). Architectural fix is sound: O(days × contracts) → O(days + contracts) for the materialize step. Byte-identity preserved via shared `_assemble_output_frame` + LOAD-BEARING `assert_frame_equal` test. Pandas index-alignment footgun caught + documented exemplary. Operator-side wiring in prefetch is correct (returns 0 immediately after batch in `--engine-source bhavcopy` mode).
+
+### Architecture verified
+
+`scripts/prefetch_universe.py:419-456` (bhavcopy mode):
+
+OLD path: enumerate contracts per (sym, expiry) pair → for each contract, `materialize_contract_from_bhavcopy` re-walks the entire date range = 9,392 contracts × 466 days ≈ 4.4M parquet ops.
+
+NEW path: single call to `materialize_contracts_batch(symbols, from_date, to_date, progress_callback)`:
+
+1. Walk cached bhavcopies in `[from_date, to_date]` ONCE, per-day filter to symbols + instrument_set, normalize legacy ltp per-day. → ~466 reads.
+2. `pd.concat(frames, ignore_index=True)` + defensive `dropna(subset=["strike", "option_type"])`.
+3. `groupby(["symbol", "expiry", "strike", "option_type"], sort=True)` → deterministic iteration.
+4. Per-group: cache-first check (`target.exists()`) → skip; lot_size_lookup → skip + log if None; contracts ≤ 0 → skip + log; else assemble + write.
+
+Counts dict: 4 buckets + skip_log capped at 100 entries.
+
+Expected wall clock for the 4-stock smoke: seconds. Claim is well-motivated from first principles (4.4M → ~10k ops).
+
+### Byte-identity preserved (LOAD-BEARING)
+
+`_assemble_output_frame(sub, lot_size)` is the single source of truth for the 16-col output schema. Both `bhavcopy_to_contract_timeseries` (per-contract path, line 173) and `materialize_contracts_batch` (batch path, line 418) call into it.
+
+The LOAD-BEARING `test_batch_output_matches_per_contract_path_for_same_inputs` proves equivalence via `pd.testing.assert_frame_equal` on the round-tripped parquets. Test runs per-contract path → reads on-disk parquet → wipes → runs batch path → reads on-disk parquet → asserts equal. Future divergence between the two callers fails LOUD.
+
+### Pandas footgun caught + documented (EXEMPLARY)
+
+`src/data/bhavcopy_to_contract.py:285-292`:
+
+```python
+# reset_index BEFORE constructing the output. Groupby sub-frames
+# retain the parent's indices (e.g., [0, 2, 5]); a freshly-built
+# ``lot_size`` Series has a 0-based RangeIndex. Without reset, the
+# DataFrame constructor aligns by index and silently produces
+# NaN-filled phantom rows where the indices don't overlap. This
+# is the canonical pandas footgun for "I just want to attach a
+# broadcast scalar column."
+sub = sub.reset_index(drop=True)
+```
+
+**This is operator-grade documentation.** The comment names the failure mode precisely:
+- Groupby retains parent indices (`[0, 2, 5]` after symbol-filter).
+- Broadcast Series has 0-based RangeIndex (`[0, 1, 2]`).
+- DataFrame constructor aligns by index → silent NaN phantom rows where indices don't overlap.
+
+BUILDER caught this during impl (per commit body: "caught during impl"). The LOAD-BEARING `test_batch_materializes_all_contracts_in_one_pass` would have flagged the bug if the reset_index were dropped. Future maintainer reading the helper understands WHY without spelunking history.
+
+### Pytest
+
+```
+tests/test_bhavcopy_to_contract.py  — 28 tests (7 new for batch path)
+  test_batch_materializes_all_contracts_in_one_pass                 PASSED
+  test_batch_output_matches_per_contract_path_for_same_inputs       PASSED  ← LOAD-BEARING byte-equality
+  test_batch_skips_already_cached_contracts                         PASSED
+  test_batch_force_true_rewrites_all                                PASSED
+  test_batch_skips_excluded_lot_size_pairs_with_named_reason        PASSED
+  test_batch_progress_callback_fires_per_group                      PASSED
+  test_batch_empty_cache_returns_zero_counts                        PASSED
+  (21 existing tests for lookup + per-contract + enumerate)         PASSED
+tests/test_smoke_post_migration.py — 10 tests                       PASSED
+==================== 38 passed in 0.55s ====================
+```
+
+38/38 pass. Test count matches BUILDER's claim (852 → 859, +7 net).
+
+### Grill #1 (MINOR, OPTIONAL — operator-flow nil impact): per-contract vs batch case-sensitivity divergence
+
+Empirically verified with the BUILDER's own equivalence test fixture, but with `'pnb'` (lowercase) instead of `'PNB'`:
+
+```
+per-contract lower-case: 0 rows (silent empty frame)
+batch lower-case:        materialized=1, log_entries=0
+```
+
+For the SAME inputs, the two paths produce DIFFERENT output:
+
+- `bhavcopy_to_contract_timeseries` does `df["symbol"] == symbol` (exact match, line 94 of `_load_one_day_filtered`).
+- `materialize_contracts_batch` does `sym_upper = {s.upper() for s in symbols}` + `df["symbol"].isin(sym_upper)` (case-insensitive, line 345).
+
+The byte-equality test passes because both fixtures use uppercase. The divergence is **latent inside the abstraction, not exposed at the operator API surface**:
+
+- Prefetch's `--engine-source bhavcopy` flow passes `args.symbols` which defaults to `blue_chip() + ["PNB", "BHEL"]` — all upper.
+- API-mode prefetch's `_process_pair` explicitly uppercases at line 151.
+
+So **operator-flow impact is nil**. But the latent inconsistency is the kind that would surprise a future maintainer adding a new caller (Phase 2 single-contract path, debug script, MCP tool, etc.).
+
+**Suggested fix (tiny, optional)**: harmonize `_load_one_day_filtered` to uppercase `symbol` once at entry, mirroring the batch path's normalization. ~3 LOC + a test fixture flip to lowercase to lock the contract. Or: explicitly document in `bhavcopy_to_contract_timeseries`'s docstring that input symbol must be upper-case (so the case-sensitive contract is intentional + advertised).
+
+Either resolution is fine. Skipping is also defensible — the divergence is invisible to current callers.
+
+### Praises
+
+- **Pandas footgun documentation** — names the failure mode precisely (groupby parent-index retention vs RangeIndex Series → silent NaN phantom rows). Operator-grade.
+- **Byte-equality test uses `pd.testing.assert_frame_equal`** on round-tripped on-disk parquets — the right level to anchor cross-caller equivalence.
+- **Per-contract path retained** for single-contract debug / Phase 2 — abstraction kept in tension; `_assemble_output_frame` is the single contract that pins them.
+- **Skip log structure** `(sym, expiry, strike, opt, reason)` capped at 100, first-10 in console summary. Operator-triage-grade.
+- **Commit body with concrete numbers** — 9,392 contracts × 466 days ≈ 4.4M parquet ops, ETA ~4.8 hr → ~466 reads + ~10k group ops. Future code archaeologist gets the architectural argument for free.
+- **Progress callback** `(processed, total)` lets prefetch print at 5% intervals (line 433-438) — coarse-grained feedback without per-row spam.
+- **Defensive `dropna(subset=["strike", "option_type"])`** at line 377 catches any NaN-strike row that slips past the instrument filter.
+- **Counts dict + skip_log** is operator-triageable (4 named buckets; first-10 in console). Matches the existing API-mode skip-categorization pattern (3-bucket from P1.5).
+- **`materialize_contract_from_bhavcopy` retained** for single-contract use — keeps the debug entry point alive.
+- **No behavior change for the per-contract path** — only the batch path is new; per-contract path's existing tests (21 of them) still pass.
+
+### Math
+
+- LOC: +413 / -67 = +346 net (commit body says "+413 / -67"; actually +346 net is correct).
+- Test count: 852 → 859 (+7 net). ✓ All 7 are new batch-path tests.
+- Pytest wall clock: 0.55s for 38 tests. No perf regression on test execution.
+
+### Behavior delta
+
+- `--engine-source bhavcopy` path: materialize step goes from ~4.8 hr to seconds for 4-stock smoke.
+- Per-contract path: unchanged.
+- Operator-facing output: same prefetch summary format (counts + first-10 skips); the "materialized / already_cached / skipped_missing_turnover / skipped_other" buckets match the prior `--engine-source bhavcopy` output structure.
+
+### State-of-tree
+
+The operator can now re-run the smoke gate prefetch in seconds (post-bhavcopy-network-fetch) rather than 4.8 hours. P1.7 still gated on operator-side PASS verdict from the smoke comparison; the new perf removes the wall-clock blocker that was preventing the gate from completing.
+
+### Open grills
+
+1. **Grill #1** (MINOR, optional): per-contract vs batch case-sensitivity divergence. Operator-flow nil impact; latent risk for future callers. ~3 LOC fix OR docstring note. Defer or close at BUILDER's discretion.
+
+No load-bearing grills.
+
+### MCP arc state
+
+Unchanged at 16/16.
+
+### Next-commit suggestion
+
+**Operator-side gate exercise** (still the gating step before P1.7). The operator should now re-run the prefetch + sweep + comparison procedure end-to-end with seconds-scale wall clock per step (post-bhavcopy-network-fetch). Two acceptable paths to P1.7:
+
+1. **Fast path**: operator runs the 6-step procedure. If PASS, BUILDER opens P1.7 with the operator's run_id pair + cells-checked count + max-delta-observed metrics embedded in the commit body.
+2. **Cautious path**: operator runs the 6-step procedure. BUILDER opens a tiny `docs(migration.smoke_executed)` commit capturing the PASS verdict + numbers, then opens P1.7 with a one-line reference to that checkpoint commit.
+
+**Optional grill follow-up**: if BUILDER chooses to close Grill #1, the natural sub-commit is `fix(bhavcopy_to_contract.case_insensitive_per_contract_path)` — ~3 LOC src + 1 test flip to lowercase. Could land before or after P1.7; not blocking.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → (operator gate exercise) → P1.7 → P1.8 → ...** With this perf fix, the operator-side gate exercise is unblocked at the materialize step.
+
+Standing by.
+
+---
