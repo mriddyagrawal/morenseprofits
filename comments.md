@@ -20862,3 +20862,85 @@ Migration cadence: **... → F9 fix ✓ → F10 fix ✓ → 🚩 operator re-swe
 Standing by.
 
 ---
+
+## Review of bfd30be — `chore(scripts.prefetch.drop_no_timeout)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Clean 465-LOC deletion of an experimental A/B variant that had become a trap-named foot-gun. BUILDER's commit body is honest about both the script's actual purpose (API-only politeness-sleep calibration A/B) AND about getting fooled by their own naming (~39 min + ~8,200 wrong-strike API fetches before the operator caught it today). The cleanup also implicitly corrects 5eea3a2's incorrect "the no-timeout variant is for long-running operator batches" framing — that wasn't true; it was an experimental calibration variant, never production-intended.
+
+### Deletion verified clean
+
+- `pytest`: 856 + 8 skipped + 2 deselected (unchanged net vs feddb5b). No test imported from the deleted script. ✓
+- `grep -rn "prefetch_universe_no_timeout"` outside `comments.md` + `.git/`: zero references in `src/`, `tests/`, `LOGIC_REVIEW.md`, `MIGRATION.md`, `DATA_PRODUCTS.md`, `MCP.md`. Deletion is non-breaking across all surfaces. ✓
+- The only remaining references are historical entries in `comments.md` — they're correct as historical commentary (referencing decisions made at the time those reviews landed).
+
+### The trap-naming framing — concur
+
+BUILDER's diagnosis is exactly right: "_no_timeout" reads as "the friendlier variant" but is actually "LEGACY API path, with a guardrail removed, at WAF risk." Trap names for legacy/experimental variants are a real footgun in handoff/resume contexts where context is recovered from script names alone.
+
+The honest admission ("I picked it from a post-compaction resume prompt today and burned ~39 min + ~8,200 wrong-strike-band API fetches before the operator caught it") closes the loop on the lesson — deleting the script eliminates the trap. **Memory entry [[feedback-prefetch-canonical-script]]** (user added at MEMORY.md line 21) pins the rule for future handoffs.
+
+### Self-correction on 5eea3a2
+
+My 5eea3a2 review (`e57dcd3`) endorsed BUILDER's framing:
+
+> "**Both prefetch scripts updated for consistency** — `prefetch_universe.py` + `prefetch_universe_no_timeout.py` stay in sync."
+
+That endorsement implicitly accepted the "two entry points" framing without questioning what `_no_timeout` actually was. **BUILDER's actual purpose was experimental A/B calibration**, not a "two parallel entry points" design. I should have grep'd the script body when reviewing 5eea3a2 to verify the "consistency between two entry points" claim — instead I took the framing at face value.
+
+This is the [[feedback_grep_code_before_accepting_calibration]] pattern again: when a commit body says "X is calibrated for Y," grep the actual code path before accepting. Same family as the F1 root cause (stale `options_loader.py:290-298` comment that assumed UDiff = lakhs). I had the script visible in my prior review and didn't audit its actual purpose.
+
+Lesson logged (no new memory needed; the existing `grep_code_before_accepting_calibration` entry covers this exact failure mode).
+
+### Praises
+
+- **Honest admission** in the commit body about getting fooled by the script's name — closes the loop on WHY the deletion is the right move.
+- **Acknowledges the implicit 5eea3a2 reframe** without explicit `revert` — the prior commit's "two-scripts-stay-in-sync" framing is silently corrected by deletion + the new canonical-script memory entry.
+- **Operator-impact framing** (39 min + 8,200 wrong-strike fetches; bhavcopy-mode at 14k contracts/30s vs API 250/30s) gives concrete operator-side justification for the cleanup.
+- **Memory entry pinning the rule** ([[feedback_prefetch_canonical_script]]) prevents the same footgun in future handoff prompts.
+- **Operator command made explicit**: `python scripts/prefetch_universe.py --workers N` (bhavcopy default; `--engine-source bhavcopy` redundant). Future operator/reviewer reading the commit body knows the canonical invocation.
+
+### Math
+
+- LOC: +0 / -465 = -465 net. ✓ Matches "1 file changed, 465 deletions(-)".
+- Test count: unchanged. ✓
+
+### Behavior delta
+
+- Script no longer present. Any operator muscle-memory invoking `prefetch_universe_no_timeout.py` will see "file not found" — louder failure than the prior trap-name silent-misdirection.
+- Operator command for re-sweep stays the same as my e41ddd1 instruction (already used `prefetch_universe.py`; correctly canonical).
+- `--engine-source` flag still works on the canonical script for the API-mode A/B comparison if the operator ever wants to reproduce the politeness-sleep measurement.
+
+### Open grills (unchanged)
+
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+
+### State-of-tree
+
+- Migration arc through P1.8d holds.
+- Operator re-sweep instruction (`prefetch_universe.py --workers 4`) is unchanged and correctly canonical.
+- No new blockers introduced.
+
+### MCP arc state
+
+16/16 (unchanged; script-only deletion).
+
+### Next-commit suggestion
+
+Unchanged:
+
+1. **🚩 OPERATOR re-sweep** with command from e41ddd1 (canonical `prefetch_universe.py` only).
+2. **P1.8b** — smoke gate redesign (F6 #1+#2).
+3. **MIGRATION.md decision-log** entry.
+4. **MCP legacy-LTP caveat for regime B**.
+5. **Phase 2b cross-boundary smoke test**.
+
+Migration cadence: **... → F10 fix ✓ → trap-named script removed ✓ → 🚩 operator re-sweep → P1.8b → ...**
+
+Standing by.
+
+---
