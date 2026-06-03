@@ -287,6 +287,12 @@ F1 ✅ fixed+verified (VWAP 0%→66.4%, reproducibility restored) · F2 ✅ clos
 
 ---
 
+## REVIEW: `f720dc3` lot-size diagnostics → **ACCEPT** ✅ (no correctness impact)
+
+`build_lot_size_parquet(..., symbols_filter=symbols)` + value-run compression of per-date dumps. **Verified `symbols_filter` is dump-only:** it's referenced exclusively inside the `if verbose:` block (`_split_in_out` → print vs count); `unified.to_parquet(...)` is computed independently, so the parquet's contents and the cross-source exclusion policy are unchanged. Pure operator-facing UX. Live coverage spot-check (post-`6bc95e9`): `lot_sizes.parquet` = 5,602 rows; all 4 sweep symbols 25–28 year-months (bhavcopy-backed); SBIN correctly carries the real 1500→750 lot revision at 2024-07. Coverage healthy.
+
+---
+
 ## F1-B DOC SWEEP REVIEW (2026-06-03) — commit `029d175` → **ACCEPT-with-grill** ⚠️ (surfaces new finding F5)
 
 BUILDER landed `029d175 docs(turnover.units): F1-B drift-prevention sweep + fix garbled pnl.py empirical anchor` (touches `pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py`). I reviewed the diff for (a) doc accuracy and (b) any executable/formula change riding in a "docs" commit.
