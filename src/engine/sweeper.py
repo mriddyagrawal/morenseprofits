@@ -151,10 +151,18 @@ def sweep_one(
     """Price ONE backtest cell: (strategy, symbol, expiry, offsets).
 
     Returns a SPECS §2.5 result dict augmented with sweep-specific
-    decorations (entry_offset_td, exit_offset_td, notional_at_entry,
-    entry_spot, exit_spot, run_id-deferred). Returns ``None`` if the
-    task is skipped due to a SKIPPABLE_ERROR (logged separately by the
-    sweeper).
+    decorations (entry_offset_td, exit_offset_td, notional_at_entry_vwap,
+    entry_spot_vwap, exit_spot_vwap, entry_spot_close, exit_spot_close,
+    run_id-deferred). Returns ``None`` if the task is skipped due to a
+    SKIPPABLE_ERROR (logged separately by the sweeper).
+
+    F10 (2026-06-03) explicit-suffix columns: ``*_vwap`` are the values
+    the engine actually used (ATM / margin / exit), ``*_close`` are
+    informational fallback values kept in the parquet so the drilldown
+    can compare what was used vs what the prior close-everywhere
+    convention would have given. The naming makes the source of every
+    cell unambiguous — no analyst should ever wonder "is `entry_spot`
+    the close or the VWAP" again.
 
     cache_only=True: implies offline=True AND OfflineCacheMiss is
     treated as a skip (not a fatal crash). For wide sweeps where the
@@ -186,16 +194,46 @@ def sweep_one(
         exit_date = trading_calendar.offset_trading_days(
             expiry, exit_offset_td, today_fn=today_fn, offline=offline,
         )
+        # F10 (logic-review 1347b8c + 6aebb31 refinement, 2026-06-03):
+        # Use the day's VWAP (volume-weighted average price) — NOT
+        # close — for the transaction-reference spot. Rationale:
+        # under P1.7 the option leg fills at premium-VWAP
+        # (turnover/volume − strike), so the spot we anchor ATM /
+        # margin / exit_spot on should sample at the same intraday
+        # moment for consistency. Spot VWAP is reliably available
+        # (logic-review 6aebb31 confirmed 0 gaps in 29,634 EQ rows
+        # across the 4-symbol smoke universe), so no close-fallback
+        # branch is needed.
+        #
+        # NOT TOUCHED: realized_vol (src/engine/vol.py) still uses
+        # close-to-close per the canonical realized-vol convention.
+        # Measured VWAP-to-VWAP is smoother than close-to-close by
+        # 1.2-3.9 pp (lower variance → margin understated → ROI
+        # overstated), so departing from close-to-close in the vol
+        # estimator would silently bias margin.
+        #
+        # F9 prereq (8f10b6d): spot_loader now filters series=="EQ"
+        # at the read boundary, so the T0/BL micro-print rows that
+        # had degenerate single-print VWAP can no longer leak in.
         spot_df = spot_loader.load_spot(
             symbol, entry_date, entry_date, today_fn=today_fn, offline=offline,
         )
         if spot_df.empty:
             return None  # treat as missing; rare but possible
-        spot_at_entry = float(spot_df.iloc[0]["close"])
+        # Read BOTH the vwap (used for math) and close (informational, written
+        # to parquet so drilldown can show side-by-side comparison) in one
+        # load_spot call. F10 design: emit both, use only vwap.
+        spot_at_entry = float(spot_df.iloc[0]["vwap"])
+        entry_spot_close = float(spot_df.iloc[0]["close"])
         exit_spot_df = spot_loader.load_spot(
             symbol, exit_date, exit_date, today_fn=today_fn, offline=offline,
         )
-        exit_spot = float(exit_spot_df.iloc[0]["close"]) if not exit_spot_df.empty else None
+        if exit_spot_df.empty:
+            exit_spot = None
+            exit_spot_close = None
+        else:
+            exit_spot = float(exit_spot_df.iloc[0]["vwap"])
+            exit_spot_close = float(exit_spot_df.iloc[0]["close"])
 
         trades = strategy.generate_trades(
             symbol=symbol, expiry=expiry,
@@ -224,22 +262,26 @@ def sweep_one(
         # names never contain '|'; messages may, but we split max-once.
         return f"skip:{type(e).__name__}|{e}"
 
-    # Sweep-specific decorations
+    # Sweep-specific decorations — explicit-suffix naming per F10:
+    # *_vwap = used for math; *_close = informational (drilldown only).
     result["entry_offset_td"] = int(entry_offset_td)
     result["exit_offset_td"] = int(exit_offset_td)
-    result["entry_spot"] = spot_at_entry
-    result["exit_spot"] = exit_spot
-    # notional_at_entry = spot × total share exposure. PLAN §4 rule #3:
-    # read per-row lot_size from legs_json, NOT a constant. NSE lot sizes
-    # vary by symbol (RELIANCE 250 / HDFCBANK 550 / INFY 400 / ICICIBANK
-    # 700) and change over time within a symbol; the per-row value the
-    # P&L kernel already extracted from the bhavcopy is canonical.
+    result["entry_spot_vwap"] = spot_at_entry
+    result["exit_spot_vwap"] = exit_spot
+    result["entry_spot_close"] = entry_spot_close
+    result["exit_spot_close"] = exit_spot_close
+    # notional_at_entry_vwap = vwap-spot × total share exposure.
+    # PLAN §4 rule #3: per-leg lot_size from legs_json, NOT a constant.
+    # NSE lot sizes vary by symbol (RELIANCE 250 / HDFCBANK 550 / INFY
+    # 400 / ICICIBANK 700) and change over time within a symbol; the
+    # per-row value the P&L kernel already extracted from the bhavcopy
+    # is canonical. No _close variant — the engine commits to vwap.
     leg_results = json.loads(result["legs_json"])
     total_share_exposure = sum(
         int(leg_r["qty_lots"]) * int(leg_r["lot_size"])
         for leg_r in leg_results
     )
-    result["notional_at_entry"] = spot_at_entry * total_share_exposure
+    result["notional_at_entry_vwap"] = spot_at_entry * total_share_exposure
     return result
 
 

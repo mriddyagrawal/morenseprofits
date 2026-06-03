@@ -58,9 +58,11 @@ def _minimal_row(
         "roi_pct": 0.5,
         "hold_trading_days": 14,
         "roi_pct_annualized": 9.0,
-        "entry_spot": 2600.0,
-        "exit_spot": 2650.0,
-        "notional_at_entry": 1300000.0,
+        "entry_spot_vwap": 2600.0,
+        "exit_spot_vwap": 2650.0,
+        "entry_spot_close": 2600.0,
+        "exit_spot_close": 2650.0,
+        "notional_at_entry_vwap": 1300000.0,
     }
 
 

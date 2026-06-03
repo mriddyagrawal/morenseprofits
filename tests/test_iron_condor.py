@@ -390,9 +390,12 @@ def test_sweep_one_iron_condor_uses_spot_based_margin(monkeypatch, tmp_path):
     monkeypatch.setattr(trading_calendar, "offset_trading_days", fake_offset)
 
     def fake_load_spot(symbol, from_date, to_date, *, today_fn=date.today, offline=False):
+        # F10: engine reads vwap for math; inject close=vwap for this test
+        # so the iron-condor strike picks stay numerically anchored.
         return pd.DataFrame({
             "date": pd.Series([pd.Timestamp(from_date)], dtype="datetime64[us]"),
             "close": [2596.65],
+            "vwap": [2596.65],
         })
     monkeypatch.setattr(spot_loader, "load_spot", fake_load_spot)
 

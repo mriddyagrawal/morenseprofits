@@ -86,10 +86,23 @@ RESULTS_COLUMNS: tuple[str, ...] = (
     "roi_pct",
     "hold_trading_days",
     "roi_pct_annualized",
-    # Underlying context
-    "entry_spot",
-    "exit_spot",
-    "notional_at_entry",
+    # Underlying context (F10, 2026-06-03):
+    #   *_vwap = the volume-weighted average price the engine ACTUALLY
+    #     used for ATM-picker / margin notional / exit_spot. Under
+    #     P1.7 the option fills at premium-VWAP, so consistency
+    #     requires the spot anchor sample at the same intraday moment.
+    #   *_close = the close-of-day fallback — kept as an informational
+    #     column so the drilldown / debugger can show "what the prior
+    #     close-everywhere convention would have given" alongside the
+    #     vwap that was used. NEVER read by the engine for math.
+    #   notional_at_entry_vwap = spot_vwap × total_share_exposure;
+    #     single column (no _close variant) because we explicitly
+    #     anchor the engine on vwap and don't compute notional twice.
+    "entry_spot_vwap",
+    "exit_spot_vwap",
+    "entry_spot_close",
+    "exit_spot_close",
+    "notional_at_entry_vwap",
 )
 
 # Skip-log columns — the parallel file recording cells that were tried
@@ -143,8 +156,10 @@ def _inferred_dtype(col: str) -> str:
     if col in ("entry_offset_td", "exit_offset_td", "hold_trading_days"):
         return "int64"
     if col in ("gross_pnl", "costs", "net_pnl", "margin_at_entry",
-               "roi_pct", "roi_pct_annualized", "entry_spot", "exit_spot",
-               "notional_at_entry"):
+               "roi_pct", "roi_pct_annualized",
+               "entry_spot_vwap", "exit_spot_vwap",
+               "entry_spot_close", "exit_spot_close",
+               "notional_at_entry_vwap"):
         return "float64"
     # Text columns — strategy, symbol, run_id, params_json, legs_json,
     # *_breakdown_json, skip_reason. All pd.StringDtype upstream.

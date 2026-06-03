@@ -1599,8 +1599,13 @@ def render_cell_drilldown(
         "Entry date": rows["entry_date"].dt.strftime("%Y-%m-%d"),
         "Exit date": rows["exit_date"].dt.strftime("%Y-%m-%d"),
         "Hold (TD)": rows["hold_trading_days"],
-        "Spot entry": rows["entry_spot"].round(2),
-        "Spot exit": rows["exit_spot"].round(2),
+        # F10 (2026-06-03): show both vwap (engine-used) and close
+        # (informational) so the operator can sanity-check that the
+        # vwap-vs-close gap is small on liquid days (typically <0.5%).
+        "Spot entry (vwap, used)": rows["entry_spot_vwap"].round(2),
+        "Spot exit (vwap, used)": rows["exit_spot_vwap"].round(2),
+        "Spot entry (close, info)": rows["entry_spot_close"].round(2),
+        "Spot exit (close, info)": rows["exit_spot_close"].round(2),
         "Gross P&L": rows["gross_pnl"].round(2),
         "Costs": rows["costs"].round(2),
         "Net P&L": rows["net_pnl"].round(2),

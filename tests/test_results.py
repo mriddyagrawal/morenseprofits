@@ -39,9 +39,11 @@ def _full_row() -> dict:
         "roi_pct": 0.30,
         "hold_trading_days": 14,
         "roi_pct_annualized": 5.46,
-        "entry_spot": 2596.65,
-        "exit_spot": 2700.0,
-        "notional_at_entry": 1298325.0,
+        "entry_spot_vwap": 2596.65,
+        "exit_spot_vwap": 2700.0,
+        "entry_spot_close": 2596.65,
+        "exit_spot_close": 2700.0,
+        "notional_at_entry_vwap": 1298325.0,
     }
 
 

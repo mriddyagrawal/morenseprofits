@@ -162,20 +162,26 @@ def main() -> int:
         print(f"  (check skip log above; not a fatal error if data was unavailable)")
     else:
         r = row.iloc[0]
-        print(f"  entry_spot   = ₹{r['entry_spot']:.2f}")
-        print(f"  exit_spot    = ₹{r['exit_spot']:.2f}")
-        print(f"  gross_pnl    = ₹{r['gross_pnl']:+,.2f}")
-        print(f"  costs        = ₹{r['costs']:,.2f}")
-        print(f"  net_pnl      = ₹{r['net_pnl']:+,.2f}")
-        print(f"  margin       = ₹{r['margin_at_entry']:,.0f}")
-        print(f"  roi_pct      = {r['roi_pct']:+.2f}%  ({r['roi_pct_annualized']:+.2f}%/yr)")
+        print(f"  entry_spot_vwap  = ₹{r['entry_spot_vwap']:.2f}")
+        print(f"  entry_spot_close = ₹{r['entry_spot_close']:.2f}")
+        print(f"  exit_spot_vwap   = ₹{r['exit_spot_vwap']:.2f}")
+        print(f"  exit_spot_close  = ₹{r['exit_spot_close']:.2f}")
+        print(f"  gross_pnl        = ₹{r['gross_pnl']:+,.2f}")
+        print(f"  costs            = ₹{r['costs']:,.2f}")
+        print(f"  net_pnl          = ₹{r['net_pnl']:+,.2f}")
+        print(f"  margin           = ₹{r['margin_at_entry']:,.0f}")
+        print(f"  roi_pct          = {r['roi_pct']:+.2f}%  ({r['roi_pct_annualized']:+.2f}%/yr)")
         # The p3.verify numbers (Tier-B, spot-based margin, 1% slippage):
         # gross ≈ +2245, net ≈ +2105, margin ≈ Tier-B with vol-derived pct.
-        # Pin the entry_spot which is deterministic from spot cache.
-        assert r["entry_spot"] == 2596.65, (
-            f"entry_spot must match Phase-3 hand-check (2596.65); got {r['entry_spot']}"
+        # Pin the entry_spot_close (Phase-3 hand-check was on close prices,
+        # pre-F10; close column still emitted for back-compat with the
+        # original anchor). The vwap column is the engine's transaction
+        # reference under F10 and is not equal to close in general.
+        assert r["entry_spot_close"] == 2596.65, (
+            "entry_spot_close must match Phase-3 hand-check (2596.65); "
+            f"got {r['entry_spot_close']}"
         )
-        print(f"  ✓ entry_spot matches Phase-3 hand-check (₹2596.65)")
+        print(f"  ✓ entry_spot_close matches Phase-3 hand-check (₹2596.65)")
 
     # === (e) timing summary ===============================================
     _h("(e) timing: per-task latency informs p4.5 (parallelization) ROI")

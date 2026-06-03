@@ -25,11 +25,17 @@ from src.engine.sweeper import _compute_run_id, sweep_grid, sweep_one
 
 
 # ----- minimal data fixtures -----
-def _spot_frame(d: date, close: float) -> pd.DataFrame:
+def _spot_frame(d: date, close: float, *, vwap: float | None = None) -> pd.DataFrame:
+    """Synthetic spot row. Defaults ``vwap = close`` so legacy tests that
+    only care about a single anchor price continue to pass under F10
+    (post-2026-06-03 the engine reads spot via ``vwap``, not ``close``,
+    for ATM-picker + margin + exit_spot — see sweeper.py). Tests that
+    want to exercise the VWAP-vs-close gap pass ``vwap=`` explicitly."""
     return pd.DataFrame({
         "date": pd.Series([pd.Timestamp(d)], dtype="datetime64[us]"),
         "symbol": pd.array(["RELIANCE"], dtype="string"),
         "close": [close],
+        "vwap": [vwap if vwap is not None else close],
     })
 
 
@@ -171,13 +177,18 @@ def test_sweep_one_returns_full_results_dict(monkeypatch, tmp_path):
     for k in ("gross_pnl", "costs", "net_pnl", "margin_at_entry", "roi_pct",
               "roi_pct_annualized", "hold_trading_days"):
         assert k in out
-    # Sweep decorations
-    for k in ("entry_offset_td", "exit_offset_td", "entry_spot", "exit_spot",
-              "notional_at_entry"):
+    # Sweep decorations — F10 explicit-suffix columns
+    for k in ("entry_offset_td", "exit_offset_td",
+              "entry_spot_vwap", "exit_spot_vwap",
+              "entry_spot_close", "exit_spot_close",
+              "notional_at_entry_vwap"):
         assert k in out
     assert out["entry_offset_td"] == 15
     assert out["exit_offset_td"] == 1
-    assert out["entry_spot"] == 2596.65
+    # The fixture _spot_frame defaults vwap=close so both columns
+    # equal the Phase-3 hand-check anchor.
+    assert out["entry_spot_vwap"] == 2596.65
+    assert out["entry_spot_close"] == 2596.65
 
 
 def test_sweep_one_hold_trading_days_is_exact_offset_difference(monkeypatch, tmp_path):
@@ -435,11 +446,14 @@ def test_notional_at_entry_uses_per_leg_lot_size_not_constant(monkeypatch, tmp_p
 
     def fake_load_spot(symbol, fd, td, *, today_fn=date.today, offline=False,
                        force_refresh=False):
-        # Same spot for both symbols → notional difference comes from lot
+        # Same spot for both symbols → notional difference comes from lot.
+        # F10: engine reads vwap for math; inject close=vwap so this test
+        # remains numerically anchored to the same 2000.0 reference price.
         return pd.DataFrame({
             "date": pd.Series([pd.Timestamp(fd)], dtype="datetime64[us]"),
             "symbol": pd.array([symbol], dtype="string"),
             "close": [2000.0],
+            "vwap": [2000.0],
         })
     monkeypatch.setattr(spot_loader, "load_spot", fake_load_spot)
 
@@ -497,10 +511,10 @@ def test_notional_at_entry_uses_per_leg_lot_size_not_constant(monkeypatch, tmp_p
     assert big is not None and small is not None
     # BIGLOT: 2000 spot × (1 lot × 550 shares × 2 legs) = 2,200,000
     # SMALLLOT: 2000 spot × (1 lot × 250 shares × 2 legs) = 1,000,000
-    assert big["notional_at_entry"] == 2_200_000.0
-    assert small["notional_at_entry"] == 1_000_000.0
+    assert big["notional_at_entry_vwap"] == 2_200_000.0
+    assert small["notional_at_entry_vwap"] == 1_000_000.0
     # Ratio matches lot ratio (550/250 = 2.2)
-    assert big["notional_at_entry"] / small["notional_at_entry"] == pytest.approx(2.2)
+    assert big["notional_at_entry_vwap"] / small["notional_at_entry_vwap"] == pytest.approx(2.2)
 
 
 def test_sweep_offline_cache_miss_propagates(monkeypatch, tmp_path):
