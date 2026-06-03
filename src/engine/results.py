@@ -30,15 +30,29 @@ from src.config import RESULTS_DIR
 # the result without column-shape inspection. Bumped explicitly when
 # pricing / costs / gates behavior changes meaningfully:
 #
-#   "p7.pricing_arc"   - includes IlliquidLegError gate (94d535f)
-#                        + VWAP fill price with close fallback (6356b90)
-#                        + turnover ingest (8caa0cd)
+#   "p7.pricing_arc"      - includes IlliquidLegError gate (94d535f)
+#                           + VWAP fill price with close fallback (6356b90)
+#                           + turnover ingest (8caa0cd).
+#   "p1.7.vwap_or_skip"   - strips ALL close fallback (46cbb4f
+#                           operator 2026-06-03 + dual-reviewer ship
+#                           verdict in 85ade54 / 7f2a4f3); Option C
+#                           liquidity bypass at 20 contracts traded
+#                           (817d4e5 — recalibrated from the initial
+#                           100k shares for symbol-invariance);
+#                           IlliquidLegError no longer raised by the
+#                           engine (collapsed into MissingTurnoverError);
+#                           F7 oi==0 + thin skip (a1b74e2). Fills are
+#                           VWAP-or-skip end-to-end. Bump justified by
+#                           the irreversible behavior change: post-bump
+#                           sweeps have ~99.6% VWAP fill rate vs ~66.4%
+#                           under "p7.pricing_arc"; MCP list_runs needs
+#                           to distinguish them.
 #
 # Legacy parquets (written before this stamp landed) return an empty
 # dict from read_run_metadata — readers should treat absent stamps
 # as "pre-p7.pricing_arc" with the matching caveats (phantom-fill on
 # zero-volume legs likely present).
-ENGINE_VERSION = "p7.pricing_arc"
+ENGINE_VERSION = "p1.7.vwap_or_skip"
 
 
 # ============================================================
