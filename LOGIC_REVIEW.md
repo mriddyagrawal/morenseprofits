@@ -293,6 +293,26 @@ F1 ✅ fixed+verified (VWAP 0%→66.4%, reproducibility restored) · F2 ✅ clos
 
 ---
 
+## F6 — smoke-gate cell-criterion is confounded; api-vs-bhav per-trade equivalence VERIFIED → **SHIP P1.7** (2026-06-03)
+
+Investigated the failing post-migration smoke gate (median: 4,612/6,903 cells FAIL; mean: 5,119 FAIL) directly against both run parquets (`sweep_api_run` 107,175 rows, `sweep_bhav_run` 102,356 rows).
+
+**The cell-aggregate failures are FALSE failures from enumeration asymmetry — confirmed 3 ways:**
+1. The two modes price **different trade universes**: 5,396 api-only + 577 bhav-only trades (only 101,779 shared). bhav-run skip log: IlliquidLegError 42,807 / OfflineCacheMiss 28,448 / MissingData 1,570 — bhav (cache-only + illiquidity + lot-size-exclusion gates) is legitimately stricter, so api enumerates ~5.4k thin/uncached contracts bhav drops. Cell median/mean over different samples ≠ a pricing test.
+2. Single-cell drilldown (operator-supplied): on the 16 **shared** expiries, max delta **0.0159 pp**, mean **0.0018 pp**; the cell FAIL was 100% caused by 1 extra bhav-only expiry (2025-08-28) shifting the aggregate — not pricing.
+3. Mean FAILS > median FAILS (5,119 > 4,612) is consistent with sample-composition (mean is sensitive to the missing expiry's *value*), not pricing.
+
+**Per-trade shared comparison (the correct criterion) PASSES:** 101,779 shared trades, 99.97% within 0.5 pp, median Δ 0.0008 pp. The **31** trades >0.5 pp are **all iron_condor** (31/31), and **31/31 show bhav carrying finer turnover than api** — root cause is **jugaad's lakhs quantization** (₹1000 = 0.01-lakh granularity; e.g. 8.215 L → 8.22 L = ₹822,000 vs bhav native ₹821,500) amplified on **1-lot (500-share) iron-condor wings** (₹2/share VWAP error → ~1 pp ROI on a thin-credit structure). **bhavcopy is the MORE ACCURATE mode**; api is the coarse one. F1 is not implicated (both compute `turnover/vol − strike` correctly).
+
+**Verdict: SHIP P1.7.** The mode being shipped (bhavcopy) is the more precise of the two; per-trade pricing is equivalent up to api's quantization floor.
+
+**Binding conditions on the gate redesign (so it isn't "lower the bar until green"):**
+- The shared-trade delta has a real fat tail from api quantization: 13,066 trades >0.016 pp, 5,655 >0.05 pp, p99 0.19 pp, max 0.956 pp. A redesigned per-trade gate at 0.05 pp would still FAIL on 5,655 — so the threshold must be **quantization-aware (~0.5 pp for an api-vs-bhav join)**, NOT 0.05.
+- Better: **api is not ground truth** (it's coarser). The real correctness gate is bhav-vs-**raw bhavcopy** precision (already proven for F1: bhav VWAP = `turnover/vol − strike` reproduces exactly). Recommend making api-vs-bhav **informational** and gating bhav against the raw source.
+- **Document bhavcopy as the canonical/more-accurate engine-source** (api = cross-check). The two modes show different trade universes; the operator's displayed heatmap depends on the mode, and bhav is the one to trust.
+
+---
+
 ## F1-B DOC SWEEP REVIEW (2026-06-03) — commit `029d175` → **ACCEPT-with-grill** ⚠️ (surfaces new finding F5)
 
 BUILDER landed `029d175 docs(turnover.units): F1-B drift-prevention sweep + fix garbled pnl.py empirical anchor` (touches `pnl.py`, `mcp/backtest_one.py`, `mcp/spot_options.py`, `web/heatmap.py`). I reviewed the diff for (a) doc accuracy and (b) any executable/formula change riding in a "docs" commit.
