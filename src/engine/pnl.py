@@ -106,22 +106,34 @@ TURNOVER_SCALE_FACTOR = 1.0
 # a band-reject on a thin contract RAISES MissingTurnoverError so the
 # sweeper skips the cell honestly — the prior close-fallback fudged
 # the fill with a tick-floor close print that misled backtest analysis.
-# On LIQUID contracts (volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME) the band
-# check is bypassed entirely and VWAP is used unconditionally — the
-# band's "VWAP could be a thin-trade outlier" concern doesn't apply
-# when N trades is large.
+# On LIQUID contracts (contracts_traded ≥
+# _VWAP_LIQUIDITY_BYPASS_CONTRACTS) the band check is bypassed
+# entirely and VWAP is used unconditionally — the band's "VWAP could
+# be a thin-trade outlier" concern doesn't apply when N trades is
+# large.
 _VWAP_CLOSE_RATIO_MIN = 0.5
 _VWAP_CLOSE_RATIO_MAX = 2.0
 
-# Volume threshold for trusting VWAP unconditionally without the
-# band check. Empirical basis (LOGIC_REVIEW.md F-band analysis,
-# 2026-06-03): of 8,168 close-fallback cases in the F1-verified
-# post-fix sweep, 99.3% had volume > 100k shares — those were
-# liquid contracts where VWAP integrated over many real trades and
-# was structurally more accurate than the tick-floor close clamp.
-# At this threshold and above, the band's "thin-contract VWAP could
-# be noisy" concern doesn't apply.
-_VWAP_LIQUIDITY_BYPASS_VOLUME = 100_000  # shares
+# Contracts-traded threshold for trusting VWAP unconditionally
+# without the band check. The Option C bypass is keyed on contracts
+# rather than share-volume so the threshold is SYMBOL-INVARIANT —
+# 20 contracts means "the contract had ≥20 trade clears worth of
+# price discovery" whether the lot_size is 75 (NIFTY) or 8000 (PNB),
+# whereas a fixed share-volume threshold (e.g., 100k shares) meant
+# wildly different trade counts across symbols (~12 contracts for
+# PNB vs ~400 contracts for RELIANCE).
+#
+# Empirical basis (LOGIC_REVIEW.md F-band analysis, 2026-06-03 + the
+# operator-driven recalibration after P1.7 first ship): of 8,168
+# close-fallback cases in the F1-verified post-fix sweep, the median
+# row had thousands of contracts; 20 catches ≥99.5% of the same
+# liquid-contract close-fallback set while keeping the threshold
+# defensible (≥20 contracts typically means ≥5-10 distinct trades,
+# enough averaging that VWAP is meaningfully more stable than the
+# single closing print). Below 20, the band stays as the safety
+# valve for thin contracts where a single-trade outlier could
+# dominate VWAP.
+_VWAP_LIQUIDITY_BYPASS_CONTRACTS = 20  # ≥ this many contracts traded → VWAP is trusted
 
 
 def _compute_vwap(
@@ -189,13 +201,16 @@ def _pick_fill_price(
          this no longer falls through to close — the cell is
          unpriceable, and a close fill at the tick floor would
          systematically bias backtest analysis of deep-OTM legs.
-      3. ``volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME`` (default 100k
-         shares): use VWAP UNCONDITIONALLY. Skip the band check —
-         a liquid contract's VWAP integrates over many trades and
-         is structurally more accurate than close on band-reject
-         (empirically: 99.3% of pre-P1.7 close-fallback cases were
-         liquid contracts where close was a tick-floor artefact).
-      4. Otherwise (thin contract), check the band:
+      3. ``contracts_traded = volume // lot_size ≥
+         _VWAP_LIQUIDITY_BYPASS_CONTRACTS`` (default 20 contracts):
+         use VWAP UNCONDITIONALLY. Skip the band check — at this
+         trade count the VWAP integrates over enough distinct
+         clears to be structurally more stable than the single
+         closing print, and the band's "thin-contract single-trade
+         outlier" concern doesn't apply. Symbol-invariant by
+         construction.
+      4. Otherwise (thin contract: contracts_traded < threshold),
+         check the band:
          - VWAP-vs-close ratio ∈ [0.5×, 2.0×] → use VWAP.
          - Out of band → raise ``MissingTurnoverError``. On a thin
            contract the band reject signals genuine arithmetic
@@ -271,12 +286,21 @@ def _pick_fill_price(
             f"P1.7 strip — cell unpriceable, skipping."
         )
 
-    # (3) Option C: liquidity-gated VWAP-band bypass. On contracts
-    # with volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME, trust VWAP
-    # unconditionally — the band's thin-trade-outlier concern doesn't
-    # apply when N trades is large.
-    if volume >= _VWAP_LIQUIDITY_BYPASS_VOLUME:
-        return premium_vwap, int(r["lot_size"]), volume, oi, turnover
+    # Read lot_size now so we can compute contracts_traded for the
+    # bypass decision below. Production loader frames carry lot_size
+    # per row; tests inject it via the _stub_load_option helpers.
+    lot_size = int(r["lot_size"])
+    contracts_traded = volume // lot_size if lot_size > 0 else 0
+
+    # (3) Option C: liquidity-gated VWAP-band bypass. At
+    # contracts_traded ≥ _VWAP_LIQUIDITY_BYPASS_CONTRACTS the
+    # contract has cleared enough distinct trades that VWAP
+    # integrates over genuine price discovery; trust VWAP
+    # unconditionally and skip the band check. Symbol-invariant —
+    # the threshold is the same whether the lot_size is 75 (NIFTY)
+    # or 8000 (PNB).
+    if contracts_traded >= _VWAP_LIQUIDITY_BYPASS_CONTRACTS:
+        return premium_vwap, lot_size, volume, oi, turnover
 
     # (4) Thin contract: band-reject → skip.
     ratio = premium_vwap / close if close != 0 else float("inf")
@@ -284,11 +308,11 @@ def _pick_fill_price(
         raise MissingTurnoverError(
             f"{context}: VWAP-vs-close band reject on thin contract on "
             f"{target} (vwap={premium_vwap:.4f}, close={close:.4f}, "
-            f"ratio={ratio:.4f}, volume={volume} < "
-            f"{_VWAP_LIQUIDITY_BYPASS_VOLUME} shares); P1.7 strip — "
+            f"ratio={ratio:.4f}, contracts_traded={contracts_traded} < "
+            f"{_VWAP_LIQUIDITY_BYPASS_CONTRACTS}); P1.7 strip — "
             f"cell unpriceable, skipping."
         )
-    return premium_vwap, int(r["lot_size"]), volume, oi, turnover
+    return premium_vwap, lot_size, volume, oi, turnover
 
 
 # ============================================================

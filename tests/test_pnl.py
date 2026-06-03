@@ -514,21 +514,22 @@ def test_nan_turnover_raises_missing_turnover_under_p1_7():
 
 def test_band_reject_on_thin_contract_raises_missing_turnover():
     """Under P1.7 a band-reject (recovered VWAP outside [0.5×, 2.0×]
-    of close) on a THIN contract (volume < 100k bypass) raises
-    MissingTurnoverError. Pre-P1.7 this fell through to close —
-    that fudged the fill with a tick-floor close print that
+    of close) on a THIN contract (contracts_traded < 20 bypass)
+    raises MissingTurnoverError. Pre-P1.7 this fell through to
+    close — that fudged the fill with a tick-floor close print that
     misled backtest analysis (per the empirical close-fallback
     audit 2026-06-03).
 
     Fixture: strike=100, close=100, vwap_premium=300 → ratio 3.0
-    (out of band), volume=10000 (well under the 100k bypass)."""
+    (out of band); volume=2500 at lot=250 → 10 contracts (well
+    under the 20-contract bypass)."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_vwap(
         strike=100.0,
         rows=[
-            (entry, 100.0, 250, 10000, 5000, 300.0),  # vwap=300 vs close=100 → out of band
-            (exit_,  20.0, 250,  5000, 4500,  20.0),
+            (entry, 100.0, 250, 2500, 5000, 300.0),   # contracts=10 → band still applies; vwap=300 vs close=100 → out of band
+            (exit_,  20.0, 250, 2500, 4500,  20.0),
         ],
     )
     load = _stub_load_option({(100.0, "CE"): df})
@@ -544,25 +545,27 @@ def test_band_reject_on_thin_contract_raises_missing_turnover():
                     slippage_model=_NO_SLIPPAGE)
 
 
-def test_band_reject_bypassed_when_volume_above_liquidity_threshold():
+def test_band_reject_bypassed_when_contracts_above_liquidity_threshold():
     """Option C (P1.7): the VWAP-vs-close band check is BYPASSED on
-    contracts with volume ≥ _VWAP_LIQUIDITY_BYPASS_VOLUME (100k
-    shares). A liquid contract's VWAP integrates over many trades
-    and is structurally more accurate than close even when the
-    ratio is wide (e.g., close is a tick-floor artefact while VWAP
-    averages morning trades at higher prices). Anti-regression on
-    the 100k bypass.
+    contracts with contracts_traded ≥
+    _VWAP_LIQUIDITY_BYPASS_CONTRACTS (20 contracts). A liquid
+    contract's VWAP integrates over many trades and is structurally
+    more accurate than close even when the ratio is wide (e.g.,
+    close is a tick-floor artefact while VWAP averages morning
+    trades at higher prices). Anti-regression on the 20-contract
+    bypass.
 
     Fixture: same shape as the band-reject test but with volume
-    raised to 200k (above the bypass). Engine uses VWAP=300 instead
-    of close=100, even though the ratio is 3.0."""
+    raised to 25,000 / lot=250 → 100 contracts (well above the
+    20-contract bypass). Engine uses VWAP=300 instead of close=100,
+    even though the ratio is 3.0."""
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
     df = _option_frame_with_vwap(
         strike=100.0,
         rows=[
-            (entry, 100.0, 250, 200_000, 5000, 300.0),  # vwap=300 vs close=100, but volume liquid
-            (exit_,  20.0, 250, 200_000, 4500,  20.0),
+            (entry, 100.0, 250, 25_000, 5000, 300.0),   # contracts=100 → bypasses band; vwap=300 vs close=100
+            (exit_,  20.0, 250, 25_000, 4500,  20.0),
         ],
     )
     load = _stub_load_option({(100.0, "CE"): df})
