@@ -20489,3 +20489,122 @@ Migration cadence: **... → F8 ✓ → 🚩 operator re-sweep → P1.8c (F9 fil
 Standing by.
 
 ---
+
+## Review of 8f10b6d — `fix(data.spot_loader.f9_t0_series_filter)` — ✅ ACCEPT (P1.8c; closes F9)
+
+**Verdict: ✅ ACCEPT.** Clean F9 closure. Read-time-boundary placement is the right architectural choice (single source of truth for all downstream consumers); defense-in-depth framing is explicit; backwards-compat guard for minimal fixtures preserves test paths; the regression test pins not just "dups removed" but "the RIGHT row survives" (load-bearing).
+
+### Fix placement verified
+
+`src/data/spot_loader.py:228-230`:
+
+```python
+if "series" in full.columns:
+    full = full[full["series"] == "EQ"].reset_index(drop=True)
+```
+
+After `pd.concat(parts, ignore_index=True)`, before date-range filter. **Single read-time boundary**: every downstream consumer (engine ATM picker, realized-vol computation, entry/exit_spot fetch) gets deduped EQ-only data without each call site re-implementing the filter.
+
+`reset_index(drop=True)` ensures clean index post-filter — no surprise gaps in later `iloc[]` calls.
+
+### Defense-in-depth verified
+
+Comment block explicitly notes:
+- `_fetch_year` already passes `series="EQ"` to jugaad (upstream filter exists).
+- The upstream filter doesn't always hold (empirically — LOGIC's audit found dups).
+- Legacy caches may have been populated under a pathway that didn't filter.
+
+So the read-time filter is the STRUCTURAL guarantee even if `_fetch_year`'s upstream filter is bypassed by future code paths. The right level for the safety net.
+
+### Backwards-compat guard verified
+
+`if "series" in full.columns:` — minimal test fixtures that omit the `series` column continue to work. Existing tests that build synthetic spot DataFrames without `series` (legacy patterns) don't break.
+
+### Independent verification on the broader scope
+
+My F9 ACK (3247923) reported SBIN/2025 had 26 dups (vs BUILDER's commit body which cites only BHEL/2025: 6 + PNB/2025: 8 from LOGIC's initial report). Verified the fix on the broader scope:
+
+```
+SBIN/2025 post-F9 fix: 249 rows, 249 unique dates, dups = 0
+series values: {'EQ': 249}
+```
+
+**The filter catches the worst-case symbol (SBIN/2025) AND the "BL" series I also flagged** — `series == "EQ"` is correctly inclusive of EQ and exclusive of EVERY non-EQ series (T0, BL, anything else NSE adds in the future). One predicate handles everything.
+
+### Test design — load-bearing assertions
+
+`test_t0_series_rows_filtered_at_read_boundary_f9` uses a hand-crafted jugaad response (3 EQ dates + 1 T0 dup on the middle date) matching the F9 contamination shape:
+
+- `out["date"].is_unique` — no dup dates survive. ✓
+- `len(out) == 3` — only EQ rows. ✓
+- `out["series"].tolist() == ["EQ"] * 3` — series column post-filter. ✓
+- **The 2024-08-29 row's volume is the EQ row's (1_000_001), NOT the T0 row's (2)** — the RIGHT row survives.
+
+**The last assertion is the load-bearing one**: it catches a regression where someone "fixes" by dropping wrong-side duplicates (keeping T0 instead of EQ). Without this, a future refactor could silently break correctness — engine sees EQ-only data structurally but with T0's single-print micro-volume values. The test asserts the engine sees the right SHAPE of data, not just the right metadata.
+
+### Pytest
+
+```
+tests/test_spot_loader.py: 12 passed
+Full suite: 856 passed + 8 skipped + 2 deselected
+```
+
+856 = 855 + 1 net. Matches BUILDER's claim. The 8 skipped are still the operator-side `test_web_e2e` cache state.
+
+### Praises
+
+- **Read-time-boundary placement** — single source of truth; all downstream consumers benefit without re-implementing the filter at each call site.
+- **Defense-in-depth comment** — explicitly states the upstream filter exists, may not always hold, AND legacy caches may bypass it. Future contributor reading the boundary filter understands WHY the redundancy is intentional.
+- **`reset_index(drop=True)`** — clean index post-filter; no surprise gaps for downstream `iloc[]` calls.
+- **Backwards-compat guard** — `if "series" in full.columns:` keeps minimal fixtures working.
+- **Load-bearing test assertion** — "the EQ row's volume survives, not T0's" catches the wrong-side-drop regression. The test pins behavior, not just data shape.
+- **F10 explicitly deferred** per LOGIC's sequencing — keeps this commit focused on the prereq.
+- **Operator impact framing** — commit body enumerates the three downstream consumers (ATM-picker, realized-vol, entry/exit_spot) and their per-consumer impact. Operator triaging margin discrepancies in the pre-fix sweep knows WHERE to look.
+
+### Math
+
+- LOC: +11 (src) + +61 (test) = +72 / -0 net. ✓ Matches.
+- Test count: 855 → 856 (+1 net). ✓
+
+### Behavior delta
+
+- **Realized-vol contamination removed**: SBIN/2025 (worst case, ~10% trading days affected) now has 0 spurious zero-return days entering rolling-vol calc. Margin model gets honest stdev → no more optimistic-margin bias for contaminated symbols.
+- **ATM-picker + entry/exit_spot**: small/zero effect (T0 row's close matches EQ row's by NSE convention; deterministic post-filter).
+- **F10 unblocked**: spot VWAP path now sees EQ-only single rows per date; no degenerate T0 single-print VWAP to corrupt the consistency upgrade.
+
+### State-of-tree
+
+- **F9** — CLOSED. ✓
+- **F10** — UNBLOCKED; can land as P1.8d.
+- **Re-sweep IMPLICATION**: operator's pending re-sweep will now produce honest realized-vol → honest margins for the contaminated symbols. This is a real behavioral improvement, not just a future-proofing fix.
+
+### Open grills
+
+- ~~F9~~ (spot cache T0/BL contamination) — **CLOSED.** ✓
+- ~~Grill #4~~, ~~F8~~ — CLOSED.
+- **F10** (close-spot vs VWAP-fill consistency) — UNBLOCKED; P1.8d candidate.
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — dual-concurred; defer.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+
+### MCP arc state
+
+16/16. F9 fix doesn't touch MCP surface; just upstream data quality.
+
+### Next-commit suggestion
+
+1. **🚩 OPERATOR re-sweep** — now produces honest realized-vol for SBIN + BHEL + PNB + RELIANCE. UPDATED command from e41ddd1 still valid.
+2. **P1.8d (F10 fix)** — switch `sweeper.py:194` from `close` to `vwap` for spot at entry. ~5-10 LOC. NOW UNBLOCKED by F9.
+3. **P1.8b** — smoke gate redesign (F6 #1+#2).
+4. **MIGRATION.md decision-log** entry.
+5. **MCP legacy-LTP caveat for regime B**.
+6. **Phase 2b cross-boundary smoke test**.
+
+Migration cadence: **... → F8 ✓ → F9 fix ✓ → 🚩 operator re-sweep (honest realized-vol now) → P1.8d (F10) → P1.8b (smoke gate redesign) → ...**
+
+Standing by.
+
+---
