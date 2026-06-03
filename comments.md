@@ -18474,3 +18474,141 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by — pivot on operator-side gate PASS or BUILDER's next move.
 
 ---
+
+## Review of 029d175 — `docs(turnover.units): F1-B drift-prevention sweep + fix garbled pnl.py empirical anchor` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Closes Grill #2 (my call-out + LOGIC's residual #3) AND lands F1-B (LOGIC's residual #2, my re-framing as drift-prevention). One **important load-bearing catch** I had not flagged: the heatmap CSV's `entry_vwap_implied` computation at `src/web/heatmap.py:1220-1229` was actively wrong post-F1 (still multiplying by 1e5) — not just docstring. Operator-facing CSV would have lied about VWAP.
+
+### Grill #2 closed — pnl.py empirical anchor now correct
+
+`src/engine/pnl.py:73-89` rewritten:
+
+```
+Empirical anchor (RELIANCE 2024-08-29 2840-CE, post-F1 fix):
+  TtlTrfVal      = 19,661,050 rupees       (UDiff bhavcopy)
+  volume         = 6,500 shares            (26 contracts × 250 lot)
+  strike         = 2,840
+  notional/share = 19,661,050 / 6,500      = 3,024.78
+  premium_vwap   = 3,024.78 − 2,840        =   184.78 ✓
+The identity being verified is the underlying-notional convention
+documented in LOGIC_REVIEW.md F1: notional/share == strike + premium
+(3,024.78 = 2,840 + 184.78), not anything involving spot. This is
+an ITM call (spot 3,041 > strike 2,840) — earlier framing as
+"deep-OTM" was wrong on both moneyness AND identity.
+```
+
+All three points fixed:
+1. Identity correctly stated as `notional = strike + premium` (not `spot + premium`). ✓
+2. Moneyness correctly stated as ITM (`spot > strike`, not OTM). ✓
+3. The dangling "≈ 3,225" sum removed. ✓
+
+**Bonus**: explicit "earlier framing was wrong on both moneyness AND identity" sentence preserves the diagnosis for future readers — they understand WHY the wrong block had to be replaced, not just WHAT the right block says.
+
+### F1-B sweep — load-bearing catch in heatmap CSV
+
+The most consequential touchpoint is `src/web/heatmap.py:1220-1229` — not a docstring, but the actual CSV computation:
+
+```python
+entry_vwap_implied = (
+    float(entry_turn) / float(entry_vol)        # was: × 100_000.0 /
+    if (entry_turn is not None and entry_vol)
+    else None
+)
+exit_vwap_implied = (
+    float(exit_turn) / float(exit_vol)          # was: × 100_000.0 /
+    if (exit_turn is not None and exit_vol)
+    else None
+)
+```
+
+Pre-F1 this was `entry_turn × 100_000.0 / entry_vol`. With turnover now in rupees, the pre-fix formula would have produced `~3×10⁸` instead of `~3,025` — the operator-facing CSV column `entry_vwap_implied` would have lied about VWAP fill source on every export. **I had not flagged this**; BUILDER caught it themselves during the sweep. Without this fix, an operator downloading the cell drilldown CSV after F1 would see `entry_vwap_implied ≈ 3×10⁸` and conclude "the VWAP path is producing absurd values" — exactly the failure mode F1 fixed but surfacing in a different surface.
+
+### F1-B sweep — bonus correctness improvements (not just lakhs→rupees)
+
+BUILDER caught two SEMANTIC errors in the old docstrings that go beyond the lakhs/rupees swap:
+
+**1. `src/mcp/backtest_one.py:67-83` — `entry_fill_source` description.**
+
+- Was: "'close' if VWAP path unavailable OR engine rejected it via the **units-sanity band**."
+- Now: "'close' if VWAP path unavailable OR engine rejected it via the **recovered-premium-vs-close safety band**."
+
+Post-F1 there is no units check; the band is a recovered-premium-vs-close sanity valve on the assumption that any sane VWAP should be within `[0.5×, 2.0×] of close`. The old "units-sanity band" framing was wrong even before F1 — it was misleading about WHAT the band protects against.
+
+**2. `src/mcp/spot_options.py:131-139` — `turnover` Field description.**
+
+- Was: "Combined with `volume` yields per-row **VWAP**: `turnover * 100_000 / volume`."
+- Now: "Combined with `volume` yields per-row **notional-per-share**: `turnover / volume`."
+
+`turnover / volume = strike + premium` (notional per share), NOT premium VWAP. The old docstring conflated `notional-per-share` with `VWAP` — the recovery formula is `notional/share − strike = premium VWAP`. New docstring correctly names the intermediate quantity.
+
+**These bonus corrections are exactly the drift-prevention pattern LOGIC re-framed F1-B around: stale docstrings don't just say wrong units, they sometimes say wrong things about what the formula computes.**
+
+### Column rename — clean
+
+`entry_turnover_lakhs` → `entry_turnover_rupees` (and exit equivalent). BUILDER claims they grep'd to confirm no test depends on the column names; I independently verified:
+
+```
+$ grep -rn "entry_turnover_lakhs\|exit_turnover_lakhs" tests/ src/
+# (no output)
+```
+
+Zero surviving references. Rename is clean. Operator-visible CSV column name now correct.
+
+### Pytest
+
+```
+857 passed, 8 skipped, 2 deselected, 1 warning in 9.91s
+```
+
+857 + 8 skipped = 865. Matches BUILDER's claim (no test count change vs F1 12893ea; the 8 skipped are `test_web_e2e` cases that need a sweep parquet in `data/results/` — environment-only).
+
+### Praises
+
+- **Self-flagged Grill #2 in the commit body** — BUILDER explicitly enumerates the three errors in the original 12893ea comment block and addresses each. No defensive framing; clean ownership.
+- **Heatmap CSV computation catch** is the most valuable scope expansion in F1-B — operator-facing surface that would have lied silently. I had not flagged this; BUILDER caught it.
+- **Bonus semantic corrections** (units-sanity band → safety band; VWAP → notional-per-share) go beyond mechanical lakhs/rupees substitution. The drift-prevention re-frame is honored: BUILDER didn't just sed/sed; they re-read each docstring.
+- **Column rename audited via grep before landing** — call-out in the commit body + my independent verification both confirm zero callers.
+- **Cross-references LOGIC_REVIEW.md from every touched docstring** — future readers land on the empirical anchor + full diagnosis without spelunking commit history.
+- **Pre-F1 history acknowledged** in the new docstrings (e.g., "pre-F1 this was carried in lakhs and the engine multiplied by 1e5"). Lets a reader cross-validate against older commits + reviews.
+- **Drilldown caption updated correctly** — "If entry_px ≈ turnover/volume - strike, the engine used VWAP" is now precise (subtracts strike to get premium VWAP, not just notional).
+- **Scope discipline**: F3 (expiry STT) and Grill #1 (cache-version stamping) explicitly deferred per the architectural priority ordering. No scope creep.
+
+### Math
+
+- LOC: +39 / -21 = +18 net. Pure docs + 4-line computation fix + 2-line column rename.
+- Test count: 857 passed + 8 skipped + 2 deselected = unchanged net vs F1 (12893ea). ✓
+
+### Behavior delta
+
+- Operator-facing CSV download (`render_cell_drilldown` → `_build_cell_csv`) now produces correct `entry_vwap_implied` / `exit_vwap_implied` values (~3,025 for the RELIANCE 2840-CE example) instead of ~3×10⁸. Live fix; not just docs.
+- CSV column header `entry_turnover_lakhs` / `exit_turnover_lakhs` renamed → operator must update any downstream parsing of the CSV (per the commit body's grep-confirmed no in-repo callers; external operator tooling would need to follow).
+- MCP `OptionRow.turnover` + `LegBreakdown.entry_turnover` field descriptions correct; downstream MCP clients reading the tool catalog get the post-F1 convention.
+
+### State-of-tree
+
+Open grills now:
+
+- **Grill #1 from 12893ea** (cache-version stamping) — dual-concurred; should land after operator gate PASS per priority ordering.
+- ~~Grill #2 (garbled pnl.py comment)~~ — **CLOSED by THIS commit.** ✓
+- ~~F1-B docstring sweep~~ — **CLOSED by THIS commit.** ✓
+- **F3** (expiry physical-settlement STT) — defer, non-blocking.
+
+Two of three follow-ups closed in a single commit. Remaining: cache-version stamping (load-bearing risk lower than F1 but still real) + F3 (modeling caveat).
+
+### MCP arc state
+
+16/16. The two MCP tools touched (`spot_options`, `backtest_one`) have field descriptions that now align with the post-F1 convention; clients reading the tool catalog won't re-derive a wrong scale.
+
+### Next-commit suggestion
+
+Unchanged priority:
+
+1. **Operator gate PASS → P1.7.**
+2. **Cache-version stamping** (Grill #1) — ~20 LOC; closes the last F1-class risk.
+3. **F3 STT caveat** — defer further.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → F1 fix ✓ → F1-B drift-prevention ✓ → (operator gate exercise — VWAP-engaged, CSV correct) → P1.7 → P1.8 → ...**
+
+Standing by.
+
+---
