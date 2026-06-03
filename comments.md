@@ -20608,3 +20608,104 @@ Migration cadence: **... → F8 ✓ → F9 fix ✓ → 🚩 operator re-sweep (h
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC's F10 update (commit 6aebb31): KEEP close for realized_vol; "VWAP-everywhere" is wrong-by-overshoot
+
+LOGIC's F10 update is a critical refinement that **prevents an over-broad "VWAP-everywhere" application from introducing an ROI bias**. The naive read of F10 (just switch all spot uses to vwap) would have understated realized vol by 1.2-3.9 pp annualized, understating margin, **overstating ROI on all four smoke symbols.** LOGIC's separation of "transaction reference" vs "volatility estimator" is the load-bearing principle.
+
+### Spot VWAP availability confirmed empirically
+
+LOGIC measured across **29,634 EQ rows** (post-F9 filter):
+- vwap NaN = 0
+- vwap ≤ 0 = 0
+- vwap out-of-band = 0
+- Rows where vwap is missing while close is valid = 0
+
+**100% availability**. No fallback path needed. The F10 fix can rely on `vwap` unconditionally for the in-scope columns.
+
+### The KEEP-close-for-realized_vol caveat — load-bearing
+
+LOGIC's empirical measurement of close-vol vs vwap-vol (annualized) on all 4 smoke symbols:
+
+| Symbol | close-vol | vwap-vol | Bias |
+|---|---|---|---|
+| RELIANCE | 50.0 | 48.8 | −2.4% |
+| SBIN | 25.9 | 23.1 | −10.8% |
+| PNB | 32.9 | 29.0 | −11.9% |
+| BHEL | 42.0 | 39.4 | −6.2% |
+
+**vwap-to-vwap log-return stdev is non-standard AND optimistically biased.** vwap is an intraday volume-weighted average → smoother time series → lower variance → understated vol → understated margin → **overstated ROI**.
+
+This is a real bias that would NOT have been caught by any other safety net (P1.7 VWAP-or-skip, Option C, F7, smoke gate). The naive F10 application (vwap everywhere in spot) would have shipped this bias undetected.
+
+**LOGIC's principle separation**: VWAP is the right **transaction reference** (what you'd trade at on the day); close-to-close is the right **volatility estimator** (statistically standard convention).
+
+### Precise F10 scope — verified
+
+- ✅ **Switch to spot `vwap`**:
+    - `sweeper.py:194` `spot_at_entry` (ATM strike selection + margin notional).
+    - `sweeper.py:198` `exit_spot` (recorded-context consistency).
+- 🚩 **KEEP close-to-close for `realized_vol`** (`vol.py:68-69`).
+- 🚩 **KEEP close** in raw display (`get_spot_series` passthrough).
+
+3-line change in sweeper.py; ZERO change to vol.py; ZERO change to get_spot_series. Surgical scope.
+
+### F9 prereq confirmed
+
+LOGIC notes: F9 must land first because otherwise `iloc[0]` could grab a T0 row whose `vwap` is a degenerate single print. **F9 just landed in 8f10b6d** (my a98e4ab review). F10 is now mechanically ready.
+
+### Operator-side ROI bias implication
+
+The pre-F10 sweep uses close for spot-everywhere. Post-F10 the sweep uses vwap for transaction reference (ATM + margin) while keeping close for vol estimation. Operator should expect:
+
+- **ATM strikes**: ~24-36% of days will pick a different strike than the pre-F10 sweep.
+- **Margin**: vol-based component unchanged (still close-to-close); spot-notional component shifts by close-vs-vwap-spot divergence (median 0.25-0.59%).
+- **ROI %**: small per-trade noise; not directionally biased; cumulative ROI distribution shifts at ~0.3% level per trade.
+- **NO realized-vol smoothing bias** — `vol.py` unchanged.
+
+The pre-F10 sweep's ROI numbers are NOT systematically wrong (close-spot for ATM is a defensible choice); F10's switch to vwap is a consistency improvement, not a correctness fix.
+
+### My broader memory update consideration
+
+This is the second time in this session a "VWAP-everywhere" instinct would have introduced a bias if applied naively:
+- F1: VWAP-everywhere for FILL was right.
+- F10 naive read: VWAP-everywhere for SPOT would have been wrong (vol smoothing).
+
+The lesson: **VWAP is the right transaction reference, not the right statistical estimator.** When applying a "consistency upgrade" across the codebase, separate the role each variable plays:
+- Transaction reference (what gets traded) → VWAP.
+- Statistical estimator (variance, kurtosis, etc.) → close-to-close convention.
+- Raw display (operator audit) → close (or whatever original NSE field).
+
+Could save this as a memory entry. Will do after committing this ACK.
+
+### Updated F10 (P1.8d) scope
+
+Was: "switch sweeper.py:194 from close to vwap. ~5-10 LOC."
+Now: "switch sweeper.py:194 + sweeper.py:198 from close to vwap; explicitly DO NOT touch vol.py:68-69 or get_spot_series. ~3 LOC src + tests."
+
+The "DO NOT" is structural — protects against a future contributor mistaking "F10 = vwap everywhere."
+
+### State-of-tree
+
+- F9 — CLOSED. ✓
+- F10 — refined scope; ready to land as P1.8d with precise boundaries.
+- Operator re-sweep still safe.
+
+### MCP arc state
+
+16/16. F10 fix won't touch MCP. Post-F10, `entry_spot` in sweep parquet reflects vwap; MCP queries returning entry_spot will reflect the new convention.
+
+### Next-commit suggestion
+
+1. **🚩 OPERATOR re-sweep** with UPDATED command from e41ddd1.
+2. **P1.8d (F10 fix)** — 3-line change in sweeper.py + tests. **KEEP close in vol.py**. Crisp scope.
+3. **P1.8b** — smoke gate redesign (F6 #1+#2).
+4. **MIGRATION.md decision-log** entry (now includes the "transaction reference vs statistical estimator" principle).
+5. **MCP legacy-LTP caveat for regime B**.
+6. **Phase 2b cross-boundary smoke test**.
+
+Migration cadence: **... → F9 fix ✓ → F10 scope refined ✓ → 🚩 operator re-sweep → P1.8d (F10 — 3 LOC; KEEP close in vol.py) → P1.8b → ...**
+
+Standing by.
+
+---
