@@ -19395,3 +19395,74 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 🎉 Standing by — migration arc complete through P1.7. Awaiting P1.8 cycle.
 
 ---
+
+## 🚩 Architectural ACK + Self-correction — LOGIC's 7f2a4f3 (P1.7 + deprecation joint review)
+
+LOGIC's joint review concurs on P1.7 + deprecation correctness, but elevates a flag I should have led with: **the operator's displayed sweep is now STALE vs the post-P1.7 engine**. My N3 framed it as "behavior is irreversible — re-running produces different cell count" — informational. LOGIC frames it as **OPERATOR ACTION REQUIRED to bring the webapp current**. LOGIC's framing is sharper and operator-actionable.
+
+### 🚩 OPERATOR ACTION REQUIRED
+
+The displayed sweep `data/results/sweep_5f199d6984f2.parquet` was generated:
+- Pre-P1.7 (carries close-fallback fills the engine no longer produces).
+- Pre-F1-cache-rebuild (used the old jugaad-derived per-contract parquets with lakhs convention).
+
+Until the operator runs a fresh prefetch + sweep on the current cache, **the webapp + MCP outputs show pre-P1.7 semantics**, not the VWAP-or-skip engine that ships in this commit. The 66.4% → ~99.6% VWAP fill rate, the ~0.05% honest skips, the ROI distribution shifts off the tick-floor bias — none of these appear in the webapp until a re-sweep lands.
+
+**Operator command** (single line, copy-paste-safe per d69c3e5):
+
+```
+rm -rf data/cache/options/ && .venv/bin/python scripts/prefetch_universe.py --symbols PNB SBIN BHEL RELIANCE --workers 4 --engine-source bhavcopy --start 2024-07-08 --end 2026-06-02 && .venv/bin/python scripts/p7_wide_sweep.py --symbols PNB SBIN BHEL RELIANCE --workers 4
+```
+
+Or staged (operator's preference):
+
+1. `rm -rf data/cache/options/`
+2. Re-run prefetch (5-15 min if bhavcopies need re-fetch; seconds if already fresh).
+3. Re-run sweep.
+4. Webapp now reflects P1.7 semantics.
+
+### Self-correction
+
+My P1.7 review's N3 said:
+
+> "Behavior is IRREVERSIBLE — re-running the sweep post-P1.7 will produce a different (smaller) cell count than pre-P1.7 sweeps — cells that previously close-fell-back are now honestly skipped."
+
+This is technically correct but framed as a property of the COMMIT, not as a property of what the operator SEES RIGHT NOW. LOGIC's framing — "the webapp will not reflect P1.7 until re-sweep" — is the operator-actionable equivalent. **Saved memory** [feedback_irreversible_engine_invalidates_displayed_data](file:///Users/mriddy/.claude/projects/-Users-mriddy-Documents-GitHub-morenseprofits/memory/feedback_irreversible_engine_invalidates_displayed_data.md) so future irreversible-engine commits get the elevated framing automatically.
+
+### Concurrence on the smoke-gate gap
+
+LOGIC notes: F6 condition 3 (bhavcopy canonical) closed by 2613129; **F6 conditions 1 + 2 (bhav-vs-raw-bhavcopy precision gate) remain OPEN**. Until that successor lands, **there is NO automated migration-parity gate**. Non-blocking (F1/F6 verified manually + per-trade equivalence 99.97% within 0.5 pp), but the successor should not be silently dropped.
+
+I had tracked this as "P1.8 candidate" in my P1.7 review; LOGIC's framing is correct — it's a real gap in the automated CI signal, not just an open feature item. BUILDER should land the bhav-vs-bhav successor before any heavy P2.x engine work where regression-detection matters.
+
+### Concurrence on the OI=0 drop (informational)
+
+LOGIC's caveat on the OI=0 + volume>0 case being silently priced now matches my N2. Both reviewers concur this is a documented operator-authorized architectural choice; not a bug. The pre-P1.7 IlliquidLegError gate was a defensive skip; post-P1.7 the engine trusts volume as the liquidity signal. Settlement-day artifacts may now price; documented in the commit body.
+
+### Updated state-of-tree
+
+- **Migration arc complete through P1.7**: code is shipped.
+- **Webapp/MCP outputs are NOT yet current**: operator must re-sweep to bring displayed data in sync with engine semantics.
+- **No automated migration-parity gate** until F6 #1+#2 land (P1.8 candidate).
+- All open grills remain as listed in my P1.7 review.
+
+### Updated next-commit priority
+
+1. **🚩 OPERATOR ACTION**: re-sweep to bring webapp current with P1.7 semantics. (Operator-side, not BUILDER-side.)
+2. **P1.8 smoke-gate replacement** (bhav-vs-bhav baseline + per-trade primary + quantization-aware threshold) — closes F6 #1+#2; LOGIC's "should not be silently dropped" framing elevates priority.
+3. **MIGRATION.md decision-log entry** for Plan C scrap + bhavcopy canonical-precision note.
+4. **Grill #1 from 12893ea** (cache-version stamping) — dual-concurred; ~20 LOC.
+
+### MCP arc state
+
+16/16. MCP queries against `sweep_5f199d6984f2.parquet` continue to return pre-P1.7 data until re-sweep. Post-re-sweep, results will reflect VWAP-or-skip semantics + the smaller cell count + the ~99.6% VWAP fill rate.
+
+### Memory update
+
+Saved [feedback_irreversible_engine_invalidates_displayed_data](file:///Users/mriddy/.claude/projects/-Users-mriddy-Documents-GitHub-morenseprofits/memory/feedback_irreversible_engine_invalidates_displayed_data.md): when reviewing irreversible engine/pricing changes, elevate "displayed data stale" from informational to OPERATOR ACTION REQUIRED. Lead with the re-sweep command, not the irreversibility framing. This is the lesson from LOGIC's reframe of my N3.
+
+Migration cadence: **... → 🎉 P1.7 VWAP-or-skip SHIPPED ✓ → 🚩 operator re-sweep (TO BRING WEBAPP CURRENT) → P1.8 (smoke gate redesign) → ...**
+
+Standing by.
+
+---
