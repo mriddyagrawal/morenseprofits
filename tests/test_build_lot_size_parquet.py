@@ -528,6 +528,24 @@ def _write_synthetic_sidecar(
 # prefetch auto-build trigger
 # ============================================================
 
+def _write_current_schema_parquet(path: Path) -> None:
+    """Helper: write a minimal valid parquet with the full current
+    ``_LOT_SIZES_REQUIRED_COLUMNS`` schema. Used by predicate tests
+    that need a parquet that PASSES the schema-staleness check so the
+    next branch (mtime / freshness) can be exercised."""
+    df = pd.DataFrame({
+        "symbol": pd.Series(["X"], dtype="string"),
+        "year": pd.Series([2024], dtype="int64"),
+        "month": pd.Series([7], dtype="int64"),
+        "lot_size": pd.Series([100], dtype="int64"),
+        "source": pd.Series(["sidecar"], dtype="string"),
+        "expiry_date": pd.Series(
+            [pd.Timestamp("2024-07-25")], dtype="datetime64[us]",
+        ),
+    })
+    df.to_parquet(path, index=False)
+
+
 def test_lot_sizes_needs_rebuild_predicate_pins_three_cases(tmp_path):
     """Anti-regression on the stale-lookup bug observed 2026-06-03:
     ``data/cache/lot_sizes.parquet`` had 4 BHEL year-months while
@@ -538,7 +556,9 @@ def test_lot_sizes_needs_rebuild_predicate_pins_three_cases(tmp_path):
 
     The new mtime-based predicate fires a rebuild in three cases;
     pinning each separately so a future contributor can't collapse
-    them and reintroduce the bug.
+    them and reintroduce the bug. Uses real parquets (not byte
+    placeholders) so the schema-staleness check Grill #5 added
+    doesn't short-circuit the mtime path.
     """
     from scripts.prefetch_universe import _lot_sizes_needs_rebuild
 
@@ -551,9 +571,9 @@ def test_lot_sizes_needs_rebuild_predicate_pins_three_cases(tmp_path):
     assert needs is True
     assert "missing" in reason
 
-    # Case 2: unified parquet present, no sibling parquets newer
-    # than it → no rebuild (cache hit).
-    unified.write_bytes(b"placeholder")
+    # Case 2: unified parquet present (current schema), no sibling
+    # parquets newer than it → no rebuild (cache hit).
+    _write_current_schema_parquet(unified)
     import os
     base_t = os.path.getmtime(unified)
     # Plant an OLDER sibling parquet (mtime = base - 60s).
@@ -575,6 +595,59 @@ def test_lot_sizes_needs_rebuild_predicate_pins_three_cases(tmp_path):
     assert needs is True
     assert "newer" in reason or "mtime" in reason
     assert "20251231" in reason  # operator-visible: first offending sibling
+
+
+def test_lot_sizes_needs_rebuild_detects_schema_staleness(tmp_path):
+    """Grill #5 (logic-review 50b6a84): a pre-fbb8e35 parquet (no
+    ``expiry_date`` column) carried over from a prior code revision
+    MUST trigger a rebuild — otherwise the post-1B sweep crashes
+    with KeyError when ``expiries_for_symbols`` reads the column.
+
+    Predicate must detect this case independent of the mtime path:
+    even when sibling mtimes are stable, a schema-stale parquet is
+    not safe to reuse.
+    """
+    from scripts.prefetch_universe import _lot_sizes_needs_rebuild
+
+    unified = tmp_path / "lot_sizes.parquet"
+    sibling = tmp_path / "bhavcopy_fo_lot_sizes"
+    sibling.mkdir()
+
+    # Write a pre-fbb8e35-shape parquet (no expiry_date column).
+    stale = pd.DataFrame({
+        "symbol": pd.Series(["X"], dtype="string"),
+        "year": pd.Series([2024], dtype="int64"),
+        "month": pd.Series([7], dtype="int64"),
+        "lot_size": pd.Series([100], dtype="int64"),
+        "source": pd.Series(["sidecar"], dtype="string"),
+    })
+    stale.to_parquet(unified, index=False)
+
+    # Sibling mtime stable (no fresh-fetch signal); but the parquet
+    # is schema-stale → MUST rebuild.
+    needs, reason = _lot_sizes_needs_rebuild(unified, sibling)
+    assert needs is True, (
+        "schema-stale parquet must trigger rebuild even when mtimes "
+        f"are stable; got: {reason}"
+    )
+    assert "schema stale" in reason
+    assert "expiry_date" in reason  # operator-visible: which column is missing
+
+
+def test_lot_sizes_needs_rebuild_detects_corrupt_parquet(tmp_path):
+    """Defensive Grill #5 corollary: if the parquet on disk is
+    unreadable (corrupt bytes), the predicate must rebuild rather
+    than crash + halt the prefetch. Triggers fresh fetch from the
+    truth sources; on-disk corruption is self-healing."""
+    from scripts.prefetch_universe import _lot_sizes_needs_rebuild
+
+    unified = tmp_path / "lot_sizes.parquet"
+    sibling = tmp_path / "bhavcopy_fo_lot_sizes"
+    sibling.mkdir()
+    unified.write_bytes(b"not a valid parquet header")
+    needs, reason = _lot_sizes_needs_rebuild(unified, sibling)
+    assert needs is True
+    assert "failed to read schema" in reason
 
 
 def test_prefetch_autobuilds_lot_size_parquet_when_missing(tmp_path, monkeypatch):

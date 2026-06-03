@@ -74,6 +74,19 @@ def _h(s: str) -> None:
     print(f"\n=== {s} ===", flush=True)
 
 
+# Columns the current build script writes into lot_sizes.parquet.
+# Used by ``_lot_sizes_needs_rebuild`` to detect schema-stale
+# parquets carried over from a prior code revision (e.g. a parquet
+# written before the ``expiry_date`` column landed in fbb8e35
+# would crash the sweep's ``expiries_for_symbols`` on KeyError if
+# the auto-rebuild predicate didn't catch it). Keep this tuple in
+# lockstep with the columns emitted by
+# ``scripts.build_lot_size_parquet.build_lot_size_parquet``.
+_LOT_SIZES_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "symbol", "year", "month", "lot_size", "source", "expiry_date",
+)
+
+
 def _lot_sizes_needs_rebuild(
     parquet_path: Path, sibling_dir: Path,
 ) -> tuple[bool, str]:
@@ -88,6 +101,13 @@ def _lot_sizes_needs_rebuild(
     Triggers a rebuild when:
 
       - the unified parquet is missing (fresh clone or operator nuke);
+      - any expected column from ``_LOT_SIZES_REQUIRED_COLUMNS`` is
+        absent (schema-staleness check: a parquet written under a
+        prior schema revision — e.g. pre-fbb8e35 without
+        ``expiry_date`` — would otherwise be reused via the mtime
+        path and crash downstream on KeyError). Reads the parquet
+        schema only, not the data — pyarrow's schema read is ~ms
+        regardless of file size;
       - any sibling per-date lot-size parquet in ``sibling_dir`` has
         an mtime newer than the unified parquet (operator fetched
         new bhavcopies after the last unified build — the new
@@ -103,6 +123,25 @@ def _lot_sizes_needs_rebuild(
     """
     if not parquet_path.exists():
         return True, f"{parquet_path} missing"
+    # Schema-staleness gate (Grill #5 fix). A parquet written by a
+    # prior code revision may lack columns the current build
+    # produces; if we hand it to the new sweep we get KeyError. Read
+    # only the parquet schema (pyarrow.parquet.read_schema) — does
+    # NOT load the data, ~ms regardless of file size.
+    try:
+        import pyarrow.parquet as pq
+        existing_cols = set(pq.read_schema(parquet_path).names)
+    except Exception as exc:
+        # Corrupt / unreadable parquet → safest action is rebuild.
+        return True, f"failed to read schema ({type(exc).__name__}: {exc})"
+    missing_cols = [
+        c for c in _LOT_SIZES_REQUIRED_COLUMNS if c not in existing_cols
+    ]
+    if missing_cols:
+        return True, (
+            f"schema stale: missing columns {missing_cols} "
+            f"(parquet was written by an earlier code revision)"
+        )
     if not sibling_dir.exists():
         # No siblings to compare against; the unified cache is the
         # only thing we have, so trust it (rebuild is a no-op).
