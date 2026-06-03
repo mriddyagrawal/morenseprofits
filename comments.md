@@ -18181,3 +18181,49 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by — pivot on BUILDER's F1 fix or operator-side gate failure (whichever lands first).
 
 ---
+
+## Architectural ACK — LOGIC reviewer's addendum 1 (commit e1e526a) closes my smoke-gate-vacuous-pass concern
+
+LOGIC reviewer's addendum resolves the load-bearing open question from my F1 concurrence (`3aefddb`): **is jugaad's `FH_TOT_TRADED_VAL` actually lakhs?** Two-way verification:
+
+**(a) Analytic proof — airtight.** `TURNOVER_SCALE_FACTOR = 100_000` was introduced in `6356b90` (2026-05-28), predates the displayed sweep `sweep_5f199d6984f2.parquet` (mtime 2026-05-31). So the engine used `×10⁵` when the sweep ran. LOGIC measured: displayed `entry_px`/`exit_px` = `turnover_now/volume − strike` for 93% of legs. For the `×10⁵` engine to have produced that result under the jugaad cache, `jugaad_turnover = turnover_now / 10⁵` ⟹ **lakhs**. Direct algebraic proof. ✓
+
+**(b) Corroboration.** Jugaad's equity-historical sibling column is literally named `TURNOVER_LACS` in `/Users/mriddy/Documents/GitHub/jugaad-data` (operator's clone — per my `reference_jugaad_local_repo.md` memory). `FH_TOT_TRADED_VAL` follows the same NSE-historical-API lakhs convention. UDiff `TtlTrfVal` is a different NSE product with a different unit. ✓
+
+### Updated risk model
+
+- **Displayed sweep's VWAP is definitively correct.** ✓ (already established by both reviewers; now algebraically proven under the engine's `×10⁵` constant.)
+- **Smoke-gate "both-paths-wrong" risk DOES NOT materialize.** Jugaad lakhs gives correct VWAP ≈ 185; UDiff rupees gives close fallback ≈ 201.70 → divergence ~9% per fill → 0.5 pp backup criterion FAILS LOUD. **The migration gate is a genuine safety net for F1, not a vacuous pass.** ✓
+- **The two regimes have genuinely different units** — jugaad/legacy = lakhs; UDiff = rupees. F1 fix must normalize at PARSE time, not just adjust the engine constant. LOGIC concurs with my fix recommendation #3 (normalize at parse).
+
+### Implications for BUILDER's F1 fix
+
+- **The operator's currently-in-flight gate exercise is now expected to FAIL on the backup criterion (~9% per-fill delta).** This is a feature, not a bug — the gate doing its job. When it fails, the operator should NOT investigate as "smoke gate is broken" — the LOGIC + arch reviews have already diagnosed it as "F1 is broken; gate is correctly catching it."
+- **Fix direction confirmed**: normalize-at-parse (single source of truth for the engine's turnover unit). The trivial scale-constant tweak (`TURNOVER_SCALE_FACTOR = 1.0`) is necessary but not sufficient — without the parse-time normalization, legacy bhavcopy lakhs would silently break the same way UDiff rupees broke under the original constant.
+- **Anti-regression test still load-bearing**: the RELIANCE 2024-08-29 2840-CE VWAP fixture (turnover=19,661,050, volume=6500, strike=2840 → premium ≈ 184.78) is the canonical anchor. Locks the fix against future regression.
+
+### Limits acknowledged
+
+LOGIC's §METHODOLOGY notes the **legacy bhavcopy regime is inference-only** — current legacy caches are 14-col (no `turnover`); the stale-cache auto-refetch in `d276419` would rewrite to 15-col, but no operator-side data has been re-fetched from pre-2024-07-08 bhavcopies yet to empirically confirm `VAL_INLAKH` is lakhs. **The column name says so + the empirical 8c2c517 sequence + the LOGIC addendum's lakhs-by-convention argument together make this very high-confidence inference, but it's not first-hand empirical until an operator-side re-fetch of a pre-2024-07-08 date.** BUILDER's F1 fix should still treat legacy = lakhs (correct by all evidence), with a comment noting the inference + a follow-up to validate empirically when a legacy date hits the operator-side gate.
+
+### No action items new
+
+F1 fix as previously recommended; LOGIC's addendum strengthens the case that:
+
+1. Fix direction is parse-time normalization (not just constant tweak).
+2. Smoke gate WILL catch F1 — operator's gate exercise failure is the right verification path.
+3. Anti-regression test on RELIANCE 2024-08-29 2840-CE remains canonical.
+
+### MCP arc state
+
+Unchanged at 16/16. Data_quality (F2) still emits wrong output until F1 lands.
+
+### Cross-reference
+
+LOGIC addendum at [LOGIC_REVIEW.md §ADDENDUM 1](LOGIC_REVIEW.md). Both reviewer streams now converged on F1 root cause + fix direction + anti-regression anchor.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → 🚨 F1 fix (BLOCKER; LOGIC + arch both concur on direction) → P1.7 → ...**
+
+Standing by — pivot on (i) operator-side gate failure (expected), then (ii) BUILDER's parse-time F1 fix.
+
+---
