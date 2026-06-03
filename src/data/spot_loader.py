@@ -219,6 +219,17 @@ def load_spot(
             for y in years
         ]
     full = pd.concat(parts, ignore_index=True)
+    # F9 (logic-review 1347b8c, 2026-06-03): cached spot parquets can
+    # carry NSE T0-series rows alongside the EQ-series prints — typically
+    # single-trade micro-volume rows on the SAME date (BHEL/2025 had 6
+    # such dups, PNB/2025 had 8). ``_fetch_year`` passes ``series="EQ"``
+    # to jugaad, but the filter doesn't always hold, AND legacy caches
+    # may have been populated under a pathway that didn't filter.
+    # Defense-in-depth: drop non-EQ rows at the read-time boundary so
+    # downstream (engine ATM picker, realized-vol computation,
+    # entry/exit_spot fetch) sees a single row per date deterministically.
+    if "series" in full.columns:
+        full = full[full["series"] == "EQ"].reset_index(drop=True)
     mask = (full["date"] >= pd.Timestamp(from_date)) & (
         full["date"] <= pd.Timestamp(to_date)
     )

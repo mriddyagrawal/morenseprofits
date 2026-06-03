@@ -253,6 +253,67 @@ def test_symbol_and_series_have_matching_dtype(monkeypatch, tmp_path):
     assert out["symbol"].dtype == out["series"].dtype
 
 
+def test_t0_series_rows_filtered_at_read_boundary_f9(monkeypatch, tmp_path):
+    """F9 (logic-review 1347b8c, 2026-06-03): cached spot parquets can
+    carry NSE T0-series rows alongside the EQ-series prints — typically
+    single-trade micro-volume rows on the SAME date. Pre-fix
+    ``load_spot`` returned both rows; downstream consumers (engine ATM
+    picker, realized-vol computation, entry/exit_spot fetch) took
+    ``iloc[0]`` order-dependently. The T0 row's close was copied from
+    the EQ row but its OHLC was a single-print degenerate shape, which
+    contaminated realized-vol (spurious zero-return day → understates
+    vol → optimistic margin).
+
+    Fix: ``load_spot`` filters ``series == "EQ"`` at the read-time
+    boundary. Defense-in-depth even though ``_fetch_year`` already
+    passes ``series="EQ"`` to jugaad (the upstream filter doesn't
+    always hold + legacy caches may have been populated under a
+    pathway that didn't filter).
+
+    Fixture: a frame carrying TWO rows on 2024-08-29 — one EQ-series
+    real print, one T0-series micro-volume duplicate. Assert load_spot
+    returns the EQ row only.
+    """
+    _redirect_cache(monkeypatch, tmp_path)
+    # Build a hand-crafted frame: 3 real EQ dates plus a T0 duplicate
+    # on the middle date. Mirrors the NSE T0-series shape per F9.
+    eq_dates = [date(2024, 8, 28), date(2024, 8, 29), date(2024, 8, 30)]
+    eq_closes = [100.0, 105.0, 110.0]
+    eq_frame = _fake_jugaad("X", eq_dates, eq_closes)
+    # T0 row for 2024-08-29: close matches EQ; OHLC degenerate single
+    # print (open=high=low=close); micro-volume.
+    t0_row = pd.DataFrame({
+        "DATE": eq_frame.iloc[[1]]["DATE"].values,
+        "SERIES": ["T0"],
+        "OPEN": [105.0], "HIGH": [105.0], "LOW": [105.0],
+        "PREV. CLOSE": [100.0], "LTP": [105.0], "CLOSE": [105.0],
+        "VWAP": [105.0], "VOLUME": [2], "VALUE": [210.0],
+        "NO OF TRADES": [1], "DELIVERY QTY": [2], "DELIVERY %": [100.0],
+        "SYMBOL": ["X"],
+    }).astype({"DATE": "datetime64[ms]"})
+    contaminated = pd.concat([eq_frame, t0_row], ignore_index=True)
+
+    _patch_jugaad(monkeypatch, lambda s, f, t, se: contaminated)
+    out = spot_loader.load_spot(
+        "X", date(2024, 1, 1), date(2024, 12, 31),
+        today_fn=lambda: date(2026, 5, 24),
+    )
+    # No date duplicates — the T0 row got filtered.
+    assert out["date"].is_unique, (
+        f"T0 row not filtered; got duplicate dates: "
+        f"{out['date'][out['date'].duplicated()].tolist()}"
+    )
+    # Exactly 3 EQ rows survive.
+    assert len(out) == 3
+    assert out["series"].tolist() == ["EQ", "EQ", "EQ"]
+    # The 2024-08-29 row is the EQ one (volume = 1_000_001 from the
+    # _fake_jugaad fixture, not the T0 row's volume of 2).
+    aug29 = out[out["date"] == pd.Timestamp("2024-08-29")].iloc[0]
+    assert aug29["volume"] != 2, (
+        "load_spot returned the T0 micro-volume row instead of the EQ row"
+    )
+
+
 def test_returned_frame_is_monotonic(monkeypatch, tmp_path):
     _redirect_cache(monkeypatch, tmp_path)
     # Hand jugaad an out-of-order response — loader must sort it
