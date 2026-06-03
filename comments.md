@@ -18227,3 +18227,166 @@ Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 �
 Standing by — pivot on (i) operator-side gate failure (expected), then (ii) BUILDER's parse-time F1 fix.
 
 ---
+
+## Review of 12893ea — `fix(engine.turnover.parse_time_normalization)` — ✅ ACCEPT (one minor optional grill)
+
+**Verdict: ✅ ACCEPT.** F1 fix executes exactly the parse-time-normalize direction both reviewers concurred on. Anti-regression test pinned at the behavioral level (RELIANCE 2024-08-29 2840-CE → 184.78). 865/865 pass. End-to-end verified independently against TWO empirical anchors from LOGIC's F1 table.
+
+### Fix execution verified
+
+`src/data/bhavcopy_fo_loader.py:parse_legacy` (line 258):
+
+```python
+"turnover": df["VAL_INLAKH"].astype("float64") * 1e5,
+```
+
+`src/data/bhavcopy_fo_loader.py:parse_udiff` (line 329, unchanged code — corrected docstring at lines 321-329):
+
+```python
+"turnover": df["TtlTrfVal"].astype("float64"),  # already rupees
+```
+
+`src/data/options_loader.py:_normalize` (line 345-346):
+
+```python
+# F1 normalization: jugaad's FH_TOT_TRADED_VAL is in lakhs of rupees
+df["turnover"] = df["turnover"] * 1e5
+```
+
+`src/engine/pnl.py:TURNOVER_SCALE_FACTOR = 1.0` (was `100_000.0`).
+
+All three ingest sites normalize to RUPEES at parse time. Engine sees a single canonical convention. Per the LOGIC reviewer's recommendation #3 and my concurrence: parse-time normalization, not constant tweak.
+
+### End-to-end independent verification
+
+Ran the new module-level helpers against two empirical anchors from LOGIC's F1 table:
+
+```
+TURNOVER_SCALE_FACTOR = 1.0
+_compute_vwap(19_661_050, 6_500, 2840)  = 184.7769  ← RELIANCE 2840-CE ≈ 184.78 ✓
+_compute_vwap SBIN 880-CE                = 31.9537  ≈ 31.95 ✓
+```
+
+Both match LOGIC's table within rounding. Both produce in-band premiums (`close=201.70` band `[100.85, 403.40]` for RELIANCE; SBIN's ≈ 31.95 in a similar band). VWAP path **engaged**, not band-rejected. F1 + F2 closed.
+
+### Anti-regression test verified at the right level
+
+`test_f1_recovers_premium_for_reliance_2840_ce_under_rupees_convention` (tests/test_pnl.py):
+
+```python
+recovered = _compute_vwap(
+    turnover=19_661_050.0, volume=6_500, strike=2840.0,
+)
+assert recovered == pytest.approx(184.7769, abs=0.001)
+```
+
+**This is the behavioral level, not the constant-equality level.** The test fires loud on TWO failure modes (per the docstring):
+
+1. F1 has been undone (revert `TURNOVER_SCALE_FACTOR` + revert parser × 1e5 → silently re-introduces band-reject).
+2. **Mixed state**: `TURNOVER_SCALE_FACTOR` re-bumped without the parsers being denormalized in lockstep, or vice versa — would produce a recovered premium of either 184.78 × 1e5 = 1.85e7 (wrong) or 184.78 / 1e5 = 0.00185 (wrong). Either fails the assertion.
+
+This is the gold standard for an anti-regression anchor. The empirical fixture is durable (not synthetic; it's from the operator's actual cache); the assertion is precise (`abs=0.001`); the docstring names the failure modes.
+
+### Cascade test updates verified
+
+20+ existing tests had their fixtures scaled by 1e5 (e.g., `260.0 → 26_000_000.0`, `99.9 → 9_990_000.0`). Recovered premium under the new convention is unchanged — only the units the fixture uses change. Cascade is mechanical and atomic.
+
+### Pytest
+
+```
+================ 865 passed, 2 deselected, 1 warning in 13.89s =================
+```
+
+865/865 pass. Test count claim (+1 net for the regression test) matches. The 1 warning is unrelated (spot loader cache miss).
+
+### Cache-wipe instructions are correct AND operator-grade
+
+```
+rm -rf data/cache/options/
+```
+
+Single-line, copy-paste-safe per the d69c3e5 lesson. Reason captured inline in the commit body: existing per-contract parquets carry MIXED turnover units (jugaad-era lakhs vs bhavcopy-era rupees) with no metadata stamp to distinguish. Engine reading with SCALE=1.0 would silently fall back to close for the lakhs-era contracts.
+
+**`data/cache/bhavcopy_fo/` is correctly NOT mentioned** for the operator's CURRENT smoke-gate universe — the 4-symbol 2024-07-08 → 2026-06-02 window is entirely UDiff regime; UDiff parquets are already rupees-native and the new `parse_udiff` doesn't scale. ✓
+
+### Grill #1 (MINOR, OPTIONAL): latent legacy bhavcopy cache-version drift
+
+The `d276419` stale-cache auto-refetch sniff checks `"turnover" in df.columns` only. After this F1 fix, the sniff has a latent failure mode:
+
+- Pre-P1.2 legacy bhavcopy cache (14-col, no `turnover`) → sniff triggers re-fetch → new `parse_legacy` (× 1e5) → rupees ✓.
+- **Post-P1.2-pre-F1 legacy bhavcopy cache (15-col, `turnover` IN LAKHS)** → sniff PASSES ("turnover" present) → engine reads lakhs as rupees → silent close fallback for legacy regime contracts.
+
+**The operator's current state**: no legacy bhavcopies cached (per LOGIC's §METHODOLOGY: "current legacy caches are 14-col"). So no live impact for the in-flight gate exercise. But a future operator running a pre-2024-07-08 sweep against a cache that was generated post-P1.2-pre-F1 would silently get close fills.
+
+**Suggested fix (small, optional, can land in a follow-up)**: bump a `_TURNOVER_CONVENTION_VERSION` constant; stamp it in cache parquet KV-metadata at write; sniff at read time; if missing or older than current → re-fetch. ~20 LOC + 1 test. Could fold into the F1-B docstring sweep, or land standalone.
+
+Not blocking — the operator's CURRENT gate exercise is unaffected because they have no legacy cache. Defer at BUILDER's discretion.
+
+### Concurrence on F1-B deferral
+
+BUILDER's "NOT IN SCOPE" section correctly defers MCP tool descriptions + UI help strings outside the F1 fix path. Those are docstring-only and don't affect correctness; folding them into this commit would have diluted the focus on the load-bearing units fix. Right call.
+
+### Praises
+
+- **Parse-time normalization at all THREE ingest sites** — symmetric across the three regimes. The asymmetry that caused F1 (one constant trying to serve mixed units) is gone by construction.
+- **Anti-regression test at the BEHAVIORAL level** — pinned to the operator's actual cache fixture (RELIANCE 2024-08-29 2840-CE), `abs=0.001` precision, docstring names both undo-F1 AND mixed-state failure modes. Future regression cannot be subtle.
+- **Cascade tests updated mechanically** — fixtures scaled by 1e5, recovered premium unchanged. Locks the existing scenarios at the new convention without changing the physics.
+- **F2 closure documented as transitive** — no separate fix needed for `data_quality` MCP tool; same constant import propagates the correction.
+- **F1-B explicitly out of scope** — keeps this commit focused on correctness; docstring cleanup is a future tidiness pass, not a correctness blocker.
+- **Cache-wipe instructions are precise** — only `data/cache/options/` is wiped; `data/cache/bhavcopy_fo/` correctly left alone for the current operator's universe.
+- **Commit body cross-references both reviewer threads** — LOGIC F1 + LOGIC addendum 1 + arch concurrence + arch ACK. Future archaeologist gets the full decision trail.
+- **Empirical anchor cited in the engine docstring itself** — RELIANCE 2024-08-29 2840-CE worked example baked into `pnl.py:TURNOVER_SCALE_FACTOR` comment block. The next contributor reads the rationale inline.
+
+### Math
+
+- LOC: +206 / -119 = +87 net. ✓ Matches `206 insertions, 119 deletions`.
+- Test count: 864 → 865 (+1 net, the new F1 regression test). ✓
+
+### Behavior delta
+
+- Engine reads turnover in rupees uniformly. Pre-fix: rejected every fill for the bhavcopy regime, fell back to close. Post-fix: VWAP path engaged for both jugaad and bhavcopy regimes; smoke gate's api-vs-bhavcopy comparison should now converge (both produce ≈ 185 VWAP for RELIANCE 2840-CE, not 201.70 close fallback).
+- F2 (data_quality MCP) now reports numerically sensible divergences; root-cause text corrected.
+- F3 (expiry physical-settlement STT) unchanged — deferred per LOGIC's classification as conservative-direction modeling.
+
+### State-of-tree
+
+Operator-side gate exercise expected to **pass cleanly** after:
+
+1. `rm -rf data/cache/options/`
+2. Re-run prefetch (now using the F1-corrected parsers → rupees-only per-contract parquets).
+3. Re-run sweep.
+4. Re-run smoke comparison.
+
+If the gate passes → P1.7 ready. If it fails → either F1 fix is incomplete (unlikely — both empirical anchors independently verified) OR a new failure mode surfaces (would be a fresh BUILDER commit cycle).
+
+### Open grills
+
+- **Grill #1** (MINOR, optional, THIS commit): latent legacy bhavcopy cache-version drift. ~20 LOC fix; not blocking; defer at discretion.
+
+### MCP arc state
+
+16/16. `data_quality` MCP tool's F2 cascade closed. F1-B docstring sweep across `src/mcp/spot_options.py`, `src/mcp/backtest_one.py`, `src/web/heatmap.py` deferred (correctly).
+
+### Next-commit suggestion
+
+**Operator-side**:
+
+1. `rm -rf data/cache/options/` (per commit body — copy-paste-safe).
+2. Re-run prefetch → sweep → smoke comparison.
+3. Report PASS verdict.
+
+**BUILDER**:
+
+- If PASS: open P1.7 with the operator's run_id pair + cells-checked count + max-delta-observed metrics + cross-reference to F1 fix (`12893ea`) embedded in the commit body.
+- If FAIL: open the diagnostic commit cycle.
+
+**Optional follow-ups** (BUILDER's discretion):
+
+- Close Grill #1 from THIS commit (legacy bhavcopy cache-version sniff) — ~20 LOC; latent only; no current impact.
+- F1-B docstring sweep across MCP / web layer — pure docs; can land anytime.
+
+Migration cadence: **P0.1 ✓ → P0.2 ✓ → P1.1 ✓ → P1.2 ✓ → P1.3 ✓ → P1.4 ✓ → P1.5 ✓ → P1.6 ✓ → F1 fix ✓ → (operator gate exercise — now should pass cleanly) → P1.7 → P1.8 → ...**
+
+Standing by.
+
+---
