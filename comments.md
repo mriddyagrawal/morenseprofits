@@ -23579,3 +23579,189 @@ Migration cadence: **... → P8 #4 regime ✓ → P8 #2 retro-fix (this commit) 
 Standing by.
 
 ---
+
+## Review of 182cf1d — `feat(p9.0.events_loader)` — ✅ ACCEPT (1 tiny grill + 1 standing concern)
+
+**Verdict: ✅ ACCEPT.** Clean implementation of §17 + §17.5 + F10 against operator-delivered CSV. Spec match is verbatim; all 21 new tests pass; full suite 947 (matches BUILDER's claim exactly); empirical verification reproduced locally (24,266 / 2,387 / 11 RELIANCE events / window math — every digit matches the commit body). One tiny case-normalization asymmetry and one continuing concern about the untracked notebook this commit treats as canonical prototype.
+
+This is exactly the data-loader discipline [[feedback_verify_downloads]] prescribes: shape (24,266 ✓), dtypes (StringDtype + datetime64[us] ✓), date range (2023-09-06 → 2026-06-03 ✓), edge cases (boundary +1 day, case, PURPOSE filter, empty frame). 21 tests cover them.
+
+### Independent reproduction (operator's actual CSV)
+
+```
+rows: 24,266
+unique symbols: 2,387
+date range: 2023-09-06 → 2026-06-03
+
+RELIANCE: 11 events (Oct 2023 → Apr 2026, quarterly cadence)
+  2023-10-27  Financial Results
+  2024-01-19  Financial Results
+  2024-04-22  Financial Results/Dividend         ← multi-category survives
+  2024-07-19  Financial Results
+  2024-10-14  Financial Results
+  2025-01-16  Financial Results
+  2025-04-25  Financial Results/Dividend/Fund Raising  ← 3-category survives
+  2025-07-18  Financial Results
+  2025-10-17  Financial Results
+  2026-01-16  Financial Results
+  2026-04-24  Financial Results/Dividend
+
+has_earnings RELIANCE [2025-04-01, 2025-05-15]: True   ✓ (event in window)
+has_earnings RELIANCE [2025-04-01, 2025-04-15]: False  ✓ (exit+1 = 04-16 < event 04-25)
+
+Extra boundary checks (mine, beyond BUILDER's):
+has_earnings [2025-04-01, 2025-04-23]: False           ✓ (exit+1 = 04-24 < event 04-25)
+has_earnings [2025-04-01, 2025-04-24]: True            ✓ (exit+1 = 04-25 == event)  ← THE +1 BUFFER FIRES
+has_earnings [2025-04-01, 2025-04-25]: True            ✓ (event ON exit day)
+```
+
+**Every digit in BUILDER's "Live verification" section matches independent reproduction**, and the +1 day buffer is demonstrably load-bearing — without it, exit=2025-04-24 would miss the 2025-04-25 announcement and the trade would carry the gap risk.
+
+### Spec match verification
+
+Memoir F10 (§21.4 line 982-991) and §17.5 (line 602-611):
+```python
+def has_earnings_in_window(events_df, symbol, entry_date, exit_date):
+    sub = events_df[
+        (events_df['SYMBOL'] == symbol)
+        & events_df['PURPOSE'].str.contains('Financial Results', na=False)
+        & (events_df['DATE'] >= entry_date)
+        & (events_df['DATE'] <= exit_date + pd.Timedelta(days=1))
+    ]
+    return len(sub) > 0
+```
+
+BUILDER (events_loader.py:217-228):
+```python
+if events_df.empty:
+    return False
+sym = symbol.upper()
+ts_entry = pd.Timestamp(entry_date)
+ts_exit_plus = pd.Timestamp(exit_date) + pd.Timedelta(days=1)
+mask = (
+    (events_df["SYMBOL"] == sym)
+    & events_df["PURPOSE"].str.contains("Financial Results", na=False)
+    & (events_df["DATE"] >= ts_entry)
+    & (events_df["DATE"] <= ts_exit_plus)
+)
+return bool(mask.any())
+```
+
+**Differences are functionally equivalent or strict improvements**:
+- `bool(mask.any())` vs `len(sub) > 0` — equivalent; avoids materializing the sub-frame (minor perf win on the 24k-row table).
+- `if events_df.empty: return False` early-exit — equivalent (spec `len([]) > 0 → False`); avoids the mask construction.
+- `pd.Timestamp(entry_date)` explicit cast — defensive against pandas version drift.
+- `symbol.upper()` — see grill below.
+
+### 🚩 GRILL 1 (TINY — SYMBOL case-normalization asymmetry)
+
+**`has_earnings_in_window` uppercases the INPUT symbol but the cached SYMBOL column preserves source casing.**
+
+`events_loader.py:33-34`: "SYMBOL ... stripped, **uppercase preserved from source**".
+`events_loader.py:219`: `sym = symbol.upper()`.
+
+So:
+- INPUT side: `'reliance' → 'RELIANCE'` (normalized).
+- CACHE side: whatever NSE source delivered (in practice uppercase, but not asserted).
+
+If NSE ever delivers a row with mixed case (e.g., `"Reliance"` post-rebrand), the cache stores `"Reliance"` and `'RELIANCE' == 'Reliance' → False` — silent miss.
+
+**In practice**: NSE always uppercases F&O tickers. This never fires in production.
+
+**Cheap fix** (1 method call): also uppercase the cached SYMBOL column at parse-time. `events_loader.py:113`:
+```python
+"SYMBOL": df["SYMBOL"].astype(str).str.strip().str.upper().astype("string"),
+```
+Then the docstring "uppercase preserved from source" → "uppercased on parse (NSE source is uppercase; we normalize defensively)". Closes the asymmetry, costs nothing.
+
+OR drop the input `symbol.upper()` to match spec literal — but the cheap fix is strictly better (defends against the hypothetical mixed-case NSE row without losing case-insensitivity).
+
+**Why TINY**: blast radius is hypothetical. Real NSE F&O tickers are uppercase. But the asymmetry creates a footgun where the `.upper()` on input gives a false sense of robustness while the cache silently doesn't match.
+
+### ⚠️ STANDING CONCERN (NOT a new grill — continuation of f126fa6 GRILL 1)
+
+This commit's body says:
+> "The notebook prototype (`scripts/research_iv_visualization.ipynb` cell 7) implemented `load_earnings_events` for the IV-visualization overlay. This commit pulls that prototype into a production module."
+
+**`scripts/research_iv_visualization.ipynb` is STILL UNTRACKED** (verified just now: `git ls-files` empty for that path).
+
+So this commit treats an untracked .ipynb as the canonical prototype source, AND production code now actively depends on logic that originated there. The §22.5 / f126fa6 GRILL 1 chain is now MORE urgent because:
+1. The reference impl underpinning F2/F3 math (memoir §22.5) is in this untracked .ipynb.
+2. The PROTOTYPE for THIS commit's `has_earnings_in_window` is in cell 7 of that same untracked .ipynb.
+3. If the operator's workspace loses the .ipynb, both provenance trails vanish.
+
+c75ff3b set the right precedent (commit `vix_visualization.ipynb` with embedded outputs). Applying the same to `research_iv_visualization.ipynb` becomes more load-bearing with each new commit that depends on it.
+
+**Re-raising f126fa6 GRILL 1 with elevated urgency**: track the .ipynb before P8 #5 IVP also derives from it.
+
+### Praise points
+
+- **Spec match is verbatim** — F10 (§21.4) + §17.5 implemented with equivalent (or strict improvement) operator-side semantics.
+- **Multi-category PURPOSE substring match** — handles `"Financial Results"`, `"Financial Results/Dividend"`, `"Financial Results/Dividend/Fund Raising"` uniformly. The 3 RELIANCE multi-category rows (2024-04-22, 2025-04-25, 2026-04-24) all survive correctly per my live check.
+- **+1 day buffer is LOAD-BEARING and tested at the boundary** — `test_has_earnings_buffer_plus_one_day_after_exit` plus my own boundary check at exit=2025-04-24 fires exactly when the buffer is needed (event=04-25, exit+1=04-25).
+- **mtime-based cache invalidation** — operator-friendly "drop in a fresh CSV, next call reflects it" pattern. `force_refresh=True` for explicit override. LOAD-BEARING test (`test_load_events_invalidates_cache_when_csv_is_newer`) pins it.
+- **Empty-frame return + non-caching of empty parse** — `_empty_frame()` preserves canonical schema; empty-result path doesn't write a parquet (avoids "fake-empty cache permanently locks out future fresh CSV").
+- **Schema-drift defense at parse boundary** — required-column check at `events_loader.py:106-111` raises BEFORE any parquet write. Tolerates whitespace + newlines in column headers (`events_loader.py:102-105` strips them) — caters to the operator's CSV that "ships with literal newlines inside the quoted column labels."
+- **Defense-in-depth PURPOSE re-filter** in `has_earnings_in_window` (line 224) — catches the hand-built-frame caller path; correctness doesn't depend on cache-side filtering.
+- **`EVENTS_COLUMNS` tuple at module scope** — single source of truth for the schema. Same anti-drift discipline that worked for india_vix.
+- **Lookahead caveat in module docstring** (lines 9-14) — acknowledges the 5-14 day gap between Reg 29(1)(a) filing and board-meeting date per memoir §17.7. Documented, not silent.
+- **cache.py extension is consistent** — `events_path()` follows the same pattern as `india_vix_path` and `lot_sizes_path`. No surprise additions.
+- **Defaults from repo root + explicit override** — `_default_csv_path()` globs `CF-Event-equities-*.csv` at repo root; explicit `csv_path=` parameter for non-default placements. Operator-friendly.
+- **24,266 rows / 2,387 symbols / 11 RELIANCE events** is the exact-match independent reproduction. The 28,215 → 24,266 delta (-3,949) is the non-FR rows filtered out as designed (Dividend, Fund Raising, Bonus, Stock Split).
+- **2,387 vs 2,390 unique symbols** (-3) — 3 symbols had ONLY non-FR events. Reasonable; they correctly drop out of the FR-filtered cache.
+
+### Math + arithmetic
+
+- LOC: +228 (events_loader.py) + 354 (test_events_loader.py) + 14 (cache.py) = +596 net. ✓ Matches `git show --stat`.
+- Tests: 926 → 947. Delta 21. ✓ Matches BUILDER's "+21 new" claim exactly.
+- 21/21 events_loader tests pass; 947/947 full suite passes (3 deselected = network-gated).
+- 28,215 - 24,266 = 3,949 non-FR rows filtered. ✓ Internally consistent.
+- 2,390 - 2,387 = 3 symbols with ONLY non-FR events. ✓ Reasonable.
+
+### State-of-tree
+
+- `main` HEAD: `182cf1d`.
+- `data/cache/events.parquet` — populated and verifiable from operator's CSV.
+- Phase numbering: BUILDER uses `p9.0`; memoir §17.6 says `feat(p8.data.events_loader)`. **Cosmetic inconsistency** between PLAN.md (P9) and memoir spec (P8). Not blocking; either rename memoir to P9 or accept the build-order drift. Worth noting in next memoir-touch commit.
+- `scripts/research_iv_visualization.ipynb` STILL UNTRACKED — and is now BOTH the §22.5 reference impl AND the prototype source for the events_loader logic landed here.
+
+### Open grills (cumulative)
+
+- **NEW: 1 tiny grill** (SYMBOL case-normalization asymmetry above).
+- **STANDING — f126fa6 GRILL 1** (research_iv .ipynb untracked) — urgency elevated; this commit treats it as canonical prototype.
+- **STANDING — f126fa6 GRILL 2** (3 PNGs missing for §22.5 evidence).
+- **STANDING — f126fa6 GRILL 3** (F3 None→NaN return-type drift).
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required for this commit. Cache is populated correctly; F&O symbol mapping note (§17.4 TATAMOTORS → TMPV per blue_chip audit) is unrelated to this loader.
+
+**Forward-looking**: `scripts/research_iv_visualization.ipynb` is now load-bearing for TWO production modules' provenance (P8 #5 IVP source + P9 #0 events prototype source) but remains untracked. Operator should commit it before the next .ipynb-dependent commit lands.
+
+### Next-commit suggestion
+
+`chore(p8.research.commit_research_iv_ipynb)` — close f126fa6 GRILL 1 + GRILL 2 in one commit:
+1. Re-execute `scripts/research_iv_visualization.ipynb` to embed PNG outputs (matching the vix_visualization pattern).
+2. Track it in git.
+3. Patch memoir §22.5 `.py` → `.ipynb` references.
+4. Optionally fold GRILL 3 (F3 None → NaN) as a 1-line memoir patch.
+
+**Why now (urgency upgrade)**: this commit is the SECOND production module that derives from cell N of the untracked .ipynb (vix_visualization was the first reference; events_loader is the second). The pattern is forming — the .ipynb is implicitly the source-of-truth for both portfolio analytics math (F2/F3/IVP) and ancillary data plumbing (events). Tracking it is no longer optional discipline; it's a prerequisite for downstream traceability before P8 #5 IVP makes it three-deep.
+
+Per [[feedback_next_commit_suggestion]]: A. de-risks the biggest unknown (citation drift compounds across commits), B. follows a real signal (this commit's prototype-source claim), C. fits in one nuclear commit. Per [[feedback_reviewer_calibration]]: NOT softening — the §22.5 grills have been open for 3 commits now (9690656, c75ff3b, 182cf1d). Cumulative drift accumulating.
+
+Alternative if BUILDER prefers parallel-track: `feat(p9.0.earnings_filter.wire)` — wire `has_earnings_in_window` into the portfolio candidate-selection path with a banner counter (per memoir §17.6 second commit). This is the natural follow-up to make the loader actually shape trades.
+
+Recommend: chore first (closes 3-commit-old grills), then `wire`.
+
+Migration cadence: **... → P9 #0 events loader ✓ → research_iv ref-impl chore (closes f126fa6 grills) → earnings_filter.wire → P8 #5 IVP materializer → ...**
+
+Standing by.
+
+---
