@@ -240,17 +240,24 @@ def test_partial_response_with_dropped_dates(monkeypatch, tmp_path):
     )
 
 
-def test_symbol_and_series_have_matching_dtype(monkeypatch, tmp_path):
-    """Both string columns must use the same na_value sentinel so that
-    dropna(subset=[...]) behaves consistently across them."""
+def test_symbol_dtype_is_explicit_stringdtype(monkeypatch, tmp_path):
+    """``symbol`` MUST be the explicit ``StringDtype``, not the
+    scalar-broadcast ``object`` flavor whose na_value is ``nan``.
+    Mixed na_value sentinels cause ``dropna(subset=[...])`` to behave
+    inconsistently across string columns.
+
+    Pre-perf-#1 this test also asserted on ``series`` dtype matching
+    (the load_spot output carried the series column). With the F9
+    filter + ``series``-column drop hoisted into ``_load_year_cached``
+    (perf #1, 2026-06-04), ``series`` is no longer in the load_spot
+    output, so the dtype-match invariant collapses to a single-column
+    assertion on ``symbol``."""
     _redirect_cache(monkeypatch, tmp_path)
     _patch_jugaad(monkeypatch, lambda s, f, t, se: _fake_jugaad(s, [date(2024, 1, 2), date(2024, 1, 3)]))
     out = spot_loader.load_spot("X", date(2024, 1, 1), date(2024, 12, 31), today_fn=lambda: date(2026, 5, 24))
-    # Both should be the explicit "string" StringDtype, not the
-    # scalar-broadcast version that uses na_value=nan.
     assert out["symbol"].dtype == pd.StringDtype()
-    assert out["series"].dtype == pd.StringDtype()
-    assert out["symbol"].dtype == out["series"].dtype
+    # Post-perf-#1: series column is dropped at the cache layer.
+    assert "series" not in out.columns
 
 
 def test_t0_series_rows_filtered_at_read_boundary_f9(monkeypatch, tmp_path):
@@ -305,7 +312,12 @@ def test_t0_series_rows_filtered_at_read_boundary_f9(monkeypatch, tmp_path):
     )
     # Exactly 3 EQ rows survive.
     assert len(out) == 3
-    assert out["series"].tolist() == ["EQ", "EQ", "EQ"]
+    # Perf #1 (2026-06-04): the F9 filter is hoisted to
+    # ``_load_year_cached`` which also drops the now-redundant
+    # ``series`` column. The "T0 row filtered" semantic is preserved
+    # via the date-uniqueness + volume-correctness assertions below;
+    # the column-tolist check no longer applies.
+    assert "series" not in out.columns
     # The 2024-08-29 row is the EQ one (volume = 1_000_001 from the
     # _fake_jugaad fixture, not the T0 row's volume of 2).
     aug29 = out[out["date"] == pd.Timestamp("2024-08-29")].iloc[0]
@@ -387,3 +399,64 @@ def test_force_refresh_refetches(monkeypatch, tmp_path):
     assert fetch_count["n"] == 1
     spot_loader.load_spot("X", date(2024, 1, 1), date(2024, 12, 31), today_fn=today, force_refresh=True)
     assert fetch_count["n"] == 2
+
+
+# === Perf #1 fast-path equivalence (2026-06-04) ===
+
+def test_single_day_fast_path_matches_range_query_result(monkeypatch, tmp_path):
+    """Perf #1 (2026-06-04): ``load_spot`` takes a single-day fast
+    path when ``from_date == to_date`` (skipping the 2-comparison +
+    AND range mask). The result MUST be byte-identical to the range-
+    query path that returns the same single date. Anti-regression on
+    a perf optimization that's easy to subtly break (e.g. a stale
+    series column check, dtype drift on the fast path).
+    """
+    _redirect_cache(monkeypatch, tmp_path)
+    eq_dates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
+    _patch_jugaad(monkeypatch, lambda s, f, t, se: _fake_jugaad(s, eq_dates))
+    today = lambda: date(2026, 5, 24)
+
+    # Fast path: from == to == the middle date.
+    fast = spot_loader.load_spot(
+        "X", date(2024, 1, 3), date(2024, 1, 3), today_fn=today,
+    )
+    # Range path: 3-day window that resolves to the same single row.
+    rng = spot_loader.load_spot(
+        "X", date(2024, 1, 3), date(2024, 1, 3) + pd.Timedelta(days=0).to_pytimedelta(),
+        today_fn=today,
+    )
+    pd.testing.assert_frame_equal(fast, rng)
+    assert len(fast) == 1
+    assert fast.iloc[0]["date"] == pd.Timestamp("2024-01-03")
+    # Series column was dropped at the cache layer.
+    assert "series" not in fast.columns
+
+
+def test_load_spot_does_not_mutate_lru_cached_year_frame(monkeypatch, tmp_path):
+    """Perf #1 (2026-06-04): when ``len(parts) == 1`` ``load_spot``
+    skips ``pd.concat`` and uses the LRU-cached frame directly as
+    ``full``. The subsequent ``.loc[mask].reset_index(drop=True)``
+    creates a NEW frame, so the cached value is never mutated. This
+    test pins that invariant — pre-perf-#1 the unconditional
+    ``pd.concat`` provided this safety via its forced copy; the
+    optimized path must preserve it via the ``.loc`` copy semantic.
+    """
+    _redirect_cache(monkeypatch, tmp_path)
+    eq_dates = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
+    _patch_jugaad(monkeypatch, lambda s, f, t, se: _fake_jugaad(s, eq_dates))
+    today = lambda: date(2026, 5, 24)
+
+    first = spot_loader.load_spot(
+        "X", date(2024, 1, 3), date(2024, 1, 3), today_fn=today,
+    )
+    # Try to mutate the returned frame; if it shares storage with the
+    # LRU-cached year frame, the cached state would now be corrupted.
+    first.loc[:, "close"] = -999.0
+
+    second = spot_loader.load_spot(
+        "X", date(2024, 1, 3), date(2024, 1, 3), today_fn=today,
+    )
+    # The cached year frame must still have the original close — if it
+    # didn't, the LRU is leaking storage and the optimization would
+    # corrupt every subsequent caller in the worker.
+    assert second.iloc[0]["close"] != -999.0
