@@ -22921,3 +22921,105 @@ Migration cadence: **... → Phase-8 #1 STT ✓ → Phase-8 #2 India VIX loader 
 Standing by.
 
 ---
+
+## Review of ffb24d5 — `chore(p8.prefetch.india_vix)` — ✅ ACCEPT (Phase-8 #3; wire-up + drive-by fix)
+
+**Verdict: ✅ ACCEPT.** Tight 83-LOC wire-up commit landing Phase-8 build-order item 3. Step-0 unconditional VIX fetch is non-fatal (degrades gracefully on NSE WAF / Akamai failures), `--vix-only` flag enables targeted retry, and there's a bonus drive-by fix on a latent argparse `%` bug. No new tests (BUILDER scopes honestly: "wire-up + CLI plumbing").
+
+### Step-0 wiring verified
+
+`_prefetch_india_vix(args.start, args.end)` runs FIRST in `main()`, before spot/bhavcopy/options. Non-fatal pattern:
+
+```python
+try:
+    df = india_vix_loader.load_india_vix(start_date, end_date, today_fn=TODAY_FN)
+    # ... print "cached {N} rows ({date_min} → {date_max}) [{t}s]"
+except Exception as e:
+    print(f"  ⚠ india_vix prefetch FAILED — {type(e).__name__}: ...", file=sys.stderr)
+    print(f"    Continuing... Re-try via `--vix-only`.", file=sys.stderr)
+```
+
+**Research infrastructure failure does NOT break the trading pipeline.** VIX absence degrades Portfolio tab's regime-gate v2 signal gracefully; options/spot/bhavcopy prefetch continues. Right architectural separation.
+
+### `--vix-only` flag
+
+Tight CLI plumbing — runs ONLY Step 0 and returns. Operator use case: retry VIX leg after a transient Akamai cookie drift without re-walking the ~30-minute options universe.
+
+### Drive-by fix — argparse `%` escape
+
+This is the **load-bearing micro-find** in the commit. The `--strikes-pct` help string had a literal `%` (`"Min %-of-spot window"`) which argparse's formatter interprets as a format-spec prefix → `TypeError` on `--help` rendering. Latent in the codebase; adding `--vix-only` made argparse traverse the help-string and trip on it.
+
+Escaped via `%%`. Verified `--help` works post-fix (independently checked).
+
+BUILDER also added an inline comment explaining the failure mode: "argparse's help formatter does `help_str % params_dict` for `%(default)s`-style substitution. A literal `%` in the help text is interpreted as a format-spec prefix → TypeError." **Future maintainer won't accidentally remove the `%%` thinking it's a typo.** Same drift-prevention pattern as FILTERS.md's gate-citation discipline.
+
+### Pytest
+
+```
+901 passed, 3 deselected, 1 warning in 32.19s
+```
+
+Unchanged from 574332e. No regressions; wire-up commit.
+
+### Scope discipline — no new tests
+
+BUILDER's framing: "No new tests — this commit is wire-up + CLI plumbing. The loader-level tests (15 in `tests/test_india_vix_loader.py`) cover correctness; the prefetch script is a wall-clock acceptance artifact, not a regression-suite target."
+
+This is honest scoping. Per [[feedback_review_loudly_not_decided]]: I'm NOT softening to "should have added a `--vix-only` flag test." Argparse wire-up is mechanical; testing it would test argparse rather than the loader. The acceptance test is the wall-clock invocation (per BUILDER's "<30s under nominal NSE response time" claim).
+
+### Praises
+
+- **Non-fatal Step-0 pattern**: research infrastructure failure doesn't block trading pipeline.
+- **Stderr-with-actionable-hint** on failure: "Re-try just this step via `--vix-only`." Operator-triage-grade.
+- **Drive-by `%%` fix with inline rationale** — future maintainer can't accidentally regress.
+- **`--vix-only` flag is operator-targeted retry** — matches the real-world failure mode (Akamai cookie drift mid-prefetch).
+- **Banner row prints VIX date range** alongside existing ranges — operator visibility.
+- **Honest scoping** on tests — wire-up doesn't need tests; loader-level tests cover correctness.
+
+### Math
+
+- LOC: +83 / -2 = +81 net. ✓ Matches.
+- Test count: 901 unchanged.
+
+### Behavior delta
+
+- `python scripts/prefetch_universe.py` now runs VIX fetch first (Step 0), non-fatal.
+- `--vix-only` enables targeted VIX retry.
+- `--help` works (was broken on the `%` literal pre-fix).
+- VIX cache populated for the requested window per the canonical loader.
+
+### State-of-tree
+
+- `main` HEAD: `ffb24d5`.
+- Phase-8 #3 (prefetch wire) landed.
+- Build-order: #1 STT ✓ → #2 VIX loader ✓ → #3 prefetch wire ✓ → #4 regime (next per BUILDER's commit body and the untracked `src/analytics/regime.py` visible in working tree).
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+Per BUILDER:
+```
+python scripts/prefetch_universe.py --vix-only
+```
+to populate VIX cache before regime analytics integration tests. **Also run the loader's network test once** to confirm NSE schema matches in production:
+```
+pytest -m network tests/test_india_vix_loader.py
+```
+
+### Next-commit suggestion
+
+`feat(p8.analytics.regime)` — already in flight per the untracked `src/analytics/regime.py` in the working tree. Per BUILDER's note: "integration test calls load_india_vix → regime_percentile; works against any cache state but most meaningful with ≥ 252 trading days (one IVP lookback window)."
+
+Migration cadence: **... → P8 #1 STT ✓ → P8 #2 VIX loader ✓ → P8 #3 prefetch wire ✓ → P8 #4 regime → Portfolio tab → ...**
+
+Standing by.
+
+---
