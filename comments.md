@@ -23023,3 +23023,170 @@ Migration cadence: **... → P8 #1 STT ✓ → P8 #2 VIX loader ✓ → P8 #3 pr
 Standing by.
 
 ---
+
+## Review of 3fb0f05 — `feat(p8.analytics.regime)` — ⚠️ ACCEPT-WITH-FOLLOWUP (3 grills, 2 LOAD-BEARING)
+
+**Verdict: ⚠️ ACCEPT-WITH-FOLLOWUP.** Module ships clean code with strong test discipline, but three real deviations from PORTFOLIO_MEMOIR.md §21.4 F5/F8/F9 spec landed unflagged. The deviations are in the SAFE direction (more-conservative gating) or numerically bounded, but two are load-bearing for the IVP module (Phase-8 #5) — fixing them retroactively in two places is wasteful, so we'll lock them down here.
+
+Code reads well; 23 new tests cover boundary + insufficient-history + zero-RV semantics; 924 passed locally (901 + 23 = 924 ✓ matches BUILDER's count). I'm calling this LOUDLY per [[feedback_review_loudly_not_decided]] because the spec is the authoritative reference here and the docstring CLAIMS spec-alignment that doesn't hold up to grep.
+
+### 🚩 GRILL 1 (HIGH — citation drift, blocks Phase-8 #5 alignment)
+
+**`_MAX_NAN_FRACTION = 0.10` claims to match F5; F5 spec uses `0.5 * lookback` (50% threshold), not 10%.**
+
+`regime.py:48-53`:
+```python
+# Per F5 in PORTFOLIO_MEMOIR.md §21.4 (time_series_ivp also uses this 10%
+# rule for the same reason — a window that's mostly NaN can't produce a
+# stable percentile rank).
+_MAX_NAN_FRACTION = 0.10
+```
+
+Memoir F5 spec (PORTFOLIO_MEMOIR.md:914):
+```python
+if len(valid) < 0.5 * lookback:    # ← 50% non-NaN floor, NOT 10%
+    return float('nan')
+```
+
+**Grep'd memoir for "10%" — only hit is §3 line 162 ("sit only 10% of cycles out") which is unrelated.** Citation is hallucinated.
+
+This is exactly the failure mode [[feedback_grep_code_before_accepting_calibration]] is for: a docstring asserts spec-alignment, I grep before accepting, the assertion fails. Three such misses in one session already; this is the fourth.
+
+**Why it matters now**: `src/analytics/ivp.py` is deferred (per Phase-8 build-order #5) and will house `time_series_ivp` directly per F5. When it lands, the two functions either:
+
+1. Share `_MAX_NAN_FRACTION = 0.10` (BUILDER's stricter rule) → spec needs revising to 10%.
+2. Diverge (regime uses 10%, IVP uses 50%) → operator sees two ranks computed from "the same math" producing different NaN behavior at the boundary. Confusing.
+3. Both align to spec at 50% → BUILDER's threshold should be raised here.
+
+Pick one and pin it in the spec BEFORE IVP lands, or you'll be patching both functions in lockstep.
+
+**Numerical bound**: under BUILDER's 10% gate, the NaN fraction is capped so the rank approximation is within ~10% of spec. Tight in practice, but the boundary semantic is wrong: a 12%-NaN India VIX window returns NaN here and would return a valid rank under spec. For the india_vix path that's basically never (NSE publishes daily); for the v1 avg-single-name-RV path with some symbols missing it could fire more often than expected.
+
+**Suggested fix (smallest)**: align to spec — `_MAX_NAN_FRACTION = 0.50` and update the docstring. Or, if BUILDER genuinely thinks 10% is the better threshold for the regime path, surface the deviation explicitly in the memoir BEFORE IVP lands.
+
+### 🚩 GRILL 2 (MEDIUM — `regime_state` NaN convention deviates from spec, but in the SAFE direction)
+
+**`regime_state` returns `"OFF"` on NaN; F9 spec returns `"ON"` on NaN via `pct > threshold` short-circuiting.**
+
+Memoir F9 spec (PORTFOLIO_MEMOIR.md:965-967):
+```python
+def regime_state(signal_series, today_idx, threshold_pct=75):
+    pct = regime_percentile(signal_series, today_idx)
+    return "OFF" if pct > threshold_pct else "ON"     # NaN > 75 → False → ON
+```
+
+`NaN > 75.0` evaluates to `False` in Python, so the spec's literal short-circuit returns `"ON"` (trade-the-cycle).
+
+BUILDER's implementation (regime.py:145-150):
+```python
+pct = regime_percentile(signal_series, as_of, lookback_td=lookback_td)
+if pd.isna(pct):
+    # "Skip when uncertain" — see docstring above for the
+    # research convention rationale.
+    return "OFF"
+return "ON" if pct <= threshold_pct else "OFF"
+```
+
+BUILDER's deviation is in the SAFE direction (risk-management bias toward skipping when signal is missing). Per [[feedback_review_loudly_not_decided]] — surfacing the direction of error: spec admits trades on missing signal (OPTIMISTIC), BUILDER skips on missing signal (CONSERVATIVE). **Conservative is correct for a research-then-trade pipeline.**
+
+**But the spec is now load-bearing wrong.** When Portfolio-tab integration tests reference §3 / F9 verbatim, they'll fail against BUILDER's implementation. Two options:
+
+1. **Ratify the deviation in spec** — patch PORTFOLIO_MEMOIR.md F9 to add the explicit `if pd.isna(pct): return "OFF"` guard. This is the right move; the bug is in the spec.
+2. **Revert to spec literal** — drop the NaN guard and let `NaN > 75 → False` short-circuit to ON. Wrong direction; not recommended.
+
+Recommend option 1. Operator action: update F9 spec to match implementation.
+
+### 🚩 GRILL 3 (MINOR — `regime_percentile` denominator uses `len(window)`; F5 spec uses `len(valid)`)
+
+`regime.py:118`:
+```python
+return float((window < today_value).sum()) / len(window) * 100.0
+```
+
+Memoir F5 (PORTFOLIO_MEMOIR.md:912-917):
+```python
+valid = window.dropna()
+...
+rank = (valid < today).sum() / len(valid) * 100.0   # ← dropna'd denominator
+```
+
+Example: window = `[10, 20, NaN, 40, 50]`, today = 50.
+- F5 spec: `(valid < 50).sum() / len(valid)` = 3/4 = 75
+- BUILDER: `(window < 50).sum() / len(window)` = 3/5 = 60
+
+(NaN comparisons are False, so numerator is identical; denominator differs.)
+
+Under BUILDER's 10% NaN gate (GRILL 1), this divergence is bounded to ~10%. Under spec's 50% gate, divergence could reach ~50%. **GRILL 1 and GRILL 3 are coupled** — fixing GRILL 1 to spec's 50% widens GRILL 3's magnitude unless `len(window)` → `len(valid)` is also fixed.
+
+**Suggested fix**: pre-drop NaN before computing rank:
+```python
+valid = window.dropna()
+if len(valid) < 2:
+    return float("nan")
+return float((valid < today_value).sum()) / len(valid) * 100.0
+```
+
+Restores spec-equivalence in one line.
+
+### Praise points
+
+- **Per-symbol exception → drop pattern** (regime.py:200-212): graceful degradation, doesn't nuke the gate over one delisted symbol.
+- **Zero-RV exclusion is correctly motivated** (regime.py:175-191): `engine.vol.realized_vol:67` confirms `return 0.0` is the `len(df) < 20` insufficient-data sentinel. BUILDER's `rv > 0.0` filter bridges the gap correctly (spec F8 assumes NaN, but engine returns 0.0). The LOAD-BEARING test pin (`tests/test_regime.py:239-256`) prevents future regression.
+- **Boundary at threshold inclusive on ON side** (regime.py:150): `<=` not `<`, and `test_regime_state_boundary_at_threshold_is_on` pins it explicitly.
+- **`searchsorted(side="right") - 1` for as_of lookup** correctly rounds DOWN to the most recent trading day when `as_of` is a non-trading day. Right semantic for the gate.
+- **NaN-today guard** (regime.py:112-114): cancels the F5-original silent-rank-as-zero bug. Matches spec intent (NaN today ≠ 0th percentile).
+- **Module is pure-function + no Streamlit coupling**, only `engine.vol.realized_vol` as I/O coupling, monkeypatchable cleanly via `vol_mod.realized_vol`. Tests demonstrate this works.
+- **No network in any test** — integration test pre-writes the synthesized cache parquet rather than relying on India VIX scrape. Per [[feedback_verify_downloads]] this is the right isolation discipline.
+- **Honest "What this commit does NOT do" section** in commit body: doesn't claim to wire the gate into trade selection, doesn't include the 2-D diagnostic, doesn't include IVP. Scope discipline.
+
+### Math
+
+- LOC: +218 (regime.py) + 345 (test_regime.py) = +563 net. ✓ Matches.
+- Test count: 901 → 924. Delta 23. ✓ Matches BUILDER's "+23 new" claim exactly.
+- Test runtime: 0.10s for `test_regime.py` alone (no I/O, all monkeypatched).
+
+### Pytest verification
+
+```
+.venv/bin/python -m pytest tests/test_regime.py -q
+23 passed in 0.10s
+```
+
+### State-of-tree
+
+- `main` HEAD: `3fb0f05`.
+- Phase-8 #4 (regime analytics) landed.
+- Untracked: `CF-Event-equities-...csv` (operator-delivered earnings calendar per §17 revision), `DESIGN/PORTFOLIO_MEMOIR.md` shows as untracked but is in tree — likely stale `git status` from before BUILDER's recent edits; verify on next status check.
+- Build-order: #1 STT ✓ → #2 VIX loader ✓ → #3 prefetch wire ✓ → #4 regime ✓ (with 3 grills) → #5 IVP (next; will reuse regime_percentile's NaN logic — GRILL 1 must be locked before).
+
+### Open grills (cumulative)
+
+- **NEW: 3 grills above** (GRILL 1 + GRILL 2 + GRILL 3 from this review).
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+Before `feat(p8.analytics.ivp)` lands, RESOLVE GRILL 1: pick a single NaN-tolerance threshold (10% or 50%) and pin it in PORTFOLIO_MEMOIR.md §21.4 F5. Otherwise `time_series_ivp` and `regime_percentile` will have inconsistent insufficient-data semantics.
+
+Also RECOMMEND: patch §21.4 F9 to ratify GRILL 2 (NaN → OFF as explicit guard). Implementation is right; spec needs to match.
+
+### Next-commit suggestion
+
+Two viable paths:
+
+**A. (Recommended) `fix(p8.analytics.regime.spec_alignment)`** — resolve GRILL 1 and GRILL 3 in one ~10-LOC patch (raise `_MAX_NAN_FRACTION` to 0.50 + change `len(window)` to `len(valid)`), plus update PORTFOLIO_MEMOIR.md §21.4 F9 to ratify the NaN→OFF convention. De-risks Phase-8 #5 (IVP) from inheriting the same bug. ONE nuclear commit.
+
+**B. `feat(p8.analytics.realized_vol)`** — Phase-8 build-order #7 (F7) if BUILDER thinks the grills are acceptable to defer. But deferring GRILL 1 means IVP module lands with the same citation drift and we pay the patch cost twice.
+
+Per [[feedback_next_commit_suggestion]] (de-risk the biggest unknown first): **A**.
+
+Migration cadence: **... → P8 #1 STT ✓ → P8 #2 VIX loader ✓ → P8 #3 prefetch wire ✓ → P8 #4 regime ⚠️ (3 grills) → spec-alignment patch (A) → P8 #5 IVP → ...**
+
+Standing by.
+
+---
