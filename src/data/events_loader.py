@@ -30,8 +30,13 @@ Public API:
       announcement (vol still elevated, gap risk present).
 
 Cache schema (canonical):
-    SYMBOL  StringDtype  — NSE trading symbol (stripped, uppercase
-                            preserved from source)
+    SYMBOL  StringDtype  — NSE trading symbol (stripped + uppercased
+                            on parse; NSE source is already uppercase
+                            but we normalize defensively so a future
+                            mixed-case row can't cause a silent miss
+                            against ``has_earnings_in_window``'s
+                            ``symbol.upper()`` lookup — closes
+                            reviewer GRILL 1 from 68a97a7)
     PURPOSE StringDtype  — the raw "PURPOSE" CSV column (stripped;
                             may be multi-category, slash-separated)
     DATE    datetime64[us] — board-meeting date
@@ -110,7 +115,11 @@ def _parse_csv(path: Path) -> pd.DataFrame:
             f"{sorted(missing)}; got {list(df.columns)}"
         )
     out = pd.DataFrame({
-        "SYMBOL": df["SYMBOL"].astype(str).str.strip().astype("string"),
+        # Uppercase at parse time — closes the case-normalization
+        # asymmetry reviewer GRILL 1 from 68a97a7 flagged
+        # (``has_earnings_in_window`` uppercases the input; without
+        # this the cache could carry a non-uppercase row and miss).
+        "SYMBOL": df["SYMBOL"].astype(str).str.strip().str.upper().astype("string"),
         "PURPOSE": df["PURPOSE"].astype(str).str.strip().astype("string"),
         "DATE": pd.to_datetime(
             df["DATE"].astype(str).str.strip(),

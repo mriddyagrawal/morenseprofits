@@ -56,6 +56,35 @@ def test_load_events_returns_canonical_schema(monkeypatch, tmp_path):
     assert out["DATE"].dtype.name == "datetime64[us]"
 
 
+def test_load_events_uppercases_symbol_at_parse_time(monkeypatch, tmp_path):
+    """LOAD-BEARING (closes 68a97a7 GRILL 1): the parse-time SYMBOL
+    column gets ``.str.upper()`` so a hypothetical mixed-case row
+    in the CSV (e.g., NSE rebrand silently changing casing) can't
+    cause a silent miss against ``has_earnings_in_window``'s
+    ``symbol.upper()`` input normalization.
+
+    Pre-grill behavior preserved source casing; post-fix normalizes
+    on the way INTO the cache so input and stored side both agree."""
+    _redirect_cache(monkeypatch, tmp_path)
+    csv = _write_csv(tmp_path / "CF-Event-equities-case.csv", [
+        {"SYMBOL": "Reliance", "COMPANY": "",   # mixed-case input
+         "PURPOSE": "Financial Results",
+         "DETAILS": "", "DATE": "29-Apr-2025"},
+        {"SYMBOL": "hdfcbank", "COMPANY": "",   # lowercase input
+         "PURPOSE": "Financial Results",
+         "DETAILS": "", "DATE": "30-Apr-2025"},
+    ])
+    out = load_events(csv_path=csv)
+    # Both rows are uppercase in the cache.
+    assert sorted(out["SYMBOL"].tolist()) == ["HDFCBANK", "RELIANCE"]
+    # Round-trip through has_earnings_in_window with the original
+    # mixed-case input would hit the cache cleanly.
+    assert has_earnings_in_window(
+        out, "Reliance",
+        entry_date=date(2025, 4, 15), exit_date=date(2025, 5, 1),
+    )
+
+
 def test_load_events_strips_whitespace_around_values(monkeypatch, tmp_path):
     """Operator-supplied NSE export ships with leading/trailing
     whitespace on SYMBOL and PURPOSE strings. Parser must normalize."""
