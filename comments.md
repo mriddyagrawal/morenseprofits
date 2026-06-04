@@ -21992,3 +21992,96 @@ Migration cadence on perf branch: **... → FILTERS.md re-verify ✓ → Phase-1
 Standing by for the production-baseline re-measurement.
 
 ---
+
+## Review of ff9833b — `perf(data.spot_loader.lru_bump)` — ✅ ACCEPT (closes my NOTE on 9263ee2)
+
+**Verdict: ✅ ACCEPT.** Tight 14-LOC tuning-constant bump closing the LRU NOTE from my Phase-2 #1 ACK. `_LRU_MAXSIZE_YEAR = 32 → 256`. Memory cost honestly bounded (~50 MB across 8-worker pool, 0.08% of operator's 64 GB). Updated comment block is operator-grade: working set + headroom + future expansion + memory math all spelled out.
+
+### The principled sizing
+
+- **Current production working set**: 50 syms × 3 years (2024/2025/2026) = 150 entries.
+- **Pre-bump LRU = 32**: would have evicted 150 - 32 = 118 entries continuously across the wide sweep.
+- **Post-bump LRU = 256**: 256 - 150 = 106-entry headroom = up to ~85-symbol universe + Dec→Jan year-roll margin.
+- **Power-of-2 choice**: standard LRU sizing convention.
+
+### The cumtime amplification insight
+
+BUILDER's commit body makes the observation I should have made more urgently in my NOTE:
+
+> "#1's per-call speedup amplifies the relative cost of an eviction (we now spend a larger fraction of per-cell time on cache misses since the in-cache-hit path is so much faster)."
+
+Pre-#1: hit ~1500 µs, miss ~5 ms = 3.3× penalty.
+Post-#1: hit ~175 µs, miss ~5 ms = 28× penalty.
+
+So each eviction hurts ~8.5× more after #1 than before. My NOTE underweighted this — I framed it as "may not matter, defer to post-#1 measurement." The right framing was "#1 makes eviction cost dominant relative to hit cost; address now." Lesson logged: when a perf commit changes the hit/miss cost ratio, the LRU-sizing concern moves from "defer until measurement" to "address in same commit cycle."
+
+### Memory budget verified
+
+```
+Per entry:   ~25 KB (250 rows × 9 cols, post-F9 series-drop)
+Per worker:  256 × 25 KB ≈ 6 MB at LRU max
+Pool max:    8 × 6 MB ≈ 50 MB total
+Available:   64 GB → 50 MB = 0.08% → negligible
+```
+
+Math is honest. The "post-F9 series-drop" qualifier ties the memory calculation to the prior #1 commit — column drop reduces per-entry size, which expands the headroom for the bump.
+
+### Pytest
+
+```
+tests/test_spot_loader.py: 14 passed in 0.18s
+```
+
+No behavior change; signature, output schema, F9 invariant all unchanged. Tuning constant; no new tests warranted (commit body explicitly notes).
+
+### Praises
+
+- **Comment block is operator-grade** — current working set, headroom rationale, future expansion cap (85 syms), memory math (per-entry + per-worker + pool), context for the operator's available memory. Future contributors changing this constant have full context.
+- **Honest cumtime-amplification framing** in commit body — explicitly cites why #1 changes the eviction cost-of-miss calculation.
+- **Cross-references both 355bf7d (perf #1) and 9263ee2 (my ACK + NOTE)** — full decision trail.
+- **Closes the NOTE I should have escalated** — sets the precedent that perf commits changing hit/miss ratios may need accompanying LRU sizing.
+- **Power-of-2 sizing convention** for the LRU — standard practice.
+
+### Math
+
+- LOC: +14 / -4 = +10 net. ✓ Matches.
+- Test count: 882 unchanged.
+
+### Behavior delta
+
+- Sweep working set (150 entries) now fits in LRU without eviction.
+- Each cell's `load_spot` call hits the LRU 100% of the time after warmup.
+- Memory: +6 MB per worker max; +50 MB pool max. Operator's 64 GB headroom unaffected.
+
+### Predicted impact on the imminent #1-only re-measurement
+
+Production wall-clock was 107s → 82s = 30% improvement from #1 alone. **The LRU bump should have negligible impact on the INFY+WIPRO 2-stock baseline** (only 2 × 3 = 6 entries needed; well under 32 anyway). But it's a **prerequisite for the 50-stock projection holding** — without the bump, the 50-stock sweep would thrash the LRU and the #1 savings would partially evaporate at scale.
+
+So the operator's 22-min projection for the 50-stock sweep (vs 30 min baseline) relies on this bump being in. Good sequencing.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `ff9833b`.
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-2 #1 (355bf7d) + LRU bump (this) both ready for production-baseline measurement.
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — on main.
+- Other grills unchanged per prior priority.
+
+### MCP arc state
+
+16/16. Tuning constant; no MCP contract change.
+
+### Next-commit suggestion
+
+1. **Operator runs `--workers 8 --force` on INFY+WIPRO** to confirm #1's 30% wall-clock improvement holds with the LRU bump (it should — 2 stocks × 3 years = 6 entries fits trivially in either 32 or 256).
+2. **Operator runs `--workers 8` on the full 50-stock production sweep** to measure absolute wall-clock for the 22-min projection.
+3. **Phase-2 #2 (offset-trading-days precompute)** per prior decision.
+
+Migration cadence on perf branch: **... → Phase-2 #1 load_spot fast path ✓ → LRU bump ✓ → re-measure → Phase-2 #2 offset table → ...**
+
+Standing by.
+
+---
