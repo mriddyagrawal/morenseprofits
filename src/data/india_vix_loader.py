@@ -10,8 +10,14 @@ API contract (operator-verified via Chrome dev tools 2026-06-04;
 sample response keys reproduced in commit body):
 
     GET https://www.nseindia.com/api/historicalOR/vixhistory
-    params: from=DD-MM-YYYY&to=DD-MM-YYYY   (DD-MM-YYYY, NOT ISO)
+    params: from=DD-MM-YYYY&to=DD-MM-YYYY&csv=true (DD-MM-YYYY)
     max range per call: 365 days
+
+CRITICAL: the ``csv=true`` flag is load-bearing. Without it NSE
+silently caps responses to 70 rows regardless of the requested
+window (operator-verified 2026-06-04). With the flag set, the API
+returns the full requested window — still as JSON despite the
+"csv" param name; the flag toggles cap-bypass, not response format.
 
     Response JSON:
         {"data": [{
@@ -77,7 +83,12 @@ _HEADERS = {
     "referer": _REFERER_URL,
 }
 
-# NSE's `/api/historicalOR/vixhistory` rejects ranges > 365 days.
+# NSE's `/api/historicalOR/vixhistory` silently caps JSON responses at
+# 70 rows per call WITHOUT the ``csv=true`` query flag. With that
+# flag set, the API returns the FULL window (still as JSON; the flag
+# name is misleading). Operator-verified 2026-06-04 via direct curl —
+# a single 365-day call with ``csv=true`` returns the entire year.
+# 365 is the max range NSE accepts.
 _MAX_CHUNK_DAYS = 365
 
 # Politeness sleep between chunks. NSE's WAF will rate-limit aggressive
@@ -160,9 +171,14 @@ def _fetch_chunk(
     """Single API call for a [from_date, to_date] window (≤ 365 days).
     Returns the raw ``data`` list. NSE expects ``DD-MM-YYYY``, not
     ISO."""
+    # ``csv=true`` is load-bearing: WITHOUT it NSE silently caps the
+    # response to 70 rows regardless of the requested range. WITH it
+    # the full window comes back (as JSON, despite the param name).
+    # Operator-verified 2026-06-04.
     params = {
         "from": from_date.strftime("%d-%m-%Y"),
         "to":   to_date.strftime("%d-%m-%Y"),
+        "csv":  "true",
     }
     r = session.get(_API_URL, params=params, timeout=60)
     r.raise_for_status()
