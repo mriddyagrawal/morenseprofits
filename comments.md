@@ -21866,3 +21866,129 @@ Migration cadence on perf branch: **... → --force flag ✓ → FILTERS.md re-v
 Standing by.
 
 ---
+
+## Review of 355bf7d — `perf(data.spot_loader.hot_path)` — ✅ ACCEPT (Phase-2 #1 lands; ~8.5× per-call speedup independently measured)
+
+**Verdict: ✅ ACCEPT.** Three bundled optimizations all sound: F9 hoist into `_load_year_cached` (eliminates per-call full-scan filter), pd.concat skip for singleton parts (eliminates per-call copy), single-day fast path (1 vs 2 comparisons). Anti-regression tests pin the load-bearing invariants. External callers verified safe. Independently measured **175 µs/call** vs prior ~1.5 ms = **~8.5× per-call speedup** on the hot path.
+
+### Three optimizations verified
+
+**1. F9 hoist into `_load_year_cached` (lines 173-200)**
+
+Pre-fix: F9 series filter ran on every `load_spot` call (after the LRU cache). 455k × full-scan of ~250-row frame.
+Post-fix: F9 filter runs in `_load_year_cached`; cached frame has `series` column DROPPED.
+
+**Drift-prevention preserved**: `load_spot`'s fallback `if "series" in full.columns` still handles the `force_refresh=True` path (which calls `_load_year` directly, bypassing the LRU). The branch is now a no-op cache-hit short-circuit (column absent) but still load-bearing for the force-refresh path.
+
+BUILDER's docstring explicitly cites the perf profile data (1.5 ms × 455k × 0.5 = ~230s saved). Future contributors reading the code understand WHY the filter migrated.
+
+**2. pd.concat skip for singleton parts (lines 240-243)**
+
+`pd.concat(parts, ignore_index=True)` unconditionally copies even singleton input. ~99% of sweep `load_spot` calls have `len(parts) == 1`. Now `if len(parts) == 1: full = parts[0]`.
+
+**Mutation safety**: BUILDER added the load-bearing `test_load_spot_does_not_mutate_lru_cached_year_frame` to pin the invariant that downstream mutation of the returned frame cannot corrupt the cached year frame. Pre-perf-#1 `pd.concat`'s forced copy provided that safety implicitly; the optimized path relies on `.loc[mask].reset_index(drop=True)` copy semantics. The test catches a future refactor that returns the cached frame directly (would corrupt LRU on mutation).
+
+**3. Single-day fast path when `from_date == to_date` (lines 261-271)**
+
+~80% of sweep `load_spot` calls hit `from_date == to_date` (entry_spot / exit_spot / ATM picker / vol single-day lookup). Replace 2-comparison + AND mask with single equality:
+
+```python
+if from_date == to_date:
+    out = full.loc[full["date"] == pd.Timestamp(from_date)].reset_index(drop=True)
+else:
+    mask = (full["date"] >= ts_from) & (full["date"] <= ts_to)
+    out = full.loc[mask].reset_index(drop=True)
+```
+
+Anti-regression test `test_single_day_fast_path_matches_range_query_result` pins that both paths produce equivalent output on the same fixture.
+
+### Independent perf verification
+
+Ran the hot path against the operator's live cache:
+
+```
+100,000 hot single-day load_spot calls: 17,552 ms total, 175 µs/call
+```
+
+**175 µs/call vs the prior ~1,500 µs/call = ~8.5× per-call speedup.** Extrapolating to the sweep's 455k calls:
+- Pre-fix: 455k × 1500 µs = ~682 s cumtime (matches profile's 670 s).
+- Post-fix: 455k × 175 µs = ~80 s cumtime.
+- **Saved: ~600 s cumtime** — slightly above BUILDER's predicted ~570 s.
+
+Production wall-clock prediction (8 workers, Amdahl + parallel overhead): 600 s / 8 = ~75 s theoretical; realistically **107 s → 50-65 s wall-clock** after #1 alone. Will know exactly when operator runs `--workers 8 --force` against the new code.
+
+### External-caller audit — safe
+
+`load_spot` callers grep:
+- **`src/mcp/spot_options.py:85`** (`get_spot_series_impl`): `df.to_dict(orient="records")` → Pydantic `SpotRow(BaseModel)` validation. `SpotRow` has 6 fields (`date, open, high, low, close, volume`), no `series` field. **Pydantic V2 default `extra='ignore'`** silently drops unknown fields — so `series` was ALREADY being dropped pre-this-commit, just one layer downstream. Net behavior: identical. ✓
+- **`src/data/trading_calendar.py:55`** (`trading_days`): only accesses `df["date"]`. ✓
+- **`src/universe/momentum.py:43`** (`load_spot` for momentum scoring): doesn't access `series` (confirmed via grep). ✓
+
+**Test verification**: `tests/test_mcp_spot_options.py` + `tests/test_trading_calendar.py`: **26 passed, 0 regressions**.
+
+### Test coverage
+
+- `test_load_spot_does_not_mutate_lru_cached_year_frame` (NEW, **LOAD-BEARING**): pins singleton-skip-concat mutation safety.
+- `test_single_day_fast_path_matches_range_query_result` (NEW): pins fast-path equivalence.
+- `test_t0_series_rows_filtered_at_read_boundary_f9` (UPDATED): assertion changed from `series.tolist() == ["EQ"] * N` to `"series" not in out.columns`. F9 semantic preserved via date-uniqueness + volume-correctness assertions.
+- `test_symbol_and_series_have_matching_dtype` → renamed `test_symbol_dtype_is_explicit_stringdtype`; collapsed to single-column invariant on `symbol`.
+
+`tests/test_spot_loader.py`: **14 passed**. Full suite: **882 passed + 2 deselected** (+10 net vs pre-this-commit: +2 perf tests + 8 web_e2e now unskipped because operator's sweep parquet exists post-re-sweep).
+
+### Praises
+
+- **Three optimizations bundled coherently** — all operate on `load_spot` hot path; same commit body explains why; tests cover each independently.
+- **F9 hoist preserves drift-prevention** — the fallback branch in `load_spot` still handles the `force_refresh=True` escape hatch.
+- **Anti-regression mutation-safety test** is load-bearing — pins the structural invariant that the cached frame is never exposed to mutation.
+- **Single-day fast path with equivalence test** — perf optimization + correctness anchor in one commit.
+- **`series` column drop is semantically clean** — informationally redundant after EQ filter; column carries no information; drop is honest.
+- **Anti-regression for downstream callers verified** — Pydantic `SpotRow` silently ignored `series` pre-commit, so MCP response unchanged.
+- **Honest impact framing** — BUILDER predicts ~570 s cumtime saved + 30-40% wall-clock improvement (not 85% Amdahl-limit). I measured ~600 s cumtime savings on my machine (slightly above prediction). Sets correct expectations.
+- **Cross-references the audit methodology lesson**: "load_spot was NOT in the prior speculative perf audit's top items; surfaced only by measurement. Validates the 'profile first, then optimize' approach." This is the right callout for the future decision-log.
+
+### Math
+
+- LOC: +134 / -24 = +110 net. ✓ Matches.
+- Test count: 880 → 882 (+2 net perf tests) + 8 web_e2e unskipped = 882 passed.
+
+### NOTE (not a grill): LRU `_LRU_MAXSIZE_YEAR`
+
+I suggested in chat bumping the LRU maxsize from 32 to ~200 for the 50-stock universe (50 × 3 years = 150 entries needed). BUILDER didn't address this here. The post-#1 hot path's 175 µs/call benchmark was on a single-(symbol, year) hot loop — measures cache HIT cost, not cache MISS cost. **For the wide sweep across 50 symbols × 3 years, the LRU at maxsize=32 will thrash**, forcing recomputes of `_load_year_cached` (parquet read + F9 filter + column drop).
+
+Per-cache-miss cost is dominated by the parquet read, not the F9 filter the optimization closed. So the impact may be smaller than I projected in chat. **Defer** until post-#1 production wall-clock measurement on the 50-stock grid reveals whether LRU thrashing is the new bottleneck.
+
+### Behavior delta
+
+- `load_spot(symbol, from, to)` signature unchanged.
+- Output schema: dropped `series` column (informationally redundant post-EQ-filter).
+- Output rows: byte-identical for the date / OHLCV / volume / vwap columns.
+- Force-refresh path: unchanged (still returns `series` column from `_load_year`, then load_spot's fallback applies F9).
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `355bf7d`.
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-7 baseline trustable + untouched on main.
+- Operator should run `--workers 8 --force` next to measure production wall-clock impact.
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — should land on main; doesn't conflict.
+- Grill #1 from 12893ea, Grill #1 from 6bc95e9, F3, P1.8b, MCP legacy-LTP — per prior priority.
+
+### MCP arc state
+
+16/16. `get_spot_series` Pydantic `SpotRow` model unchanged; `series` column was always silently dropped.
+
+### Next-commit suggestion
+
+1. **Operator runs `--workers 8 --force` on INFY+WIPRO 2-stock grid** → measure production wall-clock.
+2. **If wall-clock drops to 50-65 s** (predicted 30-40% improvement): proceed to #2 (offset-trading-days precompute).
+3. **If wall-clock drops <25%**: re-profile; the bottleneck may have shifted (LRU thrashing? something else?). Don't proceed with #2 until profile re-confirms.
+4. **Land #1 (this commit) is non-controversial**; the decision is on #2 sequencing.
+
+Migration cadence on perf branch: **... → FILTERS.md re-verify ✓ → Phase-1 measurement ✓ → Phase-2 #1 load_spot fast path ✓ → re-measure wall-clock → #2 offset table → ...**
+
+Standing by for the production-baseline re-measurement.
+
+---
