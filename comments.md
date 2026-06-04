@@ -22755,3 +22755,169 @@ Migration cadence: **... → 🎉 Phase-2 perf merge ✓ → Phase-8 #1 (STT bum
 Standing by.
 
 ---
+
+## Review of 574332e — `feat(p8.data.india_vix_loader)` — ✅ ACCEPT (Phase-8 #2; data dependency D5)
+
+**Verdict: ✅ ACCEPT.** 719-LOC commit landing the India VIX loader (PORTFOLIO_MEMOIR.md §21.2 row D5). Operator-verified response shape via Chrome devtools paste, schema-drift-fails-LOUD discipline, project-convention loader API, full 15-test coverage + 1 network-gated production check, cross-references to memoir provenance. The cache-extend edge-only logic is explicit + documented + has `force_refresh` escape hatch.
+
+### Project-convention loader API verified
+
+`load_india_vix(from_date, to_date, *, force_refresh, today_fn, offline)` matches the established loader convention (`load_spot`, `load_bhavcopy_fo`, etc.):
+- Cache-first; only fetches missing ranges.
+- `offline=True` → `OfflineCacheMiss` (matches sweeper's cache_only mode).
+- `today_fn` parameter for deterministic testing.
+- `force_refresh=True` bypasses cache.
+
+Operator can compose this with other loaders without API surface impedance.
+
+### Schema verification (operator-grade)
+
+Schema frozen + cited from operator's Chrome devtools paste:
+```
+date                 datetime64[us]
+india_vix_open       float64
+india_vix_high       float64
+india_vix_low        float64
+india_vix_close      float64
+india_vix_prev_close float64
+```
+
+Sample row from operator's capture:
+```
+EOD_TIMESTAMP: "04-JUN-2025"
+EOD_OPEN_INDEX_VAL: 16.555
+EOD_HIGH_INDEX_VAL: 17.06
+... etc
+```
+
+**5 OHLC keys + EOD_PREV_CLOSE are required**; missing keys raise `IndiaVixSchemaError`. Schema drift on NSE's side fails LOUD; the parser refuses to write a half-baked cache. This is **the [[feedback_verify_downloads]] discipline applied at the loader boundary** — when the highest-bug-density area is data fetch, failing LOUD on schema drift is the right posture.
+
+EOD_INDEX_NAME, VIX_PTS_CHG, VIX_PERC_CHG ignored (constant / derived). Reasonable scope.
+
+### Date format edge case verified independently
+
+BUILDER claims `pd.to_datetime` with `format="%d-%b-%Y"` handles both `04-JUN-2025` (uppercase) and `04-Jun-2025` (mixed case). Independent verification:
+
+```
+$ python -c "import pandas as pd; print(pd.to_datetime('04-JUN-2025', format='%d-%b-%Y'))"
+2025-06-04 00:00:00
+$ python -c "import pandas as pd; print(pd.to_datetime('04-Jun-2025', format='%d-%b-%Y'))"
+2025-06-04 00:00:00
+```
+
+Both parse correctly. ✓ (Locale-dependent in principle, but works under the operator's English locale.)
+
+### NSE endpoint mechanics
+
+- `GET https://www.nseindia.com/api/historicalOR/vixhistory` with `from=DD-MM-YYYY&to=DD-MM-YYYY`.
+- 365-day max range per call (NSE-imposed).
+- **Akamai session-warming** via referer URL — pattern matches the existing bhavcopy_fo_loader convention; future operator adding new NSE endpoints reuses the pattern.
+- 1.5s politeness sleep between chunks.
+
+Cold-cache fetch cost: ~18 years of history → ~18 chunks × 1.5s politeness = ~27s + actual network. One-shot per prefetch; operator-acceptable.
+
+### Cache-extend edge-only logic — explicit and documented
+
+```python
+def _compute_missing_ranges(cached, from_date, to_date, *, force_refresh):
+    """...Approach (intentionally coarse): we don't try to fill per-day
+    gaps inside the cached window — NSE bhavcopy days have natural
+    holes (weekends, holidays) and treating those as "missing" would
+    trigger pointless re-fetches. Instead, we extend at the EDGES..."""
+```
+
+The trade-off is honestly documented:
+- ✓ Avoids re-fetching weekend/holiday gaps.
+- ✗ Won't catch a partial-fetch failure that leaves an internal gap.
+
+Mitigation: `force_refresh=True` repopulates fully. Operator has an escape hatch when needed.
+
+### Pytest
+
+```
+tests/test_india_vix_loader.py: 15 passed, 1 deselected (network-gated)
+Full suite: 901 passed, 3 deselected (1 new + 2 pre-existing network)
+```
+
+886 (post-23fb875) + 15 = 901. ✓ Matches BUILDER's claim exactly.
+
+Test coverage is comprehensive:
+- **Chunking** (3): 365-day cap, singleton, inverted (raises).
+- **Parser** (4): canonical row, sort+dedup, missing-key → IndiaVixSchemaError, empty-input schema preservation.
+- **Missing-range** (4): cold cache, edge-extension, no-fetch when covered, force-refresh override.
+- **End-to-end** (4): offline+cold → OfflineCacheMiss, cache-hit doesn't open session, incremental extend fetches only missing tail, from > to rejected.
+- **Network-gated** (1, `@pytest.mark.network`): live one-year call asserts ~250 rows + plausible value range [5, 50]. Right pattern — production-only check that doesn't run by default but exists as the operator-facing verification.
+
+The **`@pytest.mark.network` test is operator-grade** — it's the schema-on-NSE-side-actually-matches assertion that the operator can run once after deployment. If it passes, the loader is production-ready. If it fails, the error names the missing/changed key.
+
+### Praises
+
+- **Operator-verified response shape** via Chrome devtools paste — empirical anchor, not assumed convention.
+- **Schema-drift-fails-LOUD** discipline — `IndiaVixSchemaError` refuses to write a half-baked cache. Per [[feedback_verify_downloads]].
+- **Project-convention loader API** — composes with other loaders without surface impedance.
+- **Date-format edge-case verified independently** — both UPPERCASE and mixed case parse.
+- **Cache-extend edge-only logic** explicit + documented + has `force_refresh` escape hatch.
+- **Akamai session-warming pattern** reuses the bhavcopy_fo_loader convention.
+- **`@pytest.mark.network` test for production schema verification** — operator can run once after deployment to confirm NSE's format matches.
+- **Math verified** (886 → 901 = +15 net) + matches BUILDER's claim exactly.
+- **Cross-references PORTFOLIO_MEMOIR.md §3.7 + §21.2 row D5 + §21.6 item 3** — provenance chain intact.
+- **Cold-cache fetch cost framed** (~27s + network for 18 years history). One-shot per prefetch.
+
+### NOTES (not grills)
+
+**N1: Edge-only missing-range logic assumes internal gaps are holidays.** If a partial-fetch failure ever leaves a real internal gap (e.g., network mid-call timeout), the cache would silently retain it. **Mitigation exists** (`force_refresh=True`), but worth noting that a future operator triaging "VIX cache looks complete but Portfolio tab returns wrong regime" should suspect this case + know to force-refresh. Minor; not a grill — the trade-off is documented at the function level.
+
+**N2: 5-7 DTE vs 24 DTE exclusion question** (from the operator's chat question earlier this turn) doesn't bite here because India VIX is **NSE's own VIX-style index** — NSE handles the methodology server-side. The loader just consumes the daily value. If the operator later builds their own constant-maturity IV (the F4 formula in §2.2/§21.4), THAT's where the DTE-exclusion question matters. India VIX itself is a clean input.
+
+### Math
+
+- LOC: +719 / -0 = +719 net. ✓ Matches.
+- Test count: 886 → 901 (+15 net). ✓ + 3 deselected (1 new + 2 pre-existing network).
+
+### Behavior delta
+
+- New cache: `data/cache/india_vix.parquet` (single-file, sorted by date, no duplicates).
+- Operator can call `load_india_vix(from, to)` with project-convention semantics.
+- Cold-cache fetch is one-shot per prefetch invocation (~27s + network); subsequent calls hit cache.
+
+### State-of-tree
+
+- `main` HEAD: `574332e`.
+- Phase-8 #2 (India VIX loader) landed.
+- Phase-8 build-order per memoir §21.6: #1 STT bump ✓ → #2 VIX loader ✓ → #3 prefetch wire (next per BUILDER's commit body) → ...
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+- Grill #1 from 12893ea (per-contract cache-version stamping) — could fold with 8c8a625's pattern.
+- Grill #1 from 6bc95e9 (iterdir) — MINOR; defer.
+- F3 (expiry STT) — semi-adjacent; not addressed.
+- Smoke-gate replacement (F6 #1+#2) — P1.8b.
+- MCP legacy-LTP caveat for regime B — polish.
+- Phase 2b cross-boundary smoke test — anti-regression.
+- Masked-cell tooltip — webapp polish.
+- MIGRATION.md decision-log — should now include perf arc + Phase-8 STT + VIX loader.
+- Phase-2 #3 (strike-grid cache) — operator decision.
+
+### MCP arc state
+
+16/16. India VIX loader doesn't touch MCP surface (yet); future Phase-8 work likely adds a `get_india_vix_series` MCP tool.
+
+### Operator action when this lands
+
+BUILDER specified: run network test once to confirm schema:
+```
+pytest -m network tests/test_india_vix_loader.py
+```
+
+If pass → loader is production-ready. If fail → error message names missing/changed key. **Operator should run this BEFORE the prefetch wire commit lands** so the schema is confirmed against live NSE before the prefetch step depends on it.
+
+### Next-commit suggestion
+
+Per BUILDER's commit body: `chore(p8.prefetch.india_vix)` wiring this loader into `prefetch_universe.py` with a `--vix-only` flag. Then continue Phase-8 per §21.6 (regime + Portfolio tab).
+
+Migration cadence: **... → Phase-8 #1 STT ✓ → Phase-8 #2 India VIX loader ✓ → Phase-8 #3 prefetch wire → regime → Portfolio tab → ...**
+
+Standing by.
+
+---
