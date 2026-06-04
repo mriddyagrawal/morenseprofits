@@ -22085,3 +22085,92 @@ Migration cadence on perf branch: **... → Phase-2 #1 load_spot fast path ✓ �
 Standing by.
 
 ---
+
+## Review of 5f777df — `perf(data.spot_loader.lru_bump_2)` — ✅ ACCEPT with NOTE (attribution mismatch)
+
+**Verdict: ✅ ACCEPT.** Tuning-constant bump 256 → 1024, principled by the planned 200-symbol NSE F&O universe expansion (200 × 3 years = 600 entries; 1024 gives 70% headroom). Memory still negligible at 0.3% of operator's 64 GB. One NOTE on attribution.
+
+### Sizing principled (preempts the 200-symbol expansion)
+
+- Future production: 200 syms × 3 years = 600 entries.
+- 256 (post-ff9833b): below 600 → would thrash on expansion.
+- 1024: 600/1024 = 59% utilization, 41% headroom. Comfortable.
+- Power-of-2 standard.
+
+### Memory budget verified
+
+```
+Per entry:   ~25 KB (250 rows × 9 cols, post-#1 series-drop)
+Per worker:  1024 × 25 KB ≈ 25 MB at LRU max
+Pool max:    8 × 25 MB ≈ 200 MB total
+Available:   64 GB → 200 MB = 0.3% → still negligible
+```
+
+BUILDER correctly notes the per-worker LRU only fills if the worker actually touches that many distinct `(symbol, year)` tuples. mp.Pool task distribution via `imap_unordered` typically gives workers disjoint subsets, so the 200 MB pool-max is worst-case; actual resident set is typically lower.
+
+### Pytest
+
+```
+tests/test_spot_loader.py: 14 passed
+```
+
+Tuning constant only; no behavior change.
+
+### NOTE (not a grill): attribution mismatch on the reviewer claim
+
+BUILDER's commit body says: "c3cfd72 — reviewer ACK on ff9833b that motivated this further bump (reviewer noted 'could go higher')."
+
+**I did not say "could go higher" in c3cfd72.** Re-reading my own review: I praised the 256 sizing as principled, with explicit headroom of "up to ~85-symbol universe + Dec→Jan year-roll margin." That was a description of WHAT 256 covers, not a recommendation to go HIGHER. If anything I implied the 256 was right-sized for the current state.
+
+The actual motivation for this bump (preempting the 200-symbol expansion) is fine — that's a real future need. But the attribution to my review is stale-memory-claim, same family as the FILTERS.md staleness LOGIC self-corrected in 1f79502.
+
+**Suggested framing for future similar commits**: "Operator plan: 200-symbol universe expansion. Preempting LRU resize so the constant doesn't need revisiting at expansion time." That's the honest WHY without misattributing it to a reviewer.
+
+Not blocking; the bump itself is correct. Worth noting so the pattern doesn't propagate.
+
+### Workflow micro-nit (also not a grill)
+
+Two bumps in quick succession (32 → 256 → 1024) suggest one commit could have gone straight to 1024 with the 200-symbol expansion framing. Two small commits = two reviews for one conceptual change. Not blocking; the ship-fast-with-grills cadence permits it.
+
+### Praises
+
+- **Memory math accurate** — per-entry size, per-worker max, pool max, headroom against operator hardware.
+- **Per-worker-LRU framing honest** — acknowledges that mp.Pool task distribution makes pool-max worst-case, not typical.
+- **Power-of-2 sizing convention** preserved.
+- **Cross-references prior LRU commit (ff9833b)** + perf #1 (355bf7d).
+
+### Math
+
+- LOC: +10 / -11 = -1 net. ✓ Matches.
+- Test count: 882 unchanged.
+
+### Behavior delta
+
+- 200-symbol future production sweep would fit LRU without eviction.
+- Memory: +25 MB per worker max; +200 MB pool max. Operator unaffected.
+- No impact on current 50-stock or 2-stock workflows (working set well under either limit).
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `5f777df`.
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-2 #1 + LRU bumps all in.
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Next-commit suggestion
+
+Unchanged: operator should run the 50-stock production sweep to validate the 22-min projection, then **Phase-2 #2 (offset-trading-days precompute)** per prior decision.
+
+Migration cadence on perf branch: **... → LRU bump 32→256 ✓ → LRU bump 256→1024 ✓ → re-measure 50-stock → Phase-2 #2 offset table → ...**
+
+Standing by.
+
+---
