@@ -44,6 +44,7 @@ from typing import Callable
 
 from src.config import CALENDAR_SYMBOL
 from src.data import spot_loader
+from src.data.errors import OfflineCacheMiss
 from src.data.offline import effective_offline
 
 
@@ -77,29 +78,56 @@ def _full_calendar_cached(
     """Sorted tuple of NSE trading days from ``earliest_iso`` (inclusive)
     to ``today_iso`` (inclusive). Memoized per-worker.
 
-    The cache populates with ONE ``load_spot`` call for the
-    ``CALENDAR_SYMBOL`` over the requested range. Subsequent
-    ``trading_days`` / ``offset_trading_days`` calls bisect this tuple
-    instead of re-reading + re-filtering the spot frame.
+    The cache populates by iterating YEAR-BY-YEAR over the requested
+    range and calling ``load_spot`` for each. Each year is independent:
+    if a year raises ``OfflineCacheMiss`` (the spot parquet for
+    ``CALENDAR_SYMBOL`` isn't in the cache), that year is silently
+    skipped and the tuple is built from the years that DO load.
+
+    Why per-year iteration instead of one wide-range call: under
+    ``cache_only=True`` (the normal sweep mode), the operator's
+    prefetch typically only covers the sweep's relevant date window
+    (e.g., 2024-2026) — but the calendar cache wants to span
+    ``_CALENDAR_HISTORY_YEARS`` for research-flexibility. A
+    single-range call raises on the first uncached year and aborts
+    the whole load. Per-year tolerance keeps the optimization useful
+    even when only a subset of the requested range is on disk.
 
     Key includes ``today_iso`` so a date roll mid-process invalidates
     the cache for the current-year tail (matches the
     ``_load_year_cached`` semantics in ``spot_loader``).
 
-    Returns an empty tuple when the spot frame is empty (e.g., the
-    synthetic ``_patch_load_spot`` test fixture for an empty fixture)
-    — downstream consumers must tolerate that and fall back to the
-    slow path."""
+    Returns an empty tuple when NO year loaded successfully (cold
+    cache, or every year in the requested range raised
+    ``OfflineCacheMiss``). Downstream consumers must tolerate the
+    empty case and fall back to the slow path."""
     earliest = date.fromisoformat(earliest_iso)
     today = date.fromisoformat(today_iso)
-    df = spot_loader.load_spot(
-        CALENDAR_SYMBOL, earliest, today,
-        today_fn=lambda: today,
-        offline=offline,
-    )
-    if df.empty:
-        return ()
-    return tuple(sorted(df["date"].dt.date.unique().tolist()))
+    accumulated: list[date] = []
+    for year in range(earliest.year, today.year + 1):
+        year_start = date(year, 1, 1)
+        year_end = min(date(year, 12, 31), today)
+        try:
+            df = spot_loader.load_spot(
+                CALENDAR_SYMBOL,
+                year_start,
+                year_end,
+                today_fn=lambda: today,
+                offline=offline,
+            )
+        except OfflineCacheMiss:
+            # This year's spot parquet isn't in the cache. Don't
+            # propagate — the sweep would treat the propagated
+            # OfflineCacheMiss as a per-cell skip, and EVERY cell
+            # would skip because the calendar load runs on every
+            # offset_trading_days call. Skip the year, accumulate
+            # what's available, let the bisect path use what we have
+            # + the slow-path fallback handle anchors outside the
+            # accumulated range.
+            continue
+        if not df.empty:
+            accumulated.extend(df["date"].dt.date.unique().tolist())
+    return tuple(sorted(accumulated))
 
 
 def _get_cached_calendar(

@@ -238,13 +238,16 @@ def test_overlap_with_jugaad_holidays_is_only_muhurat_trading():
 # Perf #2 (2026-06-04): bisect-based fast path equivalence
 # ============================================================
 
-def test_perf_2_repeated_calls_only_invoke_load_spot_once(monkeypatch, tmp_path):
-    """LOAD-BEARING: ``_full_calendar_cached`` populates with ONE
-    ``load_spot`` call regardless of how many times ``trading_days``
-    or ``offset_trading_days`` is invoked thereafter.
+def test_perf_2_repeated_calls_populate_cache_once(monkeypatch, tmp_path):
+    """LOAD-BEARING: ``_full_calendar_cached`` populates once per
+    process; subsequent ``trading_days`` / ``offset_trading_days``
+    calls bisect the cached tuple instead of re-invoking ``load_spot``.
 
-    Pre-perf-#2 every call read + filtered the spot frame. This test
-    pins the new behavior: the per-call ``load_spot`` re-read is gone."""
+    The populate phase calls ``load_spot`` ONCE PER YEAR in the
+    history window (perf #2 fix 2026-06-04: per-year iteration so
+    that an uncached year raising ``OfflineCacheMiss`` doesn't abort
+    the whole load). After the cache is populated, the count must
+    stay constant across many bisect-served calls."""
     _redirect_cache(monkeypatch, tmp_path)
     call_count = {"n": 0}
 
@@ -263,15 +266,21 @@ def test_perf_2_repeated_calls_only_invoke_load_spot_once(monkeypatch, tmp_path)
 
     monkeypatch.setattr(spot_loader, "load_spot", counting_load_spot)
     today = lambda: date(2026, 5, 24)
-    # 100 mixed calls — all within the cached range, none should
-    # re-invoke load_spot.
+    # First call triggers the per-year populate (one load_spot per
+    # year in the 10-year window + current = 11 calls). Subsequent
+    # calls bisect the cached tuple — NO additional load_spot.
+    trading_calendar.offset_trading_days(date(2024, 1, 25), 5, today_fn=today)
+    populate_count = call_count["n"]
+    assert populate_count >= 1, "populate must invoke load_spot at least once"
+    # Now do 99 more mixed calls. Cache is warm — count must not grow.
     for _ in range(50):
         trading_calendar.offset_trading_days(date(2024, 1, 25), 5, today_fn=today)
         trading_calendar.trading_days(
             date(2024, 1, 5), date(2024, 1, 25), today_fn=today,
         )
-    assert call_count["n"] == 1, (
-        f"_full_calendar_cached should populate once; got {call_count['n']}"
+    assert call_count["n"] == populate_count, (
+        f"cache should not re-populate; populate={populate_count}, "
+        f"after-50×2-calls={call_count['n']}"
     )
 
 
@@ -322,12 +331,16 @@ def test_perf_2_clear_cache_helper_actually_clears(monkeypatch, tmp_path):
     today = lambda: date(2026, 5, 24)
 
     trading_calendar.offset_trading_days(date(2024, 1, 25), 5, today_fn=today)
-    assert call_count["n"] == 1
+    populate_count = call_count["n"]
+    assert populate_count >= 1, "populate must invoke load_spot at least once"
 
-    # Cleared → next call must reload.
+    # Cleared → next call must re-populate (≥1 additional invocation).
     trading_calendar._clear_calendar_cache_for_test()
     trading_calendar.offset_trading_days(date(2024, 1, 25), 5, today_fn=today)
-    assert call_count["n"] == 2
+    assert call_count["n"] >= 2 * populate_count, (
+        f"cache clear failed; populate count stayed at {populate_count} "
+        f"after the post-clear call (got {call_count['n']})"
+    )
 
 
 @pytest.mark.network
