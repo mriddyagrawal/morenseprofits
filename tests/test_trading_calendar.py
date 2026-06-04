@@ -18,6 +18,21 @@ import pytest
 from src.data import cache, spot_loader, trading_calendar
 
 
+@pytest.fixture(autouse=True)
+def _clear_calendar_cache_per_test():
+    """Perf #2 (2026-06-04): trading_calendar now memoizes the wide
+    calendar tuple via ``_full_calendar_cached``. The LRU is process-
+    level state and would leak across tests within the same module —
+    test A populates it with synthetic data X, test B's monkeypatched
+    spot_loader returns synthetic data Y but the cache returns X.
+
+    Clearing before AND after each test keeps tests hermetic without
+    forcing every test to do it manually."""
+    trading_calendar._clear_calendar_cache_for_test()
+    yield
+    trading_calendar._clear_calendar_cache_for_test()
+
+
 def _redirect_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
 
@@ -217,6 +232,102 @@ def test_overlap_with_jugaad_holidays_is_only_muhurat_trading():
         f"only known-good overlaps are Muhurat Trading sessions "
         f"({sorted(KNOWN_MUHURAT_2024)})"
     )
+
+
+# ============================================================
+# Perf #2 (2026-06-04): bisect-based fast path equivalence
+# ============================================================
+
+def test_perf_2_repeated_calls_only_invoke_load_spot_once(monkeypatch, tmp_path):
+    """LOAD-BEARING: ``_full_calendar_cached`` populates with ONE
+    ``load_spot`` call regardless of how many times ``trading_days``
+    or ``offset_trading_days`` is invoked thereafter.
+
+    Pre-perf-#2 every call read + filtered the spot frame. This test
+    pins the new behavior: the per-call ``load_spot`` re-read is gone."""
+    _redirect_cache(monkeypatch, tmp_path)
+    call_count = {"n": 0}
+
+    def counting_load_spot(symbol, from_date, to_date, *,
+                           force_refresh=False, today_fn=date.today,
+                           offline=False, **kw):
+        call_count["n"] += 1
+        in_window = [d for d in _JAN_2024_NSE_DAYS if from_date <= d <= to_date]
+        return pd.DataFrame({
+            "date": pd.Series(
+                [pd.Timestamp(d) for d in in_window], dtype="datetime64[us]",
+            ),
+            "symbol": pd.array(["RELIANCE"] * len(in_window), dtype="string"),
+            "close": [100.0] * len(in_window),
+        })
+
+    monkeypatch.setattr(spot_loader, "load_spot", counting_load_spot)
+    today = lambda: date(2026, 5, 24)
+    # 100 mixed calls — all within the cached range, none should
+    # re-invoke load_spot.
+    for _ in range(50):
+        trading_calendar.offset_trading_days(date(2024, 1, 25), 5, today_fn=today)
+        trading_calendar.trading_days(
+            date(2024, 1, 5), date(2024, 1, 25), today_fn=today,
+        )
+    assert call_count["n"] == 1, (
+        f"_full_calendar_cached should populate once; got {call_count['n']}"
+    )
+
+
+def test_perf_2_fast_path_matches_slow_path_for_realistic_anchor(
+    monkeypatch, tmp_path,
+):
+    """Equivalence: fast-path bisect MUST return the same date as
+    the buffer-doubling slow path for an anchor that lies WITHIN the
+    cached calendar range. Anti-regression on the index arithmetic —
+    an off-by-one would silently shift every backtest's entry/exit
+    by a day."""
+    _redirect_cache(monkeypatch, tmp_path)
+    _patch_load_spot(monkeypatch, _JAN_2024_NSE_DAYS)
+    today = lambda: date(2026, 5, 24)
+
+    fast = trading_calendar.offset_trading_days(
+        date(2024, 1, 25), 15, today_fn=today,
+    )
+    # Force slow path by directly calling it (caller would only enter
+    # the slow path when out-of-cache; for tests we exercise it
+    # explicitly to pin equivalence).
+    slow = trading_calendar._offset_trading_days_slow(
+        date(2024, 1, 25), 15, today_fn=today,
+    )
+    assert fast == slow == date(2024, 1, 4)
+
+
+def test_perf_2_clear_cache_helper_actually_clears(monkeypatch, tmp_path):
+    """Pin the ``_clear_calendar_cache_for_test`` contract — it must
+    drop the LRU so a subsequent monkeypatched ``load_spot`` is
+    re-invoked. Required for test hermeticity."""
+    _redirect_cache(monkeypatch, tmp_path)
+    call_count = {"n": 0}
+
+    def counting(symbol, from_date, to_date, *, force_refresh=False,
+                 today_fn=date.today, offline=False, **kw):
+        call_count["n"] += 1
+        in_window = [d for d in _JAN_2024_NSE_DAYS if from_date <= d <= to_date]
+        return pd.DataFrame({
+            "date": pd.Series(
+                [pd.Timestamp(d) for d in in_window], dtype="datetime64[us]",
+            ),
+            "symbol": pd.array(["RELIANCE"] * len(in_window), dtype="string"),
+            "close": [100.0] * len(in_window),
+        })
+
+    monkeypatch.setattr(spot_loader, "load_spot", counting)
+    today = lambda: date(2026, 5, 24)
+
+    trading_calendar.offset_trading_days(date(2024, 1, 25), 5, today_fn=today)
+    assert call_count["n"] == 1
+
+    # Cleared → next call must reload.
+    trading_calendar._clear_calendar_cache_for_test()
+    trading_calendar.offset_trading_days(date(2024, 1, 25), 5, today_fn=today)
+    assert call_count["n"] == 2
 
 
 @pytest.mark.network
