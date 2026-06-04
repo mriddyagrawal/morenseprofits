@@ -189,6 +189,25 @@ def lot_sizes_path() -> Path:
     return _ensure_root() / "lot_sizes.parquet"
 
 
+def iv_path(symbol: str) -> Path:
+    """Per-symbol 30D constant-maturity ATM IV history parquet,
+    built by ``src.data.iv_materializer.materialize_iv_history``.
+
+    Schema (PORTFOLIO_MEMOIR.md §21.3 C2-C3, §21.4 F2-F4):
+      ``date``             (datetime64[us])  trading day
+      ``iv_front``         (float64)         front-month ATM IV (Series A)
+      ``iv_cmi30_raw``     (float64)         30D CMI, no DTE filter (Series B)
+      ``iv_cmi30_excl7``   (float64)         30D CMI, DTE ≥ 7 (Series C — default)
+      ``atm_strike_front`` (float64)         diagnostic
+      ``n_expiries_used``  (int64)           # expiries with successful IV
+
+    Per-symbol partition mirrors ``options/{SYM}/`` — each file is
+    small (~500-1000 rows × 6 cols ≈ ~30 KB)."""
+    if not symbol:
+        raise ValueError(f"symbol must be non-empty, got {symbol!r}")
+    return _ensure_root() / "iv" / f"{symbol.upper()}.parquet"
+
+
 def events_path() -> Path:
     """The NSE Corporate Events parquet cache, built by
     ``src.data.events_loader.load_events`` from the operator-delivered
