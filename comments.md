@@ -21592,3 +21592,101 @@ Migration cadence on main: **... → silent-drops grill → P1.8b → MIGRATION.
 Standing by on perf/profile-baseline.
 
 ---
+
+## Review of f075892 — `docs(filters): add FILTERS.md` — ✅ ACCEPT (substantive architectural doc)
+
+**Verdict: ✅ ACCEPT.** Substantive 137-LOC reference doc that codifies the two-part filter taxonomy LOGIC's F12 implicitly established. The **Part A (disqualification gates) / Part B (portfolio-construction filters)** split maps to a real operator distinction; the maintenance rules + drift-prevention discipline are operator-grade.
+
+### The two-part split — load-bearing conceptual clarification
+
+| | Part A | Part B |
+|---|---|---|
+| Question | Can this trade be priced? | Of trades we can price, which to keep? |
+| When | During sweep / materialize / heatmap-render | After cell is priced + passes min_n |
+| Effect | No P&L row exists | Trade exists; we include or exclude |
+| Owner | Data + engine correctness (loud, mechanical) | Strategy / portfolio (research choice) |
+| Reversible? | No — absence of data | Yes — change filter, re-select, no re-sweep |
+
+The cardinal rule **"absence ≠ loss for Part A; excluded ≠ bad for Part B"** captures both operator caveats in one frame. This is the kind of doc the operator can hand to a future contributor saying "read this before asking why a cell is empty."
+
+### Part A — F12 checklist elevated to authoritative repo doc
+
+Same 17 conditions LOGIC enumerated in F12, now:
+- Organized into 4 layers (pre-pricing / per-leg / post-pricing-aggregation / upstream-materialize).
+- Each gate cites `file:func` for re-verification (drift-prevention).
+- Tag legend: [logged] / [silent] / [fatal] / [mask] — operator-grade triage.
+- Cross-references the multiplicative-liquidity insight from F12 (BAJAJFINSV strangle 56% vs SBIN 83%).
+- **Maintenance rule**: "Part A must stay in lockstep with the engine — each gate cites a file:func so it can be re-verified; if the engine adds/removes a gate, edit Part A in the same commit." → same drift-prevention pattern as F1-B docstring sweep.
+- **Empirical provenance** cited: Part A verified against sweep `16277b27e2a8` + raw bhavcopies during F11/F12 audit.
+
+### Known gap explicitly documented
+
+> "Conditions #2 and #4 are [silent] — they drop a planned cell into neither output parquet, so planned ≠ priced + skipped (768 cells / 0.034% on sweep 16277b27e2a8). Candidate fix: raise a MissingSpotError / NoTradesError so they become [logged] skips and the accounting closes."
+
+This is the **F11+F12 dual-flagged silent-drops grill** formally recorded in FILTERS.md. When the fix lands, this paragraph needs to be removed (just as the F1-B docstring sweep had to update prior comments). Good architectural discipline — the doc is the canonical "where are the known gaps."
+
+### Part B — registry + template + IVP stub
+
+- **B.0 template** is operator-grade: requires Type, Stage, Inputs (with ✅/⛏ availability flags), Parameter, Direction, Rationale, Status, Caveat.
+- **Two cross-cutting rules**: no look-ahead, surface the removed count. **These two rules pin research-honesty** — a filter that secretly uses forward information or silently drops cells without reporting count would violate both.
+- **B.1 IVP filter** with explicit **"PIN DIRECTION BEFORE IMPLEMENTING"** warning is the load-bearing piece here. The doc names the trap: "the standard short-vol thesis sells premium when IV is *rich* (high IVP), so 'filter out high IVP' is the *opposite* of the usual edge — decide whether the intent is to avoid event-driven IV spikes ... or something else."
+
+This is exactly the kind of methodology note that prevents the operator from later asking "why did we filter the cells we should have kept?" Same family as the [[feedback_skew_direction_verify]] memory entry — direction matters; pin it explicitly before coding.
+
+### Placeholders for likely Part-B filters
+
+Liquidity floor, higher min_n, regime filter (with `mp_regime_filter` session-state already present but unwired noted), dispersion caps, cost realism floor. Each placeholder lists `Inputs ✅ available` or `⛏ needs new computation`. **Operator can scope the next filter by reading availability flags first** — preempts surprise discovery of missing data mid-implementation.
+
+### Cross-reference to my open grills
+
+- **F11+F12 silent-drops grill** is now formally documented in FILTERS.md's "Known gap" section. When the fix lands, the section + grill close together.
+- **My sweep-perf audit** doesn't touch FILTERS.md scope (perf is about wall-clock, not gates).
+- **F3 expiry STT** doesn't fit either Part A or Part B (it's a cost-model correctness item, not a gate or filter).
+
+### Praises
+
+- **Two-part split** clarifies a real conceptual confusion. "absence ≠ loss" + "excluded ≠ bad" framing is a one-line operator litmus test.
+- **Maintenance rule for Part A** (in-lockstep with engine, code-citation per gate) — drift-prevention discipline at the doc level. Same pattern as F1-B sweep.
+- **Empirical provenance** cited (sweep 16277b27e2a8 + raw bhavcopies via F11/F12) — Part A claims are anchored, not asserted.
+- **No-look-ahead + report-removed-count rules** for Part B — research-honesty by construction.
+- **PIN DIRECTION BEFORE IMPLEMENTING for IVP** — preempts the standard short-vol direction-confusion. Operator-grade methodology note.
+- **B.0 template with ✅/⛏ availability flags** — future filter scoping starts with "do we have the inputs?" before "how do we implement?" Operator triage discipline.
+- **Known-gap section explicit** — F11+F12 silent-drops grill formally registered; doc becomes self-updating when fix lands.
+
+### Math
+
+- LOC: +137 (FILTERS.md) + +1 (LOGIC_REVIEW.md cross-ref) = +138 net.
+
+### Behavior delta
+
+- New canonical reference doc; future "why is cell X empty" / "should we filter on Y" questions have a single landing place.
+- No code change.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: f075892 (now FILTERS.md too).
+- `main` HEAD: d9bc703 (unchanged).
+- FILTERS.md should travel with the perf work to main when it merges.
+
+### Branch consideration
+
+f075892 lives on `perf/profile-baseline`. The doc is purely additive + standalone — it doesn't depend on the perf-branch code. **Worth confirming with operator**: should FILTERS.md ALSO go to main now (since it's a canonical reference doc for any operator reading the codebase) or wait for perf branch to merge? My read: the doc adds value on main immediately, but cherry-picking back to main is operator preference.
+
+### Open grills (unchanged)
+
+- **F11 + F12 silent-drops grill** (~10 LOC) — now also documented in FILTERS.md's "Known gap" section. Fix when it lands needs to update FILTERS.md too.
+- Other grills unchanged per prior priority.
+
+### MCP arc state
+
+16/16. FILTERS.md describes existing MCP `heatmap` tool behavior (min_n at Layer III); no MCP contract changes.
+
+### Next-commit suggestion
+
+Unchanged from prior reviews. FILTERS.md becomes the canonical surface for any future filter / gate discussion.
+
+Migration cadence on perf branch: **... → --profile flag ✓ → FILTERS.md ✓ → measure baseline → Item-N optimizations → ...**
+
+Standing by.
+
+---
