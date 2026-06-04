@@ -116,6 +116,18 @@ def _parse_args() -> argparse.Namespace:
         help=f"Worker process count (default: {N_WORKERS}).",
     )
     p.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Force re-run even if data/results/sweep_{run_id}.parquet "
+            "already exists. SPECS §6c.4 default is cache-hit short-"
+            "circuit (same grid → same run_id → return cached parquet). "
+            "Pass --force during the perf measurement cycle "
+            "(profile run → production-baseline run on the same 2-stock "
+            "grid) so the second run actually re-prices instead of "
+            "returning the first run's parquet."
+        ),
+    )
+    p.add_argument(
         "--profile", action="store_true",
         help=(
             "Wrap the inner sweep_grid call in cProfile and dump the "
@@ -203,7 +215,9 @@ def main() -> int:
     # (the verbatim message goes to skip_detail, surfaced in the
     # heatmap drill-down's Skipped Expiries section).
 
-    _h(f"Running sweep (n_workers={n_workers}; cache_only=True; force=False; cache-hit short-circuits)")
+    force: bool = args.force
+    _h(f"Running sweep (n_workers={n_workers}; cache_only=True; force={force}; "
+       f"cache-hit short-circuits when force=False)")
     t0 = time.perf_counter()
     sweep_kwargs = dict(
         strategies=STRATEGIES,
@@ -213,7 +227,7 @@ def main() -> int:
         exit_offsets_td=EXIT_OFFSETS_TD,
         today_fn=TODAY_FN,
         offline=False,
-        force=False,
+        force=force,
         n_workers=n_workers,
         show_progress=True,
         cache_only=True,
