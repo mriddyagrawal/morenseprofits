@@ -189,6 +189,21 @@ def lot_sizes_path() -> Path:
     return _ensure_root() / "lot_sizes.parquet"
 
 
+def india_vix_path() -> Path:
+    """The India VIX daily-OHLC parquet, fetched from NSE's
+    ``/api/historicalOR/vixhistory`` endpoint by
+    ``src.data.india_vix_loader``.
+
+    Schema (PORTFOLIO_MEMOIR.md §21.2 row D5 + §17 data spec):
+      ``date`` (datetime64[us]), ``india_vix_open``, ``india_vix_high``,
+      ``india_vix_low``, ``india_vix_close``, ``india_vix_prev_close``
+      (all float64). Sorted by date ascending; no duplicates.
+
+    Single file (not partitioned by year — the dataset is small;
+    full-history-back-to-2008 is well under 5 MB)."""
+    return _ensure_root() / "india_vix.parquet"
+
+
 def exists(path: Path) -> bool:
     return path.is_file()
 
