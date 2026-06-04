@@ -22445,3 +22445,87 @@ Migration cadence on perf branch: **... → Phase-2 #2 (BROKEN cc2282a) → fix(
 Standing by.
 
 ---
+
+## Review of 123458e — `test(perf_2.partial_cache_anti_regression)` — ✅ ACCEPT (closes Grill #6 cleanly)
+
+**Verdict: ✅ ACCEPT.** Tight 60-LOC test commit closing Grill #6 from bc3c4fe. New `test_perf_2_per_year_offline_cache_miss_skipped` exercises the exact production code path that cc2282a broke. **Full suite is now GREEN at 886 passed** — the 5 web_e2e tests now pass (operator re-ran the sweep between my bc3c4fe review and this commit, regenerating the previously-empty parquet).
+
+### Independent verification
+
+Per the operator's "be LOUD if wrong" discipline + [[feedback_check_log_between_reviews]]: re-grepped log + re-ran pytest myself before writing.
+
+```
+$ pytest tests/test_trading_calendar.py -v → 14 passed
+$ pytest tests/ → 886 passed, 2 deselected, 1 warning
+```
+
+886 passed = 880 (pre-this-commit baseline) + 1 (new partial-cache test) + 5 (web_e2e now passing because operator regenerated sweep parquet). All accounted for.
+
+### Test design verified
+
+The new test mimics the operator's ACTUAL cache state at the time cc2282a fired:
+
+```python
+def selective_load_spot(symbol, from_date, to_date, *, ..., offline, **kw):
+    if from_date.year < 2024:
+        raise OfflineCacheMiss(f"spot {symbol} {from_date.year} not in cache")
+    # ... return synthetic 2024 frame for from_date.year >= 2024
+```
+
+This is the **failure scenario that REQUEST CHANGES surfaced** (ca8486f). Without this test, a future refactor "simplify back to single load_spot call" would silently re-introduce the bug while pytest stayed green.
+
+Two assertions exercise the production path:
+1. `trading_days(2024-01-01, 2024-01-31, offline=True)` returns the full 2024 set → per-year skip recovered.
+2. `offset_trading_days(2024-01-25, 15, offline=True) == 2024-01-04` → end-to-end production cell path matches a load-bearing hand-check.
+
+**Both use `offline=True`** — exercises the exact code path the bug originally tripped on (cc2282a only fired under `cache_only=True` → `offline=True`).
+
+### Praises
+
+- **Test mimics operator's actual cache state** at the time the bug fired — not a synthetic test fixture; the production scenario.
+- **End-to-end production code path** exercised (offline=True; same flag promotion as sweep_one).
+- **Hand-check anchor** (`2024-01-25 + 15 = 2024-01-04`) is operator-grade — easy to re-verify by counting trading days on a calendar.
+- **Honest commit body framing** — "the risk the reviewer named is concrete: a future refactor back to a single-range call would silently re-introduce cc2282a's bug AND pytest would still pass." Names the failure mode the test prevents.
+- **Cross-references full decision trail** — cc2282a (bug), 0a08d44 (fix), ca8486f (initial REQUEST CHANGES), bc3c4fe (Grill #6 raise).
+- **`886 passed` is the honestly-claimed count** — BUILDER's calibration discipline has improved post-cc2282a's overclaim.
+
+### Math
+
+- LOC: +60 / -0 = +60 net. ✓ Matches.
+- Test count: 880 → 886 (+1 new + 5 web_e2e unstuck). Full suite GREEN.
+
+### Behavior delta
+
+- New invariant pinned: partial-cache scenario (some years OfflineCacheMiss) must accumulate rest, not abort.
+- No production code change.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `123458e`.
+- `main` HEAD: `d9bc703` unchanged.
+- Full suite GREEN; Grill #6 closed.
+- Phase-2 #1 + LRU bumps + Phase-2 #2 + offline-tolerance fix + partial-cache test all in.
+- **Ready for the operator's --workers 8 --force wall-clock measurement** to verify the 4% conversion factor held for #2 (projected 82s → ~67s).
+
+### Open grills
+
+- ~~Grill #6~~ — CLOSED. ✓
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Next-commit suggestion
+
+1. **Operator runs `--workers 8 --force --symbols INFY WIPRO`** → measure production wall-clock for #2.
+2. **If 82s → ~67s (4% conversion held)**: proceed to **Phase-2 #3 (strike-grid cache)** per prior plan.
+3. **If significantly different**: re-profile before #3 (the conversion factor may have shifted; bottleneck may now be elsewhere).
+4. **Grill #6 closure is non-controversial**; the decision on #3 timing depends on the measurement.
+
+Migration cadence on perf branch: **... → fix(offline_tolerance) ✓ → Grill #6 partial-cache test ✓ → operator re-run + measure → Phase-2 #3 → ...**
+
+Standing by.
+
+---
