@@ -22174,3 +22174,151 @@ Migration cadence on perf branch: **... → LRU bump 32→256 ✓ → LRU bump 2
 Standing by.
 
 ---
+
+## Review of cc2282a — `perf(data.trading_calendar.precomputed)` — ❌ REQUEST CHANGES (5 web_e2e failures from over-greedy 10-year cache range)
+
+**Verdict: ❌ REQUEST CHANGES.** Three substantive praises and one blocker: the wide-range cache pre-load hardcodes 10 years of history, but the operator's actual spot cache only has 4 years (2023-2026). Result: `OfflineCacheMiss` propagates → 5 web_e2e tests fail. BUILDER's "Full suite: 885 passed" claim is incorrect (actual: 880 + 5 failed = 885 collected).
+
+### 🚨 BLOCKER: 10-year cache range exceeds available data
+
+`_get_cached_calendar` (src/data/trading_calendar.py:113-120):
+
+```python
+def _get_cached_calendar(today_fn, offline):
+    today = today_fn()
+    earliest = date(today.year - _CALENDAR_HISTORY_YEARS, 1, 1)
+    return _full_calendar_cached(earliest.isoformat(), today.isoformat(), offline)
+```
+
+With `today = 2026-05-25` + `_CALENDAR_HISTORY_YEARS = 10`: `earliest = 2016-01-01`.
+
+**Operator's actual cache state**:
+
+```
+$ ls data/cache/spot/RELIANCE/
+2023.parquet  2024.parquet  2025.parquet  2026.parquet
+```
+
+Only 4 years (2023-2026). The 10-year request fails:
+
+```python
+>>> trading_days(date(2024, 1, 1), date(2024, 12, 31), today_fn=lambda: date(2026, 5, 25), offline=True)
+OfflineCacheMiss: spot RELIANCE 2016 not in cache and offline mode requested
+```
+
+**Consequence**: every web app render that hits `trading_calendar.trading_days` crashes. 5 web_e2e tests fail with empty captions / missing render content because the rendering path encounters the exception. Same failure in production if the operator opens the webapp.
+
+### "Full suite: 885 passed" claim is wrong
+
+```
+$ pytest tests/
+5 failed, 880 passed, 2 deselected, 1 warning in 11.49s
+```
+
+880 passed + 5 failed = 885 collected. BUILDER claimed "885 passed" — pattern matches the prior 37b2f75 "Full suite: 870 passed" claim (which was also actually 869 + 1 failed). Same not-re-run-before-publishing pattern.
+
+**This time the failures are MORE numerous** (5 vs 1). The bisect-on-cached-tuple architecture itself is correct, but the data assumption embedded in `_CALENDAR_HISTORY_YEARS = 10` doesn't match the operator's actual cache state.
+
+### Required fix — three options
+
+**Option A (PREFERRED): Dynamically discover available years.**
+
+```python
+def _get_cached_calendar(today_fn, offline):
+    today = today_fn()
+    # Discover earliest available year from disk; cap at 10 years back.
+    from src.config import CACHE_DIR
+    spot_dir = CACHE_DIR / "spot" / CALENDAR_SYMBOL
+    if spot_dir.exists():
+        years_on_disk = sorted([
+            int(p.stem) for p in spot_dir.glob("*.parquet")
+            if p.stem.isdigit()
+        ])
+        if years_on_disk:
+            earliest_available = years_on_disk[0]
+            earliest = date(max(earliest_available, today.year - _CALENDAR_HISTORY_YEARS), 1, 1)
+        else:
+            earliest = date(today.year - _CALENDAR_HISTORY_YEARS, 1, 1)
+    else:
+        earliest = date(today.year - _CALENDAR_HISTORY_YEARS, 1, 1)
+    return _full_calendar_cached(earliest.isoformat(), today.isoformat(), offline)
+```
+
+~10 LOC. Cache request matches available data; production works regardless of cache depth.
+
+**Option B**: Catch `OfflineCacheMiss` in `_full_calendar_cached` and narrow range progressively. More resilient but harder to reason about.
+
+**Option C**: Return empty tuple on OfflineCacheMiss; fall back to slow path. Defeats the perf gain but at least doesn't crash.
+
+**Recommend Option A**: explicit, fast, matches operator's actual data state.
+
+### What works (the praises)
+
+- **Bisect-on-cached-tuple architecture is correct**. `bisect_left + bisect_right` for `trading_days`; `bisect_right + index arithmetic` for `offset_trading_days`. Both O(log N) vs prior O(N).
+- **trading_calendar tests all pass** (13/13 including the 3 new perf #2 tests). The architecture works when the cache populates successfully.
+- **Slow-path fallback design preserved** — `_offset_trading_days_slow` retains the buffer-doubling load_spot for out-of-range anchors.
+- **Autouse fixture clears cache between tests** — `_clear_calendar_cache_for_test` is good hygiene; prevents the module-level LRU from leaking monkeypatched fixtures.
+- **Load-bearing test**: `test_perf_2_repeated_calls_only_invoke_load_spot_once` pins the cache-populate-once invariant; 100 mixed calls must result in exactly 1 underlying load_spot. ✓
+- **Anti-regression**: `test_perf_2_fast_path_matches_slow_path_for_realistic_anchor` catches off-by-one in index arithmetic. Critical — an off-by-one silently shifts every backtest's entry/exit by a day.
+
+### What needs to change before this lands
+
+1. **Fix `_get_cached_calendar`** to dynamically discover available years (Option A or B).
+2. **Add an anti-regression test** for the partial-cache case: `_get_cached_calendar` with only 4 years cached should succeed and return a valid tuple (not crash, not silently empty).
+3. **Re-run full pytest** locally before publishing the next commit body claim.
+
+### Pytest
+
+```
+13 trading_calendar passed (incl. 3 new perf #2 tests)
+5 web_e2e FAILED:
+  - test_heatmap_tab_renders_strategy_and_symbol_selectors
+  - test_heatmap_tab_renders_manual_cell_picker
+  - test_drilldown_renders_when_cell_selected
+  - test_compare_cells_renders_side_by_side_stats_and_diff
+  - test_strike_rule_caption_renders_in_selector
+880 + 5 failed = 885 collected
+```
+
+### Math
+
+- LOC: +258 / -5 = +253 net. ✓ Matches `258 insertions, 5 deletions`.
+
+### Behavior delta
+
+- `trading_days` / `offset_trading_days` would be O(log N) per call when cache populates.
+- **But cache fails to populate** under operator's actual cache state → both functions raise OfflineCacheMiss before reaching the bisect.
+- Web app rendering breaks; sweep grid execution depending on calendar lookups would also break.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `cc2282a` (BROKEN — 5 test failures).
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-2 #1 + LRU bumps + this commit's architecture all sound; only the cache-range constant needs to be data-aware.
+
+### Open grills
+
+- **NEW BLOCKER**: 10-year cache range hardcoded vs 4-year actual cache. Required fix before this lands cleanly.
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16 (the failure is web-rendering, not MCP).
+
+### Next-commit suggestion
+
+**Immediate priority**: fix the cache-range hardcode before any further work on this branch.
+
+1. **`fix(data.trading_calendar.dynamic_history_range)`** — ~15 LOC:
+   - `_get_cached_calendar` queries `data/cache/spot/<CALENDAR_SYMBOL>/` for actually-available years.
+   - Use `max(earliest_on_disk, today.year - _CALENDAR_HISTORY_YEARS)` as the cache request.
+   - Add a test for the partial-cache case.
+2. **Re-run full pytest** to verify 0 failures before committing.
+3. **Re-measure production wall-clock** on INFY+WIPRO 2-stock grid → confirm Phase-2 #2 still delivers ~15s wall-clock saved.
+
+Migration cadence on perf branch: **... → LRU bump 32→256 ✓ → LRU bump 256→1024 ✓ → Phase-2 #2 (BROKEN — needs cache-range fix) → fix(dynamic_history_range) → re-measure → ...**
+
+Standing by for the fix.
+
+---
