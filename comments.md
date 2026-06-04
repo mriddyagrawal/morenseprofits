@@ -22322,3 +22322,126 @@ Migration cadence on perf branch: **... → LRU bump 32→256 ✓ → LRU bump 2
 Standing by for the fix.
 
 ---
+
+## Review of 0a08d44 — `fix(data.trading_calendar.offline_tolerance)` — ✅ ACCEPT with one real grill
+
+**Verdict: ✅ ACCEPT.** Fix is correct and independently verified. BUILDER chose Option B from my recommendations (catch `OfflineCacheMiss` per-year, accumulate the rest) instead of my preferred Option A (dynamic discovery). Both are valid; Option B is arguably MORE resilient (handles ANY mix of missing years, not just gaps at the start). **One real grill on missing dedicated partial-cache anti-regression test** — the docstring describes the behavior but no test pins it.
+
+### Independent verification
+
+Re-grepped log + re-ran pytest myself (per the operator's directive + [[feedback_check_log_between_reviews]]):
+
+```
+$ pytest tests/  → 5 failed, 880 passed
+```
+
+The 5 web_e2e failures are SAME 5 from cc2282a (`test_heatmap_tab_renders_*`, `test_drilldown_renders_*`, `test_compare_cells_*`, `test_strike_rule_caption_*`). Verified the cause:
+
+```
+$ python -c "import pandas as pd; print(pd.read_parquet('data/results/sweep_0842419c3973.parquet').shape)"
+(0, ...)
+```
+
+**The sweep parquet has 0 rows.** It was generated under cc2282a's broken state (90,000 cells all skipped as OfflineCacheMiss). BUILDER's framing matches: "the prior run's parquet is the broken empty one and the 5 web_e2e tests... will pass once the sweep is re-run."
+
+Smoke test against operator's live cache (independently reproduced BUILDER's claim):
+
+```
+trading_days(2024-01-01, 2024-12-31, offline=True) = 249 dates ✓
+offset_trading_days(2024-05-30, 15) = 2024-05-09 ✓
+```
+
+**The fix works.** It catches `OfflineCacheMiss` per-year, accumulates the available years, returns the union as a sorted tuple. Correct architecture.
+
+### Why this fix is preferable to my Option A
+
+I recommended Option A (dynamic discovery via `os.listdir`). BUILDER chose Option B (try/except per-year, skip on failure). Comparing on merits:
+
+- **Option A** (dynamic discovery): one wide `load_spot` over the discovered range. Faster on the populate path but assumes contiguous years available (gaps in the middle would still fail).
+- **Option B** (per-year iteration): N `load_spot` calls but each independent. **Handles ANY mix of missing years** including gaps in the middle, single-year cache, sparse coverage. More resilient.
+
+The cost difference: N `load_spot` calls vs 1. But `_load_year_cached` in `spot_loader` already memoizes per-year, so the second-and-later year calls would have been hot-path-fast anyway. **Per-year iteration is the right choice.** BUILDER's design is better than my recommendation.
+
+### Grill #6 (NEW): missing dedicated partial-cache anti-regression test
+
+The existing test `test_perf_2_repeated_calls_populate_cache_once` was UPDATED to handle the per-year populate (expects multiple `load_spot` calls during populate). The docstring even references the fix: "perf #2 fix 2026-06-04: per-year iteration so that an uncached year raising `OfflineCacheMiss` doesn't abort the whole load."
+
+**But the test uses `monkeypatch.setattr(spot_loader, "load_spot", counting_load_spot)` which never raises `OfflineCacheMiss`.** The partial-cache scenario (some years available, others raise `OfflineCacheMiss`) is described in the docstring but NOT exercised by any test.
+
+**Concrete risk**: a future refactor that simplifies `_full_calendar_cached` back to a single `load_spot` call would silently re-introduce cc2282a's bug, and pytest would still pass.
+
+**Suggested fix** (~15 LOC):
+
+```python
+def test_perf_2_per_year_offline_cache_miss_skipped(monkeypatch, tmp_path):
+    """Anti-regression for cc2282a (REQUEST CHANGES via ca8486f): when
+    some years in the 10-year window raise OfflineCacheMiss, the
+    per-year iteration in _full_calendar_cached must skip those years
+    and accumulate the rest, not abort the whole load.
+    
+    The operator's actual cache state (4 years of spot vs 10-year
+    request) was the failing scenario that the original perf #2 commit
+    didn't handle. Without this test, a refactor back to a single
+    load_spot call would silently re-introduce the bug."""
+    def selective_load_spot(symbol, from_date, to_date, *, ..., offline=False, **kw):
+        # 2016-2023 raise OfflineCacheMiss; 2024-2026 return valid data.
+        if from_date.year < 2024:
+            raise OfflineCacheMiss(f"spot {symbol} {from_date.year} not in cache")
+        # ... return valid frame for 2024-2026
+    monkeypatch.setattr(spot_loader, "load_spot", selective_load_spot)
+    days = trading_days(date(2024, 1, 1), date(2024, 12, 31), ...)
+    assert len(days) > 0  # 2024-2026 accumulated successfully
+```
+
+This pins the failure mode that caused cc2282a so it can't recur silently.
+
+### Praises
+
+- **Per-year iteration is more resilient than my Option A** — handles ANY mix of missing years; works under sparse cache states.
+- **Independent verification matches BUILDER's claim** — smoke test against operator's live cache returns the same values BUILDER reported.
+- **BUILDER did NOT overclaim pytest this time** — only claimed "13 trading_calendar tests passed" + honestly noted the 5 web_e2e failures will pass once sweep re-runs. **Calibration improved from cc2282a's "Full suite: 885 passed" claim.**
+- **Honest bug-framing** — "90,000 / 90,000 cells skipped, all OfflineCacheMiss... finished in 1.1s vs the 82.2s post-#1 baseline." Names the catastrophic failure mode directly.
+- **Cites operator's memory** ([[feedback_verify_downloads]]) — "NSE data fetch paths are the highest bug density area; loop closed by measuring before declaring done." Closes the methodology lesson.
+- **Cross-references ca8486f** — preserves the decision trail.
+- **Updated existing tests** to match the new populate pattern (`_invoke_load_spot_once` → `_populate_cache_once`; `clear_cache_helper` updated to count-pre/post instead of absolute n==1/n==2). Symbol drift handled.
+
+### Math
+
+- LOC: +71 / -30 = +41 net. ✓ Matches.
+- Test count: 880 passed (unchanged net from cc2282a). 5 web_e2e failures persist due to stale parquet (will resolve on operator re-run).
+
+### Behavior delta
+
+- `trading_days` / `offset_trading_days` now succeed under partial spot cache.
+- Per-year iteration cost: N (years in window) `load_spot` calls during populate. Each call hits `_load_year_cached` LRU; only first per (symbol, year) actually touches disk.
+- Bisect on cached tuple unchanged.
+- Operator's webapp will render correctly once sweep re-runs.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `0a08d44`.
+- `main` HEAD: `d9bc703` unchanged.
+- **Operator MUST re-run sweep** to regenerate `data/results/sweep_0842419c3973.parquet` (empty post-cc2282a). My e41ddd1 command pattern still applies: `rm -f data/results/sweep_*.parquet && python scripts/p7_wide_sweep.py --symbols INFY WIPRO --workers 8 --force`.
+
+### Open grills
+
+- **NEW: Grill #6** (partial-cache anti-regression test missing) — recommend adding before the next perf commit.
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Next-commit suggestion
+
+1. **`test(trading_calendar.partial_cache_anti_regression)`** — Grill #6 fix. ~15 LOC, pure test addition. Pins cc2282a's failure mode so it can't recur silently.
+2. **Operator re-runs sweep** (`--workers 8 --force` on INFY+WIPRO).
+3. **Measure production wall-clock** → expected ~67s (per the 4% conversion factor on the 390s cumtime saved).
+4. **Phase-2 #3 (strike-grid cache)** — IF the wall-clock measurement confirms #2 conversion ratio held; otherwise reprofile.
+
+Migration cadence on perf branch: **... → Phase-2 #2 (BROKEN cc2282a) → fix(offline_tolerance) ✓ → partial-cache test (Grill #6) → operator re-run + measure → Phase-2 #3 → ...**
+
+Standing by.
+
+---
