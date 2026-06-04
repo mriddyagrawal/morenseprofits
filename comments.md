@@ -23330,3 +23330,148 @@ Migration cadence: **... → P8 #1 STT ✓ → P8 #2 VIX loader ✓ → P8 #3 pr
 Standing by.
 
 ---
+
+## Review of 9690656 — `docs(memoir)` IV-script validation + T-convention + brentq — ⚠️ ACCEPT-WITH-FOLLOWUP (3 grills; math correct, citations adrift)
+
+**Verdict: ⚠️ ACCEPT-WITH-FOLLOWUP.** The three substantive changes (T=cal/365 fix, Newton→brentq upgrade, §22.5 validation record) are correct. The math is right; the empirical reasoning about A/B/C/D is sound; the disambiguation discipline ("252-day" → "252 trading days (≈1 calendar year)") is the right response to the F2 bug. But citation discipline broke down on §22.5's references to the validated artifact and PNG evidence — both are off-disk-or-format-mismatched and none are in git history. Per [[feedback_grep_code_before_accepting_calibration]]: I grep'd and the citations don't hold.
+
+The three grills are:
+
+### 🚩 GRILL 1 (MEDIUM — artifact format drift in §22.5)
+
+**§22.5 says "Built as `scripts/research_iv_visualization.py` (not a notebook)"; the only artifact on disk is `scripts/research_iv_visualization.ipynb` (notebook).**
+
+Evidence:
+```
+$ ls scripts/research_iv_*
+scripts/research_iv_visualization.ipynb   ← only this exists
+
+$ test -f scripts/research_iv_visualization.py
+(no matches found)
+```
+
+The memoir is explicit about the format: line 1213-ish "(not a notebook)". The artifact is a notebook. Citation says one thing, reality says another.
+
+**Crucially, the substantive content is intact**: I grep'd the .ipynb for the four constructs the memoir attributes to it (`brentq`, `bs76_call_price`, `dte / 365`, `extract_forward_via_parity`, `implied_vol_black76`) — ALL FIVE PRESENT. So the math claims ARE backed by the artifact; only the citation is wrong.
+
+Three resolution options:
+1. **Update memoir refs `.py` → `.ipynb`** (cheapest; matches reality).
+2. **Refactor `.ipynb` → `.py`** (matches memoir; durable as a script).
+3. **Keep both** (ipynb for interactive use; .py extracted for production reference).
+
+Whichever path: **the artifact must be committed to git.** Right now it's untracked. If the operator's workspace loses it, the only "validated reference impl" the memoir points to is gone.
+
+### 🚩 GRILL 2 (MEDIUM — missing PNG evidence)
+
+**§22.5 cites `scripts/research_iv_<SYMBOL>.png` for HDFCBANK / PNB / RELIANCE as the empirical evidence the operator and reviewer reviewed before deciding "ship C → D". None of the three PNGs are on disk.**
+
+Evidence:
+```
+$ ls scripts/research_iv_*.png
+(no matches found)
+```
+
+The §22.5 "Decision (now locked): ship C → D. The 7-DTE exclusion is load-bearing, not hygiene" is downstream of the A/B/C/D visual divergence. The visual evidence isn't reproducible from the repo. Per [[feedback_grep_code_before_accepting_calibration]] — this is the citation-without-evidence pattern.
+
+**To be clear: I'm NOT contesting the conclusion.** The physical reasoning is sound (front-month IV does spike at expiry due to vega → 0 destabilizing the inversion; 30D CMI without exclusion does get dragged toward dying contracts; 7-DTE exclusion is the standard fix). The decision "ship C → D" is correct on its face. The grill is about REPRODUCIBILITY of the evidence the spec relies on.
+
+Resolution: re-run the notebook, save the 3 PNGs under `scripts/research_iv_<SYMBOL>.png`, commit them alongside the artifact. Or, if PNGs are bulky for git, drop a `scripts/research_iv_README.md` with the methodology + cell-by-cell screenshots inline.
+
+### 🚩 GRILL 3 (LOW — return-type drift, blocks F3 → C2 boundary)
+
+**F3's new `implied_vol_black76` returns `None` on failure** (regime.py-style NaN convention is used everywhere else in §21.4).
+
+Memoir F3 (post-fix, lines 850-ish):
+```python
+def implied_vol_black76(call_px, forward, strike, T, r):
+    """Returns annualized σ, or None on failure..."""
+    if T <= 0 or call_px <= 0 ...:
+        return None
+    ...
+    return float(brentq(err, 1e-4, 5.0, xtol=1e-6, maxiter=64))
+```
+
+Downstream C2 / C4 / IVP / regime all use NaN as the insufficient-data sentinel:
+- F5 (regime_percentile, just-locked spec): NaN
+- F9 (regime_state): NaN-aware via the just-ratified `if pd.isna(pct): return "OFF"` guard
+- F8 (avg_single_name_rv): NaN
+
+The materializer (P8 #5 IVP next) will need to translate `None → NaN` at the F3/C2 boundary, or the downstream NaN convention breaks. Two cleanups:
+1. **Change F3 to return `float('nan')` instead of `None`** — most consistent with §21.4 conventions; cheapest fix.
+2. **Document the boundary explicitly in §21.6 build-order** — "the iv.py materializer translates F3's None to NaN before persisting to the IV cache."
+
+Recommend option 1. Saves the explicit translation step everywhere F3's output flows.
+
+### Praise points (substantively correct work)
+
+- **T = (calendar days) / 365 is the standard option-pricing convention** — 252-TD was a real bug in the original F2 sketch. Standard Black-76 / BS uses calendar time; the 252 clock belongs to vol annualization and the IVP lookback window. The day-count note now separating these (memoir lines 836-840) is exactly the right disambiguation.
+- **brentq over Newton-Raphson on a `[1e-4, 5.0]` bracket is a substantive upgrade**: the Black-76 call price is monotone-increasing in σ, so the root is always in the bracket and Brent's method is guaranteed to converge. Newton can stall in the flat-vega tail (deep-OTM or very-low-IV regions); brentq cannot. This is the right call.
+- **No-arb guards in F3 are correct**:
+  - `call_px ≤ intrinsic + 1e-8` → below intrinsic, return None (stale / arb).
+  - `call_px ≥ exp(-rT) * forward` → above the upper bound (call ≤ discounted forward).
+  Both checks correctly handle the cases where brentq would otherwise fail to find a root in `[1e-4, 5.0]`.
+- **PCP-forward + call-only inversion** mathematically eliminates the put inversion: under put-call parity, `C - P = exp(-rT)·(F - K)`, so once F is extracted via PCP and Black-76 is applied to the call, the put would invert to the SAME σ. Averaging CE/PE (the older §2.2 step 3 plan) was redundant work; this is correct cleanup.
+- **§22.5 empirical pattern is physically reasonable**: front-month ATM IV spiking at expiry verticals matches the vega → 0 inversion-instability story; 30D CMI being yanked toward dying front contracts matches the linear-in-variance interpolation reaching toward the spiky series; 7-DTE exclusion fixes both by removing the spike-prone tail. Standard methodology.
+- **C→D as the production signal stack** is the right call: C is the regime-faithful level series (smooth, no expiry artifacts); D is the threshold-able percentile rank. Operator reviewed; reviewer (this session) concurs on the physical reasoning.
+- **"D is jumpy day-to-day; sample at cycle entry, never daily"** caveat (§22.5 sub-bullet) is a meaningful methodological flag — the percentile transform amplifies small level moves, so a daily-rebalanced D would be over-active. Monthly cadence solves it naturally.
+- **Round-trip σ to ~1e-11** is plausible: brentq with `xtol=1e-6` on a smooth monotone function typically achieves convergence much tighter than the explicit tolerance because Brent's method is super-linearly convergent on smooth functions. Closed-form Black-76 means there's no accumulated numerical error in the forward pricing step. I trust the claim but I CANNOT reproduce it locally without GRILL 1 + GRILL 2 fixed.
+- **Disambiguation sweep** — "252-day" / "252 values" → "252 trading days (≈ 1 calendar year)" — pulled into 4 separate places (§2.1, §2.2 step 8, §20 row, §22.1 Series D, §22.5). Same conflation the F2 T-bug came from; this is the right preventative discipline.
+- **Provenance tags** `[REVISED 2026-06-04 — ...]` on F2, F3, F4 carry the audit trail forward. Future reader can grep `2026-06-04` and reconstruct the day's spec changes.
+- **§22.3 forward-reference to §22.5 RESOLVED** ties the "build the notebook before the materializer" call-to-action to its resolution. Clean cross-link discipline.
+
+### Math verification (the parts I CAN check)
+
+- T-convention: `T = (cal days) / 365`. ✓ Standard. The numerical gap memoir cites (30 cal ≈ 21 td → 0.0822 vs 0.0833) is right (`30/365 ≈ 0.0822`, `21/252 ≈ 0.0833`). Small (~1.3% relative) but real.
+- Brentq bracket `[1e-4, 5.0]`: σ ∈ [0.01%, 500%]. ✓ Covers the range of any plausible single-stock IV with margin.
+- No-arb upper bound for European call: `C ≤ exp(-rT)·F`. ✓ Correct (the call's payoff is bounded above by the forward, and present value discounts).
+- Intrinsic for forward-based call: `max(0, exp(-rT)·(F - K))`. ✓ Correct discounted-intrinsic form.
+
+### Math claims I CANNOT verify without GRILL 1 + 2 fixes
+
+- "Round-trip recovers σ to ~1e-11" — plausible but needs the script in git.
+- "C→D empirically confirmed from the 3 PNGs" — needs the PNGs in git.
+
+### Pytest verification
+
+Memoir-only commit; no test impact. Suite stays at 926.
+
+### State-of-tree
+
+- `main` HEAD: `9690656`.
+- Phase-8 build-order: #1–#4 ✓; **#5 IVP next, but blocked on GRILL 1 + 2** because IVP module is meant to mirror the (currently-uncommitted) reference impl.
+- Working tree:
+  - `M PLAN.md` — BUILDER's untracked edit; not part of this commit.
+  - `?? scripts/research_iv_visualization.ipynb` — the reference impl, UNTRACKED.
+  - PNGs that §22.5 cites: ABSENT from working tree entirely.
+
+### Open grills (cumulative)
+
+- **NEW: 3 grills above** (GRILL 1 + GRILL 2 + GRILL 3 from this review).
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+Before P8 #5 (IVP materializer) lands: resolve GRILL 1 + GRILL 2 by committing `scripts/research_iv_visualization.ipynb` (or its `.py` refactor) + the 3 PNGs (or a methodology README screenshot-block), and updating §22.5 to cite the actual filename/format. Otherwise the IVP commit will reference a "validated reference impl" that doesn't exist in git.
+
+### Next-commit suggestion
+
+`chore(p8.iv_research.commit_reference_impl)` — close GRILL 1 + GRILL 2 in one commit:
+1. Decide format (.ipynb-as-is vs .py-refactor) and commit the artifact.
+2. Regenerate the 3 PNGs and commit them, OR replace the §22.5 PNG citations with a description/screenshot block.
+3. Patch §22.5 references to match the actual format.
+4. Optionally fold GRILL 3 (F3 return-type → NaN) into the same commit since it's a 1-line memoir patch.
+
+This unblocks P8 #5 IVP and de-risks the citation-drift pattern that's now appeared in two consecutive commits (3fb0f05 GRILL 1 + 9690656 §22.5 refs). Per [[feedback_next_commit_suggestion]]: A. de-risks the biggest unknown (citation drift blocks downstream traceability), B. follows a real signal (citation didn't grep clean), C. fits in one nuclear commit.
+
+Per [[feedback_reviewer_calibration]] note: two citation-drift catches in a row (GRILL 1 of d8620f8 + GRILL 1+2 here) is a PATTERN, not noise. Worth a brief BUILDER-side check before next docs/spec commit: "did I grep what I'm citing?"
+
+Migration cadence: **... → P8 #4 regime ✓ → 9690656 IV-script docs (⚠️ 3 grills) → reference-impl commit (chore) → P8 #5 IVP materializer → P8 #6 BS inversion → ...**
+
+Standing by.
+
+---
