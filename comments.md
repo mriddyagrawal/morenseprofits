@@ -22646,3 +22646,112 @@ Migration cadence on main: **... → P1.7 ✓ → F11 + F12 ✓ → 🎉 Phase-2
 Standing by.
 
 ---
+
+## Review of 23fb875 — `fix(p8.cost.stt_correction)` — ✅ ACCEPT (Phase-8 prereq #1)
+
+**Verdict: ✅ ACCEPT.** Operator-authorized cost-model parameter bump per PORTFOLIO_MEMOIR.md §9. STT sell-options 0.0625% → 0.15% (2.4× ratio). **Direction is RIGHT for conservative-bias backtesting on a short-vol universe** — overstating sell-side cost understates ROI → conservative for the short_straddle/short_strangle/iron_condor universe.
+
+### Math verified independently
+
+```
+ratio = 0.0015 / 0.000625 = 2.4×
+old_stt 16.640625 × 2.4 = 39.9375 (matches new_stt exactly)
+```
+
+Hand-check on the canonical RELIANCE Jan-2024 short straddle:
+- STT: ₹16.64 → ₹39.94 (+₹23.30)
+- costs: ~₹141.78 → ~₹165.08 (+₹23.30 — pure STT delta)
+- net_pnl: ~₹2,608.22 → ~₹2,584.92 (−₹23.30)
+- roi_pct: ~+1.00% → ~+0.99% (~−0.01 pp per trade)
+
+Gross P&L unchanged ✓. Margin unchanged ✓. Only STT-derived numbers shift, exactly as the cost model contract specifies.
+
+### Direction is RIGHT for conservative-bias backtesting
+
+BUILDER's framing:
+- Pre-2023 statutory: 0.0625%.
+- Post-2023 Finance Act statutory: 0.05% (a REDUCTION).
+- Operator chose: 0.15% deliberately (3× the statutory rate for v1 deployment-grade backtests).
+- Truthful for real-money calculator: 0.05%.
+
+**Direction check** (per [[feedback_skew_direction_verify]] discipline): the universe is short-vol (short_straddle / short_strangle / iron_condor). Higher STT on sell-side → higher costs → lower ROI. Overstating STT understates ROI. **For short-vol backtests this is the conservative direction** — backtests that look good under inflated costs would look BETTER under real costs, not worse. The operator's "deliberate conservative overstatement" framing is correct.
+
+If the universe ever flips to long-vol (sell-side STT applies on EXIT premium, which is smaller for losing trades and larger for winning trades), the conservative direction would invert. But the current universe is uniformly short-vol; operator's choice is well-targeted.
+
+### Operator caveat is honest
+
+> "Every prior sweep result is now superficially 'wrong' — the existing `data/results/sweep_*.parquet` files were computed under the 0.0625% STT and will overstate net_pnl by ~₹23 per short straddle / similar per other strategies."
+
+Including the F11 baseline (`16277b27e2a8`). But:
+- **F11's audit verdict still holds** for what F11 audited (skip-taxonomy faithfulness, engine correctness). Costs are downstream of fills and don't affect skip semantics.
+- **Downstream analytics** (cell ROIs, heatmaps, Portfolio tab equity curves) on pre-Phase-8 parquets now overstate net_pnl.
+
+The recommended sequencing — land Phase-8 commits, then re-run before Portfolio tab consumes — is the right ordering. Operator should NOT re-run after each Phase-8 cost commit (wasted work); one re-run at the end of the cost-model changes is the right cadence.
+
+### Cross-reference to my perf merge ACK
+
+`9b6d236`'s content-equivalence assertion (`assert_frame_equal` PASSED across 1.1M rows) was for the PRE-STT-fix baseline. The perf work was content-equivalent; this commit explicitly is NOT content-equivalent (deliberate ROI change). The two don't interact incorrectly — perf was tested for behavior preservation; STT is tested for behavior delta (the hand-check fixtures).
+
+### Pytest
+
+```
+886 passed, 2 deselected, 1 warning in 34.32s
+```
+
+Same total as post-perf-merge. The cost/pnl test fixture pins were recomputed in lockstep (test_costs.py: STT-rate pins for both BUY-side and SELL-side cases; test_pnl.py: canonical RELIANCE pipeline assertion). No regressions.
+
+### Praises
+
+- **Decision provenance cited** — PORTFOLIO_MEMOIR.md §9 (decision) + §21.6 (build order). Operator can trace WHY 0.15%.
+- **Truthful gap explicit** — docstring says "post-2023 Finance Act statutory rate of 0.05%, which is the truthful figure for a real-money calculation." Future operator switching to live trading knows to use 0.05%.
+- **Direction-discipline applied** — overstating sell-side STT for short-vol universe is conservative. The framing makes this explicit.
+- **Operator-caveat honest** about prior sweep staleness; recommended sequencing prevents re-run thrash.
+- **Tests pinned in lockstep** — STT-rate pins updated for both BUY/SELL cases; canonical RELIANCE assertion recomputed.
+- **Math verified independently** — 2.4× ratio matches BUILDER's hand-check exactly.
+- **F11 verdict preserved** — costs are downstream of skip semantics; baseline trustable for what F11 audited.
+
+### Math
+
+- LOC: +28 / -21 = +7 net. ✓ Matches.
+- Test count: 886 (unchanged, fixture pins recomputed in place).
+
+### Behavior delta
+
+- Every sweep run under this commit (and later) charges 2.4× the prior STT.
+- Per short straddle: −₹23.30 net_pnl, −0.01 pp ROI.
+- Per other strategies: scales with sell-side premium notional.
+- F11 baseline (`16277b27e2a8`) is now superficially stale on cost-derived metrics; the audit verdict on skip semantics still holds.
+
+### State-of-tree
+
+- `main` HEAD: `23fb875`.
+- F1 → F10 + Grills #2-#6 all preserved.
+- Phase-2 perf gains (−40% wall-clock) preserved.
+- Phase-8 prereq #1 landed.
+- Operator should land remaining Phase-8 commits + re-run sweep once before Portfolio tab work.
+
+### Open grills (unchanged from main)
+
+- F11 + F12 silent-drops grill — STILL OPEN; should fold with the Phase-8 re-sweep cycle.
+- ~~F3 (expiry STT)~~ — semi-adjacent; this commit changed normal sell-side STT but F3 was about expiry-day physical-settlement STT (different code path). F3 remains open but less critical now that the operator is actively touching the cost model.
+- **NEW**: PORTFOLIO_MEMOIR.md §9 + §21.6 — operator's Phase-8 decision/build doc; reviewer hasn't read it yet (cross-referenced for context only).
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16. `data_quality` MCP tool surfaces costs but doesn't pin the rate; will reflect new STT on re-run.
+
+### Next-commit suggestion
+
+Per BUILDER's "land Phase-8 commits, then re-run sweep" sequencing:
+
+1. **Remaining Phase-8 commits** — India VIX loader, prefetch, regime per PORTFOLIO_MEMOIR.md §21.6 build-order.
+2. **🚩 Operator re-run sweep ONCE** at end of Phase-8 cost-model changes (before Portfolio tab consumes).
+3. **F11 + F12 silent-drops grill** — could fold with the re-sweep to keep planned-vs-recorded accounting tight.
+4. **Portfolio tab work** — consumes the fresh sweep.
+
+Migration cadence: **... → 🎉 Phase-2 perf merge ✓ → Phase-8 #1 (STT bump) ✓ → remaining Phase-8 (VIX + prefetch + regime) → operator re-sweep → silent-drops grill + Portfolio tab → ...**
+
+Standing by.
+
+---
