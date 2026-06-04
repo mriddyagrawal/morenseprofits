@@ -43,7 +43,7 @@ The operator asked: "what window do you use for IVP? is there a standard way?" H
 ### 2.1 The two terms operators often conflate
 
 - **IV (Implied Volatility)** — the volatility number that, plugged into Black-Scholes, makes the BS price match the actual market premium. Different at every strike (vol smile) and every expiry (term structure).
-- **IVP (Implied Volatility Percentile)** — for a chosen IV series, where does TODAY sit in its trailing-window history? E.g., "RELIANCE's 30D ATM IV today is at the 72nd percentile of its trailing-252-day history."
+- **IVP (Implied Volatility Percentile)** — for a chosen IV series, where does TODAY sit in its trailing-window history? E.g., "RELIANCE's 30D ATM IV today is at the 72nd percentile of its trailing 252-trading-day (≈ 1 calendar year) history."
 - **IV Rank** — tastytrade variant: `(IV_today − IV_min_52wk) / (IV_max_52wk − IV_min_52wk) × 100`. More volatile than IVP; common in retail tools.
 
 **For our portfolio strategy: use IVP, not IV Rank.** Percentile is more robust to single-day extremes (one COVID-day IV spike doesn't dominate the next 52 weeks of IV Rank readings).
@@ -63,14 +63,14 @@ Standard fix: **30-day constant-maturity ATM IV**, constructed daily, using **fo
 5. **Invert with Black-76 on F**, not Black-Scholes on spot+rate:
    - `C = exp(−r·T) · [F·Φ(d1) − K·Φ(d2)]` for calls
    - `d1 = (ln(F/K) + σ²·T/2) / (σ·√T)`, `d2 = d1 − σ·√T`
-   - Solve for σ via Newton-Raphson. Vega for Black-76: `exp(−r·T)·F·√T·φ(d1)`.
+   - Solve for σ via `brentq` on a `[1e-4, 5.0]` bracket — the Black-76 price is monotone in σ so the root is always bracketed and convergence is guaranteed (more robust than Newton-Raphson, which can stall in the deep-OTM flat-vega tail). See F3.
 6. **Linear interpolation in variance space** between the two used expiries to the 30-day target:
    - `var_30 = var_near × (DTE_far - 30) / (DTE_far - DTE_near) + var_far × (30 - DTE_near) / (DTE_far - DTE_near)`
    - `IV_30 = sqrt(var_30)`
 7. Methodology note: this interpolates **annualized σ²** linearly in DTE. CBOE VIX convention interpolates **total variance σ²·T** linearly in T. Sub-1% difference for ~28D + ~58D brackets; documented choice, not a bug.
 8. That's your single number for the day (per symbol).
 
-This gives one IV value per symbol per trading day. Across a year you have ~250 values per symbol. Then IVP = "where does today's value sit as a percentile of these trailing 252 values?"
+This gives one IV value per symbol per trading day. Across a year you have ~252 trading-day values per symbol. Then IVP = "where does today's value sit as a percentile of these trailing 252 trading-day values (≈ 1 calendar year)?"
 
 #### Why forward-based (not spot+rate)
 
@@ -108,7 +108,7 @@ Standard choices, with trade-offs:
 This is real infrastructure work, not a casual addition. The plan:
 
 **`src/engine/iv.py`** — new module:
-- `bs_implied_vol(premium, spot, strike, time_to_expiry, rate, option_type)` — Newton-Raphson root-finder on the Black-Scholes price. ~50 lines including the convergence guards.
+- `implied_vol_black76(call_px, forward, strike, T, rate)` — `brentq` bracketed root-find on the Black-76 price; `forward` comes from put-call parity (F2 step 1), so no `q`/dividend input is needed. ~40 lines including the no-arb guards. Validated reference impl: `scripts/research_iv_visualization.py`.
 - `compute_atm_iv(symbol, date)` — finds ATM strike on `date`, queries option premium from cache, inverts to IV. Returns NaN if premium is bad (zero volume, deep OTM, etc. — uses the Part A gates from `FILTERS.md`).
 - `constant_maturity_iv(symbol, date, target_dte=30)` — interpolates between bracketing expiries.
 
@@ -703,7 +703,7 @@ The operator clarified their original IVP-trap question — they were not descri
 
 | Operation | Construction | What it picks | In plan? |
 |---|---|---|---|
-| **A. Time-series IVP threshold filter** | Each stock's IV today ranked vs its OWN trailing 252-day history. Keep stocks above some absolute threshold (e.g., 60th percentile). | All stocks whose self-comparison clears the bar | ✓ v1 (e.g., "hold names above own 60th pct") |
+| **A. Time-series IVP threshold filter** | Each stock's IV today ranked vs its OWN trailing 252-trading-day (≈ 1 calendar year) history. Keep stocks above some absolute threshold (e.g., 60th percentile). | All stocks whose self-comparison clears the bar | ✓ v1 (e.g., "hold names above own 60th pct") |
 | **B. Rank-of-ranks (cross-section of TS-IVPs)** | Compute each stock's TS-IVP today. Then rank ALL stocks by their TS-IVP values. Take top-N. | The N stocks whose self-comparison is most extreme today | ✓ v1 — this IS what "top-5 by IVP" means after the threshold filter |
 | **C. Pure cross-sectional raw IV** | Today's raw IV across stocks; top stocks have highest raw IV. | High-vol stocks structurally (ADANIENT at 35% will always rank above HDFCBANK at 15%) | ✗ — bad signal, just sorts by structural vol |
 
@@ -783,13 +783,13 @@ Computed from the downloaded data. Each row references the formula in §21.4.
 | # | Quantity | Inputs | Formula ref | Where it lands |
 |---|---|---|---|---|
 | C1 | ATM strike per (symbol, expiry, date) | spot at date, available strikes from bhavcopy on date | F1 | reused from `src/strategies/_strikes.py::pick_nearest` |
-| C2 | Black-Scholes implied vol per (symbol, expiry, strike, type, date) | option premium, spot, strike, time-to-expiry, rate | F2 + F3 | new `src/engine/iv.py::bs_implied_vol` |
+| C2 | Black-76 implied vol per (symbol, expiry, strike, type, date) | call premium, parity-forward (F2 step 1), strike, T = dte/365, rate | F2 + F3 | new `src/engine/iv.py::implied_vol_black76` |
 | C3 | 30-day constant-maturity ATM IV per (symbol, date) | two bracketing-expiry ATM IVs from C2 | F4 | new `src/engine/iv.py::constant_maturity_iv` |
-| C4 | Time-series IVP per (symbol, date) | trailing 252 days of C3 values | F5 | new `src/analytics/ivp.py::time_series_ivp` |
+| C4 | Time-series IVP per (symbol, date) | trailing 252 trading days (≈ 1 calendar year) of C3 values | F5 | new `src/analytics/ivp.py::time_series_ivp` |
 | C5 | Cross-sectional rank of TS-IVPs (for top-N selection) | C4 across universe on day D | F6 | new `src/analytics/ivp.py::top_n_by_ivp` |
 | C6 | 21-day realized vol per (symbol, date) | trailing 22 daily closes from spot cache | F7 | new `src/analytics/realized_vol.py` (or reuse `src/engine/vol.py` with windowing) |
 | C7 | Average single-name realized vol (regime gate v1 proxy) | C6 averaged across universe on day D | F8 | new `src/analytics/regime.py::avg_single_name_rv` |
-| C8 | Regime gate signal (percentile rank of C7 or India VIX vs trailing 252) | C7 series or India VIX series | F9 | new `src/analytics/regime.py::regime_percentile` |
+| C8 | Regime gate signal (percentile rank of C7 or India VIX vs trailing 252 trading days) | C7 series or India VIX series | F9 | new `src/analytics/regime.py::regime_percentile` |
 | C9 | Earnings-event flag per (symbol, entry, exit) | events CSV from D4 | F10 | new `src/analytics/earnings_filter.py::has_earnings_in_window` |
 | C10 | Liquidity rank per (symbol, date) | trailing 21-day avg contracts traded from bhavcopy | F11 | new `src/analytics/liquidity.py` |
 | C11 | Per-trade net P&L | already implemented | — | `src/engine/pnl.py::price_trade` |
@@ -836,37 +836,34 @@ Where:
     d2 = d1 − σ·√T
 
 F = synthetic forward (from step 1), K = strike,
-T = time to expiry in years (252 TD per year), r = risk-free rate (use 0.065),
+T = time to expiry in years = (calendar days to expiry) / 365, r = risk-free rate (use 0.065),
 σ = volatility (the unknown), Φ = cumulative standard-normal CDF.
 ```
 
+**Day-count convention (corrected 2026-06-04, verified in `scripts/research_iv_visualization.py`):** `T` is *elapsed calendar time* to expiry, so it uses **calendar days / 365** — NOT trading-days / 252. The `252` clock belongs to two *different* quantities: the vol annualization `σ_annual = σ_daily·√252` (F7) and the IVP lookback window (F5). Keep them separate: `T` = calendar/365; vol-annualization & IVP-lookback = 252 trading days (≈ 1 calendar year). The numerical gap is tiny here (30 cal ≈ 21 td → 0.0822 vs 0.0833) but the conventions must not be conflated. The validated script uses `dte/365` throughout; production `iv.py` must match it.
+
 Why forward-based: per §2.2 — spot+rate inversion ignores dividends and borrow costs, both of which are real for single-stock options and hard to source per-stock-per-day in India. The synthetic forward IS observable in the option chain itself.
 
-**F3 — Newton-Raphson implied-volatility inversion (Black-76 vega)** *[REVISED 2026-06-04 — vega now consistent with the forward-based F2; was missing the discount factor and dividend term]*:
+**F3 — Black-76 IV inversion via a BRACKETED root-finder (`brentq`)** *[REVISED 2026-06-04 — switched from the Newton-Raphson sketch to `brentq` after `scripts/research_iv_visualization.py` validated it; round-trip recovers σ to ~1e-11]*:
 
 ```python
-def bs_implied_vol(market_price, forward, strike, T, r, option_type,
-                   sigma_init=0.30, tol=1e-4, max_iter=50):
-    """Black-76 IV inversion. `forward` is the synthetic F from F2 Step 1.
-    Vega is consistent with the F2 Black-76 price formula:
-        vega = exp(-r*T) * F * sqrt(T) * φ(d1)
-    Mis-matched vega (e.g. omitting exp(-r*T)) makes Newton-Raphson
-    over- or under-shoot and may fail to converge for r != 0.
+def implied_vol_black76(call_px, forward, strike, T, r):
+    """Black-76 ATM IV. `forward` is the synthetic F from F2 Step 1.
+    Returns annualized σ, or None on failure (below intrinsic / above
+    the no-arb upper bound / outside the [1e-4, 5.0] σ bracket).
     """
-    sigma = sigma_init
-    for _ in range(max_iter):
-        bs_price = black76(forward, strike, T, r, sigma, option_type)
-        d1 = (log(forward / strike) + sigma**2 * T / 2) / (sigma * sqrt(T))
-        vega = exp(-r * T) * forward * sqrt(T) * norm_pdf(d1)
-        diff = bs_price - market_price
-        if abs(diff) < tol: return sigma
-        if vega < 1e-8: break  # converged but not at solution; flag failed
-        sigma = sigma - diff / vega
-        if sigma <= 0: sigma = 1e-4  # clamp
-    return NaN  # failed to converge
+    if T <= 0 or call_px <= 0 or forward <= 0 or strike <= 0:
+        return None
+    intrinsic = max(0.0, exp(-r * T) * (forward - strike))
+    if call_px <= intrinsic + 1e-8:
+        return None                       # premium below intrinsic — stale/arb
+    if call_px >= exp(-r * T) * forward:
+        return None                       # above the no-arb upper bound
+    err = lambda sig: black76_call(forward, strike, T, sig, r) - call_px
+    return float(brentq(err, 1e-4, 5.0, xtol=1e-6, maxiter=64))
 ```
 
-For Indian stocks: `r = 0.065` (constant proxy for 91-day T-Bill / overnight rate). No `q` term needed — the forward absorbs all carry.
+**Why `brentq` over Newton-Raphson** (the validated choice): the Black-76 call price is monotone increasing in σ, so a fixed `[1e-4, 5.0]` bracket always contains the root and `brentq` is *guaranteed* to converge. Newton-Raphson with a bad initial guess can wander into the flat-vega (deep-OTM) tail and stall — the exact failure the earlier sketch risked. Invert the **call only** on the parity forward; put-call parity guarantees the put returns the same σ, so averaging CE/PE (the §2.2-step-3 plan) is unnecessary once the forward is correct. For Indian stocks: `r = 0.065`; no `q` term — the forward absorbs all carry.
 
 **F4 — 30-day constant-maturity ATM IV (linear in annualized variance, with near-expiry exclusion)** *[REVISED 2026-06-04 — added 7-DTE near-expiry exclusion + explicit interpolation-convention note]*:
 
@@ -1137,7 +1134,7 @@ def regime_x_ivp_breakdown(trades_df, regime_signal_series, ivp_series_per_symbo
 
 Per the other reviewer's caveats: judge each bucket by both median AND tail (CVaR-5% column above), use constant-maturity IV upstream so deciles aren't sorting on DTE, switch to quintiles if any bucket has < ~50 trades.
 
-**⚠ Look-ahead caveat on `qcut`** *[ADDED 2026-06-04]*: `pd.qcut(...)` here computes decile boundaries from the **full retrospective sample** — that's fine for THIS retrospective diagnostic (we WANT to see how trades grouped by their TRUE IVP percentile performed). But the resulting boundaries **MUST NOT** be used for LIVE trade selection. Live filtering needs **trailing-only** quantile boundaries (e.g., at each cycle entry, compute deciles from the trailing 252 days of cross-sectional IVP values, then bucket today's candidates against those trailing-window boundaries). Using full-sample boundaries live = peeking at future periods = backtest fraud. The diagnostic and the filter are two different operations; the formula above is the diagnostic version only.
+**⚠ Look-ahead caveat on `qcut`** *[ADDED 2026-06-04]*: `pd.qcut(...)` here computes decile boundaries from the **full retrospective sample** — that's fine for THIS retrospective diagnostic (we WANT to see how trades grouped by their TRUE IVP percentile performed). But the resulting boundaries **MUST NOT** be used for LIVE trade selection. Live filtering needs **trailing-only** quantile boundaries (e.g., at each cycle entry, compute deciles from the trailing 252 trading days of cross-sectional IVP values, then bucket today's candidates against those trailing-window boundaries). Using full-sample boundaries live = peeking at future periods = backtest fraud. The diagnostic and the filter are two different operations; the formula above is the diagnostic version only.
 
 ### 21.5 The India VIX research prompt (saved for posterity)
 
@@ -1181,12 +1178,12 @@ For 2-3 representative stocks (suggest RELIANCE, PNB, HDFCBANK — spanning low/
 
 1. **Pull data**: bhavcopy F&O cache → ATM call + put premium per (date, expiry) for the last ~6 months.
 2. **Extract forward** per (date, expiry) via F2 step 1 (PCP at ATM).
-3. **Invert IV** per (date, expiry) via F3 (Black-76 Newton-Raphson).
+3. **Invert IV** per (date, expiry) via F3 (Black-76, `brentq` bracketed root-find).
 4. **Build four time series** for each stock, on the same axes:
    - **Series A**: front-month ATM IV (raw, no exclusion — includes the 1-DTE spikes)
    - **Series B**: 30D constant-maturity IV including all bracketing expiries (the naive version)
    - **Series C**: 30D constant-maturity IV with 7-DTE exclusion (the methodology in F4)
-   - **Series D**: Series C's trailing-252-day IVP (rank, 0-100)
+   - **Series D**: Series C's trailing-252-trading-day (≈ 1 calendar year) IVP (rank, 0-100)
 5. **Vertical markers** at each monthly expiry date.
 
 ### 22.2 What we're looking for
@@ -1203,11 +1200,35 @@ For 2-3 representative stocks (suggest RELIANCE, PNB, HDFCBANK — spanning low/
 
 You CANNOT decide this from first principles — only from the chart. **Build the notebook before the materializer.**
 
+**RESOLVED 2026-06-04 (see §22.5):** built + run + reviewed. Series B shows clear near-expiry divergence from C that C does not have → **the 7-DTE exclusion is load-bearing; commit to it in F4 (Series C).**
+
 ### 22.4 Build cost
 
 ~1 day. ~150 lines of notebook code. Throwaway artifact, but the decision it surfaces is permanent.
 
 Optionally promote to a permanent Inspect-tab page later if the visualization stays useful for ongoing per-symbol drilldown.
+
+### 22.5 Validation results — BUILT + RUN + reviewer-verified *[ADDED 2026-06-04]*
+
+Built as `scripts/research_iv_visualization.py` (not a notebook) and run on RELIANCE / PNB / HDFCBANK over the last ~6 months → `scripts/research_iv_<SYMBOL>.png`. The script **upgraded over the F2/F3 sketch** in three ways the reviewer confirmed are improvements (now back-ported into F2/F3 above):
+- **`brentq` bracketed root-find** instead of hand-rolled Newton-Raphson (can't stall in the flat-vega tail).
+- **Put-call-parity synthetic forward + Black-76**, inverting the **call only** (parity guarantees equal call/put σ) — no dividend/`q` input needed.
+- **`T = dte/365`** (calendar) throughout — consistent with the corrected day-count note under F2.
+
+**Formula correctness — round-trip verified (reviewer, 2026-06-04):** price a Black-76 call at a known σ → recover the forward **exactly** (incl. the F≠K dividend/carry case) and σ to **~1e-11**. The three core functions (`bs76_call_price`, `extract_forward_via_parity`, `implied_vol_black76`) are correct.
+
+**Empirical finding (the 3 PNGs) — answers §22.3:**
+- **A (front-month, red)** — spikiest; sharp jumps clustered at the monthly-expiry verticals (the 1-DTE vega collapse). Conflates DTE artifact with vol regime → unusable as a signal.
+- **B (30D CMI, no exclusion, orange)** — tracks C most days but is visibly **yanked toward the dying front contract near expiries** (diverges from C exactly at the verticals).
+- **C (30D CMI + 7-DTE exclusion, blue)** — smooth across expiry transitions; the regime-faithful level series. **This is the IV level to use.**
+- **D (trailing-252-TD IVP of C, green)** — pins near 100 during the clear Feb→Apr IV uptrends (correct), oscillates 0–100 by construction. **This is the filter signal you threshold on.** Caveat: D is jumpy day-to-day (percentile transform amplifies small level moves) → sample it once at **cycle entry** (the monthly cadence already does this); never use it as a continuous/daily signal.
+
+**Decision (now locked): ship C → D. The 7-DTE exclusion is load-bearing, not hygiene.** `scripts/research_iv_visualization.py` is the **validated reference implementation** — production `src/engine/iv.py` + `iv_materializer.py` must mirror its brentq + parity-forward + `dte/365` construction (NOT the older Newton/spot-BS phrasing that lingered in earlier drafts).
+
+**Minor carry-forward notes (non-blocking, for the materializer build):**
+- `trailing_ivp` NaN-on-today already guarded (F5); the script does the same via the self-excluded `(Σ≤today − 1)/(N − 1)` percentile.
+- `constant_maturity_iv` returns NaN if fewer than 2 expiries survive the 7-DTE cut (only ~2 monthlies listed) — rare on NSE; surface as a `status` reason in the IV cache.
+- IVP needs **≥ 252 trading days** of prior IV history → the IV cache must start ≥ ~1 calendar year before any backtest date or early IVP is NaN.
 
 ---
 
