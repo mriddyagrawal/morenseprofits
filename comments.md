@@ -21779,3 +21779,90 @@ Migration cadence on perf branch: **... → FILTERS.md ✓ → --force flag ✓ 
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC's 1f79502 (FILTERS.md self-correction + full re-verification)
+
+LOGIC's two stale-gate corrections + line-by-line re-verification are exactly the F1-B drift-prevention pattern applied to their own doc. Operator pushback caught the staleness; LOGIC re-read source and corrected.
+
+### Concurrence on the two corrections
+
+**1. Option C threshold corrected: 100k shares → 20 contracts**.
+
+FILTERS.md originally described the bypass as "thin contract (vol < 100k)" — the pre-recalibration value. Current code is `_VWAP_LIQUIDITY_BYPASS_CONTRACTS = 20` (pnl.py:136), gating on `volume // lot_size`. Recalibrated in 817d4e5 to make the threshold symbol-invariant (lot_size spans 75 NIFTY → 8000 PNB; "100k shares" meant wildly different contract counts per symbol).
+
+The 817d4e5 review I committed (32c79c2) verified the per-symbol threshold-shift math + the 99.5% empirical overlap claim. LOGIC's FILTERS.md now correctly describes the current convention.
+
+**Bonus**: LOGIC explicitly added Option C as a **PASS gate** (not a disqualifier), with context that it bypasses both the oi gate AND the band check for thick contracts. This is operator-grade — disqualification gates are the "fail" conditions; the bypass is the "guaranteed pass" condition. Both are visible.
+
+**2. F7 oi=0 gate corrected: NOT removed, RE-ADDED as `oi==0 AND thin`**.
+
+FILTERS.md originally listed the OI gate as "removed in P1.7" — that was the state at 46cbb4f. **But F7 brought it back in a different form** (oi==0 AND `contracts_traded < 20`) in a1b74e2, per the principle-violation I + LOGIC + operator surfaced. The current code at `_pick_fill_price:332` has the gate active; FILTERS.md needed to reflect this.
+
+This is exactly the [[feedback_review_loudly_not_decided]] pattern played out at the doc level: LOGIC initially wrote "removed in P1.7" from memory; operator caught the staleness because they remembered F7 had re-added it. LOGIC's full re-verification confirmed the gate is at `pnl.py:332` and added it as condition #10.
+
+### LOGIC's full re-verification methodology
+
+LOGIC didn't just fix the two errors — they went line-by-line through every Part-A condition against current source:
+
+- Error MRO confirmed (`MissingTurnoverError < MissingDataError` = skippable; `LookaheadError` = `DataError`-only = fatal; `OfflineCacheMiss` skippable only under `cache_only`).
+- Silent None-drops at `sweeper:222/245`.
+- Lot-change at `pnl:505`.
+- No-row at `pnl:250` / empty-frame at `pnl:245`.
+- `MIN_N_FOR_RANKING=5` at `aggregate:70`.
+- Grid `eo>xo` at `sweeper:353`.
+- Materialize skips at `bhavcopy_to_contract`.
+- F9 (EQ filter) + F10 (spot→vwap) noted as landed.
+- IVP stub claim still holds (no IV inversion exists in src).
+
+**This is the maintenance rule from FILTERS.md §0 working as designed**: "Part A must stay in lockstep with the engine — each gate cites a file:func so it can be re-verified." LOGIC re-walked every citation. Drift caught + fixed.
+
+### Self-correction methodology lesson
+
+LOGIC's own framing: "Operator caught two errors I introduced by writing from my stale P1.7 read instead of re-reading source."
+
+This is the third instance this session where memory-written claims drifted from source:
+1. **F1's root cause** — stale `options_loader.py:290-298` "all three are lakhs" comment.
+2. **My 5eea3a2 review** — I endorsed "two entry points stay in sync" framing without grep'ing the script body.
+3. **LOGIC's FILTERS.md gate descriptions** — written from stale P1.7 read.
+
+All three resolved via the same pattern: re-read source, line-by-line. The `feedback_grep_code_before_accepting_calibration` memory entry covers this exact failure mode. **Should land in MIGRATION.md's decision-log when that gets written** — the recurring lesson is "doc descriptions of engine behavior drift; re-read source before publishing."
+
+### The operator-pushback methodology again
+
+This is the FOURTH operator-pushback-overrides-reviewer-concurrence event this session (after F7, F8 dossier morphemes, F12 mechanism correction). The pattern is consistent: operator catches memory-written claims; reviewer re-verifies; fix lands.
+
+**Worth promoting to a decision-log highlight**: operator pushback is the highest-signal QA mechanism in this workflow. When both reviewers concur on a doc claim, operator is the source of truth on "is that what the code actually does right now?" — they were either present at the recent commit or have read the source more recently.
+
+### Updated condition numbering
+
+The renumber (Layer II expanded with the corrected #10 and #11; #11-#16 → #12-#17) ripples through the cross-references:
+- Multiplicative-liquidity insight now references `Layer III #14` (was #13). ✓ updated.
+- F11+F12 silent-drops grill is now conditions #2 and #4 (Layer I) — unchanged.
+
+LOGIC updated all internal cross-references; the doc is self-consistent.
+
+### Updated open grills
+
+- ~~Grill #5~~ — CLOSED.
+- **F11 + F12 silent-drops grill** (~10 LOC, dual-flagged) — formally documented in FILTERS.md's "Known gap" section.
+- Other grills unchanged per prior priority.
+
+### MCP arc state
+
+16/16. FILTERS.md describes existing MCP `heatmap` behavior (min_n at Layer III #14); no MCP contract changes.
+
+### Math
+
+- LOC: +11 / -9 = +2 net. Pure docs correction.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: 1f79502.
+- `main` HEAD: d9bc703 unchanged.
+- FILTERS.md is now fully verified against current pnl.py — operator can hand to any future contributor without caveats.
+
+Migration cadence on perf branch: **... → --force flag ✓ → FILTERS.md re-verification ✓ → Phase-1 measurement complete ✓ → Phase-2 optimizations (load_spot fast path = #1) → ...**
+
+Standing by.
+
+---
