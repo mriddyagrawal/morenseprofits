@@ -23765,3 +23765,141 @@ Migration cadence: **... → P9 #0 events loader ✓ → research_iv ref-impl ch
 Standing by.
 
 ---
+
+## Review of 68c5c2d — `feat(p9.1.engine.iv)` Black-76 + parity + brentq — ✅ ACCEPT (math independently verified to floating-point precision)
+
+**Verdict: ✅ ACCEPT.** Clean, spec-matched implementation of memoir §21.4 F2 + F3. All four math claims (parity holds, round-trip recovery, no-arb bound rejection, composed-flow recovery) independently reproduced to floating-point precision. 18/18 IV tests pass; full suite 965+ passed. The None-vs-NaN API choice — which I flagged as drift in f126fa6 GRILL 3 — is now resolved differently than I suggested but better-justified than my proposal: BUILDER kept None with an explicit "NaN silently propagates through `mean`/`std`/reductions; None forces explicit handling" rationale. That's a sound argument and I accept it as RESOLVED.
+
+This is the kind of math-heavy commit where the LOAD-BEARING test annotations + hand-derived expected values are the entire defense surface. BUILDER nailed it.
+
+### Independent math verification (all reproduced locally)
+
+```
+ATM 30D 20vol call price:       2.274964   (BUILDER's hand-check: ~2.276, abs=0.01)  ✓
+Put-call parity gap:            5.68e-14   (test tol abs=1e-9, 4 orders below)        ✓
+Round-trip σ recovery:
+    σ_in=0.10 → σ_out err = 3.05e-11
+    σ_in=0.20 → σ_out err = 9.77e-10
+    σ_in=0.30 → σ_out err = 7.40e-09
+    σ_in=0.50 → σ_out err = 9.44e-08
+    σ_in=1.00 → σ_out err = 1.45e-10                                                    ✓
+Composed (extract F → invert IV):
+    F_ext = 1010.0000000000 (true 1010.0)                                                ✓
+    σ_recov = 0.2799999999 (true 0.28, err ~1e-10)                                       ✓
+Degenerate-input None handling:
+    Below intrinsic 9.50 vs intrinsic 9.9467 → None                                      ✓
+    Above upper 110 vs upper 109.4139 → None                                             ✓
+```
+
+**Memoir §22.5 claim "round-trip recovers σ to ~1e-11" refined empirically**: tight (3e-11) at small σ=0.10; loosens to 9e-8 at σ=0.50; both well below market-pricing resolution. Effectively exact for production use. (This is the §22.5 evidence my f126fa6 review couldn't reproduce because the source notebook was untracked; now confirmed from BUILDER's code.)
+
+### Spec match (vs PORTFOLIO_MEMOIR.md §21.4 F2 + F3 post-9690656)
+
+**F2 — Forward-based pricing**: BUILDER implements `bs76_call_price` + `bs76_put_price` with standard Black-76 formulas:
+- d1 = [ln(F/K) + σ²·T/2] / (σ·√T) ✓
+- d2 = d1 - σ·√T ✓
+- C = e^(-rT) · [F·N(d1) - K·N(d2)] ✓
+- P = e^(-rT) · [K·N(-d2) - F·N(-d1)] ✓
+
+Verified analytically: parity (C-P = e^(-rT)·(F-K)) follows from N(d) + N(-d) = 1; the test at `tests/test_engine_iv.py:42-50` pins it.
+
+**F2 step 1 — Synthetic forward via parity**: `extract_forward(c, p, K, T, r) → K + (C-P)·e^(rT)` ✓ matches spec verbatim.
+
+**F3 — brentq IV inversion**: `_solve_iv` shared internal:
+- Bracket [1e-4, 5.0] ✓ matches spec
+- xtol=1e-6, maxiter=64 ✓ matches spec
+- Intrinsic guard `market_px <= intrinsic + 1e-8` ✓
+- Upper guard `market_px >= upper - 1e-8` ✓ (slightly tighter than spec's `>=`; defensive)
+- All degenerate inputs (T≤0, market_px≤0, F≤0, K≤0) → None ✓
+- ValueError + RuntimeError from brentq → None ✓
+
+**Extension over spec**: BUILDER added `implied_vol_put` symmetrically via the same `_solve_iv` path with `side="put"` differentiation for intrinsic + upper bounds. Spec only specified call-side. The extension is correct (put intrinsic = e^(-rT)·max(0,K-F); put upper = e^(-rT)·K) and the load-bearing call-IV == put-IV parity test (`test_implied_vol_put_recovers_same_sigma_as_call_under_parity`) pins it.
+
+### Praise points
+
+- **Symmetric call + put inversion via `_solve_iv` shared internal** — call and put can't drift apart on future refactors. The `side: str` parameter cleanly differentiates intrinsic + upper bounds.
+- **`None` over `NaN` is justified with explicit rationale** (module docstring lines 57-60): "NaN propagates silently through `mean`/`std`/most numpy reductions, hiding the 'couldn't invert this' signal. `None` forces the caller to handle it explicitly." This is a SOUND engineering argument — silent NaN propagation is the exact failure mode that caused multiple regression-detection issues in prior phases. **This RESOLVES f126fa6 GRILL 3** with better reasoning than my suggestion (to change F3 to return NaN). Materializer commit (next) must handle the None→NaN translation at the cache boundary; flag for that review.
+- **Tight no-arbitrage gates BEFORE brentq** — the docstring explicitly notes "notebook's brentq fall-through on these was working but masked the structural reason for failure." This is the right discipline; fail-fast on structural conditions, don't lean on the solver.
+- **`warnings.catch_warnings()` scoped to brentq call** — silences brentq's noisy RuntimeWarning without affecting global warning state. Correct scoping.
+- **Hand-derived ATM 30D 20vol pin** (`test_bs76_call_price_atm_30d_20vol_pins_a_known_value`) — provides a manual reference point that any d1/d2 typo would break. The test docstring carries the full derivation; future maintainer can verify by hand.
+- **LOAD-BEARING parity test** (`test_bs76_put_call_parity_holds`) at floating-point precision (abs=1e-9). Any d1/d2 sign error would break it loudly.
+- **Round-trip across 5 σ orders** (0.10 to 1.00) at ATM 60D — exercises the bracket across realistic vol range; my reproduction confirms accuracy across the whole range.
+- **OTM + ITM round-trips separately** (`test_implied_vol_call_otm_round_trip`, `test_implied_vol_call_itm_round_trip`) — different d1/d2 paths (asymmetric N values) verified independently.
+- **All 5 None-return paths tested**: T≤0, market_px≤0, below intrinsic, above no-arb upper, negative F or K. Defensive surface is fully covered.
+- **End-to-end composed test** (`test_full_flow_parity_forward_then_iv_inversion`) — exactly the kernel the materializer will invoke per (symbol, date, expiry). If the materializer plumbs through this kernel correctly, IV cache values will be honest.
+- **T = calendar/365 pinned in module docstring** (lines 30-35) — and explicitly separated from realized-vol √252 convention. Resolves the 252-vs-365 confusion that bit F2 in the pre-9690656 spec.
+- **Bracket reasoning documented** (lines 71-73) — "0.01% lower lets us catch obviously low-vol mispricings (numerical artifacts only); 500% upper covers any blow-up vol seen in Indian single-name options historically." Justifies the choice empirically, not as magic numbers.
+- **Module-scope constants** for bracket + xtol + maxiter (lines 74-82) — single source of truth, refactor-friendly.
+
+### ⚠️ STANDING CONCERN (continued — escalating urgency)
+
+This commit cites `scripts/research_iv_visualization.ipynb cells 8-9` as the prototype source. That's the THIRD consecutive commit (9690656, 182cf1d, 68c5c2d) that builds production code from the SAME untracked .ipynb. Per [[feedback_reviewer_calibration]] — cumulative drift, escalating.
+
+f126fa6 GRILL 1+2 (track .ipynb + regenerate 3 PNGs) is now load-bearing for the provenance trail of:
+- §22.5 F2/F3 validation (memoir cite)
+- has_earnings_in_window (events_loader prototype source)
+- bs76_call_price + extract_forward + implied_vol_call (this commit's prototype source)
+
+Three independent production code paths depend on the same untracked file. If the operator loses it, all three lose their provenance. **The chore commit to track the .ipynb + embed PNGs is no longer optional.**
+
+### Tiny inconsistency (NOT a grill)
+
+BUILDER's commit body claims "Full suite: 965 passed (+18)". My local run: 966 passed (`966 passed, 3 deselected, 1 warning`). Delta of 1.
+
+Most likely explanation: a test that was previously deselected on BUILDER's machine (e.g., due to missing spot cache for RELIANCE 2024) runs on mine because the operator's cache state differs. The `UserWarning: [spot_loader] cache miss, fetching from NSE: RELIANCE 2024` in the output suggests a cache-state-dependent test counted differently.
+
+Not a correctness issue — just a count drift. Doesn't affect verdict.
+
+### Math + arithmetic verification
+
+- LOC: 211 (iv.py) + 243 (test_engine_iv.py) = +454 net. ✓ Matches `git show --stat`.
+- Tests: 947 → 965 (per BUILDER) / 966 (per my local). 18 new IV tests. ✓ Per-file count matches.
+- 18/18 IV tests pass; 18 + 23 (regime) + 21 (events) + 15 (vix loader) = 77 portfolio-related tests on main, all green.
+
+### State-of-tree
+
+- `main` HEAD: `68c5c2d`.
+- `src/engine/iv.py` — new module, 211 LOC; pure-arithmetic, no I/O.
+- Phase numbering: P9.0 events_loader → P9.1 engine.iv. Build-order: P9 = Portfolio tab. Memoir §17.6 says P8 for events; PLAN.md (not visible to me) presumably renumbered to P9.
+- `scripts/research_iv_visualization.ipynb` STILL UNTRACKED. Now load-bearing for THREE production code paths.
+
+### Open grills (cumulative)
+
+- **STANDING — f126fa6 GRILL 1** (research_iv .ipynb untracked) — urgency at MAX; tracking the .ipynb is now required-not-optional discipline before the materializer lands.
+- **STANDING — f126fa6 GRILL 2** (3 PNGs missing for §22.5 evidence) — same chore.
+- ~~**STANDING — f126fa6 GRILL 3** (F3 None→NaN)~~ — **RESOLVED via documented rationale**; BUILDER kept None with explicit silent-NaN-propagation argument. Sound engineering. Materializer commit must handle None→NaN at cache boundary; flag for that review.
+- **NEW — 68a97a7 grill 1** (events_loader SYMBOL case-norm asymmetry) — STILL OPEN; tiny.
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required for this commit. The IV engine is pure-arithmetic + no-I/O; the materializer (next) will plumb cache reads + writes around it.
+
+**Watch for the materializer commit**: must translate `None` → `NaN` (or `float("nan")`) at the IV cache write boundary, so downstream `time_series_ivp` (F5) and `regime_percentile` (F9) — which use NaN convention — operate on the right type. BUILDER signaled this is the plan; will verify at the next review.
+
+### Next-commit suggestion
+
+Two paths, BOTH live:
+
+**A. (Recommended)** `chore(p8.research.track_research_iv_ipynb)` — close f126fa6 GRILL 1+2 in one commit:
+1. Re-execute `scripts/research_iv_visualization.ipynb` with embedded PNG outputs.
+2. Track it in git.
+3. Patch memoir §22.5 `.py` → `.ipynb` references.
+
+This is now LOAD-BEARING discipline: three production code paths cite this .ipynb as canonical prototype; provenance trail can't depend on an untracked artifact.
+
+**B.** `feat(p9.1.iv_materializer)` — per BUILDER's "Next:" footnote. Builds the per-symbol 30D CMI history on top of `iv.py`. The natural progression.
+
+Per [[feedback_next_commit_suggestion]]: A de-risks the biggest unknown (citation drift compounding across 3 commits); B is BUILDER's stated plan. The right move is **A → B**, NOT **B**, since the materializer will be the FOURTH commit citing the untracked .ipynb if A is deferred again.
+
+Per [[feedback_reviewer_calibration]]: f126fa6 GRILLs 1+2 have been OPEN through 3 commits now. Cumulative escalation. NOT softening.
+
+Migration cadence: **... → P9 #1 engine.iv ✓ → research_iv ref-impl chore (HIGH PRIORITY) → P9 #1b iv_materializer → P9 #1c ivp/F5 wire → Portfolio tab → ...**
+
+Standing by.
+
+---
