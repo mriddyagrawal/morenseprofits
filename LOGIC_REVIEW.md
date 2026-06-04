@@ -411,6 +411,40 @@ Wide grid: 50 sym × 3 strat × 25 exp × 600 (entry>exit) pairs = 2,250,000 pla
 ### OVERALL VERDICT: ✅ TRUSTABLE as the Phase-7 baseline — no re-run needed.
 All four logged skip classes verified faithful (engine reads real data; zero masking bugs); the 50.9% skip rate and IC/SS spreads are liquidity-geography artifacts of a wide grid under VWAP-or-skip, not defects. Single blemish: 768 silently-dropped cells (0.034%) — a logging-completeness ⚠️ grill, not a correctness issue; downstream analytics on the priced rows are sound. Headline counts are **not comparable to sidecar-only baselines** (4.7× more contracts materialized) — operator caveat for any cross-sweep comparison.
 
+## F12 — Why heatmaps empty out far-from-expiry (BAJAJFINSV case) + COMPLETE disqualification checklist
+
+**Case:** BAJAJFINSV short_strangle (sweep `16277b27e2a8`) — operator saw the deep region (entry T-31+) mostly black. **Not a bug.** Grid is contiguous (entry 1–45, exit 0–15); sweep has **23 usable expiries** (not 25). Priced-expiry count per entry_offset decays with depth: T-1..T-21 = 23, T-26 = 13, T-29 = 8, **T-31 = 4, T-32 = 3, T-33 = 6, T-34 = 4**, T-40 = 0. `min_n=5` masks any cell with <5 priced expiries → the whole T-31/T-32/T-34+ rows go black; **T-33 fills only because it cleared 6 ≥ 5** (threshold noise, not structure). MCP `heatmap` tool: BAJAJFINSV strangle **376/672 cells visible (56%)** vs **SBIN 600/720 (83%)**. Deep-region (entry≥T-25) skips = **86% MissingTurnoverError** (OTM legs *materialized but zero-volume* that far back), 10% OfflineCacheMiss, 3% MissingData. Drill (entry T-35/exit T-5): 3 priced / 22 skipped → masked; e.g. `BAJAJFINSV 2024-06-27 1640-CE … turnover=0.0, volume=0` 35 td before expiry.
+
+**Mechanism:** a strangle prices only if **both OTM legs have non-zero volume on BOTH entry AND exit days = 4 independent liquidity conditions** (condor = 8). Far from expiry, each OTM leg-day's P(liquid) is low; the 4-way AND crushes it; then you still need ≥5 of 23 expiries to clear or the cell is masked. SBIN's top-tier options liquidity keeps OTM legs trading at T-40+ (14–20 expiries clear); BAJAJFINSV (mid liquidity) drops below 5 by ~T-31. **So yes — for mid-liquidity names, strangles 30–40 td before expiry are genuinely rare; for SBIN/INFY they're common.** Symbol-dependent, by design.
+
+### COMPLETE disqualification checklist — every way a planned cell fails to show a value
+**(I) Pre-pricing (`sweep_one`):**
+1. entry/exit date resolution `offset_trading_days` cache-miss → `OfflineCacheMiss` (cache_only). *[logged]*
+2. entry spot missing — `load_spot(entry).empty` → **`return None`, SILENT (neither parquet)**; spot cache-miss → `OfflineCacheMiss`. *[silent / logged]*
+3. no OPTSTK chain for (sym,expiry) on entry-day bhavcopy → `NoLiquidStrikeError`; entry bhavcopy uncached → `OfflineCacheMiss`. *[logged]*
+4. strategy returns no trades → **`return None`, SILENT.** *[silent]*
+
+**(II) Per-leg pricing (`price_trade`→`_price_one_leg`, EACH leg: strangle 2, condor 4):**
+5. contract parquet absent (never materialized) → `OfflineCacheMiss`. *[logged]*
+6. contract exists but **no row on entry OR exit date** → `MissingDataError` ("no traded row"). *[logged]*
+7. empty frame → `MissingDataError` ("empty frame"). *[logged]*
+8. **zero/missing turnover OR volume on entry OR exit day** → `MissingTurnoverError`. ← *dominant far-from-expiry killer* *[logged]*
+9. recovered premium VWAP ≤ 0 (deep-OTM ill-conditioning) → `MissingTurnoverError`. *[logged]*
+10. thin contract (vol < 100k) with VWAP outside [0.5×,2×] close band → `MissingTurnoverError`. *[logged]*
+11. lot_size changed entry→exit (split/bonus/merger) → `MissingDataError` ("lot_size changed mid-contract"). *[logged]*
+12. duplicate-date row, OR frame rows past exit_date → `LookaheadError` → **FATAL (aborts sweep, not a skip)**. *[fatal]*
+13. *(removed in P1.7: the old `oi==0` IlliquidLegError gate no longer disqualifies.)*
+
+**(III) Post-pricing aggregation (heatmap render):**
+14. cell has **< min_n (5) priced expiries → MASKED** (black even though some trades priced). ← *what blacks out BAJAJFINSV's deep region*
+15. invalid pair `entry_offset ≤ exit_offset` → never planned (the upper-left black triangle).
+
+**(IV) Upstream (materialize-time — these CAUSE #5's OfflineCacheMiss):**
+16. contract `contracts==0` on every cached day (never traded) → not materialized.
+17. lot_size excluded (cross-source mismatch) → not materialized.
+
+The far-from-expiry emptiness is **#8 × (4 leg-days) → then #14 (<5 of 23)**. Operator caveat: an empty deep cell means "the OTM legs didn't trade that early," not "the strategy lost money" — absence ≠ loss.
+
 ### STATUS (as of `46cbb4f`, P1.7 shipped)
 **Correctness: all clear.** F1/F1-B/F2/F5/F6 closed; coverage bug (`6bc95e9`) fixed; P1.7 VWAP-or-skip shipped + verified; both reviewer streams converged. **Operator action required for the webapp to be "true & best" under P1.7: re-prefetch + re-sweep** (current displayed parquet is pre-P1.7). ### 🚩 PRE-RE-SWEEP GOTCHA (operator about to wipe cache + re-prefetch + re-sweep)
 - **`run_id` is a deterministic hash of the grid; `sweep_grid` returns the cached parquet when `path.exists() and not force` ([sweeper.py:297](src/engine/sweeper.py#L297)); `p7_wide_sweep.py` runs `force=False`; and `data/results/` is NOT under `data/cache/`.** ⟹ wiping the cache does NOT remove `data/results/sweep_*.parquet`, so a same-grid re-run **silently returns the stale pre-P1.7 parquet** instead of re-pricing. **Operator MUST `rm data/results/sweep_*.parquet` (main + `_skipped`) or pass `force=True`** or the entire re-sweep is a no-op returning old data.
