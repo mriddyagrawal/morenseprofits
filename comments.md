@@ -23475,3 +23475,107 @@ Migration cadence: **... → P8 #4 regime ✓ → 9690656 IV-script docs (⚠️
 Standing by.
 
 ---
+
+## Review of c75ff3b — `fix(p8.data.india_vix_loader.csv_true)` + smoke notebook — ✅ ACCEPT (real bug caught by ground-truth contact)
+
+**Verdict: ✅ ACCEPT.** Excellent ground-truth-discovered correctness fix. NSE silently caps `/api/historicalOR/vixhistory` JSON responses at 70 rows without the `csv=true` query flag — operator caught it visually ("are you sure it works?"), BUILDER probed empirically, dug up the flag, fixed with a 1-key param addition + 3 comment blocks documenting the load-bearing trick. Independently reproduced from operator's on-disk cache (exact match) and full suite stays at 926 passed.
+
+This is the kind of commit [[feedback_verify_downloads]] is built for: NSE data fetch paths are the highest-bug-density area; the only way to catch silent failure modes is ground-truth contact. BUILDER did it right and the operator's instinct ("are you sure it works?") was the right pull.
+
+### Independent reproduction from operator's on-disk cache
+
+```
+$ test -f data/cache/india_vix.parquet && python -c "..."
+rows: 1090
+date range: 2022-01-03 → 2026-05-29
+rows per year:
+  2022    248
+  2023    246
+  2024    248
+  2025    249
+  2026     99
+```
+
+**Exact match with BUILDER's commit-body claims** (1090 / 248-246-248-249-99). The operator's cache has already been regenerated post-fix, so no operator-action grill needed — the displayed-data-now-stale concern ([[feedback_irreversible_engine_invalidates_displayed_data]]) is closed in-band.
+
+Cross-check: 248+246+248+249+99 = 1090. ✓ Arithmetic. Yearly rows match ~NSE-trading-days-per-year (~250 - holidays). 2026 partial through May 29 ≈ 100 TDs, observed 99. ✓ Physical.
+
+### Pytest verification (independently re-run)
+
+```
+.venv/bin/python -m pytest tests/test_india_vix_loader.py -q
+15 passed, 1 deselected in 0.10s
+
+.venv/bin/python -m pytest -q
+926 passed, 3 deselected, 1 warning in 32.36s
+```
+
+`csv=true` is invisible to the existing test fixtures: the boundary they monkeypatch is `session.get` / the `_session`-level mock, NOT `_fetch_chunk`. So adding a query param flows transparently through the mock. BUILDER's claim that "the param addition is invisible to test fixtures" is correct.
+
+### Code change is minimal + surgical
+
+`src/data/india_vix_loader.py` delta (verified via diff):
+- `_fetch_chunk` params dict: 2 keys → 3 keys (added `"csv": "true"`).
+- 3 docstring/comment blocks updated with operator-verified provenance tag (2026-06-04).
+- `_MAX_CHUNK_DAYS` stays at 365 (still the actual API-accepted max).
+- No other behavioral change.
+
+LOC: +20 / -2 = +18 net in the loader; +488 LOC for the .ipynb. Matches `git show --stat`.
+
+### Praise points
+
+- **Ground-truth-discovered bug**: NSE's silent 70-row cap is exactly the kind of failure mode [[feedback_verify_downloads]] warns about (data fetch paths = highest-bug-density). Caught by running the pipeline, not by static review. BUILDER's empirical probe table (`365→70, 180→70, 90→59, 60→39`) is the clean-room evidence.
+- **`csv=true` is a load-bearing misnomer** — the comments explicitly call out "the flag name is misleading — it toggles cap-bypass, not response format". Future maintainer can't accidentally remove the flag thinking it's a JSON/CSV format toggle.
+- **Operator-verified provenance tag** (`2026-06-04`) ties the trick to the empirical session. Audit trail.
+- **Module-level + function-level docs both flag the trick** — defense in depth so a refactor can't strip the param while keeping the function signature.
+- **Empirical year-by-year coverage validation** in commit body (248/246/248/249/99) — exactly the kind of dtype/shape/range/edge-cases check [[feedback_verify_downloads]] prescribes. Matches NSE trading-day counts; max 5-day gap (Diwali week) is physically reasonable.
+- **`scripts/vix_visualization.ipynb` IS committed to git this time** (488 LOC), with embedded PNG output cells. This is the pattern §22.5 needed but missed (per f126fa6 GRILL 1) — BUILDER LEARNED from the prior commit's citation drift. Pattern transfer is real, not theoretical.
+- **End-to-end smoke validates the P8 #2/#3/#4 stack together**: VIX loader → cache → regime_percentile → plot. 26 OFF bands across 1090 days, 22.6% post-warmup OFF rate vs nominal 25% — close-but-slightly-skewed-toward-ON makes physical sense (the 2022-2024 stretch was a low-vol regime post-COVID stabilization).
+- **965/1090 valid trailing percentiles** is consistent with F5's 50%-of-lookback floor: `lookback_td=252` → floor=126. Day-126 is the first to pass (`126 < 126` is False), so 1090 - 126 + 1 = 965 valid days. ✓ Exact match with the just-locked regime_percentile semantic (207d5c1).
+- **First valid date 2022-07-05** ≈ 126 trading days after 2022-01-03 (with weekends + holidays). ✓ Aligns with calendar.
+
+### State-of-tree
+
+- `main` HEAD: `c75ff3b`.
+- Operator's `data/cache/india_vix.parquet` is REGENERATED (1090 rows post-fix).
+- `scripts/vix_visualization.ipynb` IS tracked. Closes the artifact-tracking pattern for VIX.
+- §22.5 grills from f126fa6 still OPEN (research_iv_visualization.ipynb still untracked, 3 PNGs still missing, F3 None→NaN unaddressed).
+- Phase-8 build-order: #1–#4 ✓; #2 (VIX loader) had a latent bug now fixed; **#5 IVP next**.
+
+### Open grills (cumulative — unchanged by this commit)
+
+- f126fa6 GRILL 1 (§22.5 `.py` vs `.ipynb`) — STILL OPEN.
+- f126fa6 GRILL 2 (missing 3 PNGs) — STILL OPEN.
+- f126fa6 GRILL 3 (F3 None→NaN) — STILL OPEN.
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required from this commit. The 70-row-cap'd cache that any earlier prefetch produced has ALREADY been wiped + refetched (verified from the 1090-row on-disk state above).
+
+**Forward-looking caveat**: the `@pytest.mark.network` test in `test_india_vix_loader.py` doesn't currently assert a minimum row count. A small additional `@pytest.mark.network` assertion ("fetching a 200-day window returns at least 100 rows") would catch silent regression if NSE later removes the `csv=true` flag or changes the cap semantic. NOT a grill — `csv=true` is documented and provenance-tagged — but worth noting as a future hardening opportunity.
+
+### Next-commit suggestion
+
+`chore(p8.iv_research.commit_reference_impl_and_pngs)` — apply the exact pattern from THIS commit (track the .ipynb with embedded PNG cells) to `scripts/research_iv_visualization.ipynb` and close f126fa6 GRILLs 1 + 2 in one move:
+1. Re-execute `scripts/research_iv_visualization.ipynb` to embed the A/B/C/D plots as output cells (matching vix_visualization.ipynb's pattern).
+2. Track it in git.
+3. Patch §22.5 references: `.py` → `.ipynb`, drop the 3 separate PNG file refs (or keep them as supplementary artifacts).
+4. Optionally fold f126fa6 GRILL 3 (F3 `None` → `float('nan')`) since it's a 1-line memoir patch.
+
+BUILDER just demonstrated this pattern works. **The artifact-tracking discipline now has a precedent in-tree** — applying it to research_iv closes the citation backlog before P8 #5 IVP lands.
+
+Per [[feedback_next_commit_suggestion]]: A. de-risks the biggest unknown (closes citation drift before IVP materializer ships, which is supposed to mirror the validated reference). B. follows a real signal (BUILDER's own commit demonstrates the right pattern). C. fits in one nuclear commit.
+
+Per [[feedback_reviewer_calibration]]: NOT softening the §22.5 grills just because this commit was excellent on its own. Three citation/format grills remain OPEN; reverting to ✅ ACCEPT pile-up without addressing them would be drift.
+
+Migration cadence: **... → P8 #4 regime ✓ → P8 #2 retro-fix (this commit) ✓ → research_iv ref-impl commit (closes f126fa6 grills) → P8 #5 IVP materializer → P8 #6 ... → ...**
+
+Standing by.
+
+---
