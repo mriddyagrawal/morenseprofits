@@ -37,10 +37,20 @@ from src.data.telemetry import warn_fetch
 
 
 # Per-process LRU cache size for the year-keyed parquet read.
-# 10 universe symbols × 3 years = 30 entries; 32 leaves headroom.
-# Each entry is ~250 rows × 10 cols ≈ ~25KB — 8 workers × 32 × 25KB ≈ 6 MB
-# worst-case across the pool. Negligible.
-_LRU_MAXSIZE_YEAR = 32
+# 50 universe symbols × 3 years (2024 / 2025 / 2026 for the standard
+# Phase-7 wide grid) = 150 entries to cover the full production
+# working set without eviction. Bumped from 32 → 256 (2026-06-04,
+# perf-review note on 9263ee2) so the wide sweep doesn't thrash the
+# LRU through the working set every cell. 256 leaves headroom for
+# universe expansion (~85 symbols × 3 years) and a small year-roll
+# margin for sweeps that straddle Dec→Jan.
+#
+# Memory: each entry is ~250 rows × 9 cols ≈ ~25 KB post-perf-#1
+# (the F9 series-column drop removed one StringDtype column).
+# 8 workers × 256 entries × 25 KB ≈ ~50 MB worst-case across the
+# pool — well within the operator's 64 GB headroom. Per-worker
+# resident memory delta is ~6 MB at the LRU maximum.
+_LRU_MAXSIZE_YEAR = 256
 
 
 # jugaad column -> SPECS §2.1 column
