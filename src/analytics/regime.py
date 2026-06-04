@@ -44,13 +44,25 @@ from src.engine import vol as _vol
 # ============================================================
 # Regime percentile / state — generic over signal_series
 # ============================================================
-
-# Maximum allowed fraction of NaN values in the lookback window
-# before regime_percentile gives up and returns NaN. Per F5 in
-# PORTFOLIO_MEMOIR.md §21.4 (time_series_ivp also uses this 10%
-# rule for the same reason — a window that's mostly NaN can't
-# produce a stable percentile rank).
-_MAX_NAN_FRACTION = 0.10
+#
+# Spec-alignment note (2026-06-04, post-3fb0f05 review d8620f8):
+# F5 in PORTFOLIO_MEMOIR.md §21.4 uses a non-NaN MINIMUM count
+# expressed in terms of the REQUESTED lookback, not the window
+# actually realized:
+#
+#     valid = window.dropna()
+#     if len(valid) < 0.5 * lookback:    # ≥50% non-NaN floor
+#         return float('nan')
+#     rank = (valid < today).sum() / len(valid) * 100.0
+#
+# The denominator is ``len(valid)`` (NaN-dropped), not ``len(window)``.
+# The floor is 50% of LOOKBACK_TD, not of the realized window. Both
+# matter at the start of a series (when the window is shorter than
+# the lookback) and on NaN-heavy windows.
+#
+# Initial 3fb0f05 used 10% NaN-fraction + len(window) denominator;
+# reviewer d8620f8 flagged the citation drift (GRILL 1) + denominator
+# semantic (GRILL 3) — both fixed here to match F5 exactly.
 
 
 def regime_percentile(
@@ -70,11 +82,9 @@ def regime_percentile(
         float in [0.0, 100.0] when there's enough history.
         ``np.nan`` if:
           - ``as_of`` is not on (or before) any series date, OR
-          - the lookback window has < 2 observations (degenerate
-            rank), OR
-          - the window has > 10% NaN observations
-            (insufficient data per the same threshold the IVP path
-            uses; PORTFOLIO_MEMOIR.md §21.4 F5), OR
+          - the lookback window has fewer than ``0.5 * lookback_td``
+            non-NaN observations (insufficient history floor per
+            F5 in PORTFOLIO_MEMOIR.md §21.4), OR
           - the value at ``as_of`` is itself NaN.
 
     Per F9 (PORTFOLIO_MEMOIR.md §21.4): identical formula to
@@ -101,21 +111,28 @@ def regime_percentile(
     if idx_pos < 0:
         return float("nan")  # as_of predates the entire series
 
+    today_value = signal_series.iloc[idx_pos]
+    if pd.isna(today_value):
+        # NaN today → can't rank. Pin per F5's load-bearing guard
+        # ("don't silently rank NaN as 0th percentile"); the bug it
+        # closes is real in the IVP corner case where a missing-IV
+        # day would otherwise score as cheapest-vol-ever.
+        return float("nan")
+
     window_start = max(0, idx_pos - lookback_td + 1)
     window = signal_series.iloc[window_start : idx_pos + 1]
-    if len(window) < 2:
-        return float("nan")
-    nan_fraction = float(window.isna().sum()) / len(window)
-    if nan_fraction > _MAX_NAN_FRACTION:
-        return float("nan")
-
-    today_value = window.iloc[-1]
-    if pd.isna(today_value):
+    valid = window.dropna()
+    # Insufficient-history floor: < 50% of LOOKBACK_TD (not of the
+    # realized window length). At the start of a series the window
+    # is short by construction; we don't want short-window early
+    # periods to silently produce stable-looking ranks.
+    if len(valid) < 0.5 * lookback_td:
         return float("nan")
 
-    # Percentile rank: fraction of window strictly LESS than today,
-    # scaled to [0, 100]. Same as F5/F9 in the memoir.
-    return float((window < today_value).sum()) / len(window) * 100.0
+    # Percentile rank on the dropna'd subset. Matches F5 spec
+    # exactly: NaN-bearing days neither contribute to the count
+    # nor to the denominator.
+    return float((valid < today_value).sum()) / len(valid) * 100.0
 
 
 def regime_state(

@@ -104,16 +104,61 @@ def test_regime_percentile_returns_nan_on_single_row_window():
     assert np.isnan(out)
 
 
-def test_regime_percentile_returns_nan_when_window_mostly_nan():
-    """> 10% NaN fraction → NaN (matches the IVP convention in
-    PORTFOLIO_MEMOIR.md §21.4 F5)."""
+def test_regime_percentile_returns_nan_below_half_lookback_floor():
+    """PORTFOLIO_MEMOIR.md §21.4 F5: insufficient-history floor is
+    ``len(valid) < 0.5 * lookback_td``. With lookback=5, the floor is
+    2.5 → need at least 3 non-NaN observations. 5-element window with
+    3 NaN (2 valid) → 2 < 2.5 → NaN.
+
+    Anti-regression on the 3fb0f05→0a08-style fix (reviewer d8620f8
+    GRILL 1): an earlier draft used a `> 10%` NaN-fraction gate
+    against `len(window)` and claimed it matched F5; spec actually
+    uses `0.5 * lookback_td` floor against `len(valid)`."""
     series = _make_signal(
-        [1.0, np.nan, np.nan, np.nan, 5.0]   # 60% NaN
+        [1.0, np.nan, np.nan, np.nan, 5.0]   # 2 valid of lookback 5
     )
     out = regime_percentile(
         series, as_of=date(2024, 1, 6), lookback_td=5,
     )
     assert np.isnan(out)
+
+
+def test_regime_percentile_at_half_lookback_floor_is_just_valid():
+    """Boundary test on the F5 floor: exactly ``len(valid) == 0.5 *
+    lookback_td`` is INSUFFICIENT (the spec uses strict `<`, so
+    valid == floor passes). lookback=4 → floor=2; valid=2 passes;
+    valid=1 fails. Pin the inclusive-exclusive boundary explicitly."""
+    # lookback=4 → floor 2. valid=2 → just passes.
+    just_valid = _make_signal([1.0, np.nan, np.nan, 4.0])
+    out_at_floor = regime_percentile(
+        just_valid, as_of=date(2024, 1, 5), lookback_td=4,
+    )
+    # 1 value (1.0) strictly less than today (4.0); valid count 2
+    # → rank = 1/2 * 100 = 50.
+    assert out_at_floor == pytest.approx(50.0)
+
+    # 1 valid only → fails the floor.
+    just_below = _make_signal([np.nan, np.nan, np.nan, 4.0])
+    out_below = regime_percentile(
+        just_below, as_of=date(2024, 1, 5), lookback_td=4,
+    )
+    assert np.isnan(out_below)
+
+
+def test_regime_percentile_denominator_uses_valid_not_window():
+    """PORTFOLIO_MEMOIR.md §21.4 F5: denominator is ``len(valid)``,
+    not ``len(window)``. Anti-regression on d8620f8 GRILL 3.
+
+    Hand-check: 5-element window with 1 NaN; today = max.
+    Spec rank = (valid < today).sum() / len(valid) = 3/4 = 75.
+    Pre-fix BUILDER rank = 3/5 = 60 (wrong denominator)."""
+    # [10, 20, NaN, 40, 50] — today = 50 at end, valid = [10, 20, 40, 50]
+    # Spec: (valid < 50).sum() / len(valid) = 3/4 * 100 = 75.
+    series = _make_signal([10.0, 20.0, np.nan, 40.0, 50.0])
+    out = regime_percentile(
+        series, as_of=date(2024, 1, 6), lookback_td=5,
+    )
+    assert out == pytest.approx(75.0)
 
 
 def test_regime_percentile_returns_nan_when_today_value_is_nan():
