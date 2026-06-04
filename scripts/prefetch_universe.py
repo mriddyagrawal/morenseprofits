@@ -34,7 +34,7 @@ sys.path.insert(0, str(REPO))
 
 from tqdm import tqdm  # noqa: E402
 
-from src.data import bhavcopy_fo_loader, expiry_calendar, options_loader, spot_loader, trading_calendar  # noqa: E402
+from src.data import bhavcopy_fo_loader, expiry_calendar, india_vix_loader, options_loader, spot_loader, trading_calendar  # noqa: E402
 from src.data.strike_planner import strikes_around_spot_hybrid  # noqa: E402
 from src.data.errors import MissingDataError  # noqa: E402
 
@@ -303,6 +303,52 @@ def _process_pair(args_tuple: tuple) -> tuple[int, int, int, list]:
     return n_fetched, n_skipped_missing, n_skipped_other, skips
 
 
+def _prefetch_india_vix(start_date: date, end_date: date) -> None:
+    """Step-0 helper: fetch India VIX history into
+    ``data/cache/india_vix.parquet`` covering [start_date, end_date].
+
+    Non-fatal: any exception (network glitch, NSE WAF block, Akamai
+    cookie drift) is caught and reported to stderr so the rest of the
+    prefetch (options / spot / bhavcopy) continues unblocked. The
+    regime-gate v2 signal is research infrastructure — its absence
+    degrades the Portfolio tab gracefully, doesn't break trading
+    research. Operator can re-run with ``--vix-only`` to retry just
+    this step.
+    """
+    try:
+        t0 = time.perf_counter()
+        df = india_vix_loader.load_india_vix(
+            start_date, end_date, today_fn=TODAY_FN,
+        )
+        elapsed = time.perf_counter() - t0
+        if len(df) == 0:
+            print(
+                f"  ⚠ india_vix prefetch returned 0 rows for "
+                f"{start_date} → {end_date} (NSE responded but the "
+                f"window contains no trading days?). Cache unchanged.",
+                file=sys.stderr,
+            )
+            return
+        date_min = df["date"].min().date()
+        date_max = df["date"].max().date()
+        print(
+            f"  india_vix cached: {len(df)} rows  "
+            f"({date_min} → {date_max})  [{elapsed:.1f}s]"
+        )
+    except Exception as e:
+        print(
+            f"  ⚠ india_vix prefetch FAILED — {type(e).__name__}: "
+            f"{str(e)[:200]}",
+            file=sys.stderr,
+        )
+        print(
+            f"    Continuing with options / spot / bhavcopy prefetch. "
+            f"Re-try just this step via "
+            f"`python scripts/prefetch_universe.py --vix-only`.",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -317,7 +363,11 @@ def main() -> int:
     )
     ap.add_argument(
         "--strikes-pct", type=float, default=DEFAULT_STRIKES_PCT,
-        help=f"Min %-of-spot window each side of ATM per day "
+        # argparse's help formatter does `help_str % params_dict` for
+        # `%(default)s`-style substitution. A literal `%` in the help
+        # text is interpreted as a format-spec prefix → TypeError on
+        # `--help` rendering. Escape via `%%`.
+        help=f"Min %%-of-spot window each side of ATM per day "
              f"(default {DEFAULT_STRIKES_PCT}). Combined with "
              f"--strikes-per-side via max().",
     )
@@ -381,6 +431,17 @@ def main() -> int:
             "sleep, so aggregate request rate ≈ workers / 0.5s."
         ),
     )
+    ap.add_argument(
+        "--vix-only", action="store_true",
+        help=(
+            "Run ONLY the India VIX prefetch (Step 0) and return. "
+            "Useful when retrying just the VIX leg after a transient "
+            "Akamai cookie failure, without re-walking the options "
+            "universe. Pairs with --start / --end. India VIX prefetch "
+            "is also run UNCONDITIONALLY as Step 0 of the full "
+            "prefetch (i.e., omitting --vix-only does NOT skip VIX)."
+        ),
+    )
     args = ap.parse_args()
 
     symbols: list[str] = args.symbols
@@ -392,9 +453,29 @@ def main() -> int:
     print(f"  entry_window_days = {args.entry_window_days}  (calendar days back from expiry to scan spot)")
     print(f"  workers           = {args.workers}  (>1 → parallel mp.Pool over (sym, expiry) pairs)")
     print(f"  expiry range      = {args.start} → {args.end}")
+    print(f"  india_vix range   = {args.start} → {args.end}  (Phase-8 regime-gate v2 signal)")
     print(f"  cache dir         = data/cache/options/  (gitignored)")
+    if args.vix_only:
+        print(f"  --vix-only        = TRUE  (skips spot / bhavcopy / options prefetch after Step 0)")
 
     t_start = time.perf_counter()
+
+    # ============================================================
+    # Step 0 — pre-fetch India VIX history (Phase-8 regime-gate v2)
+    # ============================================================
+    # Non-fatal: a VIX prefetch failure (network glitch, NSE WAF block,
+    # Akamai cookie drift) prints to stderr and CONTINUES. The
+    # subsequent options/spot prefetch shouldn't block on this signal —
+    # the regime gate is research infrastructure, not the trading
+    # critical path. Operator can re-run with --vix-only to retry just
+    # the VIX leg without re-walking the full options universe.
+    _h(f"Step 0 — pre-fetch India VIX history  [{args.start} → {args.end}]")
+    _prefetch_india_vix(args.start, args.end)
+    if args.vix_only:
+        _h(f"--vix-only set; skipping spot / bhavcopy / options prefetch")
+        elapsed = time.perf_counter() - t_start
+        print(f"\nTotal wall-clock: {elapsed:.1f}s")
+        return 0
 
     # ============================================================
     # Step 1 — pre-warm spot data for every symbol × year in range
