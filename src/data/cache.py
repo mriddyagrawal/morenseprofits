@@ -189,6 +189,20 @@ def lot_sizes_path() -> Path:
     return _ensure_root() / "lot_sizes.parquet"
 
 
+def events_path() -> Path:
+    """The NSE Corporate Events parquet cache, built by
+    ``src.data.events_loader.load_events`` from the operator-delivered
+    ``CF-Event-equities-*.csv``.
+
+    Schema (post-filter to ``PURPOSE`` containing "Financial Results"):
+      ``SYMBOL`` (string), ``PURPOSE`` (string),
+      ``DATE`` (datetime64[us], board-meeting date).
+
+    Single file (the dataset is ~28k rows; sub-MB on disk).
+    PORTFOLIO_MEMOIR.md §17."""
+    return _ensure_root() / "events.parquet"
+
+
 def india_vix_path() -> Path:
     """The India VIX daily-OHLC parquet, fetched from NSE's
     ``/api/historicalOR/vixhistory`` endpoint by
