@@ -48,27 +48,29 @@ produce a usable value. Tag legend: **[logged]** lands in `sweep_*_skipped.parqu
 | 7 | empty frame returned | `MissingDataError` "empty frame" **[logged]** |
 | 8 | **zero/missing turnover OR volume on entry OR exit day** — `_pick_fill_price` | `MissingTurnoverError` **[logged]** — *dominant far-from-expiry killer* |
 | 9 | recovered premium VWAP ≤ 0 (deep-OTM ill-conditioning) | `MissingTurnoverError` **[logged]** |
-| 10 | thin contract (vol < 100k) with VWAP outside `[0.5×, 2×]` close band | `MissingTurnoverError` **[logged]** |
-| 11 | `lot_size` changed entry→exit (split / bonus / merger / corp action) — `_price_one_leg` | `MissingDataError` "lot_size changed mid-contract" **[logged]** |
-| 12 | duplicate-date row, OR frame rows past `exit_date` (look-ahead) — `_pick_fill_price` / `_price_one_leg` | `LookaheadError` **[fatal]** (parser-bug tripwire — aborts, never silently picks) |
-| — | *(removed in P1.7: the old `oi==0` IlliquidLegError gate no longer disqualifies — `volume>0` ⟹ a fill exists)* | — |
+| 10 | **`oi == 0` AND `contracts_traded < 20`** (thin contract nobody held overnight) — `_pick_fill_price:332` | `MissingTurnoverError` **[logged]** — **F7**, RE-ADDED `a1b74e2` (closes my own F7 finding; this gate is *active*, not removed) |
+| 11 | thin contract (`contracts_traded = volume // lot_size < 20`) **with oi > 0** and VWAP outside `[0.5×, 2×]` close band — `_pick_fill_price:343` | `MissingTurnoverError` **[logged]** |
+| 12 | `lot_size` changed entry→exit (split / bonus / merger / corp action) — `_price_one_leg` | `MissingDataError` "lot_size changed mid-contract" **[logged]** |
+| 13 | duplicate-date row, OR frame rows past `exit_date` (look-ahead) — `_pick_fill_price` / `_price_one_leg` | `LookaheadError` **[fatal]** (parser-bug tripwire — aborts, never silently picks) |
+
+**Option C — the PASS gate (not a disqualifier, shown for context):** `contracts_traded = volume // lot_size ≥ 20` (`_VWAP_LIQUIDITY_BYPASS_CONTRACTS`, `pnl.py:136`, `_pick_fill_price:318`) → VWAP trusted **unconditionally**, bypassing both #10 (oi gate) and #11 (band check). Recalibrated **100k shares → 20 contracts** in `817d4e5` so the threshold is symbol-invariant (lot_size spans 75 NIFTY … 8000 PNB). The oi gate (#10) and band-reject (#11) therefore only ever apply to **thin (<20-contract)** legs.
 
 ### Layer III — post-pricing aggregation / render (`src/analytics/heatmap.py`, `src/mcp/heatmap.py`, `MIN_N_FOR_RANKING`)
 | # | Condition | Result |
 |---|---|---|
-| 13 | cell has **< `min_n` (default 5) priced expiries** | **[mask]** — cell hidden (black) even though some trades priced |
-| 14 | invalid pair `entry_offset_td ≤ exit_offset_td` | never planned (the upper-left black triangle) |
+| 14 | cell has **< `min_n` (default 5) priced expiries** | **[mask]** — cell hidden (black) even though some trades priced |
+| 15 | invalid pair `entry_offset_td ≤ exit_offset_td` | never planned (the upper-left black triangle) |
 
 ### Layer IV — upstream materialize-time (`src/data/bhavcopy_to_contract.py`) — these *cause* #5
 | # | Condition | Result |
 |---|---|---|
-| 15 | contract `contracts == 0` on **every** cached day (never traded) | not materialized → later `OfflineCacheMiss` |
-| 16 | `lot_size` excluded (cross-source sidecar↔bhavcopy mismatch) | not materialized → later `OfflineCacheMiss` |
+| 16 | contract `contracts == 0` on **every** cached day (never traded) | not materialized → later `OfflineCacheMiss` |
+| 17 | `lot_size` excluded (cross-source sidecar↔bhavcopy mismatch) | not materialized → later `OfflineCacheMiss` |
 
 ### The multiplicative-liquidity insight (why multi-leg strategies empty out far from expiry)
 A trade prices only if **every leg has non-zero volume on BOTH entry AND exit days**:
 short-straddle/strangle = **4 leg-days**, iron-condor = **8 leg-days** — all must be liquid (#8).
-Far from expiry, each OTM leg-day's P(liquid) is low, so the AND collapses fast; then Layer III #13
+Far from expiry, each OTM leg-day's P(liquid) is low, so the AND collapses fast; then Layer III #14
 still requires ≥5 of the available expiries to clear or the cell is masked. Net: coverage on a
 `(strategy, symbol)` is gated by its **thinnest leg**, and the heatmap's empty regions are a
 *liquidity-geography* map, not a P&L signal. (Worked example: BAJAJFINSV strangle 56% filled vs
