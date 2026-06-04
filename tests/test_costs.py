@@ -1,9 +1,10 @@
 """Tests for src.engine.costs. Pure arithmetic — no network, no mocks.
 
 The load-bearing test is `test_reliance_jan_2024_short_straddle_hand_check`:
-the reviewer hand-computed total ~₹141.78 on the canonical RELIANCE Jan-2024
-short straddle (CE 56.50/95 + PE 50/0.50, lot 250). If any V1 rate drifts,
-this test will fire with the exact ₹ amount the user would actually pay.
+the reviewer hand-computed total ~₹165.08 on the canonical RELIANCE Jan-2024
+short straddle (CE 56.50/95 + PE 50/0.50, lot 250) under the v1.5 STT 0.15%
+(pre-2026-06-04: ~₹141.78 under STT 0.0625%). If any V1 rate drifts, this
+test will fire with the exact ₹ amount the user would actually pay.
 """
 from __future__ import annotations
 
@@ -27,7 +28,8 @@ def test_reliance_jan_2024_short_straddle_hand_check():
     """Same fixture the P&L kernel hand-check uses (test_pnl.py).
     CE entry 56.50, exit 95.00; PE entry 50.00, exit 0.50; lot 250; 1 lot each.
 
-    Per SPECS §4 with COST_MODEL_V1 rates:
+    Per SPECS §4 with COST_MODEL_V1 rates (STT bumped to 0.15%
+    2026-06-04 per PORTFOLIO_MEMOIR.md §9):
       Sell-side turnover (entries of both SELL legs):
         (56.50 + 50.00) × 250 = 26,625
       Buy-side turnover (exits of both SELL legs — close = BUY):
@@ -35,13 +37,13 @@ def test_reliance_jan_2024_short_straddle_hand_check():
       Total turnover = 50,500
 
       Brokerage     = 4 orders × ₹20         = ₹80.00
-      STT           = 26,625 × 0.000625      = ₹16.640625
+      STT           = 26,625 × 0.0015        = ₹39.9375
       Exchange      = 50,500 × 0.000503      = ₹25.4015
       GST           = (80 + 25.4015) × 0.18  = ₹18.972270
       SEBI          = (50,500 / 1e7) × 10    = ₹0.0505
       Stamp duty    = 23,875 × 0.00003       = ₹0.71625
       ─────────────────────────────────────────────────
-      Total                                  ≈ ₹141.780645
+      Total                                  ≈ ₹165.077520
     """
     legs = [
         _leg("SELL", 1, 250, 56.50, 95.00),  # CE
@@ -49,12 +51,12 @@ def test_reliance_jan_2024_short_straddle_hand_check():
     ]
     out = COST_MODEL_V1.total_cost(legs)
     assert out["brokerage"] == 80.0
-    assert out["stt"] == pytest.approx(16.640625, abs=1e-6)
+    assert out["stt"] == pytest.approx(39.9375, abs=1e-6)
     assert out["exchange"] == pytest.approx(25.4015, abs=1e-6)
     assert out["gst"] == pytest.approx(18.972270, abs=1e-4)
     assert out["sebi"] == pytest.approx(0.0505, abs=1e-6)
     assert out["stamp_duty"] == pytest.approx(0.71625, abs=1e-6)
-    assert out["total"] == pytest.approx(141.780645, abs=1e-3)
+    assert out["total"] == pytest.approx(165.077520, abs=1e-3)
 
 
 # ============================================================
@@ -83,13 +85,13 @@ def test_stt_sell_side_only():
     long_call = [_leg("BUY", 1, 100, 100.0, 150.0)]
     out_long = COST_MODEL_V1.total_cost(long_call)
     # SELL-side turnover = exit_px × shares = 150 × 100 = 15,000
-    assert out_long["stt"] == pytest.approx(15000 * 0.000625, abs=1e-6)
+    assert out_long["stt"] == pytest.approx(15000 * 0.0015, abs=1e-6)
 
     # Short call: SELL at 100, BUY at 50
     short_call = [_leg("SELL", 1, 100, 100.0, 50.0)]
     out_short = COST_MODEL_V1.total_cost(short_call)
     # SELL-side turnover = entry_px × shares = 100 × 100 = 10,000
-    assert out_short["stt"] == pytest.approx(10000 * 0.000625, abs=1e-6)
+    assert out_short["stt"] == pytest.approx(10000 * 0.0015, abs=1e-6)
 
 
 def test_stamp_duty_buy_side_only():

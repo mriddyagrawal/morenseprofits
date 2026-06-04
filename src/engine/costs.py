@@ -8,9 +8,13 @@ P&L to get net P&L.
 Componentwise per SPECS §4:
 - Brokerage: flat ₹20 / executed order. A short straddle = 4 orders
   total (CE entry + PE entry + CE close + PE close) = ₹80.
-- STT: 0.0625% of premium turnover, **SELL-side only on options**.
+- STT: 0.15% of premium turnover, **SELL-side only on options**.
   (For a SHORT straddle, that's both legs' ENTRY premiums; for a long
   straddle, it's both legs' EXIT premiums.)
+  Pre-Phase-8 used 0.0625%; bumped 2026-06-04 to 0.15% per operator
+  direction in PORTFOLIO_MEMOIR.md §9 (deliberate conservative
+  overstatement vs the post-2023 Finance Act statutory rate of
+  0.05%, which is the truthful figure for a real-money calculation).
 - Exchange txn fee: 0.0503% of premium turnover, **both sides**.
 - GST: 18% on (brokerage + exchange txn fee).
 - SEBI fee: ₹10 per crore of premium turnover (negligible but included
@@ -33,7 +37,7 @@ class CostModelV1:
     """SPECS §4 rates. Frozen — for sensitivity analysis create a new
     instance (or a V2 dataclass) rather than mutating."""
     brokerage_per_order: float = 20.0       # ₹/order
-    stt_sell_options_pct: float = 0.000625  # 0.0625%
+    stt_sell_options_pct: float = 0.0015     # 0.15% (PORTFOLIO_MEMOIR.md §9)
     exchange_txn_pct: float = 0.000503      # 0.0503%
     gst_pct: float = 0.18                   # 18%
     sebi_per_crore: float = 10.0            # ₹/crore

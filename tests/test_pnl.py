@@ -949,12 +949,13 @@ def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():
     """LOAD-BEARING for the full financial picture: all THREE layers
     tied together on the canonical RELIANCE Jan-2024 short straddle.
 
-    Expected from prior hand-checks:
-      gross_pnl  = +₹2,750     (P&L kernel)
-      costs      = ~₹141.78    (COST_MODEL_V1, SPECS §4)
-      net_pnl    = ~₹2,608.22
-      margin     = ₹2,60,000   (MARGIN_MODEL_V1, SPECS §4a; 2 × 0.20 × 2600 × 250)
-      roi_pct    = ~+1.00 %    (net_pnl / margin × 100)
+    Expected from prior hand-checks (STT bumped to 0.15% 2026-06-04,
+    PORTFOLIO_MEMOIR.md §9; pre-bump numbers parenthesized for record):
+      gross_pnl  = +₹2,750.00       (P&L kernel; unchanged)
+      costs      = ~₹165.08         (COST_MODEL_V1; was ~₹141.78)
+      net_pnl    = ~₹2,584.92       (was ~₹2,608.22)
+      margin     = ₹2,60,000        (MARGIN_MODEL_V1; 2 × 0.20 × 2600 × 250)
+      roi_pct    = ~+0.99 %         (net_pnl / margin × 100; was +1.00%)
     """
     entry = date(2024, 1, 4)
     exit_ = date(2024, 1, 24)
@@ -979,10 +980,10 @@ def test_reliance_jan_2024_full_pipeline_gross_costs_net_margin_roi():
         symbol_margin_pct=0.20, slippage_model=_NO_SLIPPAGE,
     )
     assert out["gross_pnl"] == 2750.0
-    assert out["costs"] == pytest.approx(141.780645, abs=1e-3)
-    assert out["net_pnl"] == pytest.approx(2608.219, abs=1e-3)
+    assert out["costs"] == pytest.approx(165.077520, abs=1e-3)
+    assert out["net_pnl"] == pytest.approx(2584.922480, abs=1e-3)
     assert out["margin_at_entry"] == 260_000.0  # 2 × 0.20 × 2600 × 250
-    assert out["roi_pct"] == pytest.approx(100 * 2608.219 / 260_000.0, abs=1e-3)
+    assert out["roi_pct"] == pytest.approx(100 * 2584.922480 / 260_000.0, abs=1e-3)
 
 
 def test_auto_vol_resolves_symbol_margin_pct_when_kwarg_absent(monkeypatch):
