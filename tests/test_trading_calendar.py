@@ -343,6 +343,66 @@ def test_perf_2_clear_cache_helper_actually_clears(monkeypatch, tmp_path):
     )
 
 
+def test_perf_2_per_year_offline_cache_miss_skipped(monkeypatch, tmp_path):
+    """Grill #6 anti-regression (logic-review bc3c4fe). cc2282a wired
+    a single-range ``load_spot`` call inside ``_full_calendar_cached``;
+    under cache_only=True the operator's prefetch covered 2024-2026
+    but the 10-year window asked for 2016-onward, so the first
+    uncached year raised ``OfflineCacheMiss``, propagated, and every
+    sweep cell skipped (90,000/90,000 in 1.1s; ca8486f / 0a08d44).
+
+    The fix iterates year-by-year and catches the per-year exception,
+    accumulating only successful years. This test pins that behavior:
+    a partial cache (2016-2023 raise; 2024-2026 succeed) must yield a
+    non-empty calendar covering only the available years. Without
+    this test, a future refactor back to a single-range call would
+    silently re-introduce cc2282a's bug AND pytest would still pass
+    (because no other test exercises the partial-cache path).
+    """
+    _redirect_cache(monkeypatch, tmp_path)
+
+    # Synthetic load_spot that mimics the operator's actual cache
+    # state: years before 2024 raise OfflineCacheMiss; 2024+ load
+    # the synthetic _JAN_2024_NSE_DAYS subset.
+    from src.data.errors import OfflineCacheMiss
+
+    def partial_load_spot(symbol, from_date, to_date, *,
+                          force_refresh=False, today_fn=date.today,
+                          offline=False, **kw):
+        if from_date.year < 2024:
+            raise OfflineCacheMiss(
+                f"synthetic: spot for {symbol} year {from_date.year} not in cache"
+            )
+        in_window = [d for d in _JAN_2024_NSE_DAYS if from_date <= d <= to_date]
+        return pd.DataFrame({
+            "date": pd.Series(
+                [pd.Timestamp(d) for d in in_window], dtype="datetime64[us]",
+            ),
+            "symbol": pd.array(["RELIANCE"] * len(in_window), dtype="string"),
+            "close": [100.0] * len(in_window),
+        })
+
+    monkeypatch.setattr(spot_loader, "load_spot", partial_load_spot)
+    today = lambda: date(2026, 5, 24)
+
+    # trading_days for the 2024 window must succeed even though
+    # ~7 years before it raised OfflineCacheMiss during populate.
+    days = trading_calendar.trading_days(
+        date(2024, 1, 1), date(2024, 1, 31), today_fn=today, offline=True,
+    )
+    assert len(days) == len(_JAN_2024_NSE_DAYS), (
+        f"per-year populate didn't recover after OfflineCacheMiss; "
+        f"expected {len(_JAN_2024_NSE_DAYS)} 2024 days, got {len(days)}"
+    )
+    # offset_trading_days must succeed too (the production cell path).
+    out = trading_calendar.offset_trading_days(
+        date(2024, 1, 25), 15, today_fn=today, offline=True,
+    )
+    assert out == date(2024, 1, 4), (
+        f"per-year populate broke offset_trading_days; got {out}"
+    )
+
+
 @pytest.mark.network
 def test_offset_trading_days_live_reliance_jan_25():
     """LIVE: the same hand-check, but driven by real NSE data through
