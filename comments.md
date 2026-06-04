@@ -23190,3 +23190,143 @@ Migration cadence: **... → P8 #1 STT ✓ → P8 #2 VIX loader ✓ → P8 #3 pr
 Standing by.
 
 ---
+
+## Review of 207d5c1 — `fix(p8.analytics.regime.spec_align)` — ✅ ACCEPT (all 3 grills closed cleanly)
+
+**Verdict: ✅ ACCEPT.** All three grills from d8620f8 (review of 3fb0f05) addressed in one ~110-LOC code+test patch + the F9 memoir ratification. Anti-regression tests pin both numeric fixes; the conservative NaN→OFF deviation is now ratified in the spec. Phase-8 #5 (IVP) can land cleanly because the percentile-rank semantic is locked at module-level.
+
+**Bonus: PORTFOLIO_MEMOIR.md is now version-controlled** (1270 LOC, first-time tracking confirmed via `git log --all -- DESIGN/PORTFOLIO_MEMOIR.md` — empty history). This was an untracked-but-existing file at session start; BUILDER folded it into git as part of the F9 ratification. Operator can now diff future memoir revisions cleanly.
+
+### GRILL 1 (HIGH) — ✅ CLOSED
+
+**`_MAX_NAN_FRACTION = 0.10` removed; `len(valid) < 0.5 * lookback_td` matches F5 spec verbatim.**
+
+`regime.py:111-134` post-fix:
+```python
+today_value = signal_series.iloc[idx_pos]
+if pd.isna(today_value):
+    return float("nan")
+
+window_start = max(0, idx_pos - lookback_td + 1)
+window = signal_series.iloc[window_start : idx_pos + 1]
+valid = window.dropna()
+if len(valid) < 0.5 * lookback_td:
+    return float("nan")
+
+return float((valid < today_value).sum()) / len(valid) * 100.0
+```
+
+F5 spec (PORTFOLIO_MEMOIR.md:907-917):
+```python
+today = iv_series.iloc[today_idx]
+if pd.isna(today):
+    return float('nan')
+window = iv_series.iloc[max(0, today_idx - lookback + 1) : today_idx + 1]
+valid = window.dropna()
+if len(valid) < 0.5 * lookback:
+    return float('nan')
+rank = (valid < today).sum() / len(valid) * 100.0
+```
+
+**Verbatim match.** ✓
+
+The new module-level spec-alignment header (`regime.py:44-65`) carries the F5 mapping verbatim — future reader can grep and verify in one read. This is the right discipline for citation-load-bearing constants.
+
+### GRILL 3 (MINOR, coupled to GRILL 1) — ✅ CLOSED
+
+Denominator now uses `len(valid)`. Anti-regression test `test_regime_percentile_denominator_uses_valid_not_window` pins the hand-checkable case:
+```
+[10, 20, NaN, 40, 50] with today=50:
+  Pre-fix: 3/5 = 60   (wrong)
+  Post-fix: 3/4 = 75  (matches spec F5)
+```
+Test asserts 75.0 ✓. Pin discipline ✓.
+
+### GRILL 2 (MEDIUM) — ✅ RATIFIED IN MEMOIR
+
+`PORTFOLIO_MEMOIR.md:957-981` (F9):
+```python
+def regime_state(signal_series, today_idx, threshold_pct=75):
+    pct = regime_percentile(signal_series, today_idx)
+    if pd.isna(pct):
+        # "Skip when uncertain" — see explanation below.
+        return "OFF"
+    return "ON" if pct <= threshold_pct else "OFF"
+```
+
+Plus a rationale paragraph at lines 973-981 explaining the "skip when uncertain" risk-management bias and explicitly calling out the naive `NaN > 75 → False → ON` short-circuit failure mode. Provenance tag `[REVISED 2026-06-04 — explicit NaN→OFF guard added per reviewer d8620f8 GRILL 2]` cross-references the review.
+
+**Phase-8 #5 (IVP) inheritance**: when `time_series_ivp` lands in `src/analytics/ivp.py`, the same NaN→OFF discipline is now codified in the SPEC, so any downstream `ivp_state`-style gate will inherit naturally. Spec drift risk closed.
+
+### New boundary test
+
+`test_regime_percentile_at_half_lookback_floor_is_just_valid` pins the inclusive-exclusive boundary on the 50% floor:
+- `lookback=4` → floor=2.0 → `valid=2` passes (`2 < 2.0` is False) → rank computed.
+- `valid=1` fails (`1 < 2.0` is True) → NaN.
+
+Behavior is right. **Tiny docstring nit (NOT a grill)**: the docstring opens with "exactly `len(valid) == 0.5 * lookback_td` is INSUFFICIENT" then immediately says "the spec uses strict `<`, so valid == floor passes" — these two statements contradict each other. The test BEHAVIOR is correct (asserts `pytest.approx(50.0)` for `valid==floor`); only the explanatory sentence is misworded. Worth a docstring sweep at some point but not blocking — leaving it as a passive note.
+
+### Pytest verification
+
+```
+.venv/bin/python -m pytest tests/test_regime.py -v
+25 passed in 0.09s
+
+.venv/bin/python -m pytest -q
+926 passed, 3 deselected, 1 warning in 29.85s
+```
+
+Independently verified BUILDER's full-suite claim (`+2 net vs 924 pre-fix`).
+
+### Praise points
+
+- **Module-level spec-alignment header** in `regime.py:44-65` carries the F5 spec verbatim with an explicit "Initial 3fb0f05 used 10% NaN-fraction + len(window) denominator; reviewer d8620f8 flagged..." breadcrumb. This is the FILTERS.md-style cross-citation discipline; future reader can grep and verify the deviation history in one read. Excellent forward-defense.
+- **Memoir F9 update carries its own rationale paragraph** (not just a code-block edit) — operator can read the WHY without needing to dig through git log. Spec docs should ratify implementation decisions, not just record them.
+- **Provenance tag `[REVISED 2026-06-04 — ...per reviewer d8620f8 GRILL 2]`** ties the spec change back to the review that triggered it. Audit trail.
+- **Anti-regression tests** for both numeric fixes (the new floor + the denominator). Direct hand-checks, not parametric — caught the GRILL 3 case explicitly.
+- **NaN-today guard moved BEFORE window construction** (`regime.py:111`) — minor restructuring that early-exits cheaper. Plus carries the F5-original rationale comment ("don't silently rank NaN as 0th percentile") so future maintainer doesn't accidentally reorder.
+- **Commit body cross-refs `feedback_grep_code_before_accepting_calibration`** as the 5th occurrence of the citation-drift failure mode. Self-aware error logging.
+- **PORTFOLIO_MEMOIR.md is now in git** — was untracked at session start (`?? DESIGN/PORTFOLIO_MEMOIR.md` in `git status` since session start). Folding it in here is good housekeeping; spec is now diff-able going forward.
+
+### Math
+
+- `regime.py`: 63 line delta (insertions+deletions in the diff); +24 net based on net code added.
+- `tests/test_regime.py`: 53 line delta; +30 net.
+- `DESIGN/PORTFOLIO_MEMOIR.md`: +1270 (first-time tracking + F9 edit). The bulk is first-time tracking.
+- Tests: 23 → 25 regime; 924 → 926 full suite. ✓
+
+### State-of-tree
+
+- `main` HEAD: `207d5c1`.
+- Phase-8 #4 (regime analytics + spec alignment) closed.
+- `DESIGN/PORTFOLIO_MEMOIR.md` now tracked.
+- Build-order: #1 STT ✓ → #2 VIX loader ✓ → #3 prefetch wire ✓ → #4 regime ✓ (initial + spec-align) → **#5 IVP (next)** — percentile-rank semantic now locked; F5 module can lift the spec-aligned implementation directly.
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. Spec + implementation now aligned.
+
+### Next-commit suggestion
+
+`feat(p8.analytics.ivp)` — Phase-8 build-order #5 (F5, F6 from memoir). Three reasons:
+
+1. **Percentile-rank semantic is now locked** — `time_series_ivp` can lift the spec-aligned formula directly from `regime.py:111-134` (or factor the shared math into a private helper if BUILDER prefers DRY over module independence). Either way, no risk of re-introducing GRILL 1/3.
+2. **NaN→OFF convention is now in spec** — when an `ivp_state` filter eventually lands, it inherits the conservative NaN handling naturally.
+3. **De-risks the biggest remaining unknown in Phase-8** — IVP construction (Black-Scholes inversion + materializer + percentile, per §2) is the largest single piece left. Better to land the F5/F6 math first against synthetic IV inputs, then bolt on the BS inversion + materializer separately.
+
+Per [[feedback_next_commit_suggestion]]: A. de-risks the biggest unknown (IVP math vs already-locked regime math), B. follows a real signal (the just-locked F5 semantic), C. fits in one nuclear commit (F5 + F6 are ~50 LOC each by memoir spec; tests add another ~150).
+
+Migration cadence: **... → P8 #1 STT ✓ → P8 #2 VIX loader ✓ → P8 #3 prefetch wire ✓ → P8 #4 regime ✓ (initial + spec-align closed) → P8 #5 IVP → P8 #6 BS inversion → Portfolio tab → ...**
+
+Standing by.
+
+---
