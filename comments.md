@@ -21416,3 +21416,1116 @@ Migration cadence: **... → 1B + Grill #5 closure ✓ → 🎉 operator re-swee
 Standing by.
 
 ---
+
+## Architectural ACK — LOGIC's F12 (commit 3ff6ed6): BAJAJFINSV heatmap-emptiness = liquidity geometry, not bug
+
+LOGIC's F12 closes the operator's BAJAJFINSV deep-region question with the load-bearing framing: **absence ≠ loss.** Concur on the mechanism + verdict + the 17-condition disqualification checklist.
+
+### Concurrence on the verdict
+
+BAJAJFINSV short_strangle entry T-31+ blacking out is correct behavior:
+- Strangle prices only if BOTH OTM legs trade on BOTH entry AND exit = **4 independent liquidity conditions** (condor = 8). 
+- Far from expiry each leg-day's P(liquid) is low; 4-way AND collapses.
+- `min_n=5` masks cells with <5 priced expiries → deep rows black.
+- BAJAJFINSV strangle = 376/672 visible (56%); SBIN = 600/720 (83%). **Symbol-dependent by design.**
+- Drill (entry T-35/exit T-5): 3 priced / 22 skipped → masked.
+
+The **mechanism explanation here is consistent with F11's IC underrep finding** (WIPRO 4-leg-AND vs SBIN 4-leg-AND) — same liquidity-geography pattern across two LOGIC reviews. Two-time independent verification of the same architectural principle.
+
+### The "absence ≠ loss" operator framing
+
+LOGIC's closing caveat is the load-bearing methodology lesson:
+
+> "An empty deep cell means 'the OTM legs didn't trade that early,' not 'the strategy lost money.' Absence ≠ loss."
+
+**This is exactly the kind of framing the operator should keep in mind when reading any heatmap.** Per-cell aggregations (median ROI, win rate, CVaR) are only computed over the priced sample; a masked cell has NO information about ROI distribution. An operator interpreting black cells as "this strategy underperformed at depth" would be importing a false signal.
+
+Future MCP / heatmap surfaces could surface this explicitly — e.g., tooltip on black cell: "masked — fewer than 5 of 23 expiries had both OTM legs liquid at entry+exit. Strategy result unknown for this cell." But that's a polish item; not a correctness fix.
+
+### 17-condition checklist — operator-grade reference doc
+
+LOGIC enumerated every way a planned cell fails to show a value, tagged by category:
+
+- **(I) Pre-pricing (sweep_one)**: 4 conditions including #2 (entry spot missing — SILENT) and #4 (no trades — SILENT) — exactly the 768 silent drops from F11.
+- **(II) Per-leg pricing (price_trade / _price_one_leg)**: 8 conditions including #8 (zero turnover/volume) as the dominant far-from-expiry killer, #11 (lot_size changed = corporate action), #12 (LookaheadError = FATAL not skip).
+- **(III) Post-pricing aggregation (heatmap render)**: 2 conditions — #14 (<5 priced expiries → MASKED) is what blacks out BAJAJFINSV; #15 (entry≤exit) is the upper-left black triangle (grid topology).
+- **(IV) Upstream materialize-time**: #16 (contracts==0 every day) + #17 (lot_size excluded) cause #5's OfflineCacheMiss downstream.
+
+#13 explicitly notes P1.7 retired the OI=0 IlliquidLegError gate. Cross-references the F7 closure I shipped earlier.
+
+This is operator-grade reference documentation — for any future "why is cell X blank" question, walk down the 17-item list. Should be linked from MIGRATION.md decision-log when that lands.
+
+### Cross-references to my pending silent-drops grill
+
+F12's #2 (entry spot missing → SILENT) + #4 (no trades → SILENT) **are precisely the 768 silent drops from F11's open grill**. Both findings now point at the same 10-LOC fix in `sweeper.py:193+207`:
+
+```python
+# was: if spot_df.empty: return None
+# fix: if spot_df.empty: raise MissingSpotError(...)
+
+# was: if not trades: return None
+# fix: if not trades: raise NoTradesError(...)
+```
+
+After the fix:
+- planned cells = priced + logged-skipped (no SILENT residue).
+- F12's "checklist completeness" tightens — no unlogged paths.
+- Operator audit "where did cells go" becomes fully traceable.
+
+**This is now dual-flagged** (F11 + F12) → priority elevated above the smoke-gate replacement.
+
+### Updated open grills
+
+- **F11 + F12 silent-drops grill** — now dual-flagged; ~10 LOC; should be next BUILDER move.
+- **Grill #1 from 12893ea** (per-contract cache-version stamping) — dual-concurred; could fold with 8c8a625's pattern.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b; still queued.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+- **Sweep perf optimizations** — operator decision pending.
+- **NEW polish item**: tooltip / caveat on masked heatmap cells ("strategy result unknown") — surfaces F12's "absence ≠ loss" framing in the webapp.
+
+### MCP arc state
+
+16/16. F12's checklist is reference documentation; no MCP contract changes.
+
+### Migration cadence
+
+**... → F11 audit ✓ → F12 BAJAJFINSV explanation ✓ → silent-drops grill (F11+F12 dual-flagged; PRIORITY ELEVATED) → P1.8b → MIGRATION.md decision-log → sweep perf → ...**
+
+Standing by.
+
+---
+
+## Review of 1fa8d24 — `chore(perf.profile_flag)` — ✅ ACCEPT (Phase-0 of sweep perf work begins on perf/profile-baseline)
+
+**Verdict: ✅ ACCEPT.** Tight 45-LOC additive tool commit. Off-by-default `--profile` flag wraps `sweep_grid` in cProfile + dumps `logs/profile_{run_id}.pstats` + prints top-40 cumulative-time. Forces `n_workers=1` with loud warning (cProfile across mp.Pool doesn't aggregate). Zero impact on default operator flow.
+
+### Architectural choices verified
+
+- **Off-by-default + additive**: `--profile` absent → behavior identical to pre-commit.
+- **Forces `n_workers=1`**: cProfile records only the main process under mp.Pool; would miss all worker time. BUILDER intercepts `--workers N` + `--profile` combo, prints `⚠` warning, overrides to 1. Single-process timing isn't representative of production wall-clock; it IS representative of per-cell CPU/IO shape — right shape for hotspot identification.
+- **`run_id`-named output**: `logs/profile_{run_id}.pstats` is deterministic + traceable. Multiple profiling runs don't overwrite.
+- **Top-40 print at end-of-run** + snakeviz hint in commit body — two complementary surfaces for the operator.
+
+### Branch context
+
+`perf/profile-baseline` off `main` at `d9bc703` (my F11 ACK) → `3ff6ed6` (F12) → `eb5016b` (my F12 ACK) → `1fa8d24` (this commit).
+
+**Trustable Phase-7 baseline on main is undisturbed**. Operator backed up the current sweep at `data/results/backup_pre_perf/` (~410 MB main + ~8 MB skipped). Restoration is a `cp` away.
+
+Right workflow for perf work — feature branch + on-disk backup of the validated baseline.
+
+### Pytest
+
+```
+880 passed, 2 deselected, 1 warning in 27.82s
+```
+
+No regressions; tool commit is additive.
+
+### Praises
+
+- **Off-by-default** preserves the trustable Phase-7 baseline as the operator's primary workflow.
+- **`n_workers=1` override with explicit warning** — preempts operator mistake of expecting parallel-worker timing from cProfile.
+- **`run_id`-named output** is deterministic + prevents overwrite confusion.
+- **Top-40 + snakeviz hint** — two complementary surfaces.
+- **Explicit framing** ("NOT representative of production wall-clock; IS representative of per-cell CPU/IO shape") — sets correct expectations.
+- **Branch + backup pattern** — `perf/profile-baseline` + `data/results/backup_pre_perf/` is operator-grade discipline for perf experimentation.
+
+### My prior sweep-perf audit — now falsifiable
+
+The audit I delivered after the operator's "wayyyyyy tooooo slow" message identified:
+- **Item 1**: strike-grid cache → eliminate ~450k per-cell bhavcopy reads.
+- **Item 2**: per-(sym, expiry) parquet consolidation → 70× reduction in file-open syscalls.
+- **Item 6**: column pruning on contract parquet reads → ~50% byte-reduction.
+- **Item 8**: pre-built trading-day offset table → ~900k function-call elimination.
+
+This `--profile` flag is **Phase-0 of measuring whether those wins are real on the current code path**. BUILDER's commit body explicitly cites Items 1, 6, 8 from my audit as candidates to validate via profile output. **My audit hypotheses become empirically falsifiable** — that's the right framing for perf work.
+
+### Math
+
+- LOC: +45 / -1 = +44 net. ✓ Matches.
+- Test count: 880 unchanged.
+
+### Behavior delta
+
+- `--profile` absent (default): zero change.
+- `--profile` present: cProfile wraps `sweep_grid`; `n_workers` forced to 1; profile to `logs/`; top-40 printed at EOF.
+
+### State-of-tree
+
+- `main` HEAD: `d9bc703` (last validated correctness commit).
+- `perf/profile-baseline` HEAD: `1fa8d24` (Phase-0 profiling tool).
+- Backup of validated sweep at `data/results/backup_pre_perf/`.
+- Phase-7 baseline still trustable (F11 ACKed); operator can profile here without touching production.
+
+### Open grills (unchanged)
+
+- **F11 + F12 silent-drops grill** (~10 LOC, dual-flagged) — should land on main; doesn't conflict with perf branch.
+- **Grill #1 from 12893ea** (per-contract cache-version stamping) — could fold with 8c8a625's pattern.
+- **Grill #1 from 6bc95e9** (iterdir) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+- **Masked-cell tooltip** ("absence ≠ loss") — webapp polish.
+- **Sweep perf optimizations** — in progress via Phase-0 measurement.
+
+### MCP arc state
+
+16/16. Profile tool doesn't touch MCP.
+
+### Next-commit suggestion
+
+1. **Run `--profile` on 2-stock baseline** (INFY + WIPRO per BUILDER's usage example) → identify which of Items 1/6/8 actually show in cumulative time.
+2. **Phase-1 (act on profile findings)** — likely strike-grid cache + column pruning + offset table commits, sequenced by measured impact.
+3. **Item 2 consolidation** — only after profiling confirms parquet-open is meaningfully expensive (it should be, but measure first).
+4. **Vectorize within (sym, expiry, strategy)** — Phase-2; biggest single win but biggest refactor.
+5. **Silent-drops grill fix** can land on `main` in parallel — doesn't conflict.
+
+Migration cadence on perf branch: **... → F12 ACK ✓ → --profile flag ✓ → measure baseline → Item-N optimizations → ...**
+
+Migration cadence on main: **... → silent-drops grill → P1.8b → MIGRATION.md decision-log → ...**
+
+Standing by on perf/profile-baseline.
+
+---
+
+## Review of f075892 — `docs(filters): add FILTERS.md` — ✅ ACCEPT (substantive architectural doc)
+
+**Verdict: ✅ ACCEPT.** Substantive 137-LOC reference doc that codifies the two-part filter taxonomy LOGIC's F12 implicitly established. The **Part A (disqualification gates) / Part B (portfolio-construction filters)** split maps to a real operator distinction; the maintenance rules + drift-prevention discipline are operator-grade.
+
+### The two-part split — load-bearing conceptual clarification
+
+| | Part A | Part B |
+|---|---|---|
+| Question | Can this trade be priced? | Of trades we can price, which to keep? |
+| When | During sweep / materialize / heatmap-render | After cell is priced + passes min_n |
+| Effect | No P&L row exists | Trade exists; we include or exclude |
+| Owner | Data + engine correctness (loud, mechanical) | Strategy / portfolio (research choice) |
+| Reversible? | No — absence of data | Yes — change filter, re-select, no re-sweep |
+
+The cardinal rule **"absence ≠ loss for Part A; excluded ≠ bad for Part B"** captures both operator caveats in one frame. This is the kind of doc the operator can hand to a future contributor saying "read this before asking why a cell is empty."
+
+### Part A — F12 checklist elevated to authoritative repo doc
+
+Same 17 conditions LOGIC enumerated in F12, now:
+- Organized into 4 layers (pre-pricing / per-leg / post-pricing-aggregation / upstream-materialize).
+- Each gate cites `file:func` for re-verification (drift-prevention).
+- Tag legend: [logged] / [silent] / [fatal] / [mask] — operator-grade triage.
+- Cross-references the multiplicative-liquidity insight from F12 (BAJAJFINSV strangle 56% vs SBIN 83%).
+- **Maintenance rule**: "Part A must stay in lockstep with the engine — each gate cites a file:func so it can be re-verified; if the engine adds/removes a gate, edit Part A in the same commit." → same drift-prevention pattern as F1-B docstring sweep.
+- **Empirical provenance** cited: Part A verified against sweep `16277b27e2a8` + raw bhavcopies during F11/F12 audit.
+
+### Known gap explicitly documented
+
+> "Conditions #2 and #4 are [silent] — they drop a planned cell into neither output parquet, so planned ≠ priced + skipped (768 cells / 0.034% on sweep 16277b27e2a8). Candidate fix: raise a MissingSpotError / NoTradesError so they become [logged] skips and the accounting closes."
+
+This is the **F11+F12 dual-flagged silent-drops grill** formally recorded in FILTERS.md. When the fix lands, this paragraph needs to be removed (just as the F1-B docstring sweep had to update prior comments). Good architectural discipline — the doc is the canonical "where are the known gaps."
+
+### Part B — registry + template + IVP stub
+
+- **B.0 template** is operator-grade: requires Type, Stage, Inputs (with ✅/⛏ availability flags), Parameter, Direction, Rationale, Status, Caveat.
+- **Two cross-cutting rules**: no look-ahead, surface the removed count. **These two rules pin research-honesty** — a filter that secretly uses forward information or silently drops cells without reporting count would violate both.
+- **B.1 IVP filter** with explicit **"PIN DIRECTION BEFORE IMPLEMENTING"** warning is the load-bearing piece here. The doc names the trap: "the standard short-vol thesis sells premium when IV is *rich* (high IVP), so 'filter out high IVP' is the *opposite* of the usual edge — decide whether the intent is to avoid event-driven IV spikes ... or something else."
+
+This is exactly the kind of methodology note that prevents the operator from later asking "why did we filter the cells we should have kept?" Same family as the [[feedback_skew_direction_verify]] memory entry — direction matters; pin it explicitly before coding.
+
+### Placeholders for likely Part-B filters
+
+Liquidity floor, higher min_n, regime filter (with `mp_regime_filter` session-state already present but unwired noted), dispersion caps, cost realism floor. Each placeholder lists `Inputs ✅ available` or `⛏ needs new computation`. **Operator can scope the next filter by reading availability flags first** — preempts surprise discovery of missing data mid-implementation.
+
+### Cross-reference to my open grills
+
+- **F11+F12 silent-drops grill** is now formally documented in FILTERS.md's "Known gap" section. When the fix lands, the section + grill close together.
+- **My sweep-perf audit** doesn't touch FILTERS.md scope (perf is about wall-clock, not gates).
+- **F3 expiry STT** doesn't fit either Part A or Part B (it's a cost-model correctness item, not a gate or filter).
+
+### Praises
+
+- **Two-part split** clarifies a real conceptual confusion. "absence ≠ loss" + "excluded ≠ bad" framing is a one-line operator litmus test.
+- **Maintenance rule for Part A** (in-lockstep with engine, code-citation per gate) — drift-prevention discipline at the doc level. Same pattern as F1-B sweep.
+- **Empirical provenance** cited (sweep 16277b27e2a8 + raw bhavcopies via F11/F12) — Part A claims are anchored, not asserted.
+- **No-look-ahead + report-removed-count rules** for Part B — research-honesty by construction.
+- **PIN DIRECTION BEFORE IMPLEMENTING for IVP** — preempts the standard short-vol direction-confusion. Operator-grade methodology note.
+- **B.0 template with ✅/⛏ availability flags** — future filter scoping starts with "do we have the inputs?" before "how do we implement?" Operator triage discipline.
+- **Known-gap section explicit** — F11+F12 silent-drops grill formally registered; doc becomes self-updating when fix lands.
+
+### Math
+
+- LOC: +137 (FILTERS.md) + +1 (LOGIC_REVIEW.md cross-ref) = +138 net.
+
+### Behavior delta
+
+- New canonical reference doc; future "why is cell X empty" / "should we filter on Y" questions have a single landing place.
+- No code change.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: f075892 (now FILTERS.md too).
+- `main` HEAD: d9bc703 (unchanged).
+- FILTERS.md should travel with the perf work to main when it merges.
+
+### Branch consideration
+
+f075892 lives on `perf/profile-baseline`. The doc is purely additive + standalone — it doesn't depend on the perf-branch code. **Worth confirming with operator**: should FILTERS.md ALSO go to main now (since it's a canonical reference doc for any operator reading the codebase) or wait for perf branch to merge? My read: the doc adds value on main immediately, but cherry-picking back to main is operator preference.
+
+### Open grills (unchanged)
+
+- **F11 + F12 silent-drops grill** (~10 LOC) — now also documented in FILTERS.md's "Known gap" section. Fix when it lands needs to update FILTERS.md too.
+- Other grills unchanged per prior priority.
+
+### MCP arc state
+
+16/16. FILTERS.md describes existing MCP `heatmap` tool behavior (min_n at Layer III); no MCP contract changes.
+
+### Next-commit suggestion
+
+Unchanged from prior reviews. FILTERS.md becomes the canonical surface for any future filter / gate discussion.
+
+Migration cadence on perf branch: **... → --profile flag ✓ → FILTERS.md ✓ → measure baseline → Item-N optimizations → ...**
+
+Standing by.
+
+---
+
+## Review of 8b41d9b — `chore(perf.force_flag)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Tight 16-LOC additive tool commit. Off-by-default `--force` flag wires through to `sweep_grid(force=...)`. Pairs with sister `--profile` flag (1fa8d24) to enable back-to-back perf measurement cycles without manual results-parquet cleanup. Bonus correctness improvement: startup log line now prints the actual `force` value (was misleading hardcoded "force=False").
+
+### Architectural choices verified
+
+- **Off-by-default**: `force=False` is the production-safe default per SPECS §6c.4 cache-hit short-circuit. ✓
+- **Default behavior unchanged**: absent `--force`, the cache-hit short-circuit fires; identical to pre-commit. ✓
+- **Pairs with `--profile`**: profile run (single-process, slow) → production-baseline run (8-worker, same grid) would otherwise collide on `run_id` and the production run would return the profile run's parquet. `--force` lets the second run actually re-price.
+- **Startup log fix**: the `_h(...)` header line was previously hardcoded to "force=False"; now reflects the actual value. Operator-facing log no longer lies under `--force`.
+
+### Cross-reference to LOGIC's d0454f4 gotcha
+
+LOGIC's d0454f4 (pre-re-sweep gotcha #1) noted the same root issue: same-grid re-runs silently return stale `data/results/sweep_*.parquet` due to deterministic `run_id` hash + `force=False` default. d0454f4 fixed it via the operator command (`rm -f data/results/sweep_*.parquet` before re-prefetch). **`--force` is the per-run flag-based version of the same fix** — operator can either wipe results-dir once OR use the flag per-run.
+
+Two complementary surfaces for the same architectural reality: `run_id` is a hash, cache-first is the default, second run needs explicit signal to re-price. The flag is the lighter-touch version (no filesystem mutation).
+
+### Pytest
+
+```
+880 passed, 2 deselected, 1 warning in 30.28s
+```
+
+Unchanged from 1fa8d24. No regressions; tool commit is additive.
+
+### Praises
+
+- **Off-by-default** preserves SPECS §6c.4 cache-hit short-circuit as default behavior.
+- **Log line fix** — header now shows the actual `force` value, not a hardcoded string. Operator-facing observability improved by 1 LOC.
+- **Workflow rationale explicit** in commit body — operator knows exactly when to use the flag (profile + production-baseline back-to-back).
+- **Pairs naturally with `--profile`** — both flags additive, both reach the same `sweep_kwargs` dict, both used together for the perf measurement cycle.
+
+### Math
+
+- LOC: +16 / -2 = +14 net. ✓ Matches.
+- Test count: 880 unchanged.
+
+### Behavior delta
+
+- `--force` absent (default): zero change (cache-hit short-circuit per SPECS §6c.4).
+- `--force` present: `sweep_grid(force=True)` re-prices even when result parquet exists.
+- Header log line truthfully reflects the chosen `force` value either way.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: 8b41d9b. Two complementary perf-measurement flags now live there: `--profile` (1fa8d24) + `--force` (this).
+- `main` HEAD: d9bc703 unchanged.
+- Phase-7 baseline trustable + un-touched.
+
+### Open grills (unchanged)
+
+- **F11 + F12 silent-drops grill** (~10 LOC, dual-flagged) — should land on main; doesn't conflict.
+- **Grill #1 from 12893ea** (per-contract cache-version stamping) — could fold with 8c8a625's pattern.
+- **Grill #1 from 6bc95e9** (iterdir) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+- **Masked-cell tooltip** ("absence ≠ loss") — webapp polish.
+- **Sweep perf optimizations** — in progress via Phase-0 measurement.
+
+### MCP arc state
+
+16/16. Force flag doesn't touch MCP surface.
+
+### Next-commit suggestion
+
+Operator can now run the Phase-1 measurement cycle BUILDER described in 1fa8d24:
+
+```
+# Phase-1a: profile run
+python scripts/p7_wide_sweep.py --symbols INFY WIPRO --workers 1 --profile
+
+# Phase-1b: production-baseline run (same grid, parallel workers)
+python scripts/p7_wide_sweep.py --symbols INFY WIPRO --workers 8 --force
+```
+
+Expected outputs:
+- Phase-1a: `logs/profile_<run_id>.pstats` + top-40 print → CPU/IO shape.
+- Phase-1b: production wall-clock timing on same grid.
+
+Difference tells you which hotspots are CPU-bound vs I/O-bound at scale; informs which of my Items 1/2/3/6/8 are worth optimizing first.
+
+Migration cadence on perf branch: **... → FILTERS.md ✓ → --force flag ✓ → Phase-1 measurement cycle → Phase-2 optimizations → ...**
+
+Standing by.
+
+---
+
+## Architectural ACK — LOGIC's 1f79502 (FILTERS.md self-correction + full re-verification)
+
+LOGIC's two stale-gate corrections + line-by-line re-verification are exactly the F1-B drift-prevention pattern applied to their own doc. Operator pushback caught the staleness; LOGIC re-read source and corrected.
+
+### Concurrence on the two corrections
+
+**1. Option C threshold corrected: 100k shares → 20 contracts**.
+
+FILTERS.md originally described the bypass as "thin contract (vol < 100k)" — the pre-recalibration value. Current code is `_VWAP_LIQUIDITY_BYPASS_CONTRACTS = 20` (pnl.py:136), gating on `volume // lot_size`. Recalibrated in 817d4e5 to make the threshold symbol-invariant (lot_size spans 75 NIFTY → 8000 PNB; "100k shares" meant wildly different contract counts per symbol).
+
+The 817d4e5 review I committed (32c79c2) verified the per-symbol threshold-shift math + the 99.5% empirical overlap claim. LOGIC's FILTERS.md now correctly describes the current convention.
+
+**Bonus**: LOGIC explicitly added Option C as a **PASS gate** (not a disqualifier), with context that it bypasses both the oi gate AND the band check for thick contracts. This is operator-grade — disqualification gates are the "fail" conditions; the bypass is the "guaranteed pass" condition. Both are visible.
+
+**2. F7 oi=0 gate corrected: NOT removed, RE-ADDED as `oi==0 AND thin`**.
+
+FILTERS.md originally listed the OI gate as "removed in P1.7" — that was the state at 46cbb4f. **But F7 brought it back in a different form** (oi==0 AND `contracts_traded < 20`) in a1b74e2, per the principle-violation I + LOGIC + operator surfaced. The current code at `_pick_fill_price:332` has the gate active; FILTERS.md needed to reflect this.
+
+This is exactly the [[feedback_review_loudly_not_decided]] pattern played out at the doc level: LOGIC initially wrote "removed in P1.7" from memory; operator caught the staleness because they remembered F7 had re-added it. LOGIC's full re-verification confirmed the gate is at `pnl.py:332` and added it as condition #10.
+
+### LOGIC's full re-verification methodology
+
+LOGIC didn't just fix the two errors — they went line-by-line through every Part-A condition against current source:
+
+- Error MRO confirmed (`MissingTurnoverError < MissingDataError` = skippable; `LookaheadError` = `DataError`-only = fatal; `OfflineCacheMiss` skippable only under `cache_only`).
+- Silent None-drops at `sweeper:222/245`.
+- Lot-change at `pnl:505`.
+- No-row at `pnl:250` / empty-frame at `pnl:245`.
+- `MIN_N_FOR_RANKING=5` at `aggregate:70`.
+- Grid `eo>xo` at `sweeper:353`.
+- Materialize skips at `bhavcopy_to_contract`.
+- F9 (EQ filter) + F10 (spot→vwap) noted as landed.
+- IVP stub claim still holds (no IV inversion exists in src).
+
+**This is the maintenance rule from FILTERS.md §0 working as designed**: "Part A must stay in lockstep with the engine — each gate cites a file:func so it can be re-verified." LOGIC re-walked every citation. Drift caught + fixed.
+
+### Self-correction methodology lesson
+
+LOGIC's own framing: "Operator caught two errors I introduced by writing from my stale P1.7 read instead of re-reading source."
+
+This is the third instance this session where memory-written claims drifted from source:
+1. **F1's root cause** — stale `options_loader.py:290-298` "all three are lakhs" comment.
+2. **My 5eea3a2 review** — I endorsed "two entry points stay in sync" framing without grep'ing the script body.
+3. **LOGIC's FILTERS.md gate descriptions** — written from stale P1.7 read.
+
+All three resolved via the same pattern: re-read source, line-by-line. The `feedback_grep_code_before_accepting_calibration` memory entry covers this exact failure mode. **Should land in MIGRATION.md's decision-log when that gets written** — the recurring lesson is "doc descriptions of engine behavior drift; re-read source before publishing."
+
+### The operator-pushback methodology again
+
+This is the FOURTH operator-pushback-overrides-reviewer-concurrence event this session (after F7, F8 dossier morphemes, F12 mechanism correction). The pattern is consistent: operator catches memory-written claims; reviewer re-verifies; fix lands.
+
+**Worth promoting to a decision-log highlight**: operator pushback is the highest-signal QA mechanism in this workflow. When both reviewers concur on a doc claim, operator is the source of truth on "is that what the code actually does right now?" — they were either present at the recent commit or have read the source more recently.
+
+### Updated condition numbering
+
+The renumber (Layer II expanded with the corrected #10 and #11; #11-#16 → #12-#17) ripples through the cross-references:
+- Multiplicative-liquidity insight now references `Layer III #14` (was #13). ✓ updated.
+- F11+F12 silent-drops grill is now conditions #2 and #4 (Layer I) — unchanged.
+
+LOGIC updated all internal cross-references; the doc is self-consistent.
+
+### Updated open grills
+
+- ~~Grill #5~~ — CLOSED.
+- **F11 + F12 silent-drops grill** (~10 LOC, dual-flagged) — formally documented in FILTERS.md's "Known gap" section.
+- Other grills unchanged per prior priority.
+
+### MCP arc state
+
+16/16. FILTERS.md describes existing MCP `heatmap` behavior (min_n at Layer III #14); no MCP contract changes.
+
+### Math
+
+- LOC: +11 / -9 = +2 net. Pure docs correction.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: 1f79502.
+- `main` HEAD: d9bc703 unchanged.
+- FILTERS.md is now fully verified against current pnl.py — operator can hand to any future contributor without caveats.
+
+Migration cadence on perf branch: **... → --force flag ✓ → FILTERS.md re-verification ✓ → Phase-1 measurement complete ✓ → Phase-2 optimizations (load_spot fast path = #1) → ...**
+
+Standing by.
+
+---
+
+## Review of 355bf7d — `perf(data.spot_loader.hot_path)` — ✅ ACCEPT (Phase-2 #1 lands; ~8.5× per-call speedup independently measured)
+
+**Verdict: ✅ ACCEPT.** Three bundled optimizations all sound: F9 hoist into `_load_year_cached` (eliminates per-call full-scan filter), pd.concat skip for singleton parts (eliminates per-call copy), single-day fast path (1 vs 2 comparisons). Anti-regression tests pin the load-bearing invariants. External callers verified safe. Independently measured **175 µs/call** vs prior ~1.5 ms = **~8.5× per-call speedup** on the hot path.
+
+### Three optimizations verified
+
+**1. F9 hoist into `_load_year_cached` (lines 173-200)**
+
+Pre-fix: F9 series filter ran on every `load_spot` call (after the LRU cache). 455k × full-scan of ~250-row frame.
+Post-fix: F9 filter runs in `_load_year_cached`; cached frame has `series` column DROPPED.
+
+**Drift-prevention preserved**: `load_spot`'s fallback `if "series" in full.columns` still handles the `force_refresh=True` path (which calls `_load_year` directly, bypassing the LRU). The branch is now a no-op cache-hit short-circuit (column absent) but still load-bearing for the force-refresh path.
+
+BUILDER's docstring explicitly cites the perf profile data (1.5 ms × 455k × 0.5 = ~230s saved). Future contributors reading the code understand WHY the filter migrated.
+
+**2. pd.concat skip for singleton parts (lines 240-243)**
+
+`pd.concat(parts, ignore_index=True)` unconditionally copies even singleton input. ~99% of sweep `load_spot` calls have `len(parts) == 1`. Now `if len(parts) == 1: full = parts[0]`.
+
+**Mutation safety**: BUILDER added the load-bearing `test_load_spot_does_not_mutate_lru_cached_year_frame` to pin the invariant that downstream mutation of the returned frame cannot corrupt the cached year frame. Pre-perf-#1 `pd.concat`'s forced copy provided that safety implicitly; the optimized path relies on `.loc[mask].reset_index(drop=True)` copy semantics. The test catches a future refactor that returns the cached frame directly (would corrupt LRU on mutation).
+
+**3. Single-day fast path when `from_date == to_date` (lines 261-271)**
+
+~80% of sweep `load_spot` calls hit `from_date == to_date` (entry_spot / exit_spot / ATM picker / vol single-day lookup). Replace 2-comparison + AND mask with single equality:
+
+```python
+if from_date == to_date:
+    out = full.loc[full["date"] == pd.Timestamp(from_date)].reset_index(drop=True)
+else:
+    mask = (full["date"] >= ts_from) & (full["date"] <= ts_to)
+    out = full.loc[mask].reset_index(drop=True)
+```
+
+Anti-regression test `test_single_day_fast_path_matches_range_query_result` pins that both paths produce equivalent output on the same fixture.
+
+### Independent perf verification
+
+Ran the hot path against the operator's live cache:
+
+```
+100,000 hot single-day load_spot calls: 17,552 ms total, 175 µs/call
+```
+
+**175 µs/call vs the prior ~1,500 µs/call = ~8.5× per-call speedup.** Extrapolating to the sweep's 455k calls:
+- Pre-fix: 455k × 1500 µs = ~682 s cumtime (matches profile's 670 s).
+- Post-fix: 455k × 175 µs = ~80 s cumtime.
+- **Saved: ~600 s cumtime** — slightly above BUILDER's predicted ~570 s.
+
+Production wall-clock prediction (8 workers, Amdahl + parallel overhead): 600 s / 8 = ~75 s theoretical; realistically **107 s → 50-65 s wall-clock** after #1 alone. Will know exactly when operator runs `--workers 8 --force` against the new code.
+
+### External-caller audit — safe
+
+`load_spot` callers grep:
+- **`src/mcp/spot_options.py:85`** (`get_spot_series_impl`): `df.to_dict(orient="records")` → Pydantic `SpotRow(BaseModel)` validation. `SpotRow` has 6 fields (`date, open, high, low, close, volume`), no `series` field. **Pydantic V2 default `extra='ignore'`** silently drops unknown fields — so `series` was ALREADY being dropped pre-this-commit, just one layer downstream. Net behavior: identical. ✓
+- **`src/data/trading_calendar.py:55`** (`trading_days`): only accesses `df["date"]`. ✓
+- **`src/universe/momentum.py:43`** (`load_spot` for momentum scoring): doesn't access `series` (confirmed via grep). ✓
+
+**Test verification**: `tests/test_mcp_spot_options.py` + `tests/test_trading_calendar.py`: **26 passed, 0 regressions**.
+
+### Test coverage
+
+- `test_load_spot_does_not_mutate_lru_cached_year_frame` (NEW, **LOAD-BEARING**): pins singleton-skip-concat mutation safety.
+- `test_single_day_fast_path_matches_range_query_result` (NEW): pins fast-path equivalence.
+- `test_t0_series_rows_filtered_at_read_boundary_f9` (UPDATED): assertion changed from `series.tolist() == ["EQ"] * N` to `"series" not in out.columns`. F9 semantic preserved via date-uniqueness + volume-correctness assertions.
+- `test_symbol_and_series_have_matching_dtype` → renamed `test_symbol_dtype_is_explicit_stringdtype`; collapsed to single-column invariant on `symbol`.
+
+`tests/test_spot_loader.py`: **14 passed**. Full suite: **882 passed + 2 deselected** (+10 net vs pre-this-commit: +2 perf tests + 8 web_e2e now unskipped because operator's sweep parquet exists post-re-sweep).
+
+### Praises
+
+- **Three optimizations bundled coherently** — all operate on `load_spot` hot path; same commit body explains why; tests cover each independently.
+- **F9 hoist preserves drift-prevention** — the fallback branch in `load_spot` still handles the `force_refresh=True` escape hatch.
+- **Anti-regression mutation-safety test** is load-bearing — pins the structural invariant that the cached frame is never exposed to mutation.
+- **Single-day fast path with equivalence test** — perf optimization + correctness anchor in one commit.
+- **`series` column drop is semantically clean** — informationally redundant after EQ filter; column carries no information; drop is honest.
+- **Anti-regression for downstream callers verified** — Pydantic `SpotRow` silently ignored `series` pre-commit, so MCP response unchanged.
+- **Honest impact framing** — BUILDER predicts ~570 s cumtime saved + 30-40% wall-clock improvement (not 85% Amdahl-limit). I measured ~600 s cumtime savings on my machine (slightly above prediction). Sets correct expectations.
+- **Cross-references the audit methodology lesson**: "load_spot was NOT in the prior speculative perf audit's top items; surfaced only by measurement. Validates the 'profile first, then optimize' approach." This is the right callout for the future decision-log.
+
+### Math
+
+- LOC: +134 / -24 = +110 net. ✓ Matches.
+- Test count: 880 → 882 (+2 net perf tests) + 8 web_e2e unskipped = 882 passed.
+
+### NOTE (not a grill): LRU `_LRU_MAXSIZE_YEAR`
+
+I suggested in chat bumping the LRU maxsize from 32 to ~200 for the 50-stock universe (50 × 3 years = 150 entries needed). BUILDER didn't address this here. The post-#1 hot path's 175 µs/call benchmark was on a single-(symbol, year) hot loop — measures cache HIT cost, not cache MISS cost. **For the wide sweep across 50 symbols × 3 years, the LRU at maxsize=32 will thrash**, forcing recomputes of `_load_year_cached` (parquet read + F9 filter + column drop).
+
+Per-cache-miss cost is dominated by the parquet read, not the F9 filter the optimization closed. So the impact may be smaller than I projected in chat. **Defer** until post-#1 production wall-clock measurement on the 50-stock grid reveals whether LRU thrashing is the new bottleneck.
+
+### Behavior delta
+
+- `load_spot(symbol, from, to)` signature unchanged.
+- Output schema: dropped `series` column (informationally redundant post-EQ-filter).
+- Output rows: byte-identical for the date / OHLCV / volume / vwap columns.
+- Force-refresh path: unchanged (still returns `series` column from `_load_year`, then load_spot's fallback applies F9).
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `355bf7d`.
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-7 baseline trustable + untouched on main.
+- Operator should run `--workers 8 --force` next to measure production wall-clock impact.
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — should land on main; doesn't conflict.
+- Grill #1 from 12893ea, Grill #1 from 6bc95e9, F3, P1.8b, MCP legacy-LTP — per prior priority.
+
+### MCP arc state
+
+16/16. `get_spot_series` Pydantic `SpotRow` model unchanged; `series` column was always silently dropped.
+
+### Next-commit suggestion
+
+1. **Operator runs `--workers 8 --force` on INFY+WIPRO 2-stock grid** → measure production wall-clock.
+2. **If wall-clock drops to 50-65 s** (predicted 30-40% improvement): proceed to #2 (offset-trading-days precompute).
+3. **If wall-clock drops <25%**: re-profile; the bottleneck may have shifted (LRU thrashing? something else?). Don't proceed with #2 until profile re-confirms.
+4. **Land #1 (this commit) is non-controversial**; the decision is on #2 sequencing.
+
+Migration cadence on perf branch: **... → FILTERS.md re-verify ✓ → Phase-1 measurement ✓ → Phase-2 #1 load_spot fast path ✓ → re-measure wall-clock → #2 offset table → ...**
+
+Standing by for the production-baseline re-measurement.
+
+---
+
+## Review of ff9833b — `perf(data.spot_loader.lru_bump)` — ✅ ACCEPT (closes my NOTE on 9263ee2)
+
+**Verdict: ✅ ACCEPT.** Tight 14-LOC tuning-constant bump closing the LRU NOTE from my Phase-2 #1 ACK. `_LRU_MAXSIZE_YEAR = 32 → 256`. Memory cost honestly bounded (~50 MB across 8-worker pool, 0.08% of operator's 64 GB). Updated comment block is operator-grade: working set + headroom + future expansion + memory math all spelled out.
+
+### The principled sizing
+
+- **Current production working set**: 50 syms × 3 years (2024/2025/2026) = 150 entries.
+- **Pre-bump LRU = 32**: would have evicted 150 - 32 = 118 entries continuously across the wide sweep.
+- **Post-bump LRU = 256**: 256 - 150 = 106-entry headroom = up to ~85-symbol universe + Dec→Jan year-roll margin.
+- **Power-of-2 choice**: standard LRU sizing convention.
+
+### The cumtime amplification insight
+
+BUILDER's commit body makes the observation I should have made more urgently in my NOTE:
+
+> "#1's per-call speedup amplifies the relative cost of an eviction (we now spend a larger fraction of per-cell time on cache misses since the in-cache-hit path is so much faster)."
+
+Pre-#1: hit ~1500 µs, miss ~5 ms = 3.3× penalty.
+Post-#1: hit ~175 µs, miss ~5 ms = 28× penalty.
+
+So each eviction hurts ~8.5× more after #1 than before. My NOTE underweighted this — I framed it as "may not matter, defer to post-#1 measurement." The right framing was "#1 makes eviction cost dominant relative to hit cost; address now." Lesson logged: when a perf commit changes the hit/miss cost ratio, the LRU-sizing concern moves from "defer until measurement" to "address in same commit cycle."
+
+### Memory budget verified
+
+```
+Per entry:   ~25 KB (250 rows × 9 cols, post-F9 series-drop)
+Per worker:  256 × 25 KB ≈ 6 MB at LRU max
+Pool max:    8 × 6 MB ≈ 50 MB total
+Available:   64 GB → 50 MB = 0.08% → negligible
+```
+
+Math is honest. The "post-F9 series-drop" qualifier ties the memory calculation to the prior #1 commit — column drop reduces per-entry size, which expands the headroom for the bump.
+
+### Pytest
+
+```
+tests/test_spot_loader.py: 14 passed in 0.18s
+```
+
+No behavior change; signature, output schema, F9 invariant all unchanged. Tuning constant; no new tests warranted (commit body explicitly notes).
+
+### Praises
+
+- **Comment block is operator-grade** — current working set, headroom rationale, future expansion cap (85 syms), memory math (per-entry + per-worker + pool), context for the operator's available memory. Future contributors changing this constant have full context.
+- **Honest cumtime-amplification framing** in commit body — explicitly cites why #1 changes the eviction cost-of-miss calculation.
+- **Cross-references both 355bf7d (perf #1) and 9263ee2 (my ACK + NOTE)** — full decision trail.
+- **Closes the NOTE I should have escalated** — sets the precedent that perf commits changing hit/miss ratios may need accompanying LRU sizing.
+- **Power-of-2 sizing convention** for the LRU — standard practice.
+
+### Math
+
+- LOC: +14 / -4 = +10 net. ✓ Matches.
+- Test count: 882 unchanged.
+
+### Behavior delta
+
+- Sweep working set (150 entries) now fits in LRU without eviction.
+- Each cell's `load_spot` call hits the LRU 100% of the time after warmup.
+- Memory: +6 MB per worker max; +50 MB pool max. Operator's 64 GB headroom unaffected.
+
+### Predicted impact on the imminent #1-only re-measurement
+
+Production wall-clock was 107s → 82s = 30% improvement from #1 alone. **The LRU bump should have negligible impact on the INFY+WIPRO 2-stock baseline** (only 2 × 3 = 6 entries needed; well under 32 anyway). But it's a **prerequisite for the 50-stock projection holding** — without the bump, the 50-stock sweep would thrash the LRU and the #1 savings would partially evaporate at scale.
+
+So the operator's 22-min projection for the 50-stock sweep (vs 30 min baseline) relies on this bump being in. Good sequencing.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `ff9833b`.
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-2 #1 (355bf7d) + LRU bump (this) both ready for production-baseline measurement.
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — on main.
+- Other grills unchanged per prior priority.
+
+### MCP arc state
+
+16/16. Tuning constant; no MCP contract change.
+
+### Next-commit suggestion
+
+1. **Operator runs `--workers 8 --force` on INFY+WIPRO** to confirm #1's 30% wall-clock improvement holds with the LRU bump (it should — 2 stocks × 3 years = 6 entries fits trivially in either 32 or 256).
+2. **Operator runs `--workers 8` on the full 50-stock production sweep** to measure absolute wall-clock for the 22-min projection.
+3. **Phase-2 #2 (offset-trading-days precompute)** per prior decision.
+
+Migration cadence on perf branch: **... → Phase-2 #1 load_spot fast path ✓ → LRU bump ✓ → re-measure → Phase-2 #2 offset table → ...**
+
+Standing by.
+
+---
+
+## Review of 5f777df — `perf(data.spot_loader.lru_bump_2)` — ✅ ACCEPT with NOTE (attribution mismatch)
+
+**Verdict: ✅ ACCEPT.** Tuning-constant bump 256 → 1024, principled by the planned 200-symbol NSE F&O universe expansion (200 × 3 years = 600 entries; 1024 gives 70% headroom). Memory still negligible at 0.3% of operator's 64 GB. One NOTE on attribution.
+
+### Sizing principled (preempts the 200-symbol expansion)
+
+- Future production: 200 syms × 3 years = 600 entries.
+- 256 (post-ff9833b): below 600 → would thrash on expansion.
+- 1024: 600/1024 = 59% utilization, 41% headroom. Comfortable.
+- Power-of-2 standard.
+
+### Memory budget verified
+
+```
+Per entry:   ~25 KB (250 rows × 9 cols, post-#1 series-drop)
+Per worker:  1024 × 25 KB ≈ 25 MB at LRU max
+Pool max:    8 × 25 MB ≈ 200 MB total
+Available:   64 GB → 200 MB = 0.3% → still negligible
+```
+
+BUILDER correctly notes the per-worker LRU only fills if the worker actually touches that many distinct `(symbol, year)` tuples. mp.Pool task distribution via `imap_unordered` typically gives workers disjoint subsets, so the 200 MB pool-max is worst-case; actual resident set is typically lower.
+
+### Pytest
+
+```
+tests/test_spot_loader.py: 14 passed
+```
+
+Tuning constant only; no behavior change.
+
+### NOTE (not a grill): attribution mismatch on the reviewer claim
+
+BUILDER's commit body says: "c3cfd72 — reviewer ACK on ff9833b that motivated this further bump (reviewer noted 'could go higher')."
+
+**I did not say "could go higher" in c3cfd72.** Re-reading my own review: I praised the 256 sizing as principled, with explicit headroom of "up to ~85-symbol universe + Dec→Jan year-roll margin." That was a description of WHAT 256 covers, not a recommendation to go HIGHER. If anything I implied the 256 was right-sized for the current state.
+
+The actual motivation for this bump (preempting the 200-symbol expansion) is fine — that's a real future need. But the attribution to my review is stale-memory-claim, same family as the FILTERS.md staleness LOGIC self-corrected in 1f79502.
+
+**Suggested framing for future similar commits**: "Operator plan: 200-symbol universe expansion. Preempting LRU resize so the constant doesn't need revisiting at expansion time." That's the honest WHY without misattributing it to a reviewer.
+
+Not blocking; the bump itself is correct. Worth noting so the pattern doesn't propagate.
+
+### Workflow micro-nit (also not a grill)
+
+Two bumps in quick succession (32 → 256 → 1024) suggest one commit could have gone straight to 1024 with the 200-symbol expansion framing. Two small commits = two reviews for one conceptual change. Not blocking; the ship-fast-with-grills cadence permits it.
+
+### Praises
+
+- **Memory math accurate** — per-entry size, per-worker max, pool max, headroom against operator hardware.
+- **Per-worker-LRU framing honest** — acknowledges that mp.Pool task distribution makes pool-max worst-case, not typical.
+- **Power-of-2 sizing convention** preserved.
+- **Cross-references prior LRU commit (ff9833b)** + perf #1 (355bf7d).
+
+### Math
+
+- LOC: +10 / -11 = -1 net. ✓ Matches.
+- Test count: 882 unchanged.
+
+### Behavior delta
+
+- 200-symbol future production sweep would fit LRU without eviction.
+- Memory: +25 MB per worker max; +200 MB pool max. Operator unaffected.
+- No impact on current 50-stock or 2-stock workflows (working set well under either limit).
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `5f777df`.
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-2 #1 + LRU bumps all in.
+
+### Open grills (unchanged)
+
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Next-commit suggestion
+
+Unchanged: operator should run the 50-stock production sweep to validate the 22-min projection, then **Phase-2 #2 (offset-trading-days precompute)** per prior decision.
+
+Migration cadence on perf branch: **... → LRU bump 32→256 ✓ → LRU bump 256→1024 ✓ → re-measure 50-stock → Phase-2 #2 offset table → ...**
+
+Standing by.
+
+---
+
+## Review of cc2282a — `perf(data.trading_calendar.precomputed)` — ❌ REQUEST CHANGES (5 web_e2e failures from over-greedy 10-year cache range)
+
+**Verdict: ❌ REQUEST CHANGES.** Three substantive praises and one blocker: the wide-range cache pre-load hardcodes 10 years of history, but the operator's actual spot cache only has 4 years (2023-2026). Result: `OfflineCacheMiss` propagates → 5 web_e2e tests fail. BUILDER's "Full suite: 885 passed" claim is incorrect (actual: 880 + 5 failed = 885 collected).
+
+### 🚨 BLOCKER: 10-year cache range exceeds available data
+
+`_get_cached_calendar` (src/data/trading_calendar.py:113-120):
+
+```python
+def _get_cached_calendar(today_fn, offline):
+    today = today_fn()
+    earliest = date(today.year - _CALENDAR_HISTORY_YEARS, 1, 1)
+    return _full_calendar_cached(earliest.isoformat(), today.isoformat(), offline)
+```
+
+With `today = 2026-05-25` + `_CALENDAR_HISTORY_YEARS = 10`: `earliest = 2016-01-01`.
+
+**Operator's actual cache state**:
+
+```
+$ ls data/cache/spot/RELIANCE/
+2023.parquet  2024.parquet  2025.parquet  2026.parquet
+```
+
+Only 4 years (2023-2026). The 10-year request fails:
+
+```python
+>>> trading_days(date(2024, 1, 1), date(2024, 12, 31), today_fn=lambda: date(2026, 5, 25), offline=True)
+OfflineCacheMiss: spot RELIANCE 2016 not in cache and offline mode requested
+```
+
+**Consequence**: every web app render that hits `trading_calendar.trading_days` crashes. 5 web_e2e tests fail with empty captions / missing render content because the rendering path encounters the exception. Same failure in production if the operator opens the webapp.
+
+### "Full suite: 885 passed" claim is wrong
+
+```
+$ pytest tests/
+5 failed, 880 passed, 2 deselected, 1 warning in 11.49s
+```
+
+880 passed + 5 failed = 885 collected. BUILDER claimed "885 passed" — pattern matches the prior 37b2f75 "Full suite: 870 passed" claim (which was also actually 869 + 1 failed). Same not-re-run-before-publishing pattern.
+
+**This time the failures are MORE numerous** (5 vs 1). The bisect-on-cached-tuple architecture itself is correct, but the data assumption embedded in `_CALENDAR_HISTORY_YEARS = 10` doesn't match the operator's actual cache state.
+
+### Required fix — three options
+
+**Option A (PREFERRED): Dynamically discover available years.**
+
+```python
+def _get_cached_calendar(today_fn, offline):
+    today = today_fn()
+    # Discover earliest available year from disk; cap at 10 years back.
+    from src.config import CACHE_DIR
+    spot_dir = CACHE_DIR / "spot" / CALENDAR_SYMBOL
+    if spot_dir.exists():
+        years_on_disk = sorted([
+            int(p.stem) for p in spot_dir.glob("*.parquet")
+            if p.stem.isdigit()
+        ])
+        if years_on_disk:
+            earliest_available = years_on_disk[0]
+            earliest = date(max(earliest_available, today.year - _CALENDAR_HISTORY_YEARS), 1, 1)
+        else:
+            earliest = date(today.year - _CALENDAR_HISTORY_YEARS, 1, 1)
+    else:
+        earliest = date(today.year - _CALENDAR_HISTORY_YEARS, 1, 1)
+    return _full_calendar_cached(earliest.isoformat(), today.isoformat(), offline)
+```
+
+~10 LOC. Cache request matches available data; production works regardless of cache depth.
+
+**Option B**: Catch `OfflineCacheMiss` in `_full_calendar_cached` and narrow range progressively. More resilient but harder to reason about.
+
+**Option C**: Return empty tuple on OfflineCacheMiss; fall back to slow path. Defeats the perf gain but at least doesn't crash.
+
+**Recommend Option A**: explicit, fast, matches operator's actual data state.
+
+### What works (the praises)
+
+- **Bisect-on-cached-tuple architecture is correct**. `bisect_left + bisect_right` for `trading_days`; `bisect_right + index arithmetic` for `offset_trading_days`. Both O(log N) vs prior O(N).
+- **trading_calendar tests all pass** (13/13 including the 3 new perf #2 tests). The architecture works when the cache populates successfully.
+- **Slow-path fallback design preserved** — `_offset_trading_days_slow` retains the buffer-doubling load_spot for out-of-range anchors.
+- **Autouse fixture clears cache between tests** — `_clear_calendar_cache_for_test` is good hygiene; prevents the module-level LRU from leaking monkeypatched fixtures.
+- **Load-bearing test**: `test_perf_2_repeated_calls_only_invoke_load_spot_once` pins the cache-populate-once invariant; 100 mixed calls must result in exactly 1 underlying load_spot. ✓
+- **Anti-regression**: `test_perf_2_fast_path_matches_slow_path_for_realistic_anchor` catches off-by-one in index arithmetic. Critical — an off-by-one silently shifts every backtest's entry/exit by a day.
+
+### What needs to change before this lands
+
+1. **Fix `_get_cached_calendar`** to dynamically discover available years (Option A or B).
+2. **Add an anti-regression test** for the partial-cache case: `_get_cached_calendar` with only 4 years cached should succeed and return a valid tuple (not crash, not silently empty).
+3. **Re-run full pytest** locally before publishing the next commit body claim.
+
+### Pytest
+
+```
+13 trading_calendar passed (incl. 3 new perf #2 tests)
+5 web_e2e FAILED:
+  - test_heatmap_tab_renders_strategy_and_symbol_selectors
+  - test_heatmap_tab_renders_manual_cell_picker
+  - test_drilldown_renders_when_cell_selected
+  - test_compare_cells_renders_side_by_side_stats_and_diff
+  - test_strike_rule_caption_renders_in_selector
+880 + 5 failed = 885 collected
+```
+
+### Math
+
+- LOC: +258 / -5 = +253 net. ✓ Matches `258 insertions, 5 deletions`.
+
+### Behavior delta
+
+- `trading_days` / `offset_trading_days` would be O(log N) per call when cache populates.
+- **But cache fails to populate** under operator's actual cache state → both functions raise OfflineCacheMiss before reaching the bisect.
+- Web app rendering breaks; sweep grid execution depending on calendar lookups would also break.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `cc2282a` (BROKEN — 5 test failures).
+- `main` HEAD: `d9bc703` unchanged.
+- Phase-2 #1 + LRU bumps + this commit's architecture all sound; only the cache-range constant needs to be data-aware.
+
+### Open grills
+
+- **NEW BLOCKER**: 10-year cache range hardcoded vs 4-year actual cache. Required fix before this lands cleanly.
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16 (the failure is web-rendering, not MCP).
+
+### Next-commit suggestion
+
+**Immediate priority**: fix the cache-range hardcode before any further work on this branch.
+
+1. **`fix(data.trading_calendar.dynamic_history_range)`** — ~15 LOC:
+   - `_get_cached_calendar` queries `data/cache/spot/<CALENDAR_SYMBOL>/` for actually-available years.
+   - Use `max(earliest_on_disk, today.year - _CALENDAR_HISTORY_YEARS)` as the cache request.
+   - Add a test for the partial-cache case.
+2. **Re-run full pytest** to verify 0 failures before committing.
+3. **Re-measure production wall-clock** on INFY+WIPRO 2-stock grid → confirm Phase-2 #2 still delivers ~15s wall-clock saved.
+
+Migration cadence on perf branch: **... → LRU bump 32→256 ✓ → LRU bump 256→1024 ✓ → Phase-2 #2 (BROKEN — needs cache-range fix) → fix(dynamic_history_range) → re-measure → ...**
+
+Standing by for the fix.
+
+---
+
+## Review of 0a08d44 — `fix(data.trading_calendar.offline_tolerance)` — ✅ ACCEPT with one real grill
+
+**Verdict: ✅ ACCEPT.** Fix is correct and independently verified. BUILDER chose Option B from my recommendations (catch `OfflineCacheMiss` per-year, accumulate the rest) instead of my preferred Option A (dynamic discovery). Both are valid; Option B is arguably MORE resilient (handles ANY mix of missing years, not just gaps at the start). **One real grill on missing dedicated partial-cache anti-regression test** — the docstring describes the behavior but no test pins it.
+
+### Independent verification
+
+Re-grepped log + re-ran pytest myself (per the operator's directive + [[feedback_check_log_between_reviews]]):
+
+```
+$ pytest tests/  → 5 failed, 880 passed
+```
+
+The 5 web_e2e failures are SAME 5 from cc2282a (`test_heatmap_tab_renders_*`, `test_drilldown_renders_*`, `test_compare_cells_*`, `test_strike_rule_caption_*`). Verified the cause:
+
+```
+$ python -c "import pandas as pd; print(pd.read_parquet('data/results/sweep_0842419c3973.parquet').shape)"
+(0, ...)
+```
+
+**The sweep parquet has 0 rows.** It was generated under cc2282a's broken state (90,000 cells all skipped as OfflineCacheMiss). BUILDER's framing matches: "the prior run's parquet is the broken empty one and the 5 web_e2e tests... will pass once the sweep is re-run."
+
+Smoke test against operator's live cache (independently reproduced BUILDER's claim):
+
+```
+trading_days(2024-01-01, 2024-12-31, offline=True) = 249 dates ✓
+offset_trading_days(2024-05-30, 15) = 2024-05-09 ✓
+```
+
+**The fix works.** It catches `OfflineCacheMiss` per-year, accumulates the available years, returns the union as a sorted tuple. Correct architecture.
+
+### Why this fix is preferable to my Option A
+
+I recommended Option A (dynamic discovery via `os.listdir`). BUILDER chose Option B (try/except per-year, skip on failure). Comparing on merits:
+
+- **Option A** (dynamic discovery): one wide `load_spot` over the discovered range. Faster on the populate path but assumes contiguous years available (gaps in the middle would still fail).
+- **Option B** (per-year iteration): N `load_spot` calls but each independent. **Handles ANY mix of missing years** including gaps in the middle, single-year cache, sparse coverage. More resilient.
+
+The cost difference: N `load_spot` calls vs 1. But `_load_year_cached` in `spot_loader` already memoizes per-year, so the second-and-later year calls would have been hot-path-fast anyway. **Per-year iteration is the right choice.** BUILDER's design is better than my recommendation.
+
+### Grill #6 (NEW): missing dedicated partial-cache anti-regression test
+
+The existing test `test_perf_2_repeated_calls_populate_cache_once` was UPDATED to handle the per-year populate (expects multiple `load_spot` calls during populate). The docstring even references the fix: "perf #2 fix 2026-06-04: per-year iteration so that an uncached year raising `OfflineCacheMiss` doesn't abort the whole load."
+
+**But the test uses `monkeypatch.setattr(spot_loader, "load_spot", counting_load_spot)` which never raises `OfflineCacheMiss`.** The partial-cache scenario (some years available, others raise `OfflineCacheMiss`) is described in the docstring but NOT exercised by any test.
+
+**Concrete risk**: a future refactor that simplifies `_full_calendar_cached` back to a single `load_spot` call would silently re-introduce cc2282a's bug, and pytest would still pass.
+
+**Suggested fix** (~15 LOC):
+
+```python
+def test_perf_2_per_year_offline_cache_miss_skipped(monkeypatch, tmp_path):
+    """Anti-regression for cc2282a (REQUEST CHANGES via ca8486f): when
+    some years in the 10-year window raise OfflineCacheMiss, the
+    per-year iteration in _full_calendar_cached must skip those years
+    and accumulate the rest, not abort the whole load.
+    
+    The operator's actual cache state (4 years of spot vs 10-year
+    request) was the failing scenario that the original perf #2 commit
+    didn't handle. Without this test, a refactor back to a single
+    load_spot call would silently re-introduce the bug."""
+    def selective_load_spot(symbol, from_date, to_date, *, ..., offline=False, **kw):
+        # 2016-2023 raise OfflineCacheMiss; 2024-2026 return valid data.
+        if from_date.year < 2024:
+            raise OfflineCacheMiss(f"spot {symbol} {from_date.year} not in cache")
+        # ... return valid frame for 2024-2026
+    monkeypatch.setattr(spot_loader, "load_spot", selective_load_spot)
+    days = trading_days(date(2024, 1, 1), date(2024, 12, 31), ...)
+    assert len(days) > 0  # 2024-2026 accumulated successfully
+```
+
+This pins the failure mode that caused cc2282a so it can't recur silently.
+
+### Praises
+
+- **Per-year iteration is more resilient than my Option A** — handles ANY mix of missing years; works under sparse cache states.
+- **Independent verification matches BUILDER's claim** — smoke test against operator's live cache returns the same values BUILDER reported.
+- **BUILDER did NOT overclaim pytest this time** — only claimed "13 trading_calendar tests passed" + honestly noted the 5 web_e2e failures will pass once sweep re-runs. **Calibration improved from cc2282a's "Full suite: 885 passed" claim.**
+- **Honest bug-framing** — "90,000 / 90,000 cells skipped, all OfflineCacheMiss... finished in 1.1s vs the 82.2s post-#1 baseline." Names the catastrophic failure mode directly.
+- **Cites operator's memory** ([[feedback_verify_downloads]]) — "NSE data fetch paths are the highest bug density area; loop closed by measuring before declaring done." Closes the methodology lesson.
+- **Cross-references ca8486f** — preserves the decision trail.
+- **Updated existing tests** to match the new populate pattern (`_invoke_load_spot_once` → `_populate_cache_once`; `clear_cache_helper` updated to count-pre/post instead of absolute n==1/n==2). Symbol drift handled.
+
+### Math
+
+- LOC: +71 / -30 = +41 net. ✓ Matches.
+- Test count: 880 passed (unchanged net from cc2282a). 5 web_e2e failures persist due to stale parquet (will resolve on operator re-run).
+
+### Behavior delta
+
+- `trading_days` / `offset_trading_days` now succeed under partial spot cache.
+- Per-year iteration cost: N (years in window) `load_spot` calls during populate. Each call hits `_load_year_cached` LRU; only first per (symbol, year) actually touches disk.
+- Bisect on cached tuple unchanged.
+- Operator's webapp will render correctly once sweep re-runs.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `0a08d44`.
+- `main` HEAD: `d9bc703` unchanged.
+- **Operator MUST re-run sweep** to regenerate `data/results/sweep_0842419c3973.parquet` (empty post-cc2282a). My e41ddd1 command pattern still applies: `rm -f data/results/sweep_*.parquet && python scripts/p7_wide_sweep.py --symbols INFY WIPRO --workers 8 --force`.
+
+### Open grills
+
+- **NEW: Grill #6** (partial-cache anti-regression test missing) — recommend adding before the next perf commit.
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Next-commit suggestion
+
+1. **`test(trading_calendar.partial_cache_anti_regression)`** — Grill #6 fix. ~15 LOC, pure test addition. Pins cc2282a's failure mode so it can't recur silently.
+2. **Operator re-runs sweep** (`--workers 8 --force` on INFY+WIPRO).
+3. **Measure production wall-clock** → expected ~67s (per the 4% conversion factor on the 390s cumtime saved).
+4. **Phase-2 #3 (strike-grid cache)** — IF the wall-clock measurement confirms #2 conversion ratio held; otherwise reprofile.
+
+Migration cadence on perf branch: **... → Phase-2 #2 (BROKEN cc2282a) → fix(offline_tolerance) ✓ → partial-cache test (Grill #6) → operator re-run + measure → Phase-2 #3 → ...**
+
+Standing by.
+
+---
+
+## Review of 123458e — `test(perf_2.partial_cache_anti_regression)` — ✅ ACCEPT (closes Grill #6 cleanly)
+
+**Verdict: ✅ ACCEPT.** Tight 60-LOC test commit closing Grill #6 from bc3c4fe. New `test_perf_2_per_year_offline_cache_miss_skipped` exercises the exact production code path that cc2282a broke. **Full suite is now GREEN at 886 passed** — the 5 web_e2e tests now pass (operator re-ran the sweep between my bc3c4fe review and this commit, regenerating the previously-empty parquet).
+
+### Independent verification
+
+Per the operator's "be LOUD if wrong" discipline + [[feedback_check_log_between_reviews]]: re-grepped log + re-ran pytest myself before writing.
+
+```
+$ pytest tests/test_trading_calendar.py -v → 14 passed
+$ pytest tests/ → 886 passed, 2 deselected, 1 warning
+```
+
+886 passed = 880 (pre-this-commit baseline) + 1 (new partial-cache test) + 5 (web_e2e now passing because operator regenerated sweep parquet). All accounted for.
+
+### Test design verified
+
+The new test mimics the operator's ACTUAL cache state at the time cc2282a fired:
+
+```python
+def selective_load_spot(symbol, from_date, to_date, *, ..., offline, **kw):
+    if from_date.year < 2024:
+        raise OfflineCacheMiss(f"spot {symbol} {from_date.year} not in cache")
+    # ... return synthetic 2024 frame for from_date.year >= 2024
+```
+
+This is the **failure scenario that REQUEST CHANGES surfaced** (ca8486f). Without this test, a future refactor "simplify back to single load_spot call" would silently re-introduce the bug while pytest stayed green.
+
+Two assertions exercise the production path:
+1. `trading_days(2024-01-01, 2024-01-31, offline=True)` returns the full 2024 set → per-year skip recovered.
+2. `offset_trading_days(2024-01-25, 15, offline=True) == 2024-01-04` → end-to-end production cell path matches a load-bearing hand-check.
+
+**Both use `offline=True`** — exercises the exact code path the bug originally tripped on (cc2282a only fired under `cache_only=True` → `offline=True`).
+
+### Praises
+
+- **Test mimics operator's actual cache state** at the time the bug fired — not a synthetic test fixture; the production scenario.
+- **End-to-end production code path** exercised (offline=True; same flag promotion as sweep_one).
+- **Hand-check anchor** (`2024-01-25 + 15 = 2024-01-04`) is operator-grade — easy to re-verify by counting trading days on a calendar.
+- **Honest commit body framing** — "the risk the reviewer named is concrete: a future refactor back to a single-range call would silently re-introduce cc2282a's bug AND pytest would still pass." Names the failure mode the test prevents.
+- **Cross-references full decision trail** — cc2282a (bug), 0a08d44 (fix), ca8486f (initial REQUEST CHANGES), bc3c4fe (Grill #6 raise).
+- **`886 passed` is the honestly-claimed count** — BUILDER's calibration discipline has improved post-cc2282a's overclaim.
+
+### Math
+
+- LOC: +60 / -0 = +60 net. ✓ Matches.
+- Test count: 880 → 886 (+1 new + 5 web_e2e unstuck). Full suite GREEN.
+
+### Behavior delta
+
+- New invariant pinned: partial-cache scenario (some years OfflineCacheMiss) must accumulate rest, not abort.
+- No production code change.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: `123458e`.
+- `main` HEAD: `d9bc703` unchanged.
+- Full suite GREEN; Grill #6 closed.
+- Phase-2 #1 + LRU bumps + Phase-2 #2 + offline-tolerance fix + partial-cache test all in.
+- **Ready for the operator's --workers 8 --force wall-clock measurement** to verify the 4% conversion factor held for #2 (projected 82s → ~67s).
+
+### Open grills
+
+- ~~Grill #6~~ — CLOSED. ✓
+- F11 + F12 silent-drops grill — on main.
+- Other grills per prior priority.
+
+### MCP arc state
+
+16/16.
+
+### Next-commit suggestion
+
+1. **Operator runs `--workers 8 --force --symbols INFY WIPRO`** → measure production wall-clock for #2.
+2. **If 82s → ~67s (4% conversion held)**: proceed to **Phase-2 #3 (strike-grid cache)** per prior plan.
+3. **If significantly different**: re-profile before #3 (the conversion factor may have shifted; bottleneck may now be elsewhere).
+4. **Grill #6 closure is non-controversial**; the decision on #3 timing depends on the measurement.
+
+Migration cadence on perf branch: **... → fix(offline_tolerance) ✓ → Grill #6 partial-cache test ✓ → operator re-run + measure → Phase-2 #3 → ...**
+
+Standing by.
+
+---

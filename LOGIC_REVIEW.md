@@ -418,6 +418,7 @@ All four logged skip classes verified faithful (engine reads real data; zero mas
 **Mechanism:** a strangle prices only if **both OTM legs have non-zero volume on BOTH entry AND exit days = 4 independent liquidity conditions** (condor = 8). Far from expiry, each OTM leg-day's P(liquid) is low; the 4-way AND crushes it; then you still need ≥5 of 23 expiries to clear or the cell is masked. SBIN's top-tier options liquidity keeps OTM legs trading at T-40+ (14–20 expiries clear); BAJAJFINSV (mid liquidity) drops below 5 by ~T-31. **So yes — for mid-liquidity names, strangles 30–40 td before expiry are genuinely rare; for SBIN/INFY they're common.** Symbol-dependent, by design.
 
 ### COMPLETE disqualification checklist — every way a planned cell fails to show a value
+> Canonical, maintained version now lives in [`FILTERS.md`](FILTERS.md) (Part A — trade gates; Part B reserves space for future portfolio-construction filters like IVP). The list below is the audit-time snapshot.
 **(I) Pre-pricing (`sweep_one`):**
 1. entry/exit date resolution `offset_trading_days` cache-miss → `OfflineCacheMiss` (cache_only). *[logged]*
 2. entry spot missing — `load_spot(entry).empty` → **`return None`, SILENT (neither parquet)**; spot cache-miss → `OfflineCacheMiss`. *[silent / logged]*

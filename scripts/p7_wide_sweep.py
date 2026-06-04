@@ -115,6 +115,33 @@ def _parse_args() -> argparse.Namespace:
         "--workers", type=int, default=N_WORKERS,
         help=f"Worker process count (default: {N_WORKERS}).",
     )
+    p.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Force re-run even if data/results/sweep_{run_id}.parquet "
+            "already exists. SPECS §6c.4 default is cache-hit short-"
+            "circuit (same grid → same run_id → return cached parquet). "
+            "Pass --force during the perf measurement cycle "
+            "(profile run → production-baseline run on the same 2-stock "
+            "grid) so the second run actually re-prices instead of "
+            "returning the first run's parquet."
+        ),
+    )
+    p.add_argument(
+        "--profile", action="store_true",
+        help=(
+            "Wrap the inner sweep_grid call in cProfile and dump the "
+            "raw pstats to logs/profile_{run_id}.pstats + print top-40 "
+            "cumulative-time entries at end-of-run. Use to identify "
+            "perf hotspots before applying optimizations; pair with a "
+            "small --symbols subset (e.g. 2 stocks) for fast iteration. "
+            "Single-process only — cProfile across mp.Pool workers "
+            "doesn't aggregate, so this flag forces n_workers=1 with a "
+            "loud warning. Profile output is NOT representative of "
+            "production wall-clock under parallel workers; it IS "
+            "representative of per-cell CPU/IO shape."
+        ),
+    )
     return p.parse_args()
 
 
@@ -122,6 +149,15 @@ def main() -> int:
     args = _parse_args()
     symbols: list[str] = args.symbols
     n_workers: int = args.workers
+    profile_enabled: bool = args.profile
+    if profile_enabled and n_workers != 1:
+        print(
+            f"  ⚠ --profile forces n_workers=1 (cProfile across "
+            f"mp.Pool workers doesn't aggregate; you'd see only the "
+            f"main process's profile, missing all worker time). "
+            f"Overriding --workers {n_workers} → 1 for this run.",
+        )
+        n_workers = 1
     _h("Phase-7 wide-grid sweep — heatmap 45×16")
     print(f"  symbols     = {symbols}  (n={len(symbols)})")
     print(f"  strategies  = {STRATEGIES}")
@@ -179,9 +215,11 @@ def main() -> int:
     # (the verbatim message goes to skip_detail, surfaced in the
     # heatmap drill-down's Skipped Expiries section).
 
-    _h(f"Running sweep (n_workers={n_workers}; cache_only=True; force=False; cache-hit short-circuits)")
+    force: bool = args.force
+    _h(f"Running sweep (n_workers={n_workers}; cache_only=True; force={force}; "
+       f"cache-hit short-circuits when force=False)")
     t0 = time.perf_counter()
-    df = sweep_grid(
+    sweep_kwargs = dict(
         strategies=STRATEGIES,
         symbols=symbols,
         expiries=expiries,
@@ -189,11 +227,31 @@ def main() -> int:
         exit_offsets_td=EXIT_OFFSETS_TD,
         today_fn=TODAY_FN,
         offline=False,
-        force=False,
+        force=force,
         n_workers=n_workers,
         show_progress=True,
         cache_only=True,
     )
+    if profile_enabled:
+        import cProfile
+        import pstats
+        log_dir = REPO / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        profile_path = log_dir / f"profile_{run_id}.pstats"
+        profiler = cProfile.Profile()
+        profiler.enable()
+        df = sweep_grid(**sweep_kwargs)
+        profiler.disable()
+        profiler.dump_stats(profile_path)
+        print(f"\n  → profile written to {profile_path}")
+        print(f"  → load + view: python -c \"import pstats; "
+              f"pstats.Stats('{profile_path}').sort_stats('cumulative').print_stats(40)\"")
+        print()
+        _h("Top 40 by cumulative time")
+        stats = pstats.Stats(str(profile_path)).sort_stats("cumulative")
+        stats.print_stats(40)
+    else:
+        df = sweep_grid(**sweep_kwargs)
     t_total = time.perf_counter() - t0
     _h(f"Sweep complete — {t_total:.1f}s ({t_total / max(n_cells_planned, 1) * 1000:.1f}ms/cell wall-clock)")
     print(f"  rows priced: {len(df)} / {n_cells_planned} planned")

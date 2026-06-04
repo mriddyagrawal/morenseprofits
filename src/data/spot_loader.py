@@ -37,10 +37,19 @@ from src.data.telemetry import warn_fetch
 
 
 # Per-process LRU cache size for the year-keyed parquet read.
-# 10 universe symbols × 3 years = 30 entries; 32 leaves headroom.
-# Each entry is ~250 rows × 10 cols ≈ ~25KB — 8 workers × 32 × 25KB ≈ 6 MB
-# worst-case across the pool. Negligible.
-_LRU_MAXSIZE_YEAR = 32
+# Operator plans to sweep the full NSE F&O universe (~200 symbols)
+# at some point; 200 symbols × 3 years = 600 entries to cover that
+# without eviction. Bumped to 1024 (2026-06-04, perf measurement
+# cycle) so universe expansion stays a no-op on this constant — no
+# need to revisit when the operator scales beyond the current 50.
+#
+# Memory: each entry is ~250 rows × 9 cols ≈ ~25 KB post-perf-#1
+# (the F9 series-column drop removed one StringDtype column).
+# 8 workers × 1024 entries × 25 KB ≈ ~200 MB worst-case across the
+# pool — 0.3% of the operator's 64 GB. Per-worker resident memory
+# delta is ~25 MB at the LRU maximum, which only fills if the
+# worker actually touches that many distinct (symbol, year) tuples.
+_LRU_MAXSIZE_YEAR = 1024
 
 
 # jugaad column -> SPECS §2.1 column
@@ -170,14 +179,33 @@ def _load_year_cached(
 
     Returns the SAME DataFrame object on cache hit — ``load_spot``
     callers do ``.loc[mask].reset_index(drop=True)`` which creates a
-    new frame, so the cached value is read-only in practice."""
+    new frame, so the cached value is read-only in practice.
+
+    Perf #1 (2026-06-04 profile of sweep 0842419c3973 showed
+    ``load_spot`` consumed 46% of cumulative profile time at 1.5 ms
+    per call × 455k calls = ~670s, dominated by the per-call F9
+    series filter on a ~250-row frame). The F9 EQ-series filter is
+    hoisted from ``load_spot`` to this cache-populate layer so the
+    full-scan ``df[df["series"] == "EQ"]`` runs at most once per
+    (symbol, year) — typically once per worker process. The
+    ``series`` column is dropped after filtering so ``load_spot``'s
+    F9 fallback branch (still needed for the ``force_refresh=True``
+    path which bypasses this LRU) short-circuits on the membership
+    check without scanning rows."""
     today = date.fromisoformat(today_iso)
-    return _load_year(
+    raw = _load_year(
         symbol, year,
         force_refresh=False,
         today_fn=lambda: today,
         offline=offline,
     )
+    if "series" in raw.columns:
+        raw = (
+            raw[raw["series"] == "EQ"]
+            .reset_index(drop=True)
+            .drop(columns=["series"])
+        )
+    return raw
 
 
 def load_spot(
@@ -218,20 +246,38 @@ def load_spot(
             _load_year_cached(symbol, y, today_iso, offline)
             for y in years
         ]
-    full = pd.concat(parts, ignore_index=True)
-    # F9 (logic-review 1347b8c, 2026-06-03): cached spot parquets can
-    # carry NSE T0-series rows alongside the EQ-series prints — typically
-    # single-trade micro-volume rows on the SAME date (BHEL/2025 had 6
-    # such dups, PNB/2025 had 8). ``_fetch_year`` passes ``series="EQ"``
-    # to jugaad, but the filter doesn't always hold, AND legacy caches
-    # may have been populated under a pathway that didn't filter.
-    # Defense-in-depth: drop non-EQ rows at the read-time boundary so
-    # downstream (engine ATM picker, realized-vol computation,
-    # entry/exit_spot fetch) sees a single row per date deterministically.
+    # Perf #1 (2026-06-04): skip pd.concat when len(parts) == 1. The hot
+    # sweep path is a single-day query within one year — ~99% of calls
+    # have len(parts) == 1. pd.concat unconditionally copies even
+    # single-frame input; we can route around it when the input is
+    # already a singleton. The cached frame is never returned directly
+    # — downstream .loc[mask].reset_index(drop=True) always builds a
+    # new frame — so this is safe.
+    if len(parts) == 1:
+        full = parts[0]
+    else:
+        full = pd.concat(parts, ignore_index=True)
+    # F9 (logic-review 1347b8c, 2026-06-03; perf hoist 2026-06-04):
+    # cached spot parquets can carry NSE T0-series rows alongside the
+    # EQ-series prints (BHEL/2025 had 6 such dups, PNB/2025 had 8).
+    # The filter is APPLIED by ``_load_year_cached`` at year-cache
+    # populate time and the ``series`` column is DROPPED there — so
+    # this branch is a no-op cache-hit short-circuit (column absent).
+    # Branch still needs to run for ``force_refresh=True`` which
+    # bypasses the LRU and returns raw ``_load_year`` output.
     if "series" in full.columns:
         full = full[full["series"] == "EQ"].reset_index(drop=True)
-    mask = (full["date"] >= pd.Timestamp(from_date)) & (
-        full["date"] <= pd.Timestamp(to_date)
-    )
-    out = full.loc[mask].reset_index(drop=True)
+    # Perf #1 fast path: single-day queries (entry_spot / exit_spot /
+    # ATM picker / vol single-day lookup) hit ``from_date == to_date``
+    # — ~80% of sweep load_spot calls. Skip the 2-comparison + AND
+    # mask construction in favor of a single equality lookup.
+    if from_date == to_date:
+        out = full.loc[
+            full["date"] == pd.Timestamp(from_date)
+        ].reset_index(drop=True)
+    else:
+        mask = (full["date"] >= pd.Timestamp(from_date)) & (
+            full["date"] <= pd.Timestamp(to_date)
+        )
+        out = full.loc[mask].reset_index(drop=True)
     return out
