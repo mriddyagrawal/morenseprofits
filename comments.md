@@ -21690,3 +21690,92 @@ Migration cadence on perf branch: **... → --profile flag ✓ → FILTERS.md �
 Standing by.
 
 ---
+
+## Review of 8b41d9b — `chore(perf.force_flag)` — ✅ ACCEPT
+
+**Verdict: ✅ ACCEPT.** Tight 16-LOC additive tool commit. Off-by-default `--force` flag wires through to `sweep_grid(force=...)`. Pairs with sister `--profile` flag (1fa8d24) to enable back-to-back perf measurement cycles without manual results-parquet cleanup. Bonus correctness improvement: startup log line now prints the actual `force` value (was misleading hardcoded "force=False").
+
+### Architectural choices verified
+
+- **Off-by-default**: `force=False` is the production-safe default per SPECS §6c.4 cache-hit short-circuit. ✓
+- **Default behavior unchanged**: absent `--force`, the cache-hit short-circuit fires; identical to pre-commit. ✓
+- **Pairs with `--profile`**: profile run (single-process, slow) → production-baseline run (8-worker, same grid) would otherwise collide on `run_id` and the production run would return the profile run's parquet. `--force` lets the second run actually re-price.
+- **Startup log fix**: the `_h(...)` header line was previously hardcoded to "force=False"; now reflects the actual value. Operator-facing log no longer lies under `--force`.
+
+### Cross-reference to LOGIC's d0454f4 gotcha
+
+LOGIC's d0454f4 (pre-re-sweep gotcha #1) noted the same root issue: same-grid re-runs silently return stale `data/results/sweep_*.parquet` due to deterministic `run_id` hash + `force=False` default. d0454f4 fixed it via the operator command (`rm -f data/results/sweep_*.parquet` before re-prefetch). **`--force` is the per-run flag-based version of the same fix** — operator can either wipe results-dir once OR use the flag per-run.
+
+Two complementary surfaces for the same architectural reality: `run_id` is a hash, cache-first is the default, second run needs explicit signal to re-price. The flag is the lighter-touch version (no filesystem mutation).
+
+### Pytest
+
+```
+880 passed, 2 deselected, 1 warning in 30.28s
+```
+
+Unchanged from 1fa8d24. No regressions; tool commit is additive.
+
+### Praises
+
+- **Off-by-default** preserves SPECS §6c.4 cache-hit short-circuit as default behavior.
+- **Log line fix** — header now shows the actual `force` value, not a hardcoded string. Operator-facing observability improved by 1 LOC.
+- **Workflow rationale explicit** in commit body — operator knows exactly when to use the flag (profile + production-baseline back-to-back).
+- **Pairs naturally with `--profile`** — both flags additive, both reach the same `sweep_kwargs` dict, both used together for the perf measurement cycle.
+
+### Math
+
+- LOC: +16 / -2 = +14 net. ✓ Matches.
+- Test count: 880 unchanged.
+
+### Behavior delta
+
+- `--force` absent (default): zero change (cache-hit short-circuit per SPECS §6c.4).
+- `--force` present: `sweep_grid(force=True)` re-prices even when result parquet exists.
+- Header log line truthfully reflects the chosen `force` value either way.
+
+### State-of-tree
+
+- `perf/profile-baseline` HEAD: 8b41d9b. Two complementary perf-measurement flags now live there: `--profile` (1fa8d24) + `--force` (this).
+- `main` HEAD: d9bc703 unchanged.
+- Phase-7 baseline trustable + un-touched.
+
+### Open grills (unchanged)
+
+- **F11 + F12 silent-drops grill** (~10 LOC, dual-flagged) — should land on main; doesn't conflict.
+- **Grill #1 from 12893ea** (per-contract cache-version stamping) — could fold with 8c8a625's pattern.
+- **Grill #1 from 6bc95e9** (iterdir) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+- **Masked-cell tooltip** ("absence ≠ loss") — webapp polish.
+- **Sweep perf optimizations** — in progress via Phase-0 measurement.
+
+### MCP arc state
+
+16/16. Force flag doesn't touch MCP surface.
+
+### Next-commit suggestion
+
+Operator can now run the Phase-1 measurement cycle BUILDER described in 1fa8d24:
+
+```
+# Phase-1a: profile run
+python scripts/p7_wide_sweep.py --symbols INFY WIPRO --workers 1 --profile
+
+# Phase-1b: production-baseline run (same grid, parallel workers)
+python scripts/p7_wide_sweep.py --symbols INFY WIPRO --workers 8 --force
+```
+
+Expected outputs:
+- Phase-1a: `logs/profile_<run_id>.pstats` + top-40 print → CPU/IO shape.
+- Phase-1b: production wall-clock timing on same grid.
+
+Difference tells you which hotspots are CPU-bound vs I/O-bound at scale; informs which of my Items 1/2/3/6/8 are worth optimizing first.
+
+Migration cadence on perf branch: **... → FILTERS.md ✓ → --force flag ✓ → Phase-1 measurement cycle → Phase-2 optimizations → ...**
+
+Standing by.
+
+---
