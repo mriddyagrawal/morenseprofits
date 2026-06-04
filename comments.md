@@ -22529,3 +22529,120 @@ Migration cadence on perf branch: **... → fix(offline_tolerance) ✓ → Grill
 Standing by.
 
 ---
+
+## 🎉 Architectural ACK — `9b6d236 Merge perf/profile-baseline` — ✅ ACCEPT (Phase-2 perf work lands on main; 40% wall-clock + content-equivalent)
+
+**Verdict: ✅ ACCEPT.** Operator merged the perf branch into main with the **load-bearing content-equivalence assertion**: `pd.testing.assert_frame_equal(new, backup) → PASSED` across 1,103,923 rows × 24 columns. **40% wall-clock improvement on the 50-stock production sweep (43:24 → 25:57) under ZERO behavior delta.** All session correctness fixes (F1, F1-B, F5, F6, F7, F8, F9, F10) preserved.
+
+### Independent verification
+
+Per the operator's "be LOUD" discipline + [[feedback_check_log_between_reviews]]: re-grepped log + re-ran pytest myself.
+
+**Merge topology**:
+- `Merge: 3ff6ed6 ec6f4d4` (F12 ∪ last perf-branch commit).
+- `main..perf/profile-baseline` = empty (perf branch fully in main).
+- `git log 9b6d236` includes both `d9bc703` (F11 ACK) and `3ff6ed6` (F12). Full session history preserved.
+
+**Test suite**:
+```
+886 passed, 2 deselected, 1 warning in 28.01s
+```
+
+GREEN at HEAD.
+
+### Headline numbers (load-bearing)
+
+| Scale | Pre-perf | Post-perf | Δ |
+|---|---|---|---|
+| 2-stock validation (90k cells) | 107.1s | 69.2s | **−35%** |
+| 50-stock production (2.25M cells) | 2604.0s (43:24) | 1557.2s (25:57) | **−40%** |
+| 50-stock throughput | 864 cells/s | 1412 cells/s | **+63%** |
+
+**The 50-stock improvement is LARGER than 2-stock** — that's the LRU bumps (32 → 1024) paying off where they actually matter (working set fits in 1024, not 32). On 2-stock the LRU was never under pressure.
+
+### Content equivalence — THE load-bearing assertion
+
+```
+pd.testing.assert_frame_equal(new, backup) → PASSED
+Both frames (1,103,923, 24) — IDENTICAL.
+All 4 skip-reason counts match exactly.
+Per-symbol per-strategy row counts match exactly.
+Per SPECS §6c.3 determinism contract.
+```
+
+**This is the right way to validate perf work**. Without this assertion, perf claims would be unfalsifiable — "fast but different output" is not faster; it's broken. The `assert_frame_equal` over 1.1M rows × 24 cols is the strict test: any divergence at any cell fails. Operator ran it; it passed.
+
+### Architecture summary (operator-grade commit body)
+
+BUILDER's commit body documents the full Phase 0 → 1 → 2 → 3 arc with every commit + every reviewer event preserved chronologically:
+
+- **Phase 0 instrumentation**: 1fa8d24 (--profile) + 8b41d9b (--force).
+- **Phase 1 baseline**: 1445.7s cProfile single-process; 107.1s 8-worker 2-stock; 2604s 50-stock.
+- **Phase 2 optimizations**: #1 (355bf7d load_spot fast path) + LRU bumps (ff9833b + 5f777df) + #2 (cc2282a → 0a08d44 fix → 123458e test).
+- **Phase 3 results**: −40% wall-clock on 50-stock under content-equivalence.
+
+**Every reviewer turn cross-referenced**: 9263ee2 (#1 ACK), c3cfd72 (LRU #1 ACK), ad988ac (LRU #2 ACK), ca8486f (REQUEST CHANGES on cc2282a), bc3c4fe (ACK + Grill #6), ec6f4d4 (Grill #6 closure ACK). The arc is fully self-documented.
+
+### Praises
+
+- **Content-equivalence assertion is load-bearing AND honest** — the right way to validate any perf work that touches data paths.
+- **40% wall-clock on 50-stock** is substantial — the kind of operator-visible improvement that justifies the saga (including cc2282a's bug + fix + test cycle).
+- **Operator-grade commit body** — full arc preserved; every reviewer event cited; decision trail intact.
+- **Honest cumtime → wall-clock framing** — the 4% conversion factor I helped budget at for 2-stock; actually the 50-stock factor is higher due to LRU benefits. BUILDER does NOT overclaim the conversion ratio.
+- **Calibration discipline maintained** — no overclaim of test count (886 passed verified by my re-run).
+- **All session correctness fixes preserved** — F9, P1.7 VWAP-or-skip, Option C 20-contract, F7 oi==0 thin, F10 spot VWAP transaction reference. The commit body explicitly enumerates these.
+- **Docs landed alongside** — FILTERS.md + its self-correction (1f79502) live on main now too.
+
+### Math
+
+- Merge brings ~22 commits + ~10 reviews + 2 docs commits into main.
+- Test count: 886 (up from main's prior 870-ish + 16 from perf branch).
+- Production wall-clock: 2604s → 1557s on 50-stock. **18 minutes saved per sweep run.**
+
+### Behavior delta
+
+- **ZERO net change on outputs.** Verified by content-equivalence over 1.1M rows.
+- Sweep wall-clock: −40% on 50-stock.
+- Webapp render path: now uses bisect-on-cached-tuple via trading_calendar; same data semantics.
+- Spot loader: `series` column dropped from output (informationally redundant post-F9 EQ filter; MCP layer silently absorbed via Pydantic extra='ignore').
+- LRU sizing: 32 → 1024 per worker; +200 MB pool worst-case (0.3% of operator's 64 GB).
+
+### State-of-tree
+
+- `main` HEAD: `9b6d236` (the merge).
+- `main` is `[ahead 63]` of origin/main — operator has unpushed work.
+- `perf/profile-baseline` HEAD: `ec6f4d4` (still alive; could be deleted now that work is on main).
+- Phase-7 baseline trustable + significantly faster.
+
+### Open grills (post-merge)
+
+- **F11 + F12 silent-drops grill** (~10 LOC, dual-flagged) — STILL OPEN; should land soon.
+- **Grill #1 from 12893ea** (per-contract options cache-version stamping) — could fold with 8c8a625's pattern.
+- **Grill #1 from 6bc95e9** (iterdir order) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+- **Masked-cell tooltip** ("absence ≠ loss") — webapp polish.
+- **MIGRATION.md decision-log** — should now include the perf arc + the 4% conversion lesson + the doc-staleness pattern + the operator-pushback-as-QA pattern.
+- **Phase-2 #3 (strike-grid cache)** — operator may or may not want to push further; 40% is a good landing point if marginal #3 isn't worth the effort.
+
+### MCP arc state
+
+16/16. Spot column drop silently absorbed by Pydantic; no MCP contract change.
+
+### Next-commit suggestion
+
+The migration arc + perf arc are both at landing points:
+
+1. **🚩 OPERATOR push to origin/main** when ready (63 commits ahead). Sets the team's main reference.
+2. **F11 + F12 silent-drops grill** (~10 LOC) — closes the planned-vs-recorded accounting gap.
+3. **MIGRATION.md decision-log** — captures the full session: P1.0-P1.8 + F1-F12 + perf arc + methodology lessons.
+4. **Phase-2 #3 (strike-grid cache)** — optional; 40% is a strong landing if marginal gain isn't worth the effort.
+5. **P1.8b smoke gate replacement** — still queued.
+
+Migration cadence on main: **... → P1.7 ✓ → F11 + F12 ✓ → 🎉 Phase-2 perf merge (−40% wall-clock, content-equivalent) ✓ → silent-drops grill → MIGRATION.md decision-log → ...**
+
+Standing by.
+
+---
