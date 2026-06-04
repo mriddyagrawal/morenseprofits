@@ -21497,3 +21497,98 @@ After the fix:
 Standing by.
 
 ---
+
+## Review of 1fa8d24 — `chore(perf.profile_flag)` — ✅ ACCEPT (Phase-0 of sweep perf work begins on perf/profile-baseline)
+
+**Verdict: ✅ ACCEPT.** Tight 45-LOC additive tool commit. Off-by-default `--profile` flag wraps `sweep_grid` in cProfile + dumps `logs/profile_{run_id}.pstats` + prints top-40 cumulative-time. Forces `n_workers=1` with loud warning (cProfile across mp.Pool doesn't aggregate). Zero impact on default operator flow.
+
+### Architectural choices verified
+
+- **Off-by-default + additive**: `--profile` absent → behavior identical to pre-commit.
+- **Forces `n_workers=1`**: cProfile records only the main process under mp.Pool; would miss all worker time. BUILDER intercepts `--workers N` + `--profile` combo, prints `⚠` warning, overrides to 1. Single-process timing isn't representative of production wall-clock; it IS representative of per-cell CPU/IO shape — right shape for hotspot identification.
+- **`run_id`-named output**: `logs/profile_{run_id}.pstats` is deterministic + traceable. Multiple profiling runs don't overwrite.
+- **Top-40 print at end-of-run** + snakeviz hint in commit body — two complementary surfaces for the operator.
+
+### Branch context
+
+`perf/profile-baseline` off `main` at `d9bc703` (my F11 ACK) → `3ff6ed6` (F12) → `eb5016b` (my F12 ACK) → `1fa8d24` (this commit).
+
+**Trustable Phase-7 baseline on main is undisturbed**. Operator backed up the current sweep at `data/results/backup_pre_perf/` (~410 MB main + ~8 MB skipped). Restoration is a `cp` away.
+
+Right workflow for perf work — feature branch + on-disk backup of the validated baseline.
+
+### Pytest
+
+```
+880 passed, 2 deselected, 1 warning in 27.82s
+```
+
+No regressions; tool commit is additive.
+
+### Praises
+
+- **Off-by-default** preserves the trustable Phase-7 baseline as the operator's primary workflow.
+- **`n_workers=1` override with explicit warning** — preempts operator mistake of expecting parallel-worker timing from cProfile.
+- **`run_id`-named output** is deterministic + prevents overwrite confusion.
+- **Top-40 + snakeviz hint** — two complementary surfaces.
+- **Explicit framing** ("NOT representative of production wall-clock; IS representative of per-cell CPU/IO shape") — sets correct expectations.
+- **Branch + backup pattern** — `perf/profile-baseline` + `data/results/backup_pre_perf/` is operator-grade discipline for perf experimentation.
+
+### My prior sweep-perf audit — now falsifiable
+
+The audit I delivered after the operator's "wayyyyyy tooooo slow" message identified:
+- **Item 1**: strike-grid cache → eliminate ~450k per-cell bhavcopy reads.
+- **Item 2**: per-(sym, expiry) parquet consolidation → 70× reduction in file-open syscalls.
+- **Item 6**: column pruning on contract parquet reads → ~50% byte-reduction.
+- **Item 8**: pre-built trading-day offset table → ~900k function-call elimination.
+
+This `--profile` flag is **Phase-0 of measuring whether those wins are real on the current code path**. BUILDER's commit body explicitly cites Items 1, 6, 8 from my audit as candidates to validate via profile output. **My audit hypotheses become empirically falsifiable** — that's the right framing for perf work.
+
+### Math
+
+- LOC: +45 / -1 = +44 net. ✓ Matches.
+- Test count: 880 unchanged.
+
+### Behavior delta
+
+- `--profile` absent (default): zero change.
+- `--profile` present: cProfile wraps `sweep_grid`; `n_workers` forced to 1; profile to `logs/`; top-40 printed at EOF.
+
+### State-of-tree
+
+- `main` HEAD: `d9bc703` (last validated correctness commit).
+- `perf/profile-baseline` HEAD: `1fa8d24` (Phase-0 profiling tool).
+- Backup of validated sweep at `data/results/backup_pre_perf/`.
+- Phase-7 baseline still trustable (F11 ACKed); operator can profile here without touching production.
+
+### Open grills (unchanged)
+
+- **F11 + F12 silent-drops grill** (~10 LOC, dual-flagged) — should land on main; doesn't conflict with perf branch.
+- **Grill #1 from 12893ea** (per-contract cache-version stamping) — could fold with 8c8a625's pattern.
+- **Grill #1 from 6bc95e9** (iterdir) — MINOR; defer.
+- **F3** (expiry STT) — defer.
+- **Smoke-gate replacement** (F6 #1+#2) — P1.8b.
+- **MCP legacy-LTP caveat for regime B** — polish.
+- **Phase 2b cross-boundary smoke test** — anti-regression.
+- **Masked-cell tooltip** ("absence ≠ loss") — webapp polish.
+- **Sweep perf optimizations** — in progress via Phase-0 measurement.
+
+### MCP arc state
+
+16/16. Profile tool doesn't touch MCP.
+
+### Next-commit suggestion
+
+1. **Run `--profile` on 2-stock baseline** (INFY + WIPRO per BUILDER's usage example) → identify which of Items 1/6/8 actually show in cumulative time.
+2. **Phase-1 (act on profile findings)** — likely strike-grid cache + column pruning + offset table commits, sequenced by measured impact.
+3. **Item 2 consolidation** — only after profiling confirms parquet-open is meaningfully expensive (it should be, but measure first).
+4. **Vectorize within (sym, expiry, strategy)** — Phase-2; biggest single win but biggest refactor.
+5. **Silent-drops grill fix** can land on `main` in parallel — doesn't conflict.
+
+Migration cadence on perf branch: **... → F12 ACK ✓ → --profile flag ✓ → measure baseline → Item-N optimizations → ...**
+
+Migration cadence on main: **... → silent-drops grill → P1.8b → MIGRATION.md decision-log → ...**
+
+Standing by on perf/profile-baseline.
+
+---
