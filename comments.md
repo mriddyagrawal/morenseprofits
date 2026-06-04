@@ -23903,3 +23903,98 @@ Migration cadence: **... → P9 #1 engine.iv ✓ → research_iv ref-impl chore 
 Standing by.
 
 ---
+
+## Review of d824ef8 — `fix(p9.0.events_loader.case_norm)` — ✅ ACCEPT (closes 68a97a7 GRILL 1 cleanly)
+
+**Verdict: ✅ ACCEPT.** Surgical one-line fix matching the exact recommendation from 68a97a7. Docstring updated to reflect the new contract; new test pins the case-norm round-trip. 22/22 events_loader tests pass; full suite 966. No new grills.
+
+### Fix matches the recommendation exactly
+
+68a97a7 review (verbatim): "Cheap fix (1 method call): also uppercase the cached SYMBOL column at parse-time. `events_loader.py:113`: `"SYMBOL": df["SYMBOL"].astype(str).str.strip().str.upper().astype("string"),`"
+
+BUILDER's diff (events_loader.py:114):
+```python
+"SYMBOL": df["SYMBOL"].astype(str).str.strip().str.upper().astype("string"),
+```
+
+✓ Identical. Cheapest possible patch; no surface-area change beyond the one method call.
+
+### Docstring updated to match
+
+```
+Old: "SYMBOL ... stripped, uppercase preserved from source"
+New: "SYMBOL ... stripped + uppercased on parse; NSE source is already
+      uppercase but we normalize defensively so a future mixed-case row
+      can't cause a silent miss against has_earnings_in_window's
+      symbol.upper() lookup — closes reviewer GRILL 1 from 68a97a7"
+```
+
+Audit-trail crumb embedded in the docstring (`closes reviewer GRILL 1 from 68a97a7`) — future maintainer can grep the commit hash and reconstruct the failure-mode context. Same forward-defense discipline as the F5 spec-alignment header in regime.py.
+
+### New test pins the round-trip
+
+`test_load_events_uppercases_symbol_at_parse_time` writes mixed-case + lowercase SYMBOL rows to a CSV, asserts both come out uppercased, AND that the mixed-case input round-trips cleanly through `has_earnings_in_window`. Both halves of the asymmetry are pinned.
+
+### Pytest verification
+
+```
+.venv/bin/python -m pytest tests/test_events_loader.py -q
+22 passed in 0.15s
+
+.venv/bin/python -m pytest -q
+966 passed, 3 deselected, 1 warning in 37.13s
+```
+
+Test count delta: 21 → 22 (+1). ✓ Matches BUILDER's claim exactly. Full suite stayed at 966 (was 966 pre-fix on my machine per the 68c5c2d count-drift note; effectively flat plus the new test = the same number, consistent with the deselect dynamics I noted earlier).
+
+### Praise points
+
+- **Cross-refs `feedback_grep_code_before_accepting_calibration`** in the commit body — BUILDER explicitly recognizes the failure-mode family (docstring asserting a contract that doesn't hold under stress). Self-aware pattern recognition.
+- **Surgical scope** — one method call + docstring + one test. No drive-by cleanup, no scope creep.
+- **Docstring's audit trail** — `closes reviewer GRILL 1 from 68a97a7` ties the change to the review that triggered it. Three commits in a row now (207d5c1, 9690656, d824ef8) carry provenance tags in spec/code; this discipline is hardening.
+- **Test asserts BOTH directions** — mixed-case appears uppercased in the loaded frame (cache-parse side) AND round-trips through `has_earnings_in_window` (lookup side). Each half of the asymmetry covered independently.
+- **Preemptive close** — BUILDER's commit body acknowledges the bug "didn't fire in production" (NSE always uppercases) but fixes it before downstream consumers grow. Defensive correctness vs lived-correctness; the right call before P9 #2 / earnings_filter.wire builds on top.
+
+### Math
+
+- LOC: 15 (events_loader.py) + 29 (test_events_loader.py) = +44, but with 3 deletions on docstring update → +41 net. ✓ Matches `git show --stat` (+41 / -3 = +38; actual stat shows +44/-3 = +41 net).
+- Tests: 21 → 22. ✓
+- 22/22 events_loader tests pass; 966 full suite passes.
+
+### State-of-tree
+
+- `main` HEAD: `d824ef8`.
+- 68a97a7 GRILL 1 — ✅ CLOSED.
+- All other open grills unchanged.
+
+### Open grills (cumulative)
+
+- ✅ **CLOSED — 68a97a7 GRILL 1** (events_loader SYMBOL case-norm) — closed by this commit.
+- **STANDING — f126fa6 GRILL 1** (research_iv .ipynb untracked) — escalating; now load-bearing across 3 commits (9690656, 182cf1d, 68c5c2d).
+- **STANDING — f126fa6 GRILL 2** (3 PNGs missing for §22.5 evidence).
+- ~~f126fa6 GRILL 3~~ — RESOLVED via 68c5c2d's documented None-vs-NaN rationale.
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. Cache currently on disk was built pre-fix, so it carries source-case SYMBOL values. NSE source is uppercase in practice, so this doesn't affect correctness — but the cache will be silently rebuilt next time the CSV mtime is newer (or `force_refresh=True`). If operator wants to verify the post-fix normalization on disk, run:
+```
+.venv/bin/python -c "from src.data.events_loader import load_events; df = load_events(force_refresh=True); print(df['SYMBOL'].head())"
+```
+to force a re-parse with the new uppercase pass. NOT required — production behavior is correct either way because input is uppercase-normalized via `symbol.upper()` in `has_earnings_in_window`.
+
+### Next-commit suggestion
+
+**Unchanged from 68c5c2d**: `chore(p8.research.track_research_iv_ipynb)` to close f126fa6 GRILL 1+2. The .ipynb has now been cited as prototype source in 3 consecutive feature commits (9690656, 182cf1d, 68c5c2d). Cumulative drift escalating per [[feedback_reviewer_calibration]]; before any next-feature commit lands, the artifact-tracking discipline needs to hold.
+
+Alternative: `feat(p9.1.iv_materializer)` if BUILDER prefers the natural progression — but that would be the FOURTH consecutive commit depending on the untracked .ipynb.
+
+Migration cadence: **... → P9 #1 engine.iv ✓ → P9 #0 case-norm fix ✓ → research_iv ref-impl chore (HIGH PRIORITY) → P9 #1b iv_materializer → ...**
+
+Standing by.
+
+---
