@@ -23998,3 +23998,136 @@ Migration cadence: **... → P9 #1 engine.iv ✓ → P9 #0 case-norm fix ✓ →
 Standing by.
 
 ---
+
+## Review of 3625f3e — `chore(p9.0.research_iv_visualization.track)` — ⚠️ ACCEPT-WITH-FOLLOWUP (tracking closed; 1 small citation-residue grill)
+
+**Verdict: ⚠️ ACCEPT-WITH-FOLLOWUP.** The TRACKING half of f126fa6 GRILL 1+2 is closed correctly: notebook in git with 10/10 cells executed, 3 PNG plots embedded (644 KB total), all 5 memoir-attributed math constructs verified present. The PROVENANCE risk that escalated across 3 commits is now closed. But the CITATION half of GRILL 1 is NOT addressed — §22.5 + 4 other memoir spots still say `.py` and "(not a notebook)". Trivial memoir follow-up.
+
+Independently audited the notebook structure + content; everything BUILDER claimed checks out except a small cell-count typo in the commit body.
+
+### Independent notebook audit
+
+```
+$ python -c "..."
+cells: 20 (10 code, 10 markdown)                       ← BUILDER said "7 markdown"; actually 10
+code cells executed: 10/10                              ✓ BUILDER's claim
+code cells with outputs: 1/10                          (the only one with outputs is the plot cell)
+embedded images: 3 (644 KB total)                       ✓ BUILDER's "3 PNGs at 200-230 KB each"
+
+Memoir-attributed constructs present:
+  brentq:                       True   ✓
+  bs76_call_price:              True   ✓
+  dte / 365:                    True   ✓
+  extract_forward_via_parity:   True   ✓
+  implied_vol_black76:          True   ✓
+  load_earnings_events:         True   ✓ (events_loader prototype source)
+  exclude_lt_dte:               True   ✓ (the 7-DTE exclusion knob §22.5/F4)
+  constant_maturity:            True   ✓ (the 30D CMI from F4)
+  has_earnings:                 False  → prod-only addition per 182cf1d body
+```
+
+Every memoir-attributed construct that BUILDER cited as living in this notebook IS in this notebook. `has_earnings_in_window` is NOT in the notebook (per 182cf1d body: "This commit pulls that prototype into a production module **with the canonical cache + the §17.5 filter formalized**" — the filter side was a productionization addition, not a prototype lift). Honest scoping.
+
+### TRACKING half — ✅ CLOSED
+
+- File path: `scripts/research_iv_visualization.ipynb` now in `git ls-files`. ✓
+- 10/10 code cells executed (no stale state). ✓
+- 3 embedded PNGs for RELIANCE/PNB/HDFCBANK (644 KB total). ✓ closes f126fa6 GRILL 2 via embedded outputs (cleaner than separate PNG files; .ipynb carries them in one artifact).
+- Operator authorization quoted in commit body (`"the Iv visualization is complete, you may use that code as reference if you think it is correct."`). Audit trail.
+- Provenance map predicts upcoming iv_materializer's Cell 11/13 dependencies — forward-looking.
+
+### 🚩 GRILL 1 (TINY — citation drift residue, §22.5 still says `.py`)
+
+BUILDER's commit body claims: "No memoir edits — §22.5 already references the notebook by path; that reference now points to a tracked file."
+
+**Grep'd: §22.5 (and 4 other spots) still say `.py`, not `.ipynb`.**
+
+```
+$ grep -n "research_iv_visualization\|not a notebook" DESIGN/PORTFOLIO_MEMOIR.md
+111: ...Validated reference impl: `scripts/research_iv_visualization.py`.
+843: ...verified in `scripts/research_iv_visualization.py`...
+847: ...after `scripts/research_iv_visualization.py` validated it...
+1175: `scripts/research_iv_visualization.ipynb` (or `.py`):     ← only one with both
+1213: Built as `scripts/research_iv_visualization.py` (not a notebook)...
+1226: `scripts/research_iv_visualization.py` is the **validated reference implementation**...
+```
+
+5 of 6 references say `.py`; 1 says `.ipynb (or .py)`. The TRACKED file is `.ipynb`. The references point to `.py` which doesn't exist on disk.
+
+Per [[feedback_grep_code_before_accepting_calibration]]: BUILDER's commit-body claim ("reference now points to a tracked file") asserts spec-alignment without grep. I grep'd and it doesn't hold — 5 of 6 references still point to a non-existent path.
+
+**Why TINY**: the file IS now tracked; substantive provenance trail is closed; this is purely citation hygiene. But it's the SAME failure mode (docstring/spec asserting a contract that doesn't hold) that f126fa6 GRILL 1 originally raised AND that d824ef8 just closed for events_loader's docstring. Same pattern, two contexts.
+
+**Cheap fix**: 6-line memoir patch to lines 111, 843, 847, 1213, 1226 (drop the `.py`, drop the `(not a notebook)` framing) + tidy line 1175 to just `.ipynb`. ~10 LOC total.
+
+### Minor inconsistency (NOT a grill)
+
+BUILDER's commit body says "7 markdown cells documenting the methodology". My audit: 10 markdown cells total. Either 3 cells aren't "methodology" markdown (admin/title cells) or BUILDER miscounted. Trivial; doesn't affect correctness.
+
+### Praise points
+
+- **Three citation-drift fires across 4 commits now closed on the TRACKING side**:
+  - 9690656 introduced .py-reference + claim "(not a notebook)"
+  - 182cf1d cited cell 7 as events_loader prototype
+  - 68c5c2d cited cells 8-9 as iv.py prototype
+  - 3625f3e tracks the file → all three downstream commits have a durable provenance link
+- **Embedded PNGs (644 KB) closes f126fa6 GRILL 2 cleanly** — the `.ipynb` output cells carry the empirical evidence (A/B/C/D divergence visualization) in the same artifact, no separate PNG management needed.
+- **Provenance map in commit body is forward-looking**: Cell 11 + Cell 13 cited as iv_materializer's source BEFORE the materializer commits. Future-self/reviewer can grep the same notebook + same cells to verify the next commit's prototype claims.
+- **Scope discipline** — "What this commit does NOT do" explicitly lists "No code changes" + "No memoir edits". Pure tracking. (Though the second commitment is what created GRILL 1 above; see citation residue.)
+- **Operator authorization quoted in commit body** — "the Iv visualization is complete, you may use that code as reference if you think it is correct." Audit trail tied to operator's actual approval text.
+- **Pattern transfer** — cites `c75ff3b` (`vix_visualization.ipynb`) as the precedent. The artifact-tracking discipline now has two in-repo precedents; future ad-hoc notebooks should follow.
+- **10/10 code cells executed** — no stale "execution_count: null" state. The notebook is reproducible from the committed snapshot (cache state-dependent, but deterministic given the cache).
+- **HONEST about prototype scope**: `has_earnings_in_window` is NOT in the notebook (per my audit), and BUILDER's 182cf1d commit body correctly framed it as a productionization addition rather than a prototype lift. Provenance claims match reality.
+
+### Math
+
+- LOC: +900 — single file, mostly base64-encoded PNG outputs + cell JSON. Reasonable for a 3-plot notebook.
+- Cells: 20 (10 code + 10 markdown). Embedded images: 3 (644 KB).
+- Test impact: zero (notebook is not in pytest discovery).
+- Full suite: 966 (unchanged from d824ef8 baseline).
+
+### State-of-tree
+
+- `main` HEAD: `3625f3e`.
+- `scripts/research_iv_visualization.ipynb` — TRACKED, executable from committed state.
+- `data/cache/india_vix.parquet` (1090 rows) + `data/cache/events.parquet` (24,266 rows) — populated.
+- Build-order: P9.0 events + case-norm fix ✓ → P9.1 engine.iv ✓ → P9.0 chore (this) ✓ → P9.1 #2 iv_materializer (BUILDER's stated next).
+
+### Open grills (cumulative)
+
+- ✅ **CLOSED — f126fa6 GRILL 1 (tracking half)** — notebook now in git.
+- ✅ **CLOSED — f126fa6 GRILL 2** — 3 PNGs embedded in notebook outputs.
+- 🚩 **NEW (tiny) — 3625f3e GRILL 1** — §22.5 + 4 other memoir spots still say `.py` instead of `.ipynb`; 6-line patch.
+- ✅ **CLOSED — f126fa6 GRILL 3** (None-vs-NaN) — resolved by 68c5c2d's documented rationale.
+- ✅ **CLOSED — 68a97a7 GRILL 1** (events_loader case-norm) — closed by d824ef8.
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required.
+
+### Next-commit suggestion
+
+**Two valid paths**, both small:
+
+**A.** `fix(memoir.research_iv_path_alignment)` — 6-line memoir patch:
+- Lines 111, 843, 847, 1213, 1226: drop `.py` extension and "(not a notebook)" framing in §22.5 / F3 / day-count note / etc.
+- Line 1175 already has `(or .py)` parenthetical; trim to just `.ipynb`.
+
+Closes 3625f3e GRILL 1; ~10 LOC; nuclear single-purpose. Cheap to fold into next memoir-touch commit too.
+
+**B.** `feat(p9.1.iv_materializer)` — BUILDER's stated next per the chore body. Cell 11 (per-(symbol, date, expiry) ATM IV) + Cell 13 (constant_maturity_30d with `exclude_lt_dte=7`) from the just-tracked notebook. Builds the 30D CMI cache on top of 68c5c2d's iv.py kernel.
+
+Per [[feedback_next_commit_suggestion]]: **B** is the natural progression and the chore commit explicitly forecasts it. The citation residue grill (A) is cosmetic and can fold into any future memoir-touch commit (e.g., the iv_materializer commit's memoir update). RECOMMEND: **B**, with A folded in.
+
+Per [[feedback_reviewer_calibration]]: NOT softening — the citation residue grill IS real, but its blast radius is zero (file is tracked, downstream just needs the right filename). Acknowledging it without escalation because the bigger drift (TRACKING) is closed.
+
+Migration cadence: **... → P9 #0 chore (research_iv tracked) ✓ → P9.1 #2 iv_materializer → memoir cite alignment → Portfolio tab → ...**
+
+Standing by.
+
+---
