@@ -25889,3 +25889,145 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 22ff990 — `feat(p9.4.portfolio_tab_skeleton)` — ✅ ACCEPT (both reviewer asks verified)
+
+**Verdict: ✅ ACCEPT.** First of 10 Phase 9.4 commits. Header + 2 standing caveats (N=5, SURVIVORSHIP) + live regime banner (v2 India VIX wired) + 8-control collapsible strategy config. BUILDER's two specific reviewer asks verified independently:
+1. **Cold-cache degrade-to-OFF + prefetch caption**: `OfflineCacheMiss` triggered on pre-2022 dates is caught by `except Exception`, renders OFF + transparent caption pointing at `scripts/prefetch_universe.py --vix-only`. ✓
+2. **Proxy banner removed**: `_render_banners` (lines 137-162) only emits 2 banners (N=5 + SURVIVORSHIP). The post-9.6 PROXY banner DROP is correct and pinned via LOAD-BEARING test_portfolio_tab_does_not_render_proxy_banner. ✓
+
+CONSTRAINT 1 inherited from Inspect tab (zero BS patterns; reviewer-grep gate `test_no_bs_calls_in_module` against 6 banned tokens). 1218 passed (+9 new tests ✓ matches BUILDER's count).
+
+### Cold-cache verification (operator's env)
+
+```
+$ python -c "current_regime_state(date(2020,1,1), offline=True)"
+Cold-cache exception (caught by banner):
+  OfflineCacheMiss: india_vix cache missing range(s)
+                    [(datetime.date(2018, 12, 2), datetime.date(2020, 1, 1))]
+                    and offline mode requested...
+```
+
+The pre-cache-start date (2020-01-01 is before operator's cache start 2022-01-03) triggers `OfflineCacheMiss` as expected. The banner's `except Exception` (lines 203-213) catches it → `state="OFF"` + `pct=NaN` + caption explicitly naming the prefetch script. **Never crashes the tab** — Phase 9.4.1 contract holds.
+
+### Proxy-banner DROP verified — drift detector pinned
+
+The mockup carried a "PROXY: regime gate uses trailing-21d realized vol as a stand-in for India VIX" banner. After Phase 9.6 (50d51c8) shipped real India VIX, this banner became factually wrong. BUILDER dropped it AND added `test_portfolio_tab_does_not_render_proxy_banner` to LOAD-BEARING pin the removal. Future copy-paste-from-mockup that re-introduces the proxy caveat trips the test immediately.
+
+This is exactly the right discipline — when a planned-future-fix actually ships, the obsolete caveat MUST go AND the removal must be tested against accidental revival.
+
+### First-render-only seed pattern (inherits b52386d fix)
+
+```python
+def _seed_session_state() -> None:
+    for key, default in _DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+```
+
+Mirror of the inspect.py pattern post-b52386d (the URL-precedence fix I caught at 74ea59e GRILL 1). Future Tweaks-panel or sidebar widgets won't get clobbered on re-render. Cross-module discipline inherits cleanly.
+
+### CONSTRAINT 1 — zero BS calls verified
+
+```
+$ grep -cE "\b(bs76_call_price|black_scholes|implied_vol_call|extract_forward|bs_premium|bsPremium)\b" src/web/portfolio.py
+0
+```
+
+`test_no_bs_calls_in_module` (LOAD-BEARING) extends the Inspect tab's anti-BS-in-hot-path discipline to Portfolio. Selection/aggregation reads pre-computed IVP via `analytics.ivp.compute_ivp`; never re-derives premium from IV.
+
+### Session state contract (mp_pf_* namespace)
+
+9 keys prefixed `mp_pf_`:
+- `_SS_UNIVERSE_N`, `_SS_STRATEGY`, `_SS_ENTRY_OFFSET`, `_SS_EXIT_OFFSET`
+- `_SS_SIZING`, `_SS_REGIME_GATE`, `_SS_IVP_BAND`, `_SS_EARNINGS_FILTER`, `_SS_AS_OF`
+
+Greppable (`mp_pf_`), namespaced from `mp_active_tab`, `mp_inspect_*`, `mp_min_n`, `mp_selected_sweep`. Clean separation.
+
+### 8-control widget count match
+
+BUILDER's test contract: 3 selectbox + 3 slider + 2 toggle = 8 widgets.
+
+I count in `_render_strategy_config`:
+- 3 selectbox: universe N, strategy, sizing
+- 3 slider: entry offset, exit offset, IVP band (range slider counts as slider in Streamlit)
+- 2 toggle: regime gate, earnings filter
+= 8 ✓ Matches `test_portfolio_tab_renders_strategy_config_widgets`.
+
+### Regime banner correctness — wired to v2 directly
+
+`_render_regime_banner` (lines 165-241) calls:
+1. `current_regime_state(as_of, offline=True, ...)` → ON/OFF verdict
+2. `default_regime_signal(as_of - backfill, as_of, offline=True)` + `regime_percentile(...)` → pct value for banner stat
+
+Two separate calls because `current_regime_state` doesn't return the pct, only the verdict. BUILDER could have returned a tuple from `current_regime_state` to save a call, but the explicit composition here is clearer and matches the existing analytics.regime API. Acceptable.
+
+**`offline=True` enforced** on both calls — UI never touches the network. Hard requirement; documented in commit body.
+
+### Standing caveat banners (memoir §11)
+
+Two banners exactly per spec:
+- **N=5** info banner: "Calmar / Ulcer / correlation are directional only. Widen to ~30 names before trusting diversification claims."
+- **SURVIVORSHIP** warning banner: "Universe is survivor blue-chips... Phase 10.1 widens to ~180–220 names."
+
+Both stay until Phase 10.1 universe-widening lands. Mockup-faithful.
+
+### Praise points
+
+- **CONSTRAINT 1 extends to Portfolio** with the same reviewer-grep gate pattern. Two web tabs now carry the discipline.
+- **Drift-detector tests for the post-9.6 proxy banner removal** — `test_portfolio_tab_does_not_render_proxy_banner` is the right way to pin "this got REMOVED for a reason." Future contributors can't accidentally restore obsolete caveats.
+- **`first-render-only` seed mirrors b52386d** — the URL-precedence fix I caught earlier carries forward as cross-module discipline.
+- **`offline=True` enforced on regime calls** — UI hard-fails network usage; cold-cache surfaces as caption, not silent fallback. Same discipline as 50d51c8 (no-auto-fallback in the analytics layer).
+- **Cold-cache caption names the prefetch script explicitly** — operator gets actionable instruction: `scripts/prefetch_universe.py --vix-only`. Better than a generic "cache miss" error.
+- **`em-dash for unfilled placeholders`** ("positions today: — / 5") instead of fake zeros — operator sees explicit "skeleton, not yet wired" signal. Same discipline as the regime tag placeholder in Inspect.
+- **Session state namespace** `mp_pf_*` greppable + non-colliding. Anti-key-collision discipline.
+- **Defaults pinned via LOAD-BEARING test** `test_session_state_seeds_with_defaults` against mockup app.jsx lines 30-38. Drift detector if mockup defaults change.
+- **Strategy/sizing labels match mockup** — vol_targeted documented as "Phase 10.2 deferred" so operator sees the roadmap. Honest scoping.
+- **Skeleton footer surfaces filtered-sweep row count** + roadmap of subsequent 9.4 commits. Operator sees what's NOT yet shipped.
+- **st.navigation migration SHELVED notice** in module docstring (lines 29-33) cross-references `DESIGN/NAVIGATION_REFACTOR.md`. Future contributor reading the radio kludge knows the migration was considered + deferred.
+
+### Tiny notes (NOT grills)
+
+- **`from datetime import timedelta` lazy-imported inside `_render_regime_banner`** (line 191) — would be cleaner at module top. Streamlit reruns this per-render so the import runs per-render too (negligible perf cost since Python caches the module). Style nit only.
+- **Broad `except Exception`** in the regime banner (line 203) catches ALL exceptions including bugs (NameError, KeyError from a future refactor). Trade-off: tab stays alive at the cost of obscuring bugs. The caption includes `type(e).__name__` so a non-OfflineCacheMiss type IS visible to a curious operator. Acceptable for v1 UI resilience.
+- **`current_regime_state` + `default_regime_signal` + `regime_percentile`** called as 3 separate analytics calls per render. Could be 1 call if the API returned `(state, pct)`. Future perf optimization; not needed now.
+
+### Math + arithmetic
+
+- LOC: +366 (portfolio.py) + 207 (test_web_portfolio.py) + 8 (app.py) + 14 (e2e tests) = +595 / -6 = +589 net. ✓ Matches `git show --stat`.
+- Tests: 1209 → 1218 (+9 new + 1 updated). ✓ Matches BUILDER's claim exactly.
+
+### State-of-tree
+
+- `main` HEAD: `22ff990`.
+- Phase 9.4 sub-arc begins: skeleton ✓ → 9.4.2 equity curve → 9.4.3 metrics strip → 9.4.4 stability → 9.4.5 worst-10 → 9.4.6 concentration → 9.4.7 2-D diagnostic → 9.4.8 sensitivity strip → 9.4.9 drilldown → 9.4.10 deeplink writer.
+- `app.py` now has 6 tabs (Leaderboard / Per-stock / Heatmap / Trends / **Portfolio** / Inspect). URL routing via `?tab=Portfolio` for the new tab; existing Inspect routing preserved.
+
+### Open grills (cumulative)
+
+- No new grills.
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. Tab renders; cold-cache handled gracefully; existing cache state preserved.
+
+### Next-commit suggestion
+
+`feat(p9.4.equity_curve)` per BUILDER's stated next (9.4.2): equity curve + drawdown subplot via `analytics.portfolio.cycle_pnl_series` + `equity_curve` + `drawdown_series` (with Option-a prepend) consumed against `df_filtered`. This is the natural next — operator sees the visual artifact of the entire 9.3.1 + 9.3.2 backend stack.
+
+The Option-a prepend fix from 3309dd9 means `equity_curve.iloc[0] == starting_capital` — the chart's t=0 point should ALSO be the starting-capital reference. Watch for the 9.4.2 commit to verify the chart's x-axis starts from the prepended date (not the first expiry).
+
+Migration cadence
+
+**... → P9.6 regime v2 ✓ → P9.4.1 skeleton ✓ → P9.4.2 equity curve → P9.4.3 headline metrics → ... → P9.4.10 deeplink writer → v1 Portfolio Foundation SHIPPED → ...**
+
+Standing by.
+
+---
