@@ -25745,3 +25745,147 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 50d51c8 — `feat(p9.6.regime_v2_india_vix)` — ✅ ACCEPT (AGREE with no-auto-fallback; election spike empirically verified)
+
+**Verdict: ✅ ACCEPT.** BUILDER explicitly asked the reviewer to verify the no-auto-fallback design decision and the election spike empirical. Both verified:
+1. **No-auto-fallback is CORRECT** — silent v2→v1 fallback would change the gate's signal semantics non-deterministically from the operator's POV; loud `OfflineCacheMiss` is the right discipline.
+2. **Election spike reproduced EXACTLY** — 2024-06-04 (NDA result day) VIX=26.75, pct=99.6, OFF on all 5 BUILDER's smoke dates ± rounding (one pct value 92.8 vs my 92.9, within 0.04% tolerance — rounding only).
+
+Plus three signal-source helpers (`load_india_vix_signal`, `default_regime_signal`, `current_regime_state`), smart indirection via `default_regime_signal` for future v3 swaps, LOAD-BEARING canonical-entry-point pin test, and Phase 9.4-ready single-call convenience. 1209 passed (+10 ✓ matches BUILDER's count).
+
+### Election spike empirical reproduction (operator's india_vix.parquet)
+
+```
+$ python -c "from src.analytics.regime import current_regime_state, ..."
+Signal: 742 rows, range 2022-01-03 → 2024-12-31
+
+  2024-05-31: VIX=24.60  pct=99.6   regime=OFF  ✓
+  2024-06-03: VIX=20.94  pct=96.0   regime=OFF  ✓
+  2024-06-04: VIX=26.75  pct=99.6   regime=OFF  ✓ ← election day; gate fires
+  2024-06-05: VIX=18.89  pct=92.9   regime=OFF  ✓ (BUILDER 92.8; rounding)
+  2024-06-10: VIX=16.40  pct=89.7   regime=OFF  ✓
+```
+
+**Every VIX value + every percentile rank + every regime state matches.** Gate correctly catches the NDA-narrow-win election spike (June 4, 2024 — India VIX peaked at 26.75, top 0.4% of trailing 252-TD distribution). 1.5 weeks of OFF around the event = exactly the regime-change v2 was designed to surface. **This is the v2 correctness pin BUILDER asked me to verify.**
+
+### Reviewer's specific ask: no-auto-fallback decision
+
+**AGREE.** Two distinct signal semantics:
+- **v1 `avg_single_name_realized_vol`**: backward-looking, 21-TD realized vol averaged across 50 stocks. Available from spot cache alone.
+- **v2 `load_india_vix_signal`**: forward-looking, market-implied 30-day vol from NIFTY index options. Single number per day; requires india_vix.parquet.
+
+Silent fallback v2→v1 would mean the regime gate uses different statistical properties on different days based on cache state. Two consequences:
+1. **Operator-facing non-determinism**: cycle-entry decisions depend on whether the operator prefetched VIX. Backtest A vs Backtest B on the same parameters could yield different gate decisions if cached differently.
+2. **Memoir §3.7 explicit guidance**: "operator runs `scripts/prefetch_universe.py --vix-only` to populate." Treating the prefetch as load-bearing (loud-fail on miss) honors this.
+
+BUILDER's choice — let `OfflineCacheMiss` propagate, let callers wanting fallback import `avg_single_name_realized_vol` explicitly — is the operationally correct discipline. Callers can always do:
+```python
+try:
+    signal = default_regime_signal(...)
+except OfflineCacheMiss:
+    rv = avg_single_name_realized_vol(symbols, as_of, ...)
+    signal = derived_from_rv(...)
+```
+
+Explicit fallback is fine; silent fallback is not.
+
+### Indirection design — `default_regime_signal`
+
+```python
+def default_regime_signal(from_date, to_date, *, today_fn, offline):
+    """Canonical entry point. Currently routes to v2 (India VIX).
+    Future v3 swap is a one-line change here."""
+    return load_india_vix_signal(from_date, to_date, ...)
+```
+
+Smart. Phase 9.4's banner calls `default_regime_signal`, not `load_india_vix_signal` directly. A v3 signal (e.g., regime-detection ML model, dispersion index) lands as a one-line change in this function — every downstream caller adapts automatically. LOAD-BEARING test `test_default_regime_signal_routes_to_v2` pins the current behavior so a future v3 swap that accidentally falls back to v1 trips immediately.
+
+### `current_regime_state` math verification
+
+Backfill cushion calculation (lines 431-433):
+```python
+backfill_days = int(lookback_td × (365/252)) + 30
+```
+
+For `lookback_td=252`: `252 × 1.448 = 365` calendar days + 30 cushion = 395 days. Realized TDs over 395 cal days ≈ 282 (with NSE holidays/weekends). Comfortably ≥ 252 lookback. ✓
+
+For shorter lookbacks (e.g., 21 TD for diagnostic): `21 × 1.448 = 30` + 30 cushion = 60 cal days → ~41 realized TDs. Still cushion-positive. ✓
+
+Cushion is bounded-additive (not multiplicative) so very-short lookbacks don't carry proportionally smaller cushions — fixed 30-day floor is appropriate for end-of-window NSE holiday clusters.
+
+### Memoir §3.7 "don't bake v2 as a theorem" preserved
+
+Module docstring lines 36-47 preserves the operator's intent:
+> "Memoir documents periods (post-Mar-2020, post-Volmageddon Feb-2018 US analogues) where HIGH-VIX environments produced the BEST short-vol returns. The market was paying you extra premium AFTER the panic; realized vol came in LOWER than implied. The gate would have made you sit out those cycles."
+
+Plus:
+> "Net read: the gate trades 'missed-good-cycles' for 'avoided-bad-cycles.' The empirical test is whether the trade is net positive on YOUR data. The Portfolio tab's sensitivity strip will answer this directly. Default 75th for v1; let the operator scan empirically. **Don't bake it in as a theorem.**"
+
+Operator's hedged framing intact. Default threshold 75 documented as operator-tunable. The sensitivity strip in 9.4 will surface the empirical answer per symbol/period.
+
+### Praise points
+
+- **`default_regime_signal` indirection** — future-proofs v3 swap at the call-site level. Phase 9.4 doesn't know whether it's calling v1 or v2 or v3; the routing changes underneath.
+- **LOAD-BEARING canonical-entry-point pin** — `test_default_regime_signal_equals_load_india_vix_signal` is a drift detector. A future PR that accidentally swaps the routing trips loudly.
+- **Election spike empirical** — 2024-06-04 is the highest-leverage v2 correctness test in the operator's actual data. The gate firing OFF here is the "this is why we built v2" moment.
+- **Reviewer-invitation-to-challenge** discipline (same as 61c3fe9 + 76549ab) — BUILDER pinned both the design decision AND the empirical as separate reviewer asks. Right way to invite scrutiny.
+- **Constants pinned at module-private level** (`_TD_TO_CALENDAR_RATIO`, `_LOOKBACK_CALENDAR_CUSHION_DAYS`) — single source of truth for the cushion math.
+- **v1 retained, rebadged** in module docstring as "v1 SIGNAL". API unchanged → no breaking change for existing F8 callers.
+- **Series `.name = "india_vix_close"` set on output** — Plotly + Streamlit consume as title/legend label.
+- **`offline=True` propagated through current_regime_state** — pinned by `test_current_regime_state_offline_forwards`. Cold-cache-on-offline mode raises OfflineCacheMiss cleanly.
+- **`backfill_days ≥ 365` for lookback_td=252** pinned by `test_backfill_cushion_covers_lookback_td`. Off-by-one regression detector.
+- **Cold-cache insufficient-history → OFF** — per memoir §F9 skip-when-uncertain. Pinned by `test_cold_cache_insufficient_history_returns_off`.
+- **Custom `threshold_pct=100` → ON always** sanity check pinned. Boundary at the top end.
+
+### Math + arithmetic
+
+- LOC: +226 (regime.py) + 169 (test) = +395 / -9 = +386 net. ✓ Matches `git show --stat`.
+- Tests: 1199 → 1209 (+10). ✓ Matches BUILDER's claim exactly.
+- 35 tests in test_regime.py (25 pre-existing + 10 new).
+
+### State-of-tree
+
+- `main` HEAD: `50d51c8`.
+- **Phase 9 BACKEND COMPLETE**. v1 Portfolio Foundation backend math fully in place:
+  - F1-F11 (Phases 1-8 + 9.1-9.2)
+  - F12-F14 aggregator (9.3.1)
+  - F15-F18 metrics (9.3.2)
+  - F19 diagnostic (9.3.3)
+  - v2 regime signal source (9.6)
+- Phase 9.5 Inspect tab shipped.
+- Phase 9.4 Portfolio tab UI (10 commits) — only remaining sub-phase for v1 Portfolio Foundation shipment.
+
+### Open grills (cumulative)
+
+- No new grills.
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update; informally noted; B.4 Caveat covers operationally).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. The v2 swap is forward-compatible: operators with existing `data/cache/india_vix.parquet` (currently 1090 rows, 2022-01-03 → 2026-05-29 from operator's cache) get v2 routing automatically when Phase 9.4 lands and consumes `default_regime_signal`.
+
+### Next-commit suggestion
+
+Phase 9.4 Portfolio tab UI (10 commits). The first 9.4 commit will likely be the scaffolding (sidebar filter wiring + main column layout + the empty banner shell that subsequent commits populate). Per BUILDER's body, 9.4 consumes the entire 9.1-9.3 + 9.6 backend stack:
+- `current_regime_state` for banner ON/OFF
+- `default_regime_signal` for regime-history plot
+- F12-F18 for stat-strip cards + equity curve + drawdown
+- `regime_x_ivp_breakdown` for 2-D diagnostic
+- Phase 9.2 filters for candidate selection + drop banners
+
+Per [[feedback_next_commit_suggestion]] — de-risk biggest unknown first. The Portfolio→Inspect deeplink writer (consuming `clear_inspect_state()` from b52386d) is the cross-phase coupling point most likely to surface unexpected behavior. If BUILDER doesn't land it early in the 9.4 sub-arc, recommend probing the contract test before the deeplink lands.
+
+Migration cadence
+
+**... → P9.3 backend ✓ → P9.6 regime v2 ✓ (PHASE 9 BACKEND COMPLETE) → P9.4 Portfolio tab UI (10 commits) → v1 Portfolio Foundation SHIPPED → ...**
+
+Standing by.
+
+---
