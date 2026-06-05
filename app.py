@@ -334,7 +334,10 @@ def main() -> None:
     # ``?tab=<Name>`` URL param. The visual is a pill bar instead of
     # underlined tabs; the routing is load-bearing for the deeplink
     # contract and outweighs the visual delta.
-    _TAB_NAMES = ["Leaderboard", "Per-stock", "Heatmap", "Trends", "Inspect"]
+    _TAB_NAMES = [
+        "Leaderboard", "Per-stock", "Heatmap", "Trends",
+        "Portfolio", "Inspect",
+    ]
     qp = st.query_params
     url_tab_raw = qp.get("tab", "Leaderboard")
     if isinstance(url_tab_raw, list):
@@ -367,6 +370,9 @@ def main() -> None:
         _render_heatmap_tab(df_filtered, skips_df=skips_df)
     elif active == "Trends":
         _render_trends_tab(df_filtered)
+    elif active == "Portfolio":
+        from src.web.portfolio import render_portfolio_tab
+        render_portfolio_tab(df_filtered)
     elif active == "Inspect":
         from src.web.inspect import render_inspect_tab
         render_inspect_tab(df_filtered)

@@ -71,14 +71,17 @@ def test_app_loads_without_crash():
 
 @SKIP_NO_SWEEP
 def test_app_renders_expected_tabs():
-    """The 5-tab structure (Leaderboard / Per-stock / Heatmap / Trends
-    / Inspect) is part of the v0.6+9.5 contract. Anyone reordering or
-    renaming tabs must update this test — load-bearing UX promise.
+    """The 6-tab structure (Leaderboard / Per-stock / Heatmap / Trends
+    / Portfolio / Inspect) is part of the v0.6+9.4+9.5 contract.
+    Anyone reordering or renaming tabs must update this test — load-
+    bearing UX promise.
 
     Phase 9.5 swapped ``st.tabs`` for ``st.radio(horizontal=True)`` so
     the ``?tab=<Name>`` URL param can drive active-tab selection per
     PORTFOLIO_MEMOIR.md §24.9 deeplink contract; the tab options now
-    appear on a radio's ``.options`` rather than ``tabs[i].label``."""
+    appear on a radio's ``.options`` rather than ``tabs[i].label``.
+
+    Phase 9.4.1 added Portfolio between Trends and Inspect."""
     at = AppTest.from_file(str(APP_PY))
     at.run(timeout=30)
     assert not at.exception
@@ -88,7 +91,8 @@ def test_app_renders_expected_tabs():
         f"{len(tab_radios)}"
     )
     assert list(tab_radios[0].options) == [
-        "Leaderboard", "Per-stock", "Heatmap", "Trends", "Inspect",
+        "Leaderboard", "Per-stock", "Heatmap", "Trends",
+        "Portfolio", "Inspect",
     ], f"tab options changed: {tab_radios[0].options}"
 
 
