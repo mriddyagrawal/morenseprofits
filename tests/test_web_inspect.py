@@ -617,6 +617,263 @@ def test_render_position_map_caption_reports_gap_count(monkeypatch):
 
 
 # ============================================================
+# Cumulative P&L path + legs table (Commit 3 — memoir §24.2 + §3a)
+# ============================================================
+
+def test_cumulative_pnl_path_sell_leg_profits_when_price_drops():
+    """§3a sign convention: SELL leg P&L = (entry − obs) × +1 × qty × lot.
+    Profit when obs drops below entry."""
+    from src.web.inspect import _cumulative_pnl_path
+    legs = [_leg("SELL", "CE", 1450.0, entry_px=25.0, lot=500, qty=1)]
+    days = [date(2026, 4, 7), date(2026, 4, 8), date(2026, 4, 9)]
+    # Price drops from 20 → 15 → 5 over the window (decay).
+    closes = [[20.0, 15.0, 5.0]]
+    out = _cumulative_pnl_path(legs, days, closes)
+    # Day 1: (25 − 20) × +1 × 1 × 500 =  +2500
+    # Day 2: (25 − 15) × +1 × 1 × 500 =  +5000
+    # Day 3: (25 − 5)  × +1 × 1 × 500 = +10000
+    assert out == [pytest.approx(2500.0), pytest.approx(5000.0), pytest.approx(10000.0)]
+
+
+def test_cumulative_pnl_path_buy_leg_profits_when_price_rises():
+    """§3a sign convention: BUY leg P&L = (entry − obs) × −1 × qty × lot
+    = (obs − entry) × qty × lot. Profit when obs rises above entry."""
+    from src.web.inspect import _cumulative_pnl_path
+    legs = [_leg("BUY", "CE", 1500.0, entry_px=8.0, lot=500, qty=1)]
+    days = [date(2026, 4, 7), date(2026, 4, 8)]
+    # Price rises 8 → 12 → 20 (good for long call).
+    closes = [[12.0, 20.0]]
+    out = _cumulative_pnl_path(legs, days, closes)
+    # Day 1: (8 − 12) × −1 × 1 × 500 = +2000
+    # Day 2: (8 − 20) × −1 × 1 × 500 = +6000
+    assert out == [pytest.approx(2000.0), pytest.approx(6000.0)]
+
+
+def test_cumulative_pnl_path_force_endpoint_clamps_last_value():
+    """Force-endpoint = row.net_pnl makes the final point match the
+    sweep row's authoritative net figure even though intermediate days
+    sum to gross. Operator sees endpoint snap = costs absorbed at exit."""
+    from src.web.inspect import _cumulative_pnl_path
+    legs = [_leg("SELL", "CE", 1450.0, entry_px=25.0, lot=500, qty=1)]
+    days = [date(2026, 4, 7), date(2026, 4, 8)]
+    closes = [[20.0, 5.0]]
+    # Gross final = (25 − 5) × 500 = 10000; net (after costs of 200) = 9800.
+    out = _cumulative_pnl_path(legs, days, closes, force_endpoint=9800.0)
+    assert out[-1] == pytest.approx(9800.0)
+    # Intermediate point unchanged.
+    assert out[0] == pytest.approx(2500.0)
+
+
+def test_cumulative_pnl_path_gap_day_carries_forward_per_leg():
+    """When one leg gaps (NaN close) for a day, the path holds that
+    leg's previous value; the OTHER leg's contribution still updates."""
+    from src.web.inspect import _cumulative_pnl_path
+    legs = [
+        _leg("SELL", "CE", 1450.0, entry_px=25.0, lot=500, qty=1),
+        _leg("SELL", "PE", 1350.0, entry_px=20.0, lot=500, qty=1),
+    ]
+    days = [date(2026, 4, 7), date(2026, 4, 8), date(2026, 4, 9)]
+    # CE closes 20 → NaN → 5. PE closes 15 → 10 → 5.
+    closes = [
+        [20.0, float("nan"), 5.0],
+        [15.0, 10.0, 5.0],
+    ]
+    out = _cumulative_pnl_path(legs, days, closes)
+    # Day 1: CE (25-20)·500=2500; PE (20-15)·500=2500 → 5000
+    # Day 2: CE carries 2500; PE (20-10)·500=5000 → 7500
+    # Day 3: CE (25-5)·500=10000; PE (20-5)·500=7500 → 17500
+    assert out[0] == pytest.approx(5000.0)
+    assert out[1] == pytest.approx(7500.0)
+    assert out[2] == pytest.approx(17500.0)
+
+
+def test_cumulative_pnl_path_empty_window_returns_empty():
+    from src.web.inspect import _cumulative_pnl_path
+    assert _cumulative_pnl_path([_leg()], [], [[]]) == []
+
+
+# ============================================================
+# Pure builder verification — _build_pnl_path_figure
+# ============================================================
+
+def test_build_pnl_path_figure_has_zero_baseline_and_endpoint_marker():
+    from src.web.inspect import _build_pnl_path_figure
+    days = pd.date_range("2026-04-07", "2026-04-15", freq="B").date.tolist()
+    cumulative = [0.0, 1000.0, 2500.0, 4500.0, 7000.0, 9500.0, 12000.0]
+    fig = _build_pnl_path_figure(
+        symbol="RELIANCE", days=days, cumulative=cumulative,
+        net_pnl=11800.0, events_df=pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    # Endpoint trace exists with x = last day, y = net_pnl.
+    endpoint_traces = [
+        t for t in fig.data
+        if (t.mode or "").endswith("text")
+    ]
+    assert len(endpoint_traces) == 1
+    et = endpoint_traces[0]
+    assert list(et.x) == [days[-1]]
+    assert list(et.y) == [11800.0]
+
+
+def test_build_pnl_path_figure_color_matches_sign_of_net_pnl():
+    from src.web.inspect import (
+        _build_pnl_path_figure, _COLOR_PNL_POS, _COLOR_PNL_NEG,
+    )
+    days = pd.date_range("2026-04-07", "2026-04-09", freq="B").date.tolist()
+    # Winning trade — main trace is green.
+    fig_pos = _build_pnl_path_figure(
+        symbol="RELIANCE", days=days, cumulative=[0.0, 500.0, 1200.0],
+        net_pnl=1200.0, events_df=pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    main_trace = next(t for t in fig_pos.data if (t.mode or "") == "lines")
+    assert main_trace.line.color == _COLOR_PNL_POS
+
+    # Losing trade — main trace is red.
+    fig_neg = _build_pnl_path_figure(
+        symbol="PNB", days=days, cumulative=[0.0, -200.0, -1500.0],
+        net_pnl=-1500.0, events_df=pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    main_trace_neg = next(t for t in fig_neg.data if (t.mode or "") == "lines")
+    assert main_trace_neg.line.color == _COLOR_PNL_NEG
+
+
+def test_build_pnl_path_figure_event_marker_at_event_date():
+    from src.web.inspect import _build_pnl_path_figure
+    days = pd.date_range("2026-04-07", "2026-04-15", freq="B").date.tolist()
+    events = pd.DataFrame({
+        "SYMBOL": ["RELIANCE"],
+        "DATE": [pd.Timestamp("2026-04-10")],
+        "PURPOSE": ["Financial Results"],
+    })
+    fig = _build_pnl_path_figure(
+        symbol="RELIANCE", days=days, cumulative=[100.0] * 7,
+        net_pnl=100.0, events_df=events,
+    )
+    verticals = [
+        s for s in fig.layout.shapes
+        if getattr(s, "x0", None) == getattr(s, "x1", None) is not None
+    ]
+    assert any(verticals), "expected at least 1 vertical event marker"
+
+
+# ============================================================
+# _render_pnl_path round-trip: endpoint matches net_pnl
+# ============================================================
+
+def test_render_pnl_path_endpoint_matches_sweep_net_pnl(monkeypatch):
+    """The §24.2 contract: chart endpoint = sweep row's net_pnl. The
+    intermediate days reflect cumulative gross-P&L from observed leg
+    closes; the endpoint snaps to the authoritative figure (which
+    absorbs the row's costs)."""
+    import src.web.inspect as ins
+    chart_calls: list[object] = []
+    monkeypatch.setattr(
+        ins.st, "plotly_chart", lambda fig, **k: chart_calls.append(fig),
+    )
+    monkeypatch.setattr(ins.st, "caption", lambda *a, **k: None)
+    sample_days = [
+        date(2026, 4, 7), date(2026, 4, 8), date(2026, 4, 9),
+    ]
+    monkeypatch.setattr(
+        ins, "_per_leg_observed_closes",
+        lambda symbol, expiry, strike, opt_type, e, x: (
+            sample_days, [20.0, 15.0, 5.0], [],
+        ),
+    )
+    monkeypatch.setattr(
+        ins, "_earnings_events_in_window",
+        lambda symbol, e, x: pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    row = _build_strangle_row()
+    ins._render_pnl_path(row, "RELIANCE", row["expiry"])
+    assert len(chart_calls) == 1
+    fig = chart_calls[0]
+    # Endpoint trace has y[0] == row["net_pnl"]
+    endpoint_traces = [
+        t for t in fig.data if (t.mode or "").endswith("text")
+    ]
+    assert len(endpoint_traces) == 1
+    assert list(endpoint_traces[0].y) == [float(row["net_pnl"])]
+
+
+def test_render_pnl_path_iron_condor_renders_chart(monkeypatch):
+    """§24.4: iron condor SUPPRESSES the position map but NOT the P&L
+    path or legs table. The P&L path must render for iron_condor too."""
+    import src.web.inspect as ins
+    chart_calls: list[object] = []
+    monkeypatch.setattr(
+        ins.st, "plotly_chart", lambda fig, **k: chart_calls.append(fig),
+    )
+    monkeypatch.setattr(ins.st, "caption", lambda *a, **k: None)
+    sample_days = [date(2026, 4, 7), date(2026, 4, 8)]
+    monkeypatch.setattr(
+        ins, "_per_leg_observed_closes",
+        lambda symbol, expiry, strike, opt_type, e, x: (
+            sample_days, [10.0, 5.0], [],
+        ),
+    )
+    monkeypatch.setattr(
+        ins, "_earnings_events_in_window",
+        lambda symbol, e, x: pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    # 4-leg iron-condor-shaped row.
+    row = _row(
+        strategy="iron_condor",
+        legs=[
+            _leg("SELL", "CE", 1450.0, 25.0, 5.0),
+            _leg("BUY",  "CE", 1500.0, 8.0,  1.0),
+            _leg("SELL", "PE", 1350.0, 20.0, 4.0),
+            _leg("BUY",  "PE", 1300.0, 5.0,  1.0),
+        ],
+    )
+    ins._render_pnl_path(row, "RELIANCE", row["expiry"])
+    assert len(chart_calls) == 1, (
+        "iron condor MUST render the cumulative P&L path; only the "
+        "position map is suppressed per memoir §24.4"
+    )
+
+
+# ============================================================
+# Legs table — total row + premium signs
+# ============================================================
+
+def test_render_legs_table_total_row_leg_pnl_matches_net_pnl(monkeypatch):
+    """§24.2: legs-table total row's leg-P&L column shows the trade's
+    authoritative net_pnl (not the sum of per-leg gross_pnl — those
+    differ by row.costs)."""
+    import src.web.inspect as ins
+    captured_df: list = []
+    monkeypatch.setattr(
+        ins.st, "dataframe", lambda df, **k: captured_df.append(df),
+    )
+    monkeypatch.setattr(ins.st, "caption", lambda *a, **k: None)
+    row = _build_strangle_row()
+    ins._render_legs_table(row)
+    assert len(captured_df) == 1
+    df = captured_df[0]
+    # Last row is the "net" total.
+    last = df.iloc[-1]
+    assert last["side"] == "net"
+    assert last["leg P&L (₹)"] == pytest.approx(float(row["net_pnl"]))
+
+
+def test_render_legs_table_premium_total_signed_sum_per_share(monkeypatch):
+    """The total-row premium column shows the signed net credit per
+    share (SELL=+, BUY=−). For a short strangle with C=25 + P=20 → 45."""
+    import src.web.inspect as ins
+    captured_df: list = []
+    monkeypatch.setattr(
+        ins.st, "dataframe", lambda df, **k: captured_df.append(df),
+    )
+    monkeypatch.setattr(ins.st, "caption", lambda *a, **k: None)
+    row = _build_strangle_row(ce_credit=25.0, pe_credit=20.0)
+    ins._render_legs_table(row)
+    df = captured_df[0]
+    last = df.iloc[-1]
+    assert last["premium (entry, ₹/share)"] == pytest.approx(45.0)
+
+
+# ============================================================
 # Existing tests resume below
 # ============================================================
 

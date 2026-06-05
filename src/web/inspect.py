@@ -881,6 +881,248 @@ def _render_position_map(row, strategy: str, symbol: str, expiry) -> None:
 
 
 # ============================================================
+# Cumulative P&L path + legs table (memoir §24.2 + §3a sign convention)
+# ============================================================
+
+# Color palette for the P&L surface — adopted from the mockup at
+# DESIGN/Complete/components/inspect.jsx lines 281, 290-292 (pos/neg
+# stroke colors); CONSTRAINT 0 says use the mockup as a visual aid
+# only — palette and structural section ordering are load-bearing.
+_COLOR_PNL_POS = "#16a34a"   # green: winning path
+_COLOR_PNL_NEG = "#dc2626"   # red:   losing path
+_COLOR_PNL_ZERO = "#9ca3af"  # grey:  zero baseline
+
+
+def _cumulative_pnl_path(
+    legs: list[dict],
+    leg_days: list,
+    leg_closes_per_leg: list[list[float]],
+    force_endpoint: float | None = None,
+) -> list[float]:
+    """Per-day cumulative gross P&L per memoir §3a sign convention:
+
+      leg_pnl[t] = (entry_px_realized − observed_close[t])
+                   × side_sign(leg.side)
+                   × leg.qty_lots × leg.lot_size
+
+    With ``side_sign(SELL)=+1`` and ``side_sign(BUY)=−1``.
+
+    Gap-day handling — carry-forward per leg (the OTHER leg's
+    contribution still updates; only the gap leg holds its previous
+    value). NaN-fill in the path would create misleading discontinuities
+    in cumulative-P&L space; carry-forward preserves shape across
+    isolated leg-day gaps. Note that this differs from the position
+    map's NaN-propagating approach because the cumulative path is a
+    SINGLE summed signal across legs — operator can't visually
+    distinguish "one leg gapped" from "P&L genuinely flat for a day"
+    on a sum-of-legs chart, so we don't try to express it there.
+
+    ``force_endpoint`` (when given) clamps the LAST value in the path
+    to the supplied number. Used so the chart's endpoint matches the
+    sweep row's ``net_pnl`` exactly — the authoritative number — even
+    though intermediate days display GROSS P&L. The cost discontinuity
+    at exit is intentional and called out in the footer caption.
+
+    Returns ``list[float]`` with length ``len(leg_days)``.
+    """
+    n = len(leg_days)
+    if n == 0:
+        return []
+    contribs_per_leg = []
+    for leg, closes in zip(legs, leg_closes_per_leg):
+        sign = 1.0 if leg.get("side") == "SELL" else -1.0
+        entry = float(leg["entry_px_realized"])
+        qty = int(leg["qty_lots"])
+        lot = int(leg["lot_size"])
+        last_known = 0.0
+        row_contrib: list[float] = []
+        for c in closes:
+            if c is None or (isinstance(c, float) and pd.isna(c)):
+                row_contrib.append(last_known)
+            else:
+                pnl = (entry - float(c)) * sign * qty * lot
+                row_contrib.append(pnl)
+                last_known = pnl
+        contribs_per_leg.append(row_contrib)
+    cumulative = [
+        sum(contribs_per_leg[l][t] for l in range(len(legs)))
+        for t in range(n)
+    ]
+    if force_endpoint is not None and cumulative:
+        cumulative[-1] = float(force_endpoint)
+    return cumulative
+
+
+def _build_pnl_path_figure(
+    *,
+    symbol: str,
+    days: list,
+    cumulative: list[float],
+    net_pnl: float,
+    events_df: pd.DataFrame,
+) -> go.Figure:
+    """Pure builder: assemble the cumulative-P&L line chart. Endpoint
+    marker colored by sign of ``net_pnl``; vertical event markers at
+    each Financial Results event in window; baseline at y=0."""
+    fig = go.Figure()
+    color = _COLOR_PNL_POS if net_pnl >= 0 else _COLOR_PNL_NEG
+
+    # Baseline at zero — helps the operator see crosses.
+    fig.add_hline(
+        y=0, line=dict(color=_COLOR_PNL_ZERO, dash="solid", width=1),
+    )
+
+    fig.add_trace(go.Scatter(
+        x=days, y=cumulative, mode="lines",
+        name="Cumulative P&L (₹)",
+        line=dict(color=color, width=2),
+    ))
+
+    # Endpoint marker — the §24.2 contract that the final point matches
+    # the sweep row's net_pnl.
+    if days and cumulative:
+        fig.add_trace(go.Scatter(
+            x=[days[-1]], y=[net_pnl],
+            mode="markers+text",
+            text=[_fmt_inr(net_pnl)],
+            textposition="top center",
+            marker=dict(color=color, size=10),
+            showlegend=False,
+            name="net P&L",
+        ))
+
+    # Event markers — same plotly workaround as position map (the
+    # add_vline annotation-midpoint path is broken for date axes).
+    for _, ev in events_df.iterrows():
+        ev_date_iso = pd.Timestamp(ev["DATE"]).strftime("%Y-%m-%d")
+        fig.add_shape(
+            type="line", xref="x", yref="paper",
+            x0=ev_date_iso, x1=ev_date_iso, y0=0, y1=1,
+            line=dict(color=_COLOR_EVENT, dash="dot", width=1),
+        )
+        fig.add_annotation(
+            x=ev_date_iso, xref="x", y=1.0, yref="paper",
+            text="⚠ earnings", showarrow=False,
+            font=dict(color=_COLOR_EVENT, size=10),
+            yanchor="bottom",
+        )
+
+    fig.update_layout(
+        title=f"Cumulative P&L · {symbol} (final: {_fmt_inr(net_pnl)})",
+        xaxis_title="Trading day",
+        yaxis_title="₹ cumulative",
+        height=320,
+        margin=dict(l=60, r=60, t=50, b=50),
+        showlegend=False,
+    )
+    return fig
+
+
+def _render_pnl_path(row, symbol: str, expiry) -> None:
+    """Render the cumulative-P&L path per memoir §24.2. Renders for
+    ALL strategies (iron condor included — the position map suppresses
+    for iron condor, the P&L path does NOT per §24.4).
+
+    Reuses ``_per_leg_observed_closes`` so the per-day options-loader
+    loop hits the same Streamlit cache as the position map — selector
+    changes don't re-pay the parquet read cost for either surface.
+    """
+    legs = json.loads(row["legs_json"])
+    entry_date = pd.to_datetime(row["entry_date"]).date()
+    exit_date = pd.to_datetime(row["exit_date"]).date()
+
+    leg_closes_per_leg: list[list[float]] = []
+    leg_days = None
+    for leg in legs:
+        try:
+            days_l, closes, _gaps = _per_leg_observed_closes(
+                symbol, expiry,
+                float(leg["strike"]), leg["option_type"],
+                entry_date, exit_date,
+            )
+        except Exception as e:  # noqa: BLE001
+            st.error(
+                f"Could not load observed leg closes for the cumulative "
+                f"P&L path: {type(e).__name__}: {e}"
+            )
+            return
+        leg_closes_per_leg.append(closes)
+        if leg_days is None:
+            leg_days = days_l
+        # Sanity: all legs share the same expiry → same trading-day grid.
+        # Per-leg gap handling is on the per-day close, not the day index.
+
+    if not leg_days:
+        st.info("Cumulative P&L path needs at least one trading day in window.")
+        return
+
+    cumulative = _cumulative_pnl_path(
+        legs, leg_days, leg_closes_per_leg,
+        force_endpoint=float(row["net_pnl"]),
+    )
+
+    events_df = _earnings_events_in_window(symbol, entry_date, exit_date)
+    fig = _build_pnl_path_figure(
+        symbol=symbol, days=leg_days, cumulative=cumulative,
+        net_pnl=float(row["net_pnl"]), events_df=events_df,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Intermediate points show gross per-day P&L from observed leg "
+        "closes; the endpoint snaps to the sweep row's authoritative "
+        "net P&L (gross − costs). The small jump at exit absorbs the "
+        f"total cost of {_fmt_inr(float(row['costs']))}."
+    )
+
+
+def _render_legs_table(row) -> None:
+    """Render the legs table per memoir §24.2: side / type / strike /
+    premium (entry) / leg P&L (final). Total row at the bottom sums
+    premium per the §24.2 layout and shows ``row.net_pnl`` in the leg-
+    P&L total column (the authoritative figure; per-leg ``gross_pnl``
+    fields sum to ``row.gross_pnl``, which differs from ``net_pnl`` by
+    ``row.costs``).
+
+    Operator-facing footer caption from the mockup: leg attribution is
+    illustrative; cycle net is authoritative.
+    """
+    legs = json.loads(row["legs_json"])
+    rows = []
+    for leg in legs:
+        rows.append({
+            "side": leg.get("side", "?"),
+            "type": leg.get("option_type", "?"),
+            "strike": float(leg["strike"]),
+            "premium (entry, ₹/share)": float(leg["entry_px_realized"]),
+            "leg P&L (₹)": float(leg.get("gross_pnl", float("nan"))),
+        })
+    df_legs = pd.DataFrame(rows)
+    # Total row — premium total is the signed net credit per share
+    # (SELL adds, BUY subtracts); leg P&L total uses the authoritative
+    # row.net_pnl per the mockup convention.
+    premium_total = sum(
+        (1.0 if leg.get("side") == "SELL" else -1.0)
+        * float(leg["entry_px_realized"])
+        for leg in legs
+    )
+    total_row = pd.DataFrame([{
+        "side": "net",
+        "type": "",
+        "strike": float("nan"),
+        "premium (entry, ₹/share)": premium_total,
+        "leg P&L (₹)": float(row["net_pnl"]),
+    }])
+    df_display = pd.concat([df_legs, total_row], ignore_index=True)
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
+    st.caption(
+        "Per-leg P&L cells show each leg's gross P&L from the sweep's "
+        "legs_json; total row shows the trade's authoritative net P&L "
+        f"(after {_fmt_inr(float(row['costs']))} costs). Leg "
+        "attribution illustrative; cycle net is authoritative."
+    )
+
+
+# ============================================================
 # Footer caption (§24.1 + §9)
 # ============================================================
 
@@ -946,5 +1188,9 @@ def render_inspect_tab(df: pd.DataFrame) -> None:
     _render_stat_strip(row, symbol)
     st.divider()
     _render_position_map(row, strategy, symbol, expiry)
+    st.divider()
+    _render_pnl_path(row, symbol, expiry)
+    st.divider()
+    _render_legs_table(row)
     st.divider()
     _render_footer()
