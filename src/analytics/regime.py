@@ -1,11 +1,49 @@
 """Regime gate signal + percentile rank.
 
 PORTFOLIO_MEMOIR.md §3 (regime gate design) and §21.4 formulas F7,
-F8, F9. Three pure functions, no Streamlit, no I/O coupling beyond
-the spot_loader call inside ``avg_single_name_realized_vol`` (which
-the caller can monkeypatch for tests).
+F8, F9. Pure-math kernel + two signal-loaders (v1 + v2).
 
-Public API:
+The regime gate is one of three layers in the v1 risk framework
+(memoir §3.7): universe-wide regime (THIS module), per-name IVP
+(``analytics.ivp``), and per-name earnings (``analytics.earnings_filter``).
+
+## Signal-source evolution (memoir §3.7)
+
+v1 (built first): ``avg_single_name_realized_vol`` — universe-
+average of per-symbol 21-TD annualized realized vol. Backward-
+looking; the "ambient single-name turbulence" proxy. Available
+from the spot cache alone; no separate fetch required.
+
+v2 (Phase 9.6 this commit): ``load_india_vix_signal`` — NSE's
+daily-published implied-vol index from NIFTY index options.
+Forward-looking; the market's own 30-day vol forecast. Per memoir
+§3.7: "India VIX IS the market-implied 30-day vol forecast. No
+need to compute it from 50 stocks; it's a single number per day,
+published since 2008."
+
+``default_regime_signal`` is the canonical entry point — Phase
+9.4's regime banner calls THIS, not the per-signal functions
+directly. Currently routes to v2 (India VIX). On a cold cache
+(no india_vix.parquet) callers can fall back to v1 by importing
+``avg_single_name_realized_vol`` explicitly; this module doesn't
+auto-fallback because silent fallback would mask "operator forgot
+to prefetch India VIX" gaps.
+
+## Why not bake v2's superiority in as a theorem (memoir §3.7)
+
+Memoir documents periods (post-Mar-2020, post-Volmageddon Feb-2018
+US analogues) where HIGH-VIX environments produced the BEST
+short-vol returns. The market was paying you extra premium AFTER
+the panic; realized vol came in LOWER than implied. The gate
+would have made you sit out those cycles.
+
+Net read: the gate trades "missed-good-cycles" for "avoided-bad-
+cycles." The empirical test is whether the trade is net positive
+on YOUR data. The Portfolio tab's sensitivity strip will answer
+this directly. Default 75th for v1; let the operator scan
+empirically. **Don't bake it in as a theorem.**
+
+## Public API
 
   ``regime_percentile(signal_series, as_of, lookback_td=252) -> float``
       Trailing-window percentile rank of today's signal value vs its
@@ -19,9 +57,29 @@ Public API:
   ``avg_single_name_realized_vol(symbols, as_of, window_td=21,
                                   today_fn=date.today, offline=False)
                                   -> float``
-      Universe-average of per-symbol 21-trading-day annualized
-      realized vol. Used as the v1 regime-gate proxy signal until
-      the India VIX series accumulates 252+ trading days of cache.
+      v1 SIGNAL — universe-average of per-symbol 21-TD annualized
+      realized vol. v1 proxy when India VIX is unavailable (cold
+      cache / pre-2008 backtest date).
+
+  ``load_india_vix_signal(from_date, to_date, *,
+                            today_fn=date.today, offline=False)
+                            -> pd.Series``
+      v2 SIGNAL — India VIX close series for the lookback window
+      (PORTFOLIO_MEMOIR.md §3.7). Date-indexed pd.Series ready for
+      ``regime_percentile`` / ``regime_state``.
+
+  ``default_regime_signal(from_date, to_date, *,
+                            today_fn=date.today, offline=False)
+                            -> pd.Series``
+      Canonical entry point — currently routes to v2 (India VIX).
+      Phase 9.4's Portfolio banner calls this.
+
+  ``current_regime_state(as_of, *, threshold_pct=75.0,
+                           lookback_td=252, today_fn=date.today,
+                           offline=False) -> Literal["ON", "OFF"]``
+      Single-call convenience: loads India VIX over the trailing
+      lookback window + computes regime_state. The function
+      Phase 9.4 banners + cycle-entry checks invoke directly.
 
 Per memoir §3.5 the average of single-name realized vols is NOT
 the same as portfolio realized vol (which depends on the covariance
@@ -32,12 +90,13 @@ confuse it with portfolio variance.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Callable, Iterable, Literal
 
 import numpy as np
 import pandas as pd
 
+from src.data import india_vix_loader
 from src.engine import vol as _vol
 
 
@@ -233,3 +292,152 @@ def avg_single_name_realized_vol(
     if not values:
         return float("nan")
     return float(np.mean(values))
+
+
+# ============================================================
+# v2 signal — India VIX (memoir §3.7)
+# ============================================================
+#
+# The forward-looking implied-vol regime signal. Phase 9.6
+# wire-in. Per memoir §3.7:
+#
+#   "India VIX is NSE's daily-published implied-vol index based
+#    on NIFTY index options. It IS the market-implied 30-day vol
+#    forecast. No need to compute it from 50 stocks; it's a
+#    single number per day, published since 2008."
+#
+# Cache layout: ``data/cache/india_vix.parquet`` (Phase 9.0
+# loader output). Columns: date, india_vix_open, india_vix_high,
+# india_vix_low, india_vix_close, india_vix_prev_close.
+#
+# The signal column is ``india_vix_close`` per memoir convention
+# — the EOD settled value.
+
+# Backfill cushion when converting a TD-counted lookback to
+# calendar days. 252 TD ≈ 365 calendar days; +30 cushion absorbs
+# weekends + holidays + the occasional NSE close-day so the
+# loaded window always covers the requested trailing TDs.
+_TD_TO_CALENDAR_RATIO = 365 / 252
+_LOOKBACK_CALENDAR_CUSHION_DAYS = 30
+
+
+def load_india_vix_signal(
+    from_date: date,
+    to_date: date,
+    *,
+    today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
+) -> pd.Series:
+    """Return India VIX close series over ``[from_date, to_date]``
+    as the v2 regime signal.
+
+    Loads via ``src.data.india_vix_loader.load_india_vix`` (cache-
+    first; networks-on-miss unless ``offline=True``) and projects
+    the ``india_vix_close`` column to a date-indexed pd.Series
+    ready for ``regime_percentile`` / ``regime_state``.
+
+    Args:
+        from_date / to_date: inclusive window. Caller typically
+            passes ``as_of - cushion`` to ``as_of`` so the
+            trailing percentile rank has 252 TDs of history.
+        today_fn / offline: forwarded to the loader. Offline mode
+            raises ``OfflineCacheMiss`` if any part of the
+            requested window is not cached.
+
+    Returns:
+        ``pd.Series`` named ``"india_vix_close"`` indexed by
+        ``date`` (datetime64[us]) ascending. Empty series if the
+        loader returns an empty frame.
+
+    NaN handling: the loader returns no NaN rows by construction
+    (cache rejects them). A non-trading-day ``as_of`` rounds
+    DOWN to the most recent EOD print via the kernel's
+    ``Series.index.searchsorted(..., side="right") - 1``.
+    """
+    df = india_vix_loader.load_india_vix(
+        from_date, to_date,
+        today_fn=today_fn, offline=offline,
+    )
+    if df.empty:
+        return pd.Series(
+            [], dtype="float64",
+            index=pd.DatetimeIndex([], name="date"),
+            name="india_vix_close",
+        )
+    out = (
+        df.sort_values("date")
+          .set_index("date")["india_vix_close"]
+          .astype("float64")
+    )
+    out.name = "india_vix_close"
+    return out
+
+
+def default_regime_signal(
+    from_date: date,
+    to_date: date,
+    *,
+    today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
+) -> pd.Series:
+    """Canonical regime-signal entry point (currently v2 = India VIX).
+
+    Phase 9.4's Portfolio banner + cycle-entry check call THIS,
+    not the per-signal functions directly. The indirection lets
+    future swaps (e.g., regime gate v3 = something better than
+    India VIX) land as a one-line change here.
+
+    No auto-fallback to v1 on cold cache — silent fallback would
+    mask "operator forgot to prefetch India VIX" gaps. Callers
+    that need a v1 fallback import ``avg_single_name_realized_vol``
+    explicitly + handle the cold case.
+
+    Args / Returns: same as ``load_india_vix_signal``.
+    """
+    return load_india_vix_signal(
+        from_date, to_date,
+        today_fn=today_fn, offline=offline,
+    )
+
+
+def current_regime_state(
+    as_of: date,
+    *,
+    threshold_pct: float = 75.0,
+    lookback_td: int = 252,
+    today_fn: Callable[[], date] = date.today,
+    offline: bool = False,
+) -> Literal["ON", "OFF"]:
+    """Single-call convenience: load India VIX + compute regime_state.
+
+    The function Phase 9.4 banners + cycle-entry checks invoke
+    directly. Loads enough trailing calendar days to realize the
+    full ``lookback_td`` TD window (TD→calendar conversion uses
+    ratio 365/252 + a 30-day cushion for weekends/holidays/closures).
+
+    Args:
+        as_of: trading date to compute the regime state for.
+        threshold_pct: ON when percentile ≤ this. Default 75 per
+            memoir §3.1 (also the value pinned by the operator-
+            tunable sensitivity strip on the Portfolio tab).
+        lookback_td: trailing window in trading days. Default 252.
+        today_fn / offline: forwarded to the loader.
+
+    Returns:
+        ``"ON"`` (cycle opens) or ``"OFF"`` (skip the cycle).
+        NaN percentile → ``"OFF"`` per memoir §21.4 F9
+        skip-when-uncertain convention.
+    """
+    backfill_days = int(
+        lookback_td * _TD_TO_CALENDAR_RATIO
+    ) + _LOOKBACK_CALENDAR_CUSHION_DAYS
+    from_date = as_of - timedelta(days=backfill_days)
+    signal = default_regime_signal(
+        from_date, as_of,
+        today_fn=today_fn, offline=offline,
+    )
+    return regime_state(
+        signal, as_of,
+        threshold_pct=threshold_pct,
+        lookback_td=lookback_td,
+    )

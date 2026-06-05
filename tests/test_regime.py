@@ -388,3 +388,172 @@ def test_integration_india_vix_to_regime_percentile_returns_pct_in_range(
         close, as_of=dates[252].date(), lookback_td=252,
     )
     assert 0.0 <= pct <= 100.0
+
+
+# ============================================================
+# Phase 9.6 v2 signal — India VIX → regime
+# ============================================================
+
+from src.analytics import regime as _regime_mod
+from src.analytics.regime import (
+    current_regime_state,
+    default_regime_signal,
+    load_india_vix_signal,
+)
+
+
+def _stub_india_vix_loader(monkeypatch, df: pd.DataFrame) -> list[tuple]:
+    """Stub india_vix_loader.load_india_vix so v2 tests don't
+    need parquet I/O. Returns a list the stub appends to so
+    tests can assert on the call args."""
+    calls: list[tuple] = []
+
+    def fake_load_india_vix(
+        from_date, to_date, *,
+        force_refresh=False, today_fn=None, offline=False,
+    ):
+        calls.append((from_date, to_date, offline))
+        # Filter the canned frame to the requested window, matching
+        # what the real loader does.
+        mask = (df["date"] >= pd.Timestamp(from_date)) & (
+            df["date"] <= pd.Timestamp(to_date)
+        )
+        return df[mask].copy()
+
+    monkeypatch.setattr(
+        _regime_mod.india_vix_loader, "load_india_vix",
+        fake_load_india_vix,
+    )
+    return calls
+
+
+def _canonical_india_vix_frame(n: int = 300) -> pd.DataFrame:
+    """Build a canonical India VIX frame matching the loader's
+    schema. 300 daily rows starting 2024-01-02 with sine-wave
+    closes in a plausible range."""
+    dates = pd.date_range("2024-01-02", periods=n, freq="D")
+    vals = 15.0 + 5.0 * np.sin(np.linspace(0, 6 * np.pi, n)) + np.linspace(0, 2, n)
+    return pd.DataFrame({
+        "date": dates.astype("datetime64[us]"),
+        "india_vix_open":  vals - 0.5,
+        "india_vix_high":  vals + 0.5,
+        "india_vix_low":   vals - 1.0,
+        "india_vix_close": vals,
+        "india_vix_prev_close": np.concatenate([[vals[0]], vals[:-1]]),
+    })
+
+
+def test_load_india_vix_signal_returns_close_series(monkeypatch):
+    """LOAD-BEARING shape contract: returns a date-indexed
+    pd.Series of float64 named 'india_vix_close'."""
+    df = _canonical_india_vix_frame(60)
+    _stub_india_vix_loader(monkeypatch, df)
+    s = load_india_vix_signal(date(2024, 1, 2), date(2024, 3, 1))
+    assert isinstance(s, pd.Series)
+    assert s.dtype == np.float64
+    assert s.name == "india_vix_close"
+    assert isinstance(s.index, pd.DatetimeIndex)
+
+
+def test_load_india_vix_signal_sorted_ascending(monkeypatch):
+    """Index ascending — regime_percentile requires this."""
+    df = _canonical_india_vix_frame(60)
+    # Shuffle the frame so the function has to sort.
+    df = df.sample(frac=1, random_state=0).reset_index(drop=True)
+    _stub_india_vix_loader(monkeypatch, df)
+    s = load_india_vix_signal(date(2024, 1, 2), date(2024, 3, 1))
+    assert s.index.is_monotonic_increasing
+
+
+def test_load_india_vix_signal_empty_window_returns_empty_series(monkeypatch):
+    """Loader returns empty → signal is empty schema-shaped Series."""
+    df = _canonical_india_vix_frame(60)
+    _stub_india_vix_loader(monkeypatch, df)
+    s = load_india_vix_signal(date(2099, 1, 1), date(2099, 12, 31))
+    assert s.empty
+    assert s.name == "india_vix_close"
+
+
+def test_load_india_vix_signal_forwards_offline(monkeypatch):
+    """offline=True propagates to the loader."""
+    df = _canonical_india_vix_frame(60)
+    calls = _stub_india_vix_loader(monkeypatch, df)
+    load_india_vix_signal(
+        date(2024, 1, 2), date(2024, 3, 1), offline=True,
+    )
+    assert calls[0][2] is True  # offline flag
+
+
+def test_default_regime_signal_routes_to_v2_india_vix(monkeypatch):
+    """LOAD-BEARING canonical entry point: default_regime_signal
+    returns what load_india_vix_signal returns (v2). If the
+    canonical signal drifts back to v1 without intent, this
+    catches it."""
+    df = _canonical_india_vix_frame(60)
+    _stub_india_vix_loader(monkeypatch, df)
+    s_default = default_regime_signal(date(2024, 1, 2), date(2024, 3, 1))
+    s_v2 = load_india_vix_signal(date(2024, 1, 2), date(2024, 3, 1))
+    pd.testing.assert_series_equal(s_default, s_v2)
+
+
+def test_current_regime_state_composes_load_and_state(monkeypatch):
+    """LOAD-BEARING end-to-end: current_regime_state(as_of) loads
+    India VIX over a backfilled lookback window and returns ON/OFF.
+    The result should match calling load + regime_state by hand."""
+    df = _canonical_india_vix_frame(400)
+    _stub_india_vix_loader(monkeypatch, df)
+    as_of = date(2024, 12, 1)
+    state = current_regime_state(as_of, lookback_td=252)
+    assert state in ("ON", "OFF")
+    # Match the hand-composed result.
+    signal = load_india_vix_signal(
+        date(2024, 1, 2), date(2024, 12, 1),
+    )
+    hand_state = regime_state(signal, as_of, lookback_td=252)
+    # Both should agree (current_regime_state backfilled enough).
+    assert state == hand_state
+
+
+def test_current_regime_state_uses_backfill_cushion(monkeypatch):
+    """LOAD-BEARING: the function backfills enough calendar days
+    to cover the requested TD lookback. With lookback_td=252,
+    it must load ≥ ~365 + 30 calendar days."""
+    df = _canonical_india_vix_frame(400)
+    calls = _stub_india_vix_loader(monkeypatch, df)
+    as_of = date(2024, 12, 1)
+    current_regime_state(as_of, lookback_td=252)
+    assert len(calls) >= 1
+    from_date, to_date, _ = calls[0]
+    spanned = (to_date - from_date).days
+    assert spanned >= 365  # 252 * 365/252 = 365
+    assert spanned >= 252 * 365 / 252  # explicit pin
+
+
+def test_current_regime_state_off_on_insufficient_history(monkeypatch):
+    """Cold cache for the lookback window → percentile NaN →
+    state OFF per memoir §21.4 F9 skip-when-uncertain."""
+    # Only 30 days of data → << 0.5 * 252 = 126 floor → NaN → OFF.
+    df = _canonical_india_vix_frame(30)
+    _stub_india_vix_loader(monkeypatch, df)
+    as_of = date(2024, 12, 1)
+    assert current_regime_state(as_of, lookback_td=252) == "OFF"
+
+
+def test_current_regime_state_forwards_offline(monkeypatch):
+    df = _canonical_india_vix_frame(400)
+    calls = _stub_india_vix_loader(monkeypatch, df)
+    current_regime_state(date(2024, 12, 1), offline=True)
+    assert calls[0][2] is True
+
+
+def test_current_regime_state_custom_threshold(monkeypatch):
+    """Custom threshold_pct flows through to regime_state.
+    Threshold=0 → OFF unless percentile is exactly 0 (impossible
+    on a non-flat series); threshold=100 → ON always (unless NaN)."""
+    df = _canonical_india_vix_frame(400)
+    _stub_india_vix_loader(monkeypatch, df)
+    as_of = date(2024, 12, 1)
+    # threshold_pct=100 → percentile ≤ 100 is always true (if not NaN) → ON.
+    assert current_regime_state(
+        as_of, threshold_pct=100.0, lookback_td=252,
+    ) == "ON"
