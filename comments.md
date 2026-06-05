@@ -24499,3 +24499,124 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of b52386d — `fix(p9.5.inspect.url_precedence)` — ✅ ACCEPT (grill closed + forward-looking helper added)
+
+**Verdict: ✅ ACCEPT.** Closes 7aef085 GRILL 1 with the literal recommended fix (first-render-only seed via `if _SS_STRATEGY in st.session_state: return`) AND a forward-looking addition I didn't ask for but is exactly right: a public `clear_inspect_state()` helper that preserves the §24.9 contract for future deeplink writers. 1059 passed (matches BUILDER). All 3 of my tiny concerns addressed explicitly in the commit body.
+
+### Fix matches recommendation A
+
+`inspect.py:252-254` (new):
+```python
+if _SS_STRATEGY in st.session_state:
+    # Already seeded; widget binding owns the keys from here.
+    return
+```
+
+Plus the URL-or-session-state Python-or chain (the root cause) removed entirely — first-render seeds purely from URL:
+```python
+url = _read_url_params()
+snapped = _snap_to_valid(
+    df,
+    url.get("strategy"),
+    url.get("symbol"),
+    url.get("expiry"),
+    url.get("entry_offset_td"),
+    url.get("exit_offset_td"),
+)
+```
+
+Clean. The cascading-validity snap still runs on the first-render seed so a malformed deeplink (`?strategy=bogus`) lands on a real sweep row instead of crashing.
+
+### Forward-looking improvement — `clear_inspect_state()`
+
+I would have stopped at first-render-only. BUILDER also added a public helper for the Phase 9.4 deeplink-rewrite flow:
+
+```python
+def clear_inspect_state() -> None:
+    for k in _PRIVATE_SS_KEYS:
+        st.session_state.pop(k, None)
+```
+
+This solves the OTHER problem the first-render-only fix introduces: after first seed, a NEW deeplink (e.g., Portfolio writes new URL + reruns) won't re-read URL because session_state is still populated. The helper lets Phase 9.4 deeplink writers do:
+
+```python
+for k, v in deeplink_url_params.items():
+    st.query_params[k] = v
+st.query_params["tab"] = "Inspect"
+from src.web.inspect import clear_inspect_state
+clear_inspect_state()
+st.rerun()
+```
+
+**Preserves the §24.9 contract** that `mp_inspect_*` keys are private to this module — deeplink writers don't reach into them directly. Better than the operator alternative (clear session_state from outside) which would violate the privacy boundary. Right architectural call.
+
+### 3 new tests verified
+
+1. **`test_user_click_overrides_deeplink_on_subsequent_render`** — the LITERAL regression I suggested. Seeds URL with `strategy=short_strangle`, seeds session, simulates selectbox click writing `short_straddle`, re-runs init, asserts `short_straddle` survives. Pre-fix this test would have failed on the final assertion. ✓
+2. **`test_clear_inspect_state_drops_private_keys_only`** — verifies the helper drops all 5 `_PRIVATE_SS_KEYS` and preserves unrelated keys (`mp_active_tab`, etc.). The privacy-respecting contract is testable. ✓
+3. **`test_clear_then_seed_picks_up_new_url`** — end-to-end deeplink-rewrite flow that Phase 9.4 will use. Documents the API contract for downstream consumers. ✓
+
+### Independent pytest verification
+
+```
+$ pytest -q
+1059 passed, 3 deselected, 1 warning in 19.54s   ✓ matches BUILDER exactly
+```
+
+### CONSTRAINT 1 still green
+
+```
+$ grep -nE "(bs76|bs_premium|black_scholes|implied_vol)" src/web/inspect.py tests/test_web_inspect.py
+tests/test_web_inspect.py:399-402:   r"\bbs76\b" ... r"\bimplied_vol\b"   ← the gate's own pattern list
+```
+
+The only hits are the regex patterns inside `_BS_REJECT_PATTERNS = [...]` which the gate test (line 432) explicitly strips out via `re.sub(r"_BS_REJECT_PATTERNS\s*=\s*\[.*?\]", "", src, flags=re.DOTALL)` before grepping. Self-exclusion handled correctly.
+
+### Praise points
+
+- **Commit body documents the root-cause failure-sequence** (deeplink → first render → user click → rerun → URL still there → clobber). Future maintainer reading the body understands why the `if k in session_state: return` short-circuit is load-bearing, not "defensive belt-and-suspenders."
+- **Mirrors `app.py`'s tab-routing seed pattern verbatim** in the docstring (lines 240-243). Same idiom in two places now — future contributor learns the pattern from either entry point.
+- **Addresses ALL three of my tiny concerns** in the commit body (16-vs-15 test count, every-render runtime cost, NaT expiry handling). Each one explicitly acknowledged with disposition. Audit-trail discipline.
+- **Net test count exactly matches**: 1056 → 1059 (+3 new, none removed). BUILDER's arithmetic checked out.
+- **`clear_inspect_state()` is OPTIONAL helper** — Phase 9.4 can choose to use it or not. Doesn't bind the deeplink-writer contract to a specific implementation strategy.
+- **Existing pre-clip pattern in `_render_selectors`** (cited explicitly in the new docstring at lines 232-236) is recognized as the validity-handling mechanism for post-seed renders. The cleanup correctly identifies WHY removing the every-render re-seed is safe.
+
+### Math
+
+- LOC: 90 / 21 = +69 net (inspect.py) + 101 / 0 = +101 (test). +170 total / -21 = +149 net. ✓ Matches `git show --stat` (+170, -21).
+- Tests: 1056 → 1059 (+3 new). ✓
+- 19 tests in test_web_inspect.py (16 skeleton + 3 from this commit).
+
+### State-of-tree
+
+- `main` HEAD: `b52386d`.
+- 7aef085 GRILL 1 — ✅ CLOSED.
+- Phase 9.5 sub-arc: skeleton → URL-precedence fix → 9.5.2 position map (next) → 9.5.3 cumulative P&L + legs.
+
+### Open grills (cumulative)
+
+- ✅ **CLOSED — 7aef085 GRILL 1** by this commit.
+- ✅ **CLOSED — 3625f3e GRILL 1** by 3720be8 (memoir .py→.ipynb fix).
+- F11 + F12 silent-drops grill — STILL OPEN on main (pre-P8 backlog).
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required.
+
+### Next-commit suggestion
+
+`feat(p9.5.2.inspect.position_map)` — Phase 9.5.2 per BUILDER's stated sub-arc. Position-map chart for the selected sweep row. Will likely touch the same `_render_selectors` adjacency but `clear_inspect_state()` and the seed pattern are now stable to build on.
+
+Migration cadence
+
+**... → P9.5.0 skeleton ⚠️ → P9.5.0 URL-precedence fix ✓ → P9.5.2 position map → P9.5.3 P&L path + legs → P9.4 Portfolio (deeplink writer; consumes clear_inspect_state) → ...**
+
+Standing by.
+
+---
