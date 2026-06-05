@@ -111,29 +111,146 @@ Two cross-cutting rules for any Part-B filter:
 2. **Surface the count it removes.** Like `min_n`, a portfolio filter should report how many priced
    cells it excluded, so "filtered" never silently reads as "didn't exist."
 
-### B.1 — IV-Percentile (IVP) filter — PLANNED (stub, not yet implemented)
-- **Idea (operator, 2026-06):** filter cells by the entry-day implied-volatility percentile of the
-  underlying — e.g. exclude entries whose IVP is outside a chosen band.
-- **Inputs:** ⛏ **IVP is not currently computed anywhere.** The engine has *realized* vol
-  (`src/engine/vol.py`, close-to-close, from the spot cache) but **no implied-vol inversion**.
-  Implementing IVP requires: (a) invert option premium → IV (Black-Scholes/Black-76) per
-  contract/day, (b) build an ATM-IV series per symbol, (c) rank each entry-day IV against a trailing
-  window → percentile. That's a real new compute step (its own spec + tests), upstream of this filter.
-- **Direction — PIN BEFORE IMPLEMENTING:** the standard short-vol thesis sells premium when IV is
-  *rich* (high IVP), so "filter out high IVP" is the *opposite* of the usual edge — decide whether
-  the intent is to avoid event-driven IV spikes (which often precede large moves that hurt short
-  strangles/straddles) or something else, and write the rationale in when it lands.
-- **Status:** planned. **Caveat:** IVP needs a clean, no-look-ahead trailing window; an
-  ATM-IV built from thin far-OTM legs (see Part A #8) would itself be noisy on low-liquidity names.
+### B.1 — IV-Percentile (IVP) filter — PLANNED (math built, wire-in pending in Phase 9.4)
+- **Type:**       rank-top-k (cross-sectional rank within candidate universe)
+- **Stage:**      portfolio candidate selection (post-sweep analytics; runs AFTER B.4 liquidity floor
+                  per memoir §11 — IVP rank only operates on names that already cleared the floor).
+- **Inputs:**     ✅ available. `data/cache/iv/{SYMBOL}.parquet` (per-symbol 30D CMI ATM IV history,
+                  Series C `iv_cmi30_excl7` is the operator-locked default — built by
+                  `src.data.iv_materializer.materialize_iv_history`, commit `9d65809`).
+                  Time-series IVP rank computed by `src.analytics.ivp.compute_ivp`
+                  (commit `52a9036`); cross-sectional top-N selector
+                  `src.analytics.ivp.top_n_by_ivp`.
+- **Parameter:**  `lookback_td=252` (default; memoir F5); `series="iv_cmi30_excl7"` (default;
+                  operator-locked); cutoff/range knob on the Portfolio tab.
+- **Direction:**  HIGH IVP passes (rich vol → favorable for premium sellers). Memoir §2: the
+                  standard short-vol thesis. Sensitivity strip on the Portfolio tab will let the
+                  operator scan deciles (0-9, 10-19, …, 90-99) to find the empirical sweet spot per
+                  memoir §2.5.
+- **Rationale:**  High percentile = "this name's vol is rich vs its own 1-year history." Combined
+                  with regime gate (B.2) and earnings filter (B.3), forms the 3-layer risk
+                  framework per memoir §3.7 — IVP captures per-name idiosyncratic vol mispricings
+                  that the universe-level regime gate is structurally blind to.
+- **Status:**     planned (wire-in). Math: `feat(p9.1.iv_materializer)` `9d65809`,
+                  `feat(p9.1.analytics.ivp)` `52a9036`. Sweep wire-in: Phase 9.4.
+- **Caveat:**     No look-ahead — `compute_ivp(symbol, as_of)` uses a TRAILING 252-TD window with
+                  explicit NaN guards on today's value (closes the F5 silent-rank-NaN-as-0 bug per
+                  memoir §21.4). ATM-IV built from thin far-OTM legs (see Part A #8) would be noisy
+                  on low-liquidity names — the B.4 liquidity floor running first mitigates.
+
+### B.2 — Regime gate filter — PLANNED (math built, wire-in pending in Phase 9.4)
+- **Type:**       universe-wide ON/OFF (skips the entire cycle when OFF)
+- **Stage:**      cycle entry decision (BEFORE candidate selection — when OFF the universe doesn't
+                  matter, no positions open this cycle).
+- **Inputs:**     ✅ available. v1: `avg_single_name_realized_vol` over the candidate universe via
+                  `src.analytics.regime.regime_percentile` + `regime_state` (already shipped). v2:
+                  India VIX series via `src.data.india_vix_loader` →
+                  `data/cache/india_vix.parquet` (Phase 9.0 deliverable). Phase 9.6 swaps v1 → v2.
+- **Parameter:**  `threshold_pct=75.0` (default per memoir §3.1; production may use 90 for
+                  less-aggressive sit-out); `lookback_td=252`.
+- **Direction:**  Cycle opens when percentile ≤ threshold ("ambient vol is in the lower three
+                  quartiles" → trade). Cycle skips when percentile > threshold ("ambient vol
+                  elevated" → sit out). NaN percentile → OFF per memoir §21.4 F9's
+                  skip-when-uncertain convention.
+- **Rationale:**  Per memoir §3.1: short-vol strategies systematically lose in vol-elevated
+                  regimes (single-name mean-reversion correlations collapse, tail risk inflates).
+                  Skipping high-vol cycles is the cleanest mitigation — better than per-name
+                  filtering which is structurally blind to systematic risk.
+- **Status:**     planned (wire-in). Math: pre-Phase-9 in `src.analytics.regime`; Phase 9.6 v1→v2
+                  swap. Sweep wire-in: Phase 9.4 banner + cycle entry.
+- **Caveat:**     No look-ahead — `regime_percentile` uses a trailing 252-TD window. v1's
+                  `avg_single_name_realized_vol` reads from `engine.vol.realized_vol`, which returns
+                  0.0 on insufficient data (NOT NaN); the regime path filters `rv == 0.0` as
+                  "missing." Phase 9.6 v2 (India VIX) is the cleaner forward-looking signal vs the
+                  v1 backward-looking realized proxy per memoir §3.7.
+
+### B.3 — Earnings filter — PLANNED (math built, wire-in pending in Phase 9.4)
+- **Type:**       exclude (universe-level; drops symbols with in-window Financial Results event)
+- **Stage:**      portfolio candidate selection (BEFORE the IVP rank — drops feed the Portfolio
+                  banner's "X candidates dropped: earnings in window" counter).
+- **Inputs:**     ✅ available. `data/cache/events.parquet` (NSE Corporate Events feed, parsed
+                  from `CF-Event-equities-*.csv`; built by `src.data.events_loader.load_events`,
+                  commit `182cf1d` + case-norm fix `d824ef8`). Filter via
+                  `src.analytics.earnings_filter.filter_universe_by_earnings` (commit `c7563d7`).
+- **Parameter:**  Window = `[entry_date, exit_date + 1 calendar day]`. The `+1` buffer catches
+                  the case where exit is the day BEFORE announcement per memoir §21.4 F10. No
+                  knob; operator either trusts the filter or doesn't run it.
+- **Direction:**  Symbols with any Financial Results event in window are DROPPED. Multi-category
+                  PURPOSE rows (e.g. "Financial Results/Dividend") substring-match → dropped.
+                  Non-Financial-Results events (Dividend, Fund Raising, Stock Split alone) DO
+                  NOT trigger the filter per memoir §17.5.
+- **Rationale:**  Per memoir §3.7 (Layer 2 of the 3-layer risk framework): earnings announcements
+                  are scheduled per-name catalysts that the regime gate (universe-wide) is
+                  structurally blind to. A name at high IVP because the MARKET knows its earnings
+                  are coming will look "rich" to a naive IVP filter; the earnings filter intercepts
+                  before the catalyst hits.
+- **Status:**     planned (wire-in). Math: `feat(p9.0.events_loader)` `182cf1d`,
+                  `feat(p9.2.analytics.earnings_filter)` `c7563d7`. Sweep wire-in: Phase 9.4.
+- **Caveat:**     **5-14 day lookahead documented and accepted** per memoir §17.7 — the events
+                  CSV's DATE column is the board-meeting date, but Reg 29(1)(a) notice is filed
+                  5-14 days BEFORE the meeting (= publicly knowable). Operator-accepted ("avoid
+                  the earnings event, not model exact lead-time"); not a silent bug. Cold-cache
+                  pass-through (`events_df=None`) keeps the universe intact when the CSV hasn't
+                  been downloaded — the banner can detect via `events_df is None` AND
+                  `n_dropped == 0`.
+
+### B.4 — Liquidity floor (universe pre-filter) — PLANNED (math built, wire-in pending in Phase 9.4)
+- **Type:**       rank-top-k (universe pre-filter; runs FIRST in candidate selection per memoir §11)
+- **Stage:**      portfolio candidate selection — BEFORE B.1 IVP and B.3 earnings. Memoir §11
+                  intent: only spend IVP-compute on names that already cleared the floor.
+- **Inputs:**     ✅ available. Trailing-21-TD OPTSTK bhavcopy data via
+                  `src.data.bhavcopy_fo_loader.load_bhavcopy_fo`. Score computed by
+                  `src.analytics.liquidity.compute_liquidity_scores`; selector
+                  `src.analytics.liquidity.top_n_by_liquidity` (commit `61c3fe9`).
+- **Parameter:**  `lookback_td=21` (default; memoir F11); `n` = how many top-liquid names to
+                  carry forward to the IVP rank (typical: ~25-50 from a universe of ~150-200).
+- **Direction:**  Top N PASS (most-liquid names survive). Per memoir §11.b: "the most-traded
+                  symbols" — high score = high daily total OPTSTK contracts averaged across the
+                  21-TD window.
+- **Rationale:**  Per memoir §11: the universe at backtest date D = `{symbol where bhavcopy_fo[D]
+                  has OPTSTK rows}` ≈ 150-200 names. Most are too thin to support a 5-stock
+                  portfolio cycle without each leg hitting Part-A's `volume==0` gate. The
+                  liquidity floor pre-filters to names where the strategy can actually clear Part
+                  A on entry day.
+- **Status:**     planned (wire-in). Math: `feat(p9.2.analytics.liquidity_rank)` `61c3fe9`.
+                  Sweep wire-in: Phase 9.4 candidate selection. Surface-the-count: caller reports
+                  `len(universe) - len(top_n_by_liquidity_output)` to the banner.
+- **Caveat:**     **Documented deviation from the memoir's code sketch**: implemented per-day
+                  total → mean across days (matches English description "average contracts
+                  traded"), NOT the sketch's `sub['contracts'].mean()` per-row mean (which would
+                  punish symbols with a fat ATM + many skinny OTM strikes). Reviewer challenge
+                  surface left open in the commit message. OPTSTK-only — OPTIDX (index options)
+                  out of scope through Phase 11. NaN score when symbol has fewer than 50% of
+                  lookback distinct trade dates (insufficient sampling); NaN scores EXCLUDED from
+                  top-N ranking.
+
+### B.5 — Sector concentration cap — PLANNED (no math yet; placeholder for Phase 9.4)
+- **Type:**       cap-per-bucket (limits N per sector after IVP rank)
+- **Stage:**      final candidate selection — AFTER B.1 IVP and B.3 earnings have produced a
+                  ranked list. Re-orders / drops to honor the cap.
+- **Inputs:**     ⛏ **Sector mapping not yet wired.** Needs a per-symbol sector assignment table
+                  (NSE Industry Code → sector bucket). The 50-symbol universe is dominated by
+                  Financials + Energy + IT; a 5-stock cycle with no cap can end up 3-of-5
+                  Financials on any given day.
+- **Parameter:**  `max_per_sector` (typical: 2 — cycle of 5 with max 2 per sector forces at least
+                  3 sectors represented).
+- **Direction:**  Names PASS subject to the cap; once a sector hits cap, lower-ranked names in
+                  that sector are skipped and the next-ranked name in any other sector takes the
+                  slot.
+- **Rationale:**  Per memoir §3.7 + Phase 9.4 `feat(p9.4.concentration_correlation)` — short-vol
+                  P&L is highly correlated within sectors when sector-wide volatility events hit
+                  (rate moves for Financials, oil shocks for Energy, etc.). The 3-layer risk
+                  framework's structural-risk layer (Layer 1) is the regime gate; sector
+                  concentration is the soft constraint that prevents the candidate-selection
+                  step from concentrating risk WITHIN a single trading cycle.
+- **Status:**     placeholder. No math built; lands inside Phase 9.4 cycle drilldown / final
+                  selection commit, not as its own analytics module.
+- **Caveat:**     Sector mapping itself becomes a maintained data artifact (NSE periodically
+                  reclassifies names); cold-cache pass-through (no mapping → no cap applied) keeps
+                  the v1 backtest from failing when the table is absent.
 
 ### Other likely Part-B filters (placeholders — describe when scoped)
-- **Liquidity floor** — exclude cells whose legs are below a min entry volume / OI (a softer,
-  portfolio-level version of the Part-A `volume>0` gate; lets you demand *meaningful* liquidity, not
-  just non-zero). Inputs ✅ available (`entry_volume`/`entry_oi` in `legs_json`).
 - **Higher `min_n`** — require more than 5 expiries for portfolio inclusion (stability over coverage).
-- **Regime filter** — include only bullish / neutral / non-bullish regime entries. A session-state
-  key (`mp_regime_filter`) already exists in the web app but is **not yet wired**; needs an entry-day
-  regime label per symbol.
 - **Dispersion / tail caps** — exclude cells with `std_roi` or `CVaR-5%` beyond a threshold
   (portfolio risk control). Inputs ✅ available from per-cell stats.
 - **Cost/slippage realism floor** — exclude cells whose edge is within the cost band.
