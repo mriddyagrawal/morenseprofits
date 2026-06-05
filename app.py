@@ -327,15 +327,49 @@ def main() -> None:
     _render_sidebar(results_df)
     df_filtered = _apply_filters(results_df)
 
-    tabs = st.tabs(["Leaderboard", "Per-stock", "Heatmap", "Trends"])
-    with tabs[0]:
+    # URL-driven active-tab selection per PORTFOLIO_MEMOIR.md §24.9.
+    # Streamlit's ``st.tabs`` has no native default-active-tab from URL
+    # params, which the Inspect deeplink contract requires. The
+    # workaround: render a horizontal radio that's keyed to a
+    # ``?tab=<Name>`` URL param. The visual is a pill bar instead of
+    # underlined tabs; the routing is load-bearing for the deeplink
+    # contract and outweighs the visual delta.
+    _TAB_NAMES = ["Leaderboard", "Per-stock", "Heatmap", "Trends", "Inspect"]
+    qp = st.query_params
+    url_tab_raw = qp.get("tab", "Leaderboard")
+    if isinstance(url_tab_raw, list):
+        url_tab_raw = url_tab_raw[0] if url_tab_raw else "Leaderboard"
+    url_tab = url_tab_raw if url_tab_raw in _TAB_NAMES else "Leaderboard"
+
+    # Seed session state on first render so the URL param wins; on
+    # later reruns the radio's own session state is sticky.
+    if "mp_active_tab" not in st.session_state:
+        st.session_state["mp_active_tab"] = url_tab
+
+    active = st.radio(
+        "Tab",
+        _TAB_NAMES,
+        horizontal=True,
+        key="mp_active_tab",
+        label_visibility="collapsed",
+    )
+
+    # Keep the URL in sync with the radio so a refresh preserves the
+    # operator's selection and bookmarked URLs reproduce.
+    if qp.get("tab") != active:
+        qp["tab"] = active
+
+    if active == "Leaderboard":
         _render_leaderboard_tab(df_filtered)
-    with tabs[1]:
+    elif active == "Per-stock":
         _render_per_stock_tab(df_filtered)
-    with tabs[2]:
+    elif active == "Heatmap":
         _render_heatmap_tab(df_filtered, skips_df=skips_df)
-    with tabs[3]:
+    elif active == "Trends":
         _render_trends_tab(df_filtered)
+    elif active == "Inspect":
+        from src.web.inspect import render_inspect_tab
+        render_inspect_tab(df_filtered)
 
 
 if __name__ == "__main__":

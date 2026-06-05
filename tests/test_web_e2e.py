@@ -71,16 +71,25 @@ def test_app_loads_without_crash():
 
 @SKIP_NO_SWEEP
 def test_app_renders_expected_tabs():
-    """The 4-tab structure (Leaderboard / Per-stock / Heatmap / Trends)
-    is part of v0.6's contract. Anyone reordering or renaming tabs
-    must update this test — load-bearing UX promise."""
+    """The 5-tab structure (Leaderboard / Per-stock / Heatmap / Trends
+    / Inspect) is part of the v0.6+9.5 contract. Anyone reordering or
+    renaming tabs must update this test — load-bearing UX promise.
+
+    Phase 9.5 swapped ``st.tabs`` for ``st.radio(horizontal=True)`` so
+    the ``?tab=<Name>`` URL param can drive active-tab selection per
+    PORTFOLIO_MEMOIR.md §24.9 deeplink contract; the tab options now
+    appear on a radio's ``.options`` rather than ``tabs[i].label``."""
     at = AppTest.from_file(str(APP_PY))
     at.run(timeout=30)
     assert not at.exception
-    tab_labels = [t.label for t in at.tabs]
-    assert tab_labels == ["Leaderboard", "Per-stock", "Heatmap", "Trends"], (
-        f"tab labels changed: {tab_labels}"
+    tab_radios = [r for r in at.radio if r.key == "mp_active_tab"]
+    assert len(tab_radios) == 1, (
+        f"expected one active-tab radio with key='mp_active_tab'; got "
+        f"{len(tab_radios)}"
     )
+    assert list(tab_radios[0].options) == [
+        "Leaderboard", "Per-stock", "Heatmap", "Trends", "Inspect",
+    ], f"tab options changed: {tab_radios[0].options}"
 
 
 # ============================================================
@@ -91,8 +100,13 @@ def test_app_renders_expected_tabs():
 def test_heatmap_tab_renders_strategy_and_symbol_selectors():
     """The Heatmap tab MUST surface a Strategy + Symbol selectbox.
     These are the operator's entry point into the tab; without them,
-    no cell can be picked."""
+    no cell can be picked.
+
+    Phase 9.5: ``st.tabs`` was swapped for ``st.radio`` so only the
+    active tab's content renders. Seed the active-tab key to
+    ``"Heatmap"`` so the heatmap content body runs."""
     at = AppTest.from_file(str(APP_PY))
+    at.session_state["mp_active_tab"] = "Heatmap"
     at.run(timeout=30)
     assert not at.exception
     selectbox_labels = [s.label for s in at.selectbox]
@@ -110,6 +124,7 @@ def test_heatmap_tab_renders_manual_cell_picker():
     mechanism (click isn't reliable across browsers). They MUST
     render even before the operator interacts with the tab."""
     at = AppTest.from_file(str(APP_PY))
+    at.session_state["mp_active_tab"] = "Heatmap"
     at.run(timeout=30)
     assert not at.exception
     selectbox_labels = [s.label for s in at.selectbox]
@@ -139,6 +154,8 @@ def test_drilldown_renders_when_cell_selected():
     at = AppTest.from_file(str(APP_PY))
     # Seed the cell selection BEFORE running, so when render_cell_drilldown
     # reads session_state during the first run it finds the picked cell.
+    # Phase 9.5 also requires the active-tab key (radio replaced st.tabs).
+    at.session_state["mp_active_tab"] = "Heatmap"
     at.session_state["mp_heatmap_selected_cell"] = (15, 3)
     at.run(timeout=30)
     assert not at.exception, f"drill-down render raised: {at.exception}"
@@ -232,6 +249,7 @@ def test_compare_cells_renders_no_p_values():
     rendered output. If a future contributor wires in scipy.stats or
     adds a 'p-value' column to the diff table, this fires."""
     at = AppTest.from_file(str(APP_PY))
+    at.session_state["mp_active_tab"] = "Heatmap"
     at.session_state["mp_heatmap_mode"] = "Compare cells"
     at.session_state["mp_heatmap_compare_cells"] = [(15, 3), (30, 5)]
     at.run(timeout=30)
@@ -255,6 +273,7 @@ def test_compare_cells_renders_side_by_side_stats_and_diff():
     no-p-values test passes only because the comparison silently
     failed to render, this test catches it."""
     at = AppTest.from_file(str(APP_PY))
+    at.session_state["mp_active_tab"] = "Heatmap"
     at.session_state["mp_heatmap_mode"] = "Compare cells"
     at.session_state["mp_heatmap_compare_cells"] = [(15, 3), (30, 5)]
     at.run(timeout=30)
@@ -285,8 +304,13 @@ def test_strike_rule_caption_renders_in_selector():
     """The display_strike_rule caption under the Strategy selector
     (commit 861b307) MUST render. Anti-regression for the strike-
     disclosure honesty contract — if a future strategy refactor breaks
-    display_strike_rule, this test fires."""
+    display_strike_rule, this test fires.
+
+    The strike-rule caption lives in the Heatmap tab's strategy
+    selector helper; seed active-tab to Heatmap so its content runs
+    under the §24.9 ``st.radio`` routing scheme."""
     at = AppTest.from_file(str(APP_PY))
+    at.session_state["mp_active_tab"] = "Heatmap"
     at.run(timeout=30)
     assert not at.exception
     captions = [c.value for c in at.caption]
