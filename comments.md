@@ -24620,3 +24620,159 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 9e91360 — `feat(p9.5.inspect.position_map)` — ✅ ACCEPT (CONSTRAINT 1 + §24.2-5 all clean)
+
+**Verdict: ✅ ACCEPT.** Position map chart lands between stat strip and footer per §24.2 layout. All chart series are observed-only (CONSTRAINT 1 grep returns 0 BS patterns); per-leg gap handling per §24.5 with `connectgaps=False` + sorted-unique-reason captions; iron-condor blocked card per §24.4 with 4-leg/2-BE rationale visible to operator. Math correct (`K_call + obs_close` decays toward K as time value erodes; `K_put − obs_close` mirrors); BE lines locked at entry are horizontal (`y0==y1` test pins it). 1070 passed (matches BUILDER exactly). 11 new tests, comprehensive trace + shape + caption coverage.
+
+### Independent verification
+
+```
+$ pytest -q
+1070 passed, 3 deselected, 1 warning in 19.70s    ✓ matches BUILDER exactly
+
+$ grep -cE "(bs76|bs_premium|black_scholes|implied_vol)" src/web/inspect.py
+0                                                  ✓ CONSTRAINT 1 still clean
+```
+
+### Math + chart semantics verified
+
+| Series | Formula | Source | §24 ref |
+|---|---|---|---|
+| Spot path | `spot_close[t]` | `spot_loader.load_spot` | §24.2 |
+| Call leg line | `K_call + observed_call_close[t]` | `options_loader.load_option` per day | §24.3 |
+| Put leg line | `K_put − observed_put_close[t]` | `options_loader.load_option` per day | §24.3 |
+| Upper BE | `K_call + per_share_credit` (horizontal) | `legs_json.entry_px_realized` sum | §24.2 |
+| Lower BE | `K_put − per_share_credit` (horizontal) | same | §24.2 |
+| Profit zone | hrect `[lower_be, upper_be]` | derived from BEs | §24.2 |
+| Event markers | vertical line at each Financial Results DATE | `events_loader.load_events` | §24.5 |
+
+`per_share_credit` (lines 579-594) correctly sums signed `entry_px_realized` (SELL=+1, BUY=−1) across all legs. The per-share convention means `qty_lots × lot_size` scaling cancels — same number anchors both BEs across heterogeneous strikes.
+
+`upper_be = K_call + credit` decays-target: as call premium → 0 at expiry, leg line → K_call (the strike). If spot at expiry is BETWEEN BEs, both legs expire OTM and trade keeps the full credit. If spot crosses a BE, the leg starts losing money. Visually intuitive per §24.3.
+
+### CONSTRAINT 1 — observed-only verification
+
+Module-level grep returns 0 hits for `bs76|bs_premium|black_scholes|implied_vol`. The position-map data flow:
+- Spot: `spot_loader.load_spot` (cached parquet read)
+- Leg closes: `options_loader.load_option` per day (cached parquet read)
+- BEs: `legs_json.entry_px_realized` (observed at fill time)
+- Events: `events_loader.load_events` filtered to Financial Results
+
+Zero BS recomputation. The IV cache read (`load_iv_history`) stays in the stat strip; the position map never touches it. Reviewer-grep gate test (`test_no_bs_calls_in_inspect_module` + sibling) still green.
+
+### Per-leg gap handling (§24.5) — comprehensive coverage
+
+`_per_leg_observed_closes` catches 4 specific FILTERS Part A error classes + maps each to a human-readable reason string:
+
+| Exception | Reason caption | FILTERS §A # |
+|---|---|---|
+| `df.empty` from `load_option` | "missing row" | #6 |
+| `MissingTurnoverError` | "zero turnover" | #8 |
+| `IlliquidLegError` | "oi=0 + thin trades" | #10 |
+| `MissingDataError` | "missing data" | (catch-all) |
+| `OfflineCacheMiss` | "OfflineCacheMiss" | (cache plumbing) |
+
+Each NaN-fills the close + records (date, reason). `connectgaps=False` on the trace means the line breaks visibly per §24.5. Caption emitted below the chart sorts unique reasons:
+
+```python
+f"Call leg: {len(call_gaps)} day(s) no observed premium ({'; '.join(reasons)})"
+```
+
+Operator sees data-quality breaks explicitly, not as chart bugs. The OTHER leg's series continues normally per §24.5 spec (each leg's helper independent).
+
+### Iron condor (§24.4) — blocked card
+
+`strategy == "iron_condor"` early-returns with:
+> "⊘ Can't inspect a condor here. The position map plots one short call and one short put against spot. An iron condor has **4 legs** and **two** breakeven pairs — a single spot-vs-leg view would misrepresent it. The P&L path and legs table below still apply. *switch strategy → Strangle or Straddle to see the map*"
+
+✓ Matches §24.4 spec: doesn't try to render a misleading 2-pair view; tells operator to switch strategy; promises P&L path + legs table still render (Phase 9.5.3 will deliver those). Pinned with `test_position_map_iron_condor_renders_blocked_card` (verifies `st.plotly_chart` is NOT called).
+
+### Pure-builder separation pattern
+
+`_build_position_map_figure` takes already-fetched inputs (legs + spot_df + leg closes/gaps + events_df) and returns `go.Figure`. Separating the build from the Streamlit render lets tests verify trace + shape + annotation structure directly without mocking `st.plotly_chart`.
+
+This is the right pattern. Tests for the builder are pure functional:
+- `test_build_position_map_figure_has_spot_call_put_traces` — 3 traces present
+- `test_build_position_map_figure_static_BEs_are_horizontal` — `y0==y1` at K±credit
+- `test_build_position_map_figure_profit_zone_between_BEs` — hrect spans BEs
+- `test_build_position_map_figure_leg_lines_NaN_propagates` — NaN in closes flows through + `connectgaps=False`
+- `test_build_position_map_figure_event_markers_at_event_dates` — vertical line at event x-coord
+
+Render-side tests cover the Streamlit wiring separately (`test_render_position_map_caption_reports_gap_count` monkeypatches the per-leg helper).
+
+### Plotly bug workaround — documented inline
+
+`add_vline(annotation_text=...)` triggers Plotly's `_mean(x)` codepath which is broken for both `pd.Timestamp` (TypeError in pandas 3.x) AND ISO-date strings (`sum()` can't add strings to 0). BUILDER's workaround:
+- `add_shape` for the vertical line (no midpoint math)
+- `add_annotation` for the label
+
+Inline docstring (lines 764-769) warns a future contributor not to "simplify" back to the broken path. Forward-defense discipline.
+
+### Streamlit caching — load-bearing for selector responsiveness
+
+`@st.cache_data(show_spinner=False)` on:
+- `_per_leg_observed_closes` — keyed by 6-tuple `(symbol, expiry, strike, type, entry_date, exit_date)`
+- `_spot_path` — keyed by `(symbol, entry, exit)`
+- `_earnings_events_in_window` — keyed by `(symbol, entry, exit)`
+
+Selector changes that don't change the cache key get O(1) hits. The per-day parquet-read loop in `_per_leg_observed_closes` only fires once per unique trade.
+
+CONSTRAINT 9 (selector-rerun cheapness) honored.
+
+### Praise points
+
+- **Trace order is visual-hierarchy-correct**: profit-zone hrect drawn FIRST so lines render on top; spot heavy-neutral; legs warm/cool dotted at BEs; events amber dotted verticals. Operator's eye scans without re-mapping.
+- **Color palette explicit at module scope** (lines 553-558): `_COLOR_CALL` warm orange, `_COLOR_PUT` cool blue, `_COLOR_SPOT` heavy neutral, `_COLOR_PROFIT_ZONE` translucent green, `_COLOR_EVENT` amber. Refactor-friendly; theme-consistency-friendly.
+- **`_per_share_credit` docstring documents the strangle/straddle assumption** (lines 586-588): "assumes both legs share lot_size + qty_lots; per-share view so qty/lot scaling cancels." Future maintainer who adds a multi-lot leg knows the unit convention.
+- **Catch-all guard at render layer** (lines 845-850): any non-FILTERS-§A exception from `_per_leg_observed_closes` surfaces as `st.error(f"Could not load... {type(e).__name__}: {e}")`. App doesn't crash on unexpected exception types.
+- **Per-leg gap captions use sorted-unique reasons** (lines 870-871, 876-877): stable output across runs; one caption per leg; reason list joined with `'; '`.
+- **`_render_position_map` clean entry point** — `strategy == "iron_condor"` early return; `_short_legs` returns `(None, None)` for graceful degradation on long-vol or one-sided trades (`test_position_map_warns_when_no_short_legs` pins it).
+- **`load_events()` cache-miss → empty frame** (lines 666-669): position map still renders without event markers if operator hasn't materialized events. Operator sees chart; not a hard failure.
+- **`_per_share_credit` signed-sum works for arbitrary leg combinations**: strangle (1 SC + 1 SP), straddle (1 SC + 1 SP at same K), iron condor (1 SC + 1 LC + 1 SP + 1 LP). Iron condor is blocked upstream but the math is general.
+- **Forward-dependencies explicitly carried** in commit body: counterfactual rendering deferred to post-Phase-9.2; regime tag still placeholder. No silent unfinished surface.
+
+### Tiny notes (NOT grills)
+
+- **Date-range filter on events is `[entry_date, exit_date]`** (no +1 day buffer like `has_earnings_in_window` uses). Correct for DISPLAY (chart x-axis is `[entry, exit]` anyway, so events outside that range have nowhere to render). The +1 buffer in F10 is for the FILTER (decide whether to take the trade), a different concern.
+- **5 specific FILTERS §A reasons enumerated** in `_per_leg_observed_closes`. If a future Part A check adds a new error class, it needs to be added here (or it falls through to the generic `except Exception` at the render layer with a less-helpful caption). Minor maintenance concern; would surface as a runtime test failure if a new Part A error class lands.
+- **Per-share view** — assumes both legs share `lot_size`. For an asymmetric strangle (which doesn't exist in NSE F&O practice but theoretically possible), the BE math would skew. Documented in the docstring; matches operator convention.
+
+### Math + arithmetic
+
+- LOC: +347 (inspect.py) + 324 (test) = +671 net. ✓ Matches `git show --stat`.
+- Tests: 1059 → 1070 (+11). ✓ Matches BUILDER's claim exactly.
+- 30 tests in test_web_inspect.py now (19 prior + 11 new).
+- 4 traces fixed (spot + call + put + 2 BE horizontals) + 1 profit-zone hrect + N event-vertical shapes.
+
+### State-of-tree
+
+- `main` HEAD: `9e91360`.
+- Phase 9.5 sub-arc: skeleton ✓ → URL-precedence fix ✓ → position map ✓ → 9.5.3 cumulative P&L + legs table (next).
+- Position map renders between stat strip and footer; layout per §24.2 intact.
+
+### Open grills (cumulative)
+
+- No new grills.
+- F11 + F12 silent-drops grill — STILL OPEN on main (pre-P8 backlog).
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN (pre-P8 backlog).
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required.
+
+### Next-commit suggestion
+
+`feat(p9.5.3.inspect.pnl_path_and_legs)` — Phase 9.5.3 per BUILDER's stated sub-arc. Cumulative P&L path + legs table. The blocked-card iron-condor path explicitly promises "P&L path and legs table below still apply" so this is the natural next.
+
+Migration cadence
+
+**... → P9.5.0 skeleton ✓ → P9.5.0 url-precedence fix ✓ → P9.5.2 position map ✓ → P9.5.3 P&L path + legs table → P9.4 Portfolio (deeplink writer; consumes clear_inspect_state) → ...**
+
+Standing by.
+
+---
