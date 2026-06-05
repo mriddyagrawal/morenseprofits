@@ -24948,3 +24948,135 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of c7563d7 — `feat(p9.2.analytics.earnings_filter)` — ✅ ACCEPT (live smoke EXACT MATCH including MARUTI exit+1 buffer)
+
+**Verdict: ✅ ACCEPT.** Clean batch wrapper on top of `has_earnings_in_window`. Single-pass index over events_df (not N scans), structured `DroppedSymbol` with event_date + purpose for drilldown, cold-cache pass-through, deterministic input-order output, multi-event-same-quarter resolution by earliest date. All 24 tests pass; full suite 1106 (matches BUILDER's +24 claim exactly). Live smoke reproduced 1:1 from operator's events.parquet — including MARUTI on Apr 26 caught by the exit+1 buffer.
+
+### Independent live-smoke reproduction (operator's events.parquet)
+
+```
+$ python -c "filter_universe_by_earnings(...10 blue chips..., 2024-04-01, 2024-04-25, events_df=events)"
+total: 10
+n_dropped: 6
+banner: '6 candidates dropped: earnings in window'
+kept: ['ITC', 'ASIANPAINT', 'SUNPHARMA', 'BHARTIARTL']
+  drop: TCS         event=2024-04-12  purpose=Financial Results/Dividend
+  drop: INFY        event=2024-04-18  purpose=Financial Results/Dividend
+  drop: HDFCBANK    event=2024-04-20  purpose=Financial Results/Dividend
+  drop: RELIANCE    event=2024-04-22  purpose=Financial Results/Dividend
+  drop: BAJFINANCE  event=2024-04-25  purpose=Financial Results/Dividend
+  drop: MARUTI      event=2024-04-26  purpose=Financial Results/Dividend   ← exit+1 buffer fires
+```
+
+**Every digit + every date + every PURPOSE string matches BUILDER's commit body.** Including MARUTI on Apr 26 caught by exit+1 = Apr 26 — pins the F10 +1-day buffer in production data. Multi-category PURPOSE values (`Financial Results/Dividend`) all survive the substring match correctly.
+
+### Spec match (§21.4 F10 + §17.5)
+
+Window: `[entry_date, exit_date + 1 day]` (lines 167-168):
+```python
+ts_entry = pd.Timestamp(entry_date)
+ts_exit_plus = pd.Timestamp(exit_date) + pd.Timedelta(days=1)
+```
+
+Filter: PURPOSE substring `"Financial Results"` (line 172). Re-applied DEFENSIVELY here even though `events_loader.load_events()` already filters at parse time per 182cf1d cache schema. Same belt-and-suspenders pattern `has_earnings_in_window` uses; matches the existing convention.
+
+### Single-pass index discipline
+
+```python
+in_window = events_df[mask]                          # one events_df scan
+for sym, sub in in_window.groupby("SYMBOL", sort=False):
+    row = sub.sort_values("DATE").iloc[0]            # earliest by date wins
+    first_event[str(sym)] = (date, purpose)
+```
+
+Then per-symbol lookup is O(1):
+```python
+for raw in symbols_list:
+    sym = str(raw).upper()
+    if sym in first_event:
+        dropped.append(DroppedSymbol(...))
+    else:
+        kept.append(sym)
+```
+
+**Complexity**: O(|events_df|) once + O(|symbols|) per call, NOT O(|events_df| × |symbols|). For 24,266 events × 50-symbol universe this is the difference between ~50 scans and 1.
+
+### Cold-cache pass-through (FILTERS §B.0 "absence ≠ loss")
+
+`events_df is None or events_df.empty → return EarningsFilterResult(kept=symbols_list[:])` (lines 161-163).
+
+Fresh-clone UX where operator hasn't downloaded `CF-Event-equities-*.csv` yet doesn't fail the backtest. Conservative: better to over-include than fail loudly. Caller can detect via `n_dropped == 0 AND events_df is None` per the docstring guidance.
+
+### Determinism + tiebreaker
+
+- `kept` and `dropped` preserve input order (line 187 iterates `symbols_list` ↦ append per side).
+- Multi-event-same-quarter (rare; annual + quarterly overlap): `sub.sort_values("DATE").iloc[0]` picks earliest. Defined, not random.
+- `groupby(..., sort=False)` preserves first-encounter order on the events side (not load-bearing since the final iteration is symbol-driven, but defensive).
+
+Determinism matches SPECS §6c.3 byte-identical contract — important when Portfolio banner output flows into reproducible artifacts.
+
+### Cross-cutting rules (FILTERS.md Part B)
+
+- **No look-ahead** (lines 26-33 docstring + commit body): board-meeting date is 5-14d lookahead vs strictly Reg 29(1)(a)-public knowledge. Operator-accepted ("avoid the earnings event, not model exact lead-time"). Caveat row must be added to FILTERS.md when 9.2.3 lands per BUILDER's note.
+- **Surface the count**: `n_dropped` property + `banner_text()` method, both 1-call cheap.
+
+### LOAD-BEARING parity test (drift detector)
+
+The parametrized parity test runs BOTH the batch wrapper AND the single-symbol `has_earnings_in_window` kernel on the same 6 boundary cases (inside window / entry day / exit+1 buffer / exit+2 outside / before entry / way after) and asserts agreement. Drift here would mean Portfolio banner and the backtester disagree on what's in/out — the test catches it.
+
+### Praise points
+
+- **`banner_text()` empty-on-no-drops** (lines 102-112) — caller idiom `if result.banner_text(): show_it` skips rendering when irrelevant. Honest signal without UX clutter.
+- **Two convenience properties** (`total`, `n_dropped`) + one method (`banner_text()`) — covers Portfolio banner's three needs in three call sites. Right surface area.
+- **`@dataclass(frozen=True)` on both** `DroppedSymbol` and `EarningsFilterResult` — immutable; safe to thread through caller code without defensive copies.
+- **Case-insensitive input** (line 188: `sym = str(raw).upper()`) — matches d824ef8's uppercase-cache fix from the opposite side. The d824ef8 commit fixed the cache; this commit fixes the lookup. Symmetric.
+- **`_has_earnings_in_window` re-export with explicit "NOT a public API name" docstring** (lines 211-215) — supports parametrized parity tests without forcing them across module boundaries. Test discipline.
+- **`first_event` dict keyed by uppercased SYMBOL** — the cache stores uppercase (per d824ef8), input is uppercased to match, dict lookup is canonical.
+- **Defensive double-PURPOSE-filter** (line 172) — same belt-and-suspenders idiom `has_earnings_in_window` uses. Catches hand-built frames + future cache-schema drift.
+- **Inverted-window ValueError** (line 152-155) — explicit guard; same pattern as `iv_materializer.materialize_iv_history`.
+- **Empty-symbols early return** (line 158-159) — `EarningsFilterResult()` with default-empty kept/dropped; total=0; banner=""; clean degenerate case.
+
+### Tiny notes (NOT grills)
+
+- The `_has_earnings_in_window` re-export docstring says "NOT a public API name" but the underscore prefix already signals privacy. Slightly redundant but not wrong.
+- Empty `dropped` returns the same banner as no symbols processed — both return "". Documented as the caller-side detection point.
+
+### Math + arithmetic
+
+- LOC: 215 (earnings_filter.py) + 387 (test) = +602 net. ✓ Matches `git show --stat`.
+- Tests: 1082 → 1106 (+24). ✓ Matches BUILDER's claim exactly.
+- Live smoke: 10 universe → 6 dropped + 4 kept = 10 total. ✓ Conservation.
+
+### State-of-tree
+
+- `main` HEAD: `c7563d7`.
+- Phase 9.2 sub-arc begins: earnings filter (this) → liquidity rank (BUILDER's stated next) → ... → filter pipeline that adds `status` column to sweep rows (unblocks Inspect counterfactual rendering).
+- Layered cleanly on existing `events_loader` work — no breaking changes.
+
+### Open grills (cumulative)
+
+- No new grills.
+- F11 + F12 silent-drops grill — STILL OPEN on main (pre-P8 backlog).
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. Filter is ready for the Portfolio banner to consume per Phase 9.4.
+
+### Next-commit suggestion
+
+`feat(p9.2.analytics.liquidity_rank)` — F11 trailing 21-TD avg contracts/day per symbol, per BUILDER's stated next. The liquidity gate runs BEFORE the IVP rank in candidate selection per memoir §3, so this is the natural progression. Same Part B template + cross-cutting rules apply.
+
+Migration cadence
+
+**... → PHASE 9.5 CLOSED → P9.2 earnings filter ✓ → P9.2 liquidity rank → P9.2 filter pipeline (status column, unblocks counterfactual) → P9.3 portfolio aggregator → P9.4 Portfolio tab + deeplink writer → ...**
+
+Standing by.
+
+---
