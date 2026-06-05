@@ -24776,3 +24776,175 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 10114e2 — `feat(p9.5.inspect.pnl_path_and_legs)` — ✅ ACCEPT (closes Phase 9.5 Inspect cluster)
+
+**Verdict: ✅ ACCEPT.** Cumulative P&L path + legs table land between position map and footer. §24.2 layout now complete: Header → Stat strip → Position map → P&L path → Legs table → Footer. Math per §3a sign convention verified (SELL profits when price drops; BUY profits when price rises). Chart endpoint = `row.net_pnl` (the authoritative figure) via `force_endpoint` clamp; intermediate days show gross MTM; cost discontinuity at exit is explicit with caption. CONSTRAINT 1 still clean (0 BS patterns). 1082 passed (matches BUILDER); 42 tests now in test_web_inspect.py (16 + 3 + 11 + 12).
+
+### Independent verification
+
+```
+$ pytest -q
+1082 passed, 3 deselected, 1 warning in 20.08s    ✓ matches BUILDER exactly
+
+$ grep -cE "\b(bs76|bs_premium|black_scholes|implied_vol)\b" src/web/inspect.py
+0                                                  ✓ CONSTRAINT 1 still clean
+```
+
+### Math verification — `_cumulative_pnl_path` per §3a
+
+```python
+leg_pnl[t] = (entry_px_realized − observed_close[t]) × side_sign × qty × lot
+where side_sign(SELL) = +1, side_sign(BUY) = −1
+```
+
+Sign-convention truth table:
+
+| Side | Price moves | (entry − close) | × side_sign | P&L | Verdict |
+|---|---|---|---|---|---|
+| SELL | drops | + | + | + | ✓ shorted + dropped = win |
+| SELL | rises | − | + | − | ✓ shorted + rose = lose |
+| BUY | drops | + | − | − | ✓ bought + dropped = lose |
+| BUY | rises | − | − | + | ✓ bought + rose = win |
+
+Tests pin both polarities (`test_cumulative_pnl_path_sell_leg_profits_when_price_drops` + `_buy_leg_profits_when_price_rises`).
+
+### Mark-to-market = cumulative-from-entry by construction
+
+Each leg's `row_contrib[t] = (entry − close[t]) × ...` is the unrealized MTM gain/loss at time t (vs entry, not vs t−1). Summing across legs at each t gives the portfolio MTM at t — which is exactly the cumulative P&L from entry by definition. The naming "cumulative" matches the meaning. ✓
+
+### `force_endpoint` clamp — authoritative-figure discipline
+
+Intermediate days display gross MTM. The endpoint snaps to `row.net_pnl`:
+```python
+if force_endpoint is not None and cumulative:
+    cumulative[-1] = float(force_endpoint)
+```
+
+This means:
+- The chart's last point = the sweep row's authoritative `net_pnl` (gross − costs).
+- The "jump" between the last MTM intermediate point and the endpoint = `row.costs`.
+- Caption makes it explicit: `"The small jump at exit absorbs the total cost of ₹X."`
+
+This is the right design choice. Otherwise the operator would either see (a) gross P&L throughout with no cost surface, or (b) net P&L throughout with cost spread incorrectly across days. The endpoint-clamp + caption is the honest middle ground.
+
+### Gap-day handling — carry-forward (NOT NaN-propagate)
+
+`_cumulative_pnl_path` carries forward the leg's last-known contribution on gap days (`last_known`). Documented in the docstring with rationale (lines 910-918):
+
+> "NaN-fill in the path would create misleading discontinuities in cumulative-P&L space; carry-forward preserves shape across isolated leg-day gaps. Note that this differs from the position map's NaN-propagating approach because the cumulative path is a SINGLE summed signal across legs — operator can't visually distinguish 'one leg gapped' from 'P&L genuinely flat for a day' on a sum-of-legs chart."
+
+**This is the right call**. The two surfaces serve different purposes:
+- Position map: per-leg lines, gap is visible per-leg via `connectgaps=False`. Operator sees data-quality break.
+- P&L path: sum-of-legs single line, NaN would alias data-gap-on-one-leg with portfolio-flat-day. Carry-forward preserves visual continuity.
+
+Tested by `test_cumulative_pnl_path_gap_day_carries_forward_per_leg`.
+
+### Iron condor (§24.4) — chart renders, position map blocks
+
+`_render_pnl_path` and `_render_legs_table` BOTH render for ALL strategies including iron_condor. Only `_render_position_map` blocks for iron_condor (per §24.4 — 4-leg / 2-BE pair would mislead in the single-pair view). Polarity test pinned by `test_render_pnl_path_iron_condor_renders_chart`.
+
+This matches §24.4 spec: "The P&L path and legs table below still apply." Iron condor operator gets a meaningful read on the trade even without the position map.
+
+### Legs table — authoritative net pinning
+
+```
+| side  | type | strike | premium (entry, ₹/share) | leg P&L (₹) |
+|-------|------|--------|--------------------------|-------------|
+| SELL  | CE   | 1400   | 30.0                     | leg.gross_pnl |
+| SELL  | PE   | 1400   | 28.0                     | leg.gross_pnl |
+| net   |      | NaN    | signed_sum(entry_px×side_sign) | row.net_pnl |
+```
+
+Two intentional asymmetries between per-leg and total:
+1. **Premium column**: per-leg cells show absolute `entry_px_realized`; total shows signed sum. Cosmetically the same column reads two different ways. Documented in caption ("Leg attribution illustrative; cycle net is authoritative.")
+2. **Leg P&L column**: per-leg cells show `leg.gross_pnl` (sums to `row.gross_pnl`); total shows `row.net_pnl` (= gross − costs). Same caption explains.
+
+This is the mockup-faithful convention per `inspect.jsx:227-231` (cited in commit body). The operator who reads "the leg cells don't add up to the total" gets the caption explanation. **Acceptable.**
+
+Test pin: `test_render_legs_table_total_row_leg_pnl_matches_net_pnl` + `test_render_legs_table_premium_total_signed_sum_per_share`.
+
+### Cache reuse with position map (CONSTRAINT 9)
+
+`_render_pnl_path` calls `_per_leg_observed_closes` from commit 2 — the same `@st.cache_data` cache. Selector changes that don't change the per-leg-cache-key get O(1) hits across BOTH surfaces simultaneously. Selector responsiveness preserved.
+
+Also `_earnings_events_in_window` reuse means event-marker computation is shared between position map and P&L path. No double-fetch.
+
+### CONSTRAINT 1 — still clean
+
+The P&L path's per-day leg-close reads go through `_per_leg_observed_closes` (parquet reads only, no BS). The legs-table per-leg P&L cells READ from `leg.gross_pnl` in `legs_json` (already computed at sweep time per Phase 5). The total row READS `row.net_pnl` directly. **Zero recompute, zero BS, zero IV inversion.**
+
+Reviewer-grep gate: still 0 hits.
+
+### Praise points
+
+- **Pure-builder separation pattern** kept consistent with the position map: `_cumulative_pnl_path` (pure math), `_build_pnl_path_figure` (pure Plotly), `_render_pnl_path` (Streamlit wrapper). Tests verify each layer independently.
+- **Plotly workaround documented twice** — `_build_pnl_path_figure` uses the same `add_shape` + `add_annotation` pattern as the position map for event markers (lines 994-1008). Inline comment cross-refs the position-map note. Future maintainer who removes one would notice the other and be warned.
+- **Endpoint marker is a SEPARATE Plotly trace** (lines 983-992) — `markers+text` mode with `_fmt_inr(net_pnl)` label. The chart title also shows `(final: ₹X.XX K)`. Operator sees the authoritative figure in three places: chart endpoint, chart title, legs-table total row.
+- **Color signals net sign** (lines 968, 989): `_COLOR_PNL_POS` (green) when `net_pnl >= 0`, `_COLOR_PNL_NEG` (red) when `net_pnl < 0`. Mockup-faithful palette. Test `test_build_pnl_path_figure_color_matches_sign_of_net_pnl` pins both polarities.
+- **Zero baseline horizontal** (lines 970-973) — explicit `y=0` line so operator can see crosses. Helps quickly identify break-even crossing points during the hold.
+- **Catch-all guard at render layer** (lines 1043-1048): if `_per_leg_observed_closes` throws something other than FILTERS Part A errors, surfaces as `st.error` rather than crashing the whole tab. Same pattern as position map.
+- **`gap-day handling differs from position map` is documented inline** (lines 914-918) — future contributor reading either function knows the other exists and why they differ.
+- **Forward-dependencies still carried**: counterfactual rendering still deferred to post-Phase-9.2; regime tag still placeholder. Phase 9.5 cluster doesn't quietly drop these.
+- **`force_endpoint=None` default** keeps the function pure-callable for unit tests (the kernel test doesn't pass force_endpoint), then the render layer always passes `row.net_pnl`. Clean separation.
+
+### Tiny notes (NOT grills)
+
+- **Gap on entry day (t=0)** → `last_known=0.0` is used → leg contributes 0 to cumulative on day 0. Reasonable default (no data = no signal); intentional starting state.
+- **Cost discontinuity is "the cost" but actually `gross_pnl − net_pnl`** — should equal `row.costs` by definition (gross − costs = net). Caption uses `row.costs` directly. ✓
+- **Premium column dual-semantic** (absolute per-leg, signed for total) is mockup-faithful but technically two different units in one column. Caption pins it; future Portfolio-tab analogues might want a separate "net" row visually distinguished by background color or italic to make the unit shift more visible.
+
+### Math + arithmetic
+
+- LOC: +246 (inspect.py) + 257 (test) = +503 net. ✓ Matches `git show --stat`.
+- Tests: 1070 → 1082 (+12). ✓ Matches BUILDER's claim exactly.
+- 42 tests in test_web_inspect.py (16 skeleton + 3 url_precedence + 11 position_map + 12 this). ✓
+- `inspect.py` ~1200 LOC, ~30 LOC of `_render_*` wiring + 100s of LOC of pure builders + helpers. Layered cleanly.
+
+### State-of-tree
+
+- `main` HEAD: `10114e2`.
+- **Phase 9.5 Inspect cluster CLOSED**:
+  - 9.5.1 skeleton ✓ (74ea59e)
+  - 9.5.1.fix url_precedence ✓ (b52386d)
+  - 9.5.2 position map ✓ (9e91360)
+  - 9.5.3 P&L path + legs table ✓ (this)
+- §24.2 layout complete: Header → Stat strip → Position map → P&L path → Legs table → Footer.
+
+### Open grills (cumulative)
+
+- F11 + F12 silent-drops grill — STILL OPEN on main (pre-P8 backlog).
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate — STILL OPEN.
+- **NO new grills from Phase 9.5 cluster** (skeleton URL-precedence was opened + closed within cluster).
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. Inspect tab is shippable as a v1 read-side surface. Recommend a manual smoke pass once a `RELIANCE` cycle is selected with both legs intact + event-bearing window to visually verify the position map + P&L path render correctly against the operator's expectation.
+
+### Next-commit suggestion
+
+Per BUILDER's stated PLAN.md Phase 9 sub-arc:
+
+**A.** `feat(p9.2.filter_pipeline)` — Phase 9.2 filter infrastructure (~1.5d). Adds the `status` column to sweep rows; unblocks the counterfactual rendering forward-dependency carried since the skeleton.
+
+**B.** `feat(p9.3.portfolio_aggregator)` — Phase 9.3 portfolio aggregator + metrics (~2.5d). Cycle P&L → equity → DD → Calmar/Sortino — the C13-C19 stack I recommended back on 04afbdf as the highest-leverage missing piece.
+
+Per [[feedback_next_commit_suggestion]] (de-risk biggest unknown):
+- **A** is the natural progression in BUILDER's PLAN.md ordering AND unblocks the counterfactual rendering that's been deferred across all 3 Inspect commits.
+- **B** is the highest-impact missing piece overall (Portfolio tab's foundation).
+- They're independent — could go either order.
+
+Recommend **A first** because: (1) it's smaller and unblocks Inspect's forward-deps; (2) Phase 9.3 will consume the filter pipeline's `status` column too; (3) better to land the filter infrastructure before piling more dependents on top.
+
+Migration cadence
+
+**... → P9.5.0 skeleton ✓ → URL-precedence fix ✓ → P9.5.2 position map ✓ → P9.5.3 P&L + legs ✓ (PHASE 9.5 CLOSED) → P9.2 filter pipeline (unblocks counterfactual) → P9.3 portfolio aggregator → P9.4 Portfolio tab + deeplink writer → P9.6 India VIX → regime gate v2 → ...**
+
+Standing by.
+
+---
