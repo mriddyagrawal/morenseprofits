@@ -24131,3 +24131,216 @@ Migration cadence: **... → P9 #0 chore (research_iv tracked) ✓ → P9.1 #2 i
 Standing by.
 
 ---
+
+## Review of 9d65809 — `feat(p9.1.iv_materializer)` — ✅ ACCEPT (closes None→NaN grill; all empirical claims reproduced)
+
+**Verdict: ✅ ACCEPT.** Per-symbol 30D CMI ATM IV materializer composing iv.py (68c5c2d) over the bhavcopy + spot caches. 32/32 tests pass. RELIANCE 2024 cache (192 rows) on disk matches every BUILDER empirical claim **exactly** (range 0.1494..0.3648 ✓, IVP at 3 dates ✓). The None→NaN cache-boundary translation I flagged as deferred-grill on c79e1ce is closed cleanly with a LOAD-BEARING test pin.
+
+### Independent reproduction (operator's RELIANCE cache)
+
+```
+data/cache/iv/RELIANCE.parquet:
+  192 rows, 2024-03-21 → 2024-12-31
+  cols: date, iv_front, iv_cmi30_raw, iv_cmi30_excl7, atm_strike_front, n_expiries_used
+  iv_cmi30_excl7 range: 0.1494 .. 0.3648    ✓ matches BUILDER exactly
+  iv_cmi30_excl7 NaN count: 0/192            (no degenerate days)
+```
+
+### Closes c79e1ce / f126fa6 GRILL 3 (None→NaN cache boundary)
+
+`_compute_iv_for_day` (lines 298-307):
+```python
+"iv_front": iv_front if iv_front is not None else np.nan,
+"iv_cmi30_raw": iv_cmi30_raw if iv_cmi30_raw is not None else np.nan,
+"iv_cmi30_excl7": iv_cmi30_excl7 if iv_cmi30_excl7 is not None else np.nan,
+```
+
+`test_materialize_none_to_nan_at_cache_boundary` (LOAD-BEARING) pins it. Downstream consumers (IVP, regime) see uniform float64 columns with NaN gaps — pandas `rolling`/`pct_rank` handle natively. The engine returns `None` (justified by 68c5c2d's "loud-fail-not-silent-NaN-propagation"); the materializer translates at the cache write boundary. Boundary discipline correct.
+
+### Math verification
+
+- **Variance-space CMI interpolation** (lines 268-275): `var_30 = var_near · (far.dte - 30)/span + var_far · (30 - near.dte)/span` — standard linear interpolation in variance space. ✓ Correct (at near.dte: weight 1; at far.dte: weight 1; at midpoint: each 0.5).
+- **Negative-variance clamp** (line 275): `max(var_30, 0.0)` defends against extrapolation crossing zero in the all-one-side branch. Reasonable.
+- **Tied-DTE RMS combine** (line 267): `√(0.5·(σ_near² + σ_far²))` — variance-average when interpolation impossible. ✓ Correct.
+- **Bracket selection**: `near=max(near, by dte)`, `far=min(far, by dte)` — closest bracket on each side. ✓
+- **All-one-side fallback** (lines 257-261): two-closest + orient by DTE. Documented as extrapolation; clamped on negative output.
+
+### Praise points
+
+- **ATM strike with both-legs-non-zero gate** (`_atm_strike` lines 137-158): parity needs CE AND PE > 0; the gate catches stale or no-trade contracts upstream of brentq.
+- **`_iv_per_expiry` skip-don't-fail discipline**: empty bhav / unknown symbol / expired DTE / no ATM / failed inversion → just drop that expiry. Resilience pattern.
+- **Operator constants pinned at module level** (lines 95, 100, 107): `RISK_FREE_RATE`, `TARGET_DTE`, `NEAR_EXPIRY_EXCLUSION_DAYS` — single source of truth, drift-detection-tested (`test_constants_match_operator_locked_values`).
+- **`_empty_frame()` returns canonical schema** (lines 310-322) — same anti-empty-DataFrame pattern as events_loader. Downstream type-stability.
+- **`materialize_iv_history` skip-on-missing discipline** — bhavcopy offline-miss, spot offline-miss, no-expiry-survives all silently skip the day. Batch tool, not transactional.
+- **`load_iv_history` raises FileNotFoundError on missing cache** (line 422) — `cache.read` standard error behavior, NOT silent empty. Downstream "materialize first" error is louder than zero-row-frame.
+- **Inverted-window ValueError** (line 365) + **empty-window schema-shaped frame** (lines 368-371) — explicit handling of both degenerate window inputs.
+
+### Tiny concerns (NOT grills)
+
+- **`force_refresh` accepted but documented as no-op** (lines 332, 363: `del force_refresh`). Footgunish to accept an unused param. BUILDER documents the rationale ("API symmetry; reserved for future incremental"). Acceptable.
+- **`n_expiries_used` counts inverted expiries, not survivors-after-DTE-filter** (line 306): for a day with 3 inverted expiries where 1 has DTE<7, `n_expiries_used=3` but Series C uses only 2. Column name slightly ambiguous; operator reading the parquet might misinterpret. Mild.
+- **`atm_strike_front` persists only the front-month ATM** (line 305): different expiries can have different ATM strikes. Losing them for downstream diagnostics. Acceptable simplification.
+
+### Pytest
+
+`32 passed in 0.16s` (test_iv_materializer.py); `1040 passed` full suite (was 966 pre-9d65809; +74 across the 3-commit stack). ✓
+
+### State-of-tree
+
+- `main` HEAD: at this point `9d65809`; now superseded by 52a9036 + b60d9ca.
+- `data/cache/iv/RELIANCE.parquet` populated (192 rows).
+- Open grills: 3625f3e GRILL 1 (§22.5 .py citation residue) STILL OPEN.
+
+### Operator action
+
+None required.
+
+### Next-commit suggestion (looking at it post-hoc)
+
+BUILDER's stated next was `feat(p9.1.analytics.ivp)`. Landed as 52a9036 — reviewed below.
+
+---
+
+## Review of 52a9036 — `feat(p9.1.analytics.ivp)` — ✅ ACCEPT (preemptively applies all 3 reviewer grills from 3fb0f05)
+
+**Verdict: ✅ ACCEPT.** F5 + F6 implementation that reads the iv_materializer cache (9d65809). 24/24 tests pass; live smoke values (RELIANCE 2024-06-28 NaN, 09-30 24.62, 12-31 28.12) reproduce **exactly** from operator's cache. Notable: **BUILDER preemptively applied all three reviewer grills I caught in 3fb0f05** (NaN guard on today's value, 50%-of-lookback floor not 10%, `len(valid)` denominator) — and cited reviewer d8620f8 by name as the load-bearing rationale.
+
+### Independent reproduction (RELIANCE 2024 cache)
+
+```
+IVP on 2024-06-28: NaN    ✓ matches BUILDER (124 TD < 126 floor)
+IVP on 2024-09-30: 24.62  ✓ matches BUILDER exactly
+IVP on 2024-12-31: 28.12  ✓ matches BUILDER exactly
+```
+
+Every digit matches. The 2024-06-28 NaN is mechanistic: only ~70 trading days into the 192-day cache, well under the 126 floor (50% × 252). The cache spans 2024-03-21..12-31 — far shorter than 252 TDs — so IVP only becomes non-NaN once cumulative observations cross 126.
+
+### Pre-empts 3fb0f05's 3 grills
+
+All 4 pin-points carry "do not drift without a memoir revision" annotations (lines 130-134):
+- Numerator: `(valid < today).sum()` — strictly less than ✓
+- Denominator: `len(valid)` — NaN-dropped, NOT `len(window)` ✓ (closes d8620f8 GRILL 3 family)
+- Floor: `< 0.5 × lookback_td` of REQUESTED lookback ✓ (closes d8620f8 GRILL 1 family)
+- NaN-today guard at line 157-164 ✓ (closes F5's silent-rank-as-0 bug family)
+
+`test_time_series_ivp_uses_len_valid_denominator` carries an explicit "DRIFT DETECTOR" comment showing `44/45 ≈ 97.78` vs the buggy `44/50 = 88.0` — the ~10pp gap acts as a regression trap.
+
+### F6 tiebreaker decision (explicitly documented)
+
+Memoir doesn't pin a tiebreaker. BUILDER chose symbol-name ASCENDING for SPECS §6c.3 byte-identical determinism. Two-stage stable sort (line 270-271): symbol-ASC first, then IVP-DESC reverse. ✓ Mathematically correct (stable sort preserves the secondary key when primary keys tie).
+
+This is the right call. Sweep results MUST be byte-identical across runs; without a tiebreaker, dict iteration order leaks into the top-N output.
+
+### Pin: `compute_ivp` default series
+
+`DEFAULT_IV_SERIES = "iv_cmi30_excl7"` (line 90) — Series C, operator-locked per 2026-05-31 + notebook 3625f3e empirical study. Pinned in code + tested via constants_match_memoir_spec.
+
+### Praise points
+
+- **Inline math duplication with regime_percentile** (lines 102-107) — BUILDER documents the deliberate choice ("the alternative would couple regime to a deferred IVP module just to share four lines of arithmetic"). Same call I'd have made; DRY is bad value at 4 LOC across two modules that conceptually represent different signals.
+- **`compute_ivp` unknown-column raise** (line 215-219) — wrong series name fails loud with available-columns list. Surface-area discipline.
+- **`top_n_by_ivp` handles None entries** (line 265) — defensive against dict callers that might pass `None` instead of NaN.
+- **Negative-N raises ValueError** (line 260-261) — operator footgun guard.
+- **NaN exclusion before ranking** (lines 262-266) — symbols with cold-cache / insufficient-history IVP drop out cleanly; ranking only operates on usable signal.
+- **Provenance crumb at the floor** (lines 169-172) and **denominator** (lines 176-179) — explicit citations to reviewer d8620f8 GRILLs 1 and 3 inline. Future maintainer who reads the code first (not the memoir) understands WHY without grepping.
+
+### Pytest
+
+`24 passed in 0.18s` (test_analytics_ivp.py).
+
+### Operator action
+
+None required. Future Portfolio tab integration will compose `compute_ivp` over the eligible universe and feed `top_n_by_ivp` for selection.
+
+---
+
+## Review of b60d9ca — `feat(p9.1.analytics.realized_vol)` — ✅ ACCEPT (BYTE-IDENTICAL to engine.vol verified)
+
+**Verdict: ✅ ACCEPT.** F7 pure-math kernel factored out of engine.vol cleanly. 18/18 tests pass. Live cross-check shows **byte-identical output** to existing `engine.vol.realized_vol` at the same `window_td=21` — operator's RV calculations are unchanged where they overlap. The coexistence story (two entry points, two contracts) is explicit and load-bearing.
+
+### Independent BYTE-IDENTICAL cross-check (RELIANCE 2024)
+
+```
+RV 2024-06-28: analytics=0.4043  engine=0.4043  match=True   ✓
+RV 2024-09-30: analytics=0.1848  engine=0.1848  match=True   ✓
+RV 2024-12-30: analytics=0.1827  engine=0.1827  match=True   ✓
+```
+
+Same daily log-return math; only the I/O wrapper differs. The 0.4043 (40.43%) annualized RV at 2024-06-28 reflects the Indian election-result-week vol shock — physically consistent. The 0.18-range at quarter-ends matches typical RELIANCE realized vol.
+
+### Coexistence story — explicit and load-bearing
+
+Two entry points, two contracts, both pinned in code + docstring (lines 22-43):
+
+| Entry point | Default lookback | Insufficient-data | Purpose |
+|---|---|---|---|
+| `engine.vol.realized_vol` | 126 TD | returns `0.0` (Tier-B margin signal) | SPECS §4a margin estimation |
+| `analytics.realized_vol.compute_rv` | 21 TD | returns `NaN` (F8 universe-mean filter expects it) | F7 / F8 regime gate v1 proxy |
+| `analytics.realized_vol.realized_vol_from_closes` | — (pure math) | `NaN` | unit-testable kernel |
+
+The 0.0-vs-NaN return on insufficient-data is **NOT a contradiction** — it's two different downstream consumers expecting two different sentinels. BUILDER explicitly carries this in the docstring and the F8 path's existing `rv == 0.0` filter (`analytics.regime.avg_single_name_realized_vol`) is preserved untouched.
+
+This matches my [[feedback_vwap_role_separation_not_everywhere]] discipline — separate the ROLE each value plays, don't reflex-unify on consistency grounds.
+
+### Math verification
+
+`realized_vol_from_closes` (lines 103-169):
+```python
+arr = np.asarray(closes, dtype=float).ravel()
+arr = arr[~np.isnan(arr)]              # NaN-drop
+if len(arr) < min_obs + 1: return NaN  # need 21 returns → 22 closes
+if (arr <= 0.0).any(): return NaN      # log undefined
+log_returns = np.diff(np.log(arr))
+daily_std = float(np.std(log_returns, ddof=1))
+return daily_std * sqrt(252)
+```
+
+✓ Matches memoir F7 verbatim. `ddof=1` (sample std) pinned per F7 — small-sample bias ~2.5% at 21 obs.
+
+### Praise points
+
+- **NaN-drop BEFORE length check** (line 158-160) — defensive against NaN-bearing close series. Length check operates on the cleaned array.
+- **Non-positive guard returns NaN** (line 161-163) — log undefined; correct hard-fail (not 0.0 silent-pass).
+- **Constants pinned** with explicit memoir cross-refs (lines 81-96): `RV_WINDOW_TD=21`, `TRADING_DAYS_PER_YEAR=252`, `RV_MIN_OBS=20`. Drift-detection-tested.
+- **`compute_rv` raises `OfflineCacheMiss`** (lines 226-230) — distinguishes "genuine cache gap" from "insufficient data" (the latter is NaN). Two failure modes, two paths.
+- **Annualization-clock note** (lines 86-90) — explicit callout that `252` (trading days for annualization) is a DIFFERENT clock from `365` (calendar days for IV pricing). Same disambiguation discipline that fixed F2 in 9690656.
+- **`accepts list / pd.Series / np.ndarray`** — `np.asarray(closes, dtype=float).ravel()` handles all three uniformly. Tested explicitly.
+- **`annualize=False` escape hatch** for daily-step diagnostics — useful for sub-window aggregation checks.
+- **Custom `trading_days_per_year` override** — diagnostic-only, but available.
+
+### Pytest
+
+`18 passed in 0.10s` (test_analytics_realized_vol.py).
+
+### Open question BUILDER raised (NEXT COMMIT options)
+
+BUILDER asked the reviewer to weigh in on three options:
+- **A.** Migrate `avg_single_name_realized_vol` to NaN-native path (clean dedup; touches a load-bearing regime path).
+- **B.** Add C7-style avg-single-name-RV history materializer (pre-built series for `regime_percentile` instead of per-call loop).
+- **C.** Move to portfolio-foundation aggregates (C13-C19: cycle P&L, equity, DD, Calmar, Ulcer, Sortino).
+
+**My recommendation: C, then B, then maybe A.**
+
+Reasoning per [[feedback_next_commit_suggestion]]:
+- **C is the highest-leverage**: cycle P&L → equity → DD → Calmar/Sortino is the entire portfolio-foundation arc. Memoir §21.3 C13-C19. Without these, the Portfolio tab can't surface anything meaningful, and the IVP + regime + RV + earnings filters all become inputs to a missing engine. De-risk the biggest downstream unknown.
+- **B is medium-leverage**: pre-built avg-RV series helps regime_percentile's call cost but the regime gate is called O(1)/day, not in a hot loop. Performance win is marginal; the dedup is real but small.
+- **A is low-leverage AND risky**: touching `avg_single_name_realized_vol` swaps a documented-and-tested 0.0 sentinel for NaN. The memory entry I wrote ([[feedback_vwap_role_separation_not_everywhere]]) covers exactly this — DON'T reflex-unify just because two functions share math. The current dual-sentinel split has a real role-separation; preserve it unless C or B forces the migration.
+
+### Open grills (cumulative — across the 3-commit stack)
+
+- ✅ **CLOSED — c79e1ce GRILL (None→NaN cache boundary)** by 9d65809.
+- ✅ **CLOSED — d8620f8 GRILL family pre-empted in IVP module** by 52a9036.
+- 🚩 **STILL OPEN — 3625f3e GRILL 1** (§22.5 .py citation residue, 6-LOC memoir patch).
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+
+### MCP arc state
+
+16/16.
+
+### Migration cadence
+
+**... → P9.1 #2 iv_materializer ✓ → P9.1 #3 ivp ✓ → P9.1 #4 realized_vol ✓ → memoir cite alignment / portfolio foundation aggregates (recommend C) → Portfolio tab → ...**
+
+Standing by.
+
+---
