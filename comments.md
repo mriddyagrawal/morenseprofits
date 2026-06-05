@@ -25456,3 +25456,146 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 3309dd9 — `feat(p9.3.portfolio_metrics)` + Option-a prepend fix folded — ✅ ACCEPT (both 76549ab grills closed cleanly)
+
+**Verdict: ✅ ACCEPT.** BUILDER folded the Option-a prepend fix into this commit per my recommendation, AND added F15-F18 metrics on top. Both 76549ab grills CLOSED:
+- **GRILL 1** (HIGH): equity_curve now prepends `starting_capital` → length N+1 → cummax anchors at true peak. Verified end-to-end on my exact scenario: max DD = ₹30k correctly recovered (vs Option-b's ₹5k miss).
+- **GRILL 2** (MEDIUM test gap): `test_equity_curve_prepend_catches_drawdown_from_negative_first_cycle` reproduces the bug scenario with `-25k, +5k, +10k` cycles on ₹100k starting — pins max DD = ₹25k as the LOAD-BEARING regression. Docstring cites 70dc408 explicitly.
+
+Plus F15-F18 metrics implemented cleanly with the REVISED memoir formulas (F17 Sortino: N_total denominator + (r-target)² offset). 1184 passed; 57 tests in the P9.3 stack.
+
+### Independent verification of the fix
+
+```
+$ python -c "from src.analytics.portfolio import equity_curve, drawdown_series; ..."
+equity (len=4): [100000.0, 70000.0, 80000.0, 75000.0]
+iloc[0] == starting (100k)? True       ← spec-literal F15 denominator works
+drawdown: [0.0, -30000.0, -20000.0, -25000.0]
+max DD: ₹30,000  (TRUE = ₹30,000)      ← CORRECT (was ₹5,000 pre-fix)
+```
+
+Bug scenario from 70dc408 (`-30k, +10k, -5k` on ₹100k starting) now recovers the true ₹30k drawdown. Option-a fix verified.
+
+### Regression test pins the exact bug
+
+`test_equity_curve_prepend_catches_drawdown_from_negative_first_cycle` (test file line 366-393):
+
+```python
+pnl = pd.Series([-25_000.0, 5_000.0, 10_000.0])
+eq = equity_curve(pnl, starting_capital=100_000.0)
+dd = drawdown_series(eq)
+assert abs(dd.min()) == pytest.approx(25_000.0)
+assert dd.tolist() == pytest.approx([0.0, -25_000.0, -20_000.0, -10_000.0])
+```
+
+Docstring explicitly says "LOAD-BEARING regression for reviewer 70dc408 grill" and shows both the bug and the fix output. Future refactor that reverts to Option-b trips this test immediately.
+
+### F15-F18 math verification
+
+**F15 simple_annualized_return** (lines 144-195):
+```python
+n_cycles      = len(equity_curve) − 1            # length is N+1 post-prepend
+total_return  = (equity[-1] − equity[0]) / equity[0]   # iloc[0] = starting
+annual_return = total_return × (periods_per_year / n_cycles)
+```
+✓ Matches memoir literal F15 directly post-prepend. No more separate `starting_capital` parameter — the simplification BUILDER promised in the deviation note is realized.
+
+**Calmar** (lines 198-228): `simple_annualized_return / abs(max_DD_pct)`. inf on monotone-up; negative on losing book. ✓
+
+**F16 Ulcer Index** (lines 235-261):
+```python
+dd_pct = drawdown_pct_series × ULCER_PCT_SCALE     # × 100 to % units
+return sqrt(mean(dd_pct ** 2))
+```
+✓ Standard Martin Ulcer formula. % units pinned via `ULCER_PCT_SCALE` constant.
+
+**F17 Sortino (REVISED)** (lines 268-330):
+```python
+excess_return_annualized = (mean(r) - target) × periods
+deviations_below_target = (r - target).clip(upper=0)
+downside_dev_sq = mean(deviations_below_target ** 2)   # N_TOTAL not N_downside
+TDD = sqrt(downside_dev_sq × periods)
+sortino = excess_return_annualized / TDD
+```
+**BOTH F17 REVISED fixes correctly applied**:
+1. ✓ Denominator divides by N_TOTAL (not N_downside) — `(deviations_below_target ** 2).mean()` operates over ALL entries.
+2. ✓ Squared term is `(r - target)²` (not `r²`) — `deviations_below_target = (r - target).clip(upper=0)` correctly offsets.
+
+LOAD-BEARING pin tests: `test_sortino_divides_by_N_total_not_N_downside` + `test_sortino_squared_term_uses_target_offset`. Drift detectors for both fixes.
+
+**F18 max_drawdown_inr** (lines 337-355): `abs(drawdown_series.min())`. Returns 0.0 (NOT NaN) on monotone-up or empty — operator-facing card convention. ✓
+
+### Live smoke math verification
+
+```
+equity range: ₹544,209 .. ₹1,035,169   (peak post-prepend)
+Max DD ₹: ₹490,960 (47.4%)
+  → 1,035,169 - 544,209 = 490,960 ✓
+  → 490,960 / 1,035,169 = 47.4% ✓
+annualized return: -19.28%
+  → final equity 598k from 76549ab smoke survives; (598k - 1M) / 1M = -40.2%
+  → -40.2% × (12/25) = -19.3% ✓
+Calmar: -0.407
+  → -0.193 / 0.474 = -0.407 ✓
+```
+
+Math is internally consistent. For THIS specific smoke (portfolio peaked above ₹1M), Option-b and Option-a give the same max DD — the bug only fires when first cycle's loss exceeds the eventual high-water mark. Operator's portfolio went up first, so max DD = ₹490,960 is correct in both regimes. But the FIX is structurally needed for losing-from-start portfolios.
+
+### Praise points
+
+- **Folded the fix into the metrics commit per my recommendation** — no separate fix commit needed; equity_curve and the metrics that consume it ship together cleanly.
+- **Commit body acknowledges the reviewer-flagged bug explicitly** with the exact `-30k, +10k, -5k` scenario reproduced (and the test uses similar `-25k, +5k, +10k`). Audit trail for the bug + fix is complete.
+- **`equity_curve` adds optional `start_date` parameter** for explicit t=0 control. Default `first_expiry - 1 day` (DatetimeIndex) or `index[0] - 1` (integer) — sensible auto-choice + escape hatch for callers wanting explicit dates.
+- **F15 simplification realized** — no more separate `starting_capital` parameter on `simple_annualized_return` / `calmar`. The spec-literal F15 formula works directly. The deviation BUILDER documented at 76549ab is RESOLVED, not just patched.
+- **LOAD-BEARING simple-vs-geometric Calmar drift detector** (per commit body) — `test_calmar_simple_vs_geometric_drift_detector` compares against CAGR on a 2-year span, diverges ~2.4pp. Future refactor adding CAGR-on-additive-equity trips loudly.
+- **Sortino F17 REVISED both fixes pinned** with drift-detector tests:
+  - `test_sortino_divides_by_N_total_not_N_downside`
+  - `test_sortino_squared_term_uses_target_offset`
+- **`ulcer_index` % units pinned** — `ULCER_PCT_SCALE = 100.0` constant. Future maintainer can't accidentally use 0.10 fraction without trippin the scale test.
+- **`max_drawdown_inr` returns 0.0 (not NaN) on empty / monotone-up** — operator-facing card convention. Card rendering with NaN would look broken; 0.0 is the meaningful "no drawdown" signal.
+- **`cycle_returns` denominator explanation** in docstring — "Under equal-margin no-reinvest, every cycle's denominator is the same starting capital." Future maintainer thinking about compounded sizing knows what to change.
+- **Module docstring sizing-convention coupling** (lines 30-42): F15 simple ↔ F13 additive ↔ §7 equal-margin. The three are tied; switching any one requires switching the others. Pinned as a cluster.
+- **Composed F12→F13→F14→F15-F18 round-trip test** on 6-cycle hand-checked portfolio per commit body. Cross-module integration discipline.
+
+### Math + arithmetic
+
+- LOC: 104 (portfolio.py changes) + 355 (portfolio_metrics.py NEW) + 83 (portfolio test updates) + 375 (portfolio_metrics test NEW) = +917 / -58 = +859 net. ✓ Matches `git show --stat`.
+- Tests: 1153 → 1184 (+31 new; +2 from the aggregator regression overlap as BUILDER notes). 57 in P9.3 stack.
+- All 57 P9.3 tests pass in 0.06s (pure functions, no I/O).
+
+### State-of-tree
+
+- `main` HEAD: `3309dd9`.
+- 76549ab GRILL 1 + GRILL 2 — ✅ CLOSED.
+- Phase 9.3 sub-arc: aggregator ✓ → metrics ✓ → 9.3.3 2-D regime×IVP diagnostic (next per BUILDER).
+
+### Open grills (cumulative)
+
+- ✅ CLOSED — 76549ab GRILL 1 (Option-b drawdown bug).
+- ✅ CLOSED — 76549ab GRILL 2 (test gap on first-loss case).
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update; informally noted, B.4 Caveat covers operationally).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required for landing. Live smoke max DD ₹490,960 stays correct under the fix (portfolio peaked above starting). If operator runs the metrics on a portfolio that LOSES from cycle 1 (no prior new high), max DD ₹ will now be MORE than the Option-b would have reported. Per [[feedback_irreversible_engine_invalidates_displayed_data]] — any Portfolio-tab cache built on Option-b semantics needs rebuilding when 9.4 lands. Currently no such cache exists.
+
+### Next-commit suggestion
+
+BUILDER's stated next: `feat(p9.3.regime_x_ivp_diagnostic)` — F19 2-D table per memoir §18.4. Cross-tabulates trade outcomes by (regime_state ∈ {ON, OFF}) × (IVP_decile ∈ 0..9). Caveats per §18.4: judge each bucket by median + CVaR-5%, switch to quintiles if bucket count < ~50.
+
+This is the load-bearing operator-facing diagnostic that answers "does IVP add signal beyond the regime gate?" — non-negotiable per memoir §15 #15.
+
+Migration cadence
+
+**... → P9.3 aggregator ⚠️ → fix folded + F15-F18 metrics ✓ → P9.3.3 2-D regime×IVP diagnostic → P9.4 Portfolio tab + deeplink writer → P9.6 India VIX → regime gate v2 → ...**
+
+Standing by.
+
+---
