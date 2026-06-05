@@ -25199,3 +25199,90 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 2e1faef — `chore(p9.2.filters_md)` — ✅ ACCEPT (B.4 Caveat documents deviation in operational location)
+
+**Verdict: ✅ ACCEPT.** 5 Part-B entries registered (IVP, regime, earnings, liquidity, sector concentration) following the §B.0 template. Cross-cutting rules (no look-ahead, surface-the-count) honored in each. The 61c3fe9 GRILL 1 I raised (memoir F11 sketch update) is NOT addressed in this commit — BUILDER explicitly chose to leave the memoir sketch stale and document the deviation in FILTERS.md B.4 Caveat instead. Defensible: FILTERS.md is the live filter registry, the operationally-correct place for the deviation pin. My grill stays informally OPEN as a tiny "would be nicer to fix memoir too" preference, not a blocker. 1127 passed (memoir-only commit; full suite unchanged).
+
+### B.4 Caveat row pins the deviation operationally
+
+`FILTERS.md:218-225`:
+```
+- **Caveat:**     **Documented deviation from the memoir's code sketch**: implemented per-day
+                  total → mean across days (matches English description "average contracts
+                  traded"), NOT the sketch's `sub['contracts'].mean()` per-row mean (which would
+                  punish symbols with a fat ATM + many skinny OTM strikes). Reviewer challenge
+                  surface left open in the commit message. OPTSTK-only — OPTIDX (index options)
+                  out of scope through Phase 11. NaN score when symbol has fewer than 50% of
+                  lookback distinct trade dates (insufficient sampling); NaN scores EXCLUDED from
+                  top-N ranking.
+```
+
+Future operator/contributor reading FILTERS.md B.4 sees the deviation explicitly + the rationale + the drift detector test name + the cross-document pointer. This is the canonical filter registry; pinning the deviation here is operationally correct. My preference (also update PORTFOLIO_MEMOIR.md §21.4 F11 sketch) is stylistic — BUILDER's choice is equivalent in operational impact.
+
+I'll DOWNGRADE my 61c3fe9 GRILL 1 from "should fix" to "informally noted; no longer blocking." The deviation IS now documented in a location operators will read.
+
+### §B.0 template compliance — verified
+
+Each of B.1-B.5 follows the standard template:
+- **Type** (rank-top-k / event-skip / etc.)
+- **Stage** (when in candidate selection)
+- **Inputs** (availability status + cross-refs to analytics modules)
+- **Parameter** (named tunables with defaults)
+- **Direction** (which side passes the gate — explicit polarity)
+- **Rationale** (operator intent + cross-ref to memoir)
+- **Status** (planned vs in-progress vs shipped + sweep wire-in target)
+- **Caveat** (look-ahead, cold-cache pass-through, etc.)
+
+The cross-cutting rules from §B.0 are addressed in each Caveat row:
+- B.1 IVP: NaN convention + trailing-window enforcement
+- B.2 Regime: trailing 252-TD window + India VIX swap caveat
+- B.3 Earnings: 5-14 day lookahead per §17.7 (operator-accepted) + cold-cache pass-through
+- B.4 Liquidity: per-day-total deviation + OPTSTK-only scope + 50%-of-lookback NaN floor
+- B.5 Sector concentration: external dependency (sector mapping) not yet wired
+
+### Praise points
+
+- **Cross-references actual commits** for each filter (9d65809 + 52a9036 for IVP, c7563d7 for earnings, 61c3fe9 for liquidity). Future contributor can grep the commit hash to find the math.
+- **Direction pinned explicitly** for each filter — "HIGH IVP PASSES", "skip-cycle when percentile > 75", "DROP symbol if event in window", "Top N PASS". No ambiguity about polarity.
+- **Status row points at the wire-in target commit** (Phase 9.4 candidate selection) — operators know what's "math built but not yet integrated" vs "shipped end-to-end."
+- **B.3 Earnings cold-cache pass-through documented** in the Caveat — important UX note for the fresh-clone case.
+- **B.4 Caveat includes the per-row alternative explicitly** so a future reviewer who doesn't read 61c3fe9's commit body still sees the rejected option. Anti-amnesia.
+- **B.5 explicitly placeholder** with the external dependency (sector mapping) called out. Honest about what's NOT built rather than vague-stub.
+- **Pruned obsolete placeholders** ("Other likely Part-B filters" bullets) that are now first-class entries. Avoids stale-doc rot.
+- **"Reviewer challenge surface left open in the commit message"** in B.4 — honest framing that the deviation isn't unilaterally decided; an inviting language for future reviewers.
+
+### State-of-tree
+
+- `main` HEAD: `2e1faef`.
+- FILTERS.md: 5 Part-B entries registered. Phase 9.2 filter infra documented end-to-end.
+- Phase 9.2 filter infra CLOSED on the analytics+registry side; wire-in is Phase 9.4 scope.
+
+### Open grills (cumulative)
+
+- 🟡 **DOWNGRADED — 61c3fe9 GRILL 1** (memoir F11 sketch update): informally OPEN; no longer blocking now that FILTERS.md B.4 documents the deviation. Future memoir-touch commit can fold the sketch update in.
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. Filter registry is consulted at design / wire-in time, not at runtime.
+
+### Next-commit suggestion
+
+BUILDER's stated next: `feat(p9.3.portfolio_aggregator)` — F12 cycle P&L + F13 additive equity + F14 drawdown series per memoir §21.4 F12-F14. Pure functions over the sweep + 9.2 filter outputs. Same pattern as the analytics modules in 9.1/9.2 (kernel + symbol-aware convenience + batch + top-N).
+
+This is the C13-C19 "portfolio aggregates" stack I recommended back at 04afbdf. Phase 9.3 unblocks the Portfolio tab UI (Phase 9.4) — the highest-leverage missing piece for the overall §24 vision.
+
+Migration cadence
+
+**... → P9.2 filters_md ✓ (PHASE 9.2 CLOSED — analytics + registry) → P9.3 portfolio aggregator (F12-F14) → P9.4 Portfolio tab + deeplink writer + sweep wire-in → P9.6 India VIX → regime gate v2 → ...**
+
+Standing by.
+
+---
