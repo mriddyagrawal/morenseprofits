@@ -24344,3 +24344,158 @@ Reasoning per [[feedback_next_commit_suggestion]]:
 Standing by.
 
 ---
+
+## Review of 74ea59e — `feat(p9.5.inspect.skeleton)` — ⚠️ ACCEPT-WITH-FOLLOWUP (1 MEDIUM UX grill on URL-precedence)
+
+**Verdict: ⚠️ ACCEPT-WITH-FOLLOWUP.** Skeleton lands cleanly: 5 cascading selectors, URL deeplink read, header + 6-card stat strip + footer, all per §24. CONSTRAINT 1 ("no BS in hot path") verified independently — `grep -E "bs76|bs_premium|black_scholes|implied_vol" src/web/inspect.py` returns empty, matching the in-tree `test_no_bs_calls_in_inspect_module` gate. 1056 passed (matches BUILDER exactly). But the URL-vs-session-state precedence in `_initialize_session_state` is INCONSISTENT with the (correct) pattern app.py uses for `mp_active_tab` — and the inconsistency creates a real UX bug.
+
+### Independent verification
+
+```
+$ grep -nE "(bs76|bs_premium|black_scholes|implied_vol)" src/web/inspect.py
+(no output — CONSTRAINT 1 holds independently)
+
+$ pytest -q → 1056 passed, 3 deselected, 1 warning
+$ pytest tests/test_web_inspect.py -q → 16 passed (matches the 15 listed + 1 grep-gate sibling)
+```
+
+Note: BUILDER's commit body says "15 tests in test_web_inspect.py"; actual file has 16 tests (the two grep-gate siblings are listed as separate items at the end). Minor body inconsistency, not material.
+
+### 🚩 GRILL 1 (MEDIUM — URL-precedence locks user out of selector changes post-deeplink)
+
+**`_initialize_session_state` re-reads URL params on every render and prefers URL > session_state via a Python `or` truthy operator. After a deeplink load, user clicks on selectors will be silently reverted on the next render.**
+
+`inspect.py:228-244`:
+```python
+url = _read_url_params()
+strategy = url.get("strategy") or st.session_state.get(_SS_STRATEGY)
+# ... same pattern for symbol/expiry/entry/exit_
+snapped = _snap_to_valid(df, strategy, symbol, expiry, entry, exit_)
+# ... write snapped back to session_state
+```
+
+The function is called on EVERY render (line 521: `_initialize_session_state(df)`), BEFORE `_render_selectors`. So:
+
+1. User loads `?tab=Inspect&strategy=foo&symbol=AAA&expiry=...&entry_offset_td=15&exit_offset_td=3`
+2. Render 1: `url.get("strategy") = "foo"` → snap sets `session_state.strategy = "foo"` ✓
+3. User clicks selectbox to change strategy → `bar`. Streamlit sets `session_state.strategy = "bar"`.
+4. Render 2 (after Streamlit rerun): `_initialize_session_state` runs.
+5. URL still has `strategy=foo` (no auto-clear; Streamlit's `qp` is reactive but persistent).
+6. `url.get("strategy") or session_state.get(...)` → `"foo"` wins.
+7. `_snap_to_valid` returns `("foo", ...)` → `session_state.strategy = "foo"` (user's "bar" silently clobbered).
+8. Selectbox renders showing `"foo"` again. User confused.
+
+**Contrast with `app.py:343-355` (correct pattern)**:
+
+```python
+# Seed session state on first render so the URL param wins; on
+# later reruns the radio's own session state is sticky.
+if "mp_active_tab" not in st.session_state:
+    st.session_state["mp_active_tab"] = url_tab
+...
+# Keep the URL in sync with the radio so a refresh preserves the
+# operator's selection and bookmarked URLs reproduce.
+if qp.get("tab") != active:
+    qp["tab"] = active
+```
+
+The tab routing uses **first-render-only seeding** + **URL write-back on every change**. This is the right pattern: URL acts as initial-load deeplink, then session state is sticky, and URL stays in sync.
+
+The Inspect module needs the SAME pattern. Three viable fixes:
+
+**A. Match app.py's first-render-only seed** (recommended; smallest change):
+```python
+def _initialize_session_state(df):
+    if _SS_STRATEGY in st.session_state:
+        # Already seeded; respect user's clicks. Just snap-validate.
+        ...
+        return
+    # First render — read URL + cascade defaults.
+    url = _read_url_params()
+    ...
+```
+
+**B. Write URL params back on every render** to match session state (matches the tab pattern but more verbose for 5 fields).
+
+**C. Clear URL params after first read** — simplest but loses bookmarkability.
+
+Recommend **A** — it's symmetric with app.py and preserves URL-stable bookmarks.
+
+**Why MEDIUM, not HIGH**: only affects the deeplink-then-click flow. Manual-load-Inspect-and-click works correctly (URL has no deeplink params, falls through to session_state). The bug only fires when the operator is exercising the very feature the §24.9 deeplink contract exists to support.
+
+**Test gap**: `test_read_url_params_*` tests verify URL parsing in isolation but NONE exercise the deeplink-then-click flow that would catch this. Suggest:
+```python
+def test_user_click_overrides_deeplink_on_subsequent_render():
+    # Seed URL with strategy="A"; first render snaps to A; mutate
+    # session_state to strategy="B" (simulating selectbox click);
+    # re-call _initialize_session_state; assert strategy stays "B".
+```
+
+### Praise points
+
+- **CONSTRAINT 1 enforced both at runtime and as a reviewer-grep gate**: `test_no_bs_calls_in_inspect_module` + `test_no_bs_calls_in_this_test_file` (the operator's mechanical-uniformity pin). Future contributor adding `from src.engine.iv import bs76_call_price` to inspect.py would trigger an immediate test failure. Right discipline.
+- **Lazy import of `render_inspect_tab`** (app.py line 374-375 within the `elif active == "Inspect":` branch) — other tabs don't pay the `iv_materializer.load_iv_history` cost on every render. Performance-conscious.
+- **Pre-clip pattern in `_render_selectors`** (lines 269-270, 279-280, 291-292, 307-310, 323-326): each selectbox's session_state value is checked against the freshly-computed options list BEFORE the widget renders. Prevents Streamlit's "value not in options" exception when an upstream change invalidates a downstream selection.
+- **§24.8 cascading defaults match spec verbatim**:
+  - strategy = first sorted ✓
+  - symbol = first sorted within strategy ✓
+  - expiry = MOST RECENT (line 143: `expiries[-1]`) ✓
+  - entry = median entry_offset_td (line 150) ✓
+  - exit = median exit_offset_td with `exit < entry` constraint (line 156, 170) ✓
+- **Entry > exit hard rule enforced via fallback walk-down** (lines 159-167) — if the picked entry has no valid exit, walks down through smaller entries. The grid constraint is the sweep's hard rule; the snap respects it.
+- **§24.9 deeplink contract: URL is public, session state is private** — `_PRIVATE_SS_KEYS` tuple + module-docstring callout pin this explicitly.
+- **`_iv_at_date` reads from cache only**, no recomputation (lines 385-403). Documented as "CONSTRAINT 1: this is the IV cache read — no BS computation." ✓
+- **`_net_credit_at_entry`** sums `entry_px_realized × qty_lots × lot_size` with side signs (SELL=+1, BUY=−1) — observed-price discipline; uses the realized fill price, not BS-derived. ✓
+- **6-card stat strip** per §24.2: Net P&L, Ann ROI, Premium collected, Underlying move, IV in→out, IVP at entry. All values pulled from sweep row + observed legs + materialized IV cache. ✓
+- **IV in→out delta_color inverted** (line 467: `"inverse" if iv_out > iv_in else "normal"`) — vol expanding is bad for short-vol; inverted color makes the operator's visual scan match the P&L sign. Nice touch.
+- **IVP at entry uses `compute_ivp` with default Series C** — matches the operator-locked methodology default. Cache-miss falls back to "—" gracefully.
+- **Footer caption per §24.1 + §9** — STT rationale pending verification + premiums are observed (not reconstructed). Both load-bearing disclosures.
+- **Forward-dependencies explicitly documented** in module docstring (lines 20-29): REGIME placeholder pending Phase 9.4/9.6 cache; TAKEN status pending Phase 9.2 filter pipeline. No silent unfinished surface.
+- **Heatmap → Inspect deeplink DROPPED** per the 2026-06-05 memoir §24.9 amendment — BUILDER followed the operator's revision without legacy carryover.
+- **Indian INR formatting helper** (`_fmt_inr`) handles ₹ / K / L / Cr with signed output. Matches library1's nse_heatmap_app.py convention.
+- **`render_inspect_tab` guards on empty df** (line 514) and on None-tuple resolution (line 529) — explicit failure modes, no silent breakage.
+- **app.py tab-radio first-render-only seed + write-back on change** is the RIGHT pattern (see grill above for the inspect.py contrast).
+- **E2E tests updated to set `mp_active_tab` before `at.run()`** — the st.tabs → st.radio swap means only the active tab body renders, so e2e tests that exercise Heatmap body content need to seed the active tab. BUILDER caught and migrated 5 tests.
+
+### Tiny concerns (NOT grills)
+
+- **BUILDER's commit body says "15 tests"; actual file has 16** (the test_no_bs_calls_in_this_test_file sibling). Off-by-one in the body, not material.
+- **`_initialize_session_state` runs on every render** — could short-circuit if session_state is already valid (would also fix the GRILL above). Tied to fix A.
+- **Expiry from URL parsed via `pd.to_datetime(s)`** — silently could return NaT if Streamlit ever delivers a non-string. The downstream `not in exps_ts` check at line 142 catches it (defaults to most recent), so no real bug. Defensive enough.
+
+### Math + state-of-tree
+
+- LOC: 555 (inspect.py NEW) + 339 (test NEW) + 44 (app.py) + 40 (e2e) = +965 / −13 = +952 net. ✓ Matches `git show --stat`.
+- Tests: 1042 → 1056 per BUILDER (delta +14); my local pre-state 1040 → 1056 (+16, two e2e tests reshape between). Net new tests: 16 in test_web_inspect.py + e2e adjustments.
+- `main` HEAD: `74ea59e`. P9.5 skeleton lands.
+- Phase 9.5 sub-arc: skeleton → 9.5.2 position map → 9.5.3 cumulative P&L + legs table.
+
+### Open grills (cumulative)
+
+- 🚩 **NEW (MEDIUM) — 74ea59e GRILL 1** — URL-precedence locks user clicks post-deeplink. Fix is small (match app.py's first-render-only seed); test gap suggested.
+- 🚩 **STILL OPEN — 3625f3e GRILL 1** (§22.5 .py citation residue).
+- F11 + F12 silent-drops grill — STILL OPEN on main.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required for landing; recommend addressing GRILL 1 before Phase 9.5.2 (position map) lands, since the position-map commit will also touch `_initialize_session_state`-adjacent code and the fix is cheaper to do once.
+
+### Next-commit suggestion
+
+**A.** `fix(p9.5.inspect.url_precedence)` — match app.py's first-render-only seed pattern + add the deeplink-then-click regression test. ~15 LOC. Closes 74ea59e GRILL 1.
+
+**B.** `feat(p9.5.inspect.position_map)` — Phase 9.5.2 per BUILDER's stated next. Position-map chart. The grill is small enough to fold INTO the position-map commit if BUILDER prefers (the position map will likely touch the same `_initialize_session_state` path).
+
+Per [[feedback_next_commit_suggestion]]: A. de-risks the deeplink contract before P9.5.2 piles more state-management on top; B. is the natural progression. Recommend **A folded into B** if BUILDER is touching the same area anyway.
+
+Migration cadence
+
+**... → P9.1 stack ✓ → P9.5.0 skeleton ⚠️ (1 grill) → URL-precedence fix → P9.5.2 position map → P9.5.3 P&L path + legs → P9.4 Portfolio (deeplink writer) → ...**
+
+Standing by.
+
+---
