@@ -108,7 +108,7 @@ Standard choices, with trade-offs:
 This is real infrastructure work, not a casual addition. The plan:
 
 **`src/engine/iv.py`** — new module:
-- `implied_vol_black76(call_px, forward, strike, T, rate)` — `brentq` bracketed root-find on the Black-76 price; `forward` comes from put-call parity (F2 step 1), so no `q`/dividend input is needed. ~40 lines including the no-arb guards. Validated reference impl: `scripts/research_iv_visualization.py`.
+- `implied_vol_black76(call_px, forward, strike, T, rate)` — `brentq` bracketed root-find on the Black-76 price; `forward` comes from put-call parity (F2 step 1), so no `q`/dividend input is needed. ~40 lines including the no-arb guards. Validated reference impl: `scripts/research_iv_visualization.ipynb`.
 - `compute_atm_iv(symbol, date)` — finds ATM strike on `date`, queries option premium from cache, inverts to IV. Returns NaN if premium is bad (zero volume, deep OTM, etc. — uses the Part A gates from `FILTERS.md`).
 - `constant_maturity_iv(symbol, date, target_dte=30)` — interpolates between bracketing expiries.
 
@@ -840,11 +840,11 @@ T = time to expiry in years = (calendar days to expiry) / 365, r = risk-free rat
 σ = volatility (the unknown), Φ = cumulative standard-normal CDF.
 ```
 
-**Day-count convention (corrected 2026-06-04, verified in `scripts/research_iv_visualization.py`):** `T` is *elapsed calendar time* to expiry, so it uses **calendar days / 365** — NOT trading-days / 252. The `252` clock belongs to two *different* quantities: the vol annualization `σ_annual = σ_daily·√252` (F7) and the IVP lookback window (F5). Keep them separate: `T` = calendar/365; vol-annualization & IVP-lookback = 252 trading days (≈ 1 calendar year). The numerical gap is tiny here (30 cal ≈ 21 td → 0.0822 vs 0.0833) but the conventions must not be conflated. The validated script uses `dte/365` throughout; production `iv.py` must match it.
+**Day-count convention (corrected 2026-06-04, verified in `scripts/research_iv_visualization.ipynb`):** `T` is *elapsed calendar time* to expiry, so it uses **calendar days / 365** — NOT trading-days / 252. The `252` clock belongs to two *different* quantities: the vol annualization `σ_annual = σ_daily·√252` (F7) and the IVP lookback window (F5). Keep them separate: `T` = calendar/365; vol-annualization & IVP-lookback = 252 trading days (≈ 1 calendar year). The numerical gap is tiny here (30 cal ≈ 21 td → 0.0822 vs 0.0833) but the conventions must not be conflated. The validated script uses `dte/365` throughout; production `iv.py` must match it.
 
 Why forward-based: per §2.2 — spot+rate inversion ignores dividends and borrow costs, both of which are real for single-stock options and hard to source per-stock-per-day in India. The synthetic forward IS observable in the option chain itself.
 
-**F3 — Black-76 IV inversion via a BRACKETED root-finder (`brentq`)** *[REVISED 2026-06-04 — switched from the Newton-Raphson sketch to `brentq` after `scripts/research_iv_visualization.py` validated it; round-trip recovers σ to ~1e-11]*:
+**F3 — Black-76 IV inversion via a BRACKETED root-finder (`brentq`)** *[REVISED 2026-06-04 — switched from the Newton-Raphson sketch to `brentq` after `scripts/research_iv_visualization.ipynb` validated it; round-trip recovers σ to ~1e-11]*:
 
 ```python
 def implied_vol_black76(call_px, forward, strike, T, r):
@@ -1166,6 +1166,212 @@ In dependency order (each commit depends on the ones above it):
 
 ---
 
+## 24. The Inspect tab — full specification *[ADDED 2026-06-05]*
+
+The Inspect tab was under-specced for ~10 days — three one-liner mentions scattered across the doc, no chart spec, no data-flow contract. This section pins it. Mockup reference: `DESIGN/Complete/components/inspect.jsx`.
+
+### 24.0 Purpose
+
+Visual diagnosis of **why a single (strategy, symbol, expiry, entry, exit) trade won or lost.** Two access patterns:
+
+1. **Standalone** — operator picks symbol + cycle + strategy and inspects any historical trade.
+2. **Drilldown from Portfolio** — clicking a stock in the Portfolio cycle drilldown deeplinks here with pre-filled selectors.
+
+The Portfolio tab tells you WHICH cycles won and lost. Inspect tells you WHY any one of them did.
+
+### 24.1 DATA FLOW — load-bearing, do not invert
+
+**This is the most important rule in this section.** The mockup at `DESIGN/Complete/components/inspect.jsx` contains a `bsPremium(S, K, IV, DTE, kind)` function (lines 331-341) that COMPUTES option premium from spot / IV / strike / DTE / r via Black-Scholes. **This exists ONLY because the mockup uses synthetic data and needs to fake premiums from synthetic spot+IV paths.**
+
+**PRODUCTION MUST DO THE OPPOSITE.** The whole point of Inspect is "show what actually happened to this trade based on observed market data." Computing it from IV would defeat the entire point.
+
+Production data flow:
+
+1. **Premium DISPLAY** = observed close from `options_loader.load_option(symbol, expiry, strike, type, entry_date, exit_date)` for each leg, for each trading day in `[entry_date, exit_date]`. Read straight from `data/cache/options/{SYMBOL}/{EXPIRY}/{STRIKE}-{TYPE}.parquet`. **Never compute, never re-derive.**
+
+2. **IV at entry / exit** = invert the OBSERVED premium via `src/engine/iv.py` (Phase 9.1 already shipped this — `extract_forward` via PCP + `implied_vol_call` / `implied_vol_put` via brentq). Phase 9.1 built the inversion DIRECTION; the Inspect tab consumes it. **The arrow goes: observed premium → IV. NOT IV → premium.**
+
+3. **IVP at entry** = trailing-252-TD percentile rank of the 30D constant-maturity ATM IV series from `data/cache/iv/{SYMBOL}.parquet` (Phase 9.1 `iv_materializer` already built this cache). The Inspect tab does not re-compute IV history — it reads the cache.
+
+4. **Per-day leg P&L** = `(observed_close[day] − entry_close) × side_sign × qty × lot_size` per memoir §3a sign convention. No re-pricing.
+
+5. **The position-map call-leg line** at time t = `K_call + observed_call_close[t]`. The put-leg line at t = `K_put − observed_put_close[t]`. Both observed, both straight from the cache, **not BS-derived**.
+
+6. **The horizontal static-breakeven dotted lines** = `K_call + entry_credit` (upper) and `K_put − entry_credit` (lower), where `entry_credit` is the OBSERVED entry premium total. Locked at entry, drawn as horizontals through the chart.
+
+7. **The "IV entry → exit" stat** in the headline strip reads IV from `data/cache/iv/{SYMBOL}.parquet` at `entry_date` and `exit_date`. Already-computed, already-cached, single lookup per date.
+
+**The production Inspect tab contains ZERO Black-Scholes calls in its hot path.** All BS work happened upstream when `engine.iv` materialized the IV cache. Inspect is a pure read.
+
+**Any commit that ports the mockup's `bsPremium()` into production code is wrong and must be rejected at review.** The reviewer should specifically grep for `def bs76\|def bs_premium\|black_scholes\|implied_vol` in the Inspect-side files (`src/web/inspect.py` and any new helper) — those calls belong upstream in `engine.iv`, never in the Inspect read-path.
+
+**Counterfactual exception**: when a trade was NOT taken (status: gated / ivp-skip / earn-skip per the regime gate / IVP filter / earnings filter), the position map and P&L path show "what would have happened if traded." For these counterfactual paths only, we DO need to reconstruct premium evolution. Even then, **prefer observed premiums from the cached contract parquets** (which we have regardless of whether the trade was taken — the prefetch caches the full strike chain). Only fall back to BS reconstruction if the contract data itself is missing (rare). Tag the chart clearly: "BS-reconstructed counterfactual; not observed."
+
+### 24.2 Layout
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Header: The Inspect · inspect_trade(SYM · EXPIRY)  [Back to Portfolio] │
+├─────────────────────────────────────────────────────────────────────┤
+│ Picker row:                                                          │
+│   symbol [SEG]  cycle [DROPDOWN]  strategy [SEG]  (override tag)    │
+├─────────────────────────────────────────────────────────────────────┤
+│ Header: SYM name · strategy tag · cycle EXPIRY · entry/exit T-N     │
+│                                  · regime tag · status tag (TAKEN)  │
+├─────────────────────────────────────────────────────────────────────┤
+│ [if NOT TAKEN] Skip-reason banner — gated / ivp-skip / earn-skip    │
+├─────────────────────────────────────────────────────────────────────┤
+│ Stat strip:                                                          │
+│   Net P&L | Ann. ROI | Premium collected | Underlying move          │
+│   IV in→out | IVP at entry                                          │
+├─────────────────────────────────────────────────────────────────────┤
+│ Position map (price space) — straddle/strangle ONLY                 │
+│   · spot path (heavy neutral)                                       │
+│   · call-leg observed-premium series: K_call + observed_call_close  │
+│   · put-leg observed-premium series:  K_put  − observed_put_close   │
+│   · upper static BE dotted: K_call + entry_credit                   │
+│   · lower static BE dotted: K_put  − entry_credit                   │
+│   · profit zone shaded between BEs                                  │
+│   · event markers (earnings, RBI, etc.)                             │
+│   IRON CONDOR: blocked card "switch strategy to inspect"            │
+├─────────────────────────────────────────────────────────────────────┤
+│ Cumulative P&L path (holding window)                                │
+│   · net P&L over time                                               │
+│   · event markers vertical dotted lines                             │
+│   · endpoint annotated with final P&L                               │
+├─────────────────────────────────────────────────────────────────────┤
+│ Legs table: side / type / strike / entry premium / leg P&L         │
+├─────────────────────────────────────────────────────────────────────┤
+│ Footer: STT-pending note + reconstruction transparency caption      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 24.3 What you SEE on different trade outcomes
+
+The position map is designed so the operator can diagnose the FAILURE MODE visually:
+
+- **Profitable trade (theta winning)**: spot stays well between the dotted breakeven lines; the call-leg and put-leg series both decay smoothly toward their respective strikes as expiry approaches. Visual: lines converge inward, spot doesn't go near them. Wins from time decay alone.
+
+- **Losing trade (vega expansion)**: spot stays calm but the call-leg and put-leg series REFUSE to converge — they stay elevated or expand because IV is expanding. Visual: the gap between the leg lines and their strikes stays wide even as DTE shrinks. Losses come from rising vol, not spot movement.
+
+- **Losing trade (spot side)**: spot drifts toward or through one of the dotted breakeven lines. The leg series on the threatened side rises sharply (premium expansion as the option goes ITM). Visual: spot crosses a dotted line; that leg's series explodes upward. Losses come from underlying movement.
+
+- **Losing trade (event)**: an event marker on the chart (vertical dotted line) marks an earnings / RBI / budget day inside the hold window. Both leg series spike on the event day; spot may gap. Losses come from a discrete event the regime/earnings filters didn't catch.
+
+The diagnostic narrative is written into the operator's reading of the chart — they don't need text annotations to know which failure mode happened.
+
+### 24.4 Iron condor — exclusion + fallback
+
+A 4-strike iron condor has 4 leg lines + 2 strike pairs + 2 breakeven pairs + spot = 11 lines on one chart. Unreadable.
+
+**Decision**: when strategy = `iron_condor`, suppress the position map and show a blocked-state card with copy:
+
+> ⊘ Can't inspect a condor here. The position map plots one short call and one short put against spot. An iron condor has 4 legs and two breakeven pairs — a single spot-vs-leg view would misrepresent it. The P&L path and legs table below still apply. *switch strategy → Strangle or Straddle to see the map*
+
+The P&L path chart, legs table, and headline stats all still render for iron condor — only the position map is suppressed.
+
+### 24.5 Per-leg gap handling — observed-data robustness
+
+When a leg's contract data on a specific day fails the Part A gates from `FILTERS.md` (#6 missing row, #8 zero turnover, #10 oi=0 + thin trades, #11 wide VWAP-vs-close band), the leg's series for THAT day renders as a gap in the line; the OTHER leg's series continues normally.
+
+Implementation:
+- Reindex each leg's series to the full trading-day calendar in `[entry_date, exit_date]` using `trading_calendar.trading_days()`.
+- NaN-fill days where the leg failed Part A.
+- Plotly trace: `connectgaps=False`.
+- Annotate gaps with a small caption: "Call leg: 3 days no observed premium (FILTERS §A #8)" so the operator knows it's data quality, not a chart bug.
+
+The static breakeven lines, spot path, and P&L path are NOT subject to per-leg gaps — they use spot (continuous from `spot_loader`) and entry premium (always known by definition since the trade priced at entry).
+
+### 24.6 Counterfactual mode (NOT TAKEN trades)
+
+When the operator inspects a trade that wasn't actually taken (because the regime gate / IVP filter / earnings filter blocked it), the position map and P&L path are shown as **counterfactual**:
+
+- The chart line is rendered dashed instead of solid.
+- A serif italic caption inside the chart reads "counterfactual — not actually traded."
+- The headline stat strip's Net P&L label changes to "Net P&L · counterfactual" with sub "if it had traded."
+- The skip-reason banner above explains WHY (regime / IVP / earnings) with the specific filter parameter that fired.
+- The chart still uses observed contract premiums from the cache if available (the contracts exist regardless of whether we traded them) — falling back to BS reconstruction only if the contract data is missing.
+
+This lets the operator inspect "what would have happened if the gate hadn't fired?" — useful for empirically validating whether the gates are throwing away good trades.
+
+### 24.7 Strategy override
+
+The operator can locally override the strategy without disturbing the Portfolio tab's config. Useful for "what if this expiry had been a straddle instead of strangle?" exploration. When the strategy differs from the Portfolio's strategy, a small "override" badge appears next to the strategy picker. On navigation back to Portfolio (via the Back button), the override is dropped — Portfolio's config is canonical.
+
+### 24.8 Selector contract
+
+| selector | type | options | default |
+|---|---|---|---|
+| symbol | seg (button group) | from the universe in the current sweep | first symbol with a taken trade in the most recent expiry |
+| cycle | dropdown | distinct expiries from sweep | most recent expiry with at least one taken trade |
+| strategy | seg | strangle / straddle / condor | inherits from Portfolio config; locally overridable |
+
+### 24.9 Deeplink contract (Portfolio → Inspect)
+
+When the operator clicks a stock in the Portfolio cycle drilldown 5-stocks panel, the deeplink:
+
+1. Writes `(strategy, symbol, expiry)` into URL params or session state.
+2. Switches the active tab to Inspect.
+3. Inspect reads the pre-fill from URL params on mount and populates the selectors before its first render.
+
+The deeplink is one-way: Inspect can be navigated back via the Back button but cannot push state back to Portfolio.
+
+### 24.10 Data dependencies
+
+| input | source | already exists? |
+|---|---|---|
+| Per-leg observed premium series over hold window | `options_loader.load_option(...)` | ✅ Phase 0-1 |
+| Spot path | `spot_loader.load_spot(...)` | ✅ Phase 0-1 |
+| Trading-day calendar for reindex | `trading_calendar.trading_days(...)` | ✅ Phase 0-1 |
+| Entry / exit premiums for the legs (already-priced) | sweep parquet `legs_json` column | ✅ Phase 5 |
+| IV at entry / exit | `data/cache/iv/{SYMBOL}.parquet` | ✅ Phase 9.1 (commit `9d65809`) |
+| IVP at entry | trailing-252-TD percentile rank of the IV cache | ⏳ Phase 9.1 `feat(p9.1.analytics.ivp)` (next commit) |
+| Events for the in-window markers | `data/cache/events.parquet` | ✅ Phase 9.0 (commit `182cf1d`) |
+| Sweep-row context (legs, costs, margin, net) | sweep parquet | ✅ |
+
+The Inspect tab depends on Phase 9.0 + Phase 9.1 (engine.iv + iv_materializer) being landed. Phase 9.1.3 (`analytics.ivp`) is the only remaining upstream dependency, and it's the next commit per the IV materializer's commit message.
+
+### 24.11 Implementation plan
+
+Three nuclear commits, ~2-3 days total:
+
+1. `feat(p9.5.inspect.skeleton)` — `src/web/inspect.py`: new tab with selectors + header + stat strip + footer. No charts yet. ~half day.
+2. `feat(p9.5.inspect.position_map)` — the price-space chart with spot + observed-leg-premium series + static breakeven lines + profit zone shading + event markers + iron condor blocked-state fallback. Per-leg gap handling per §24.5. ~1 day.
+3. `feat(p9.5.inspect.pnl_path_and_legs)` — cumulative P&L over hold window + legs table + counterfactual labeling + strategy-override badge. ~half day to 1 day.
+
+Deeplink from Portfolio is a separate commit (`feat(p9.5.inspect.deeplink`) that lands AFTER Phase 9.4 Portfolio tab cycle drilldown, NOT inside Phase 9.5. Adding the URL-param handler is ~half day and depends on the Portfolio tab existing.
+
+### 24.12 Why Inspect should go FIRST (before Portfolio)
+
+The original Phase 9 plan (per PLAN.md) sequences as 9.0 → 9.1 → 9.2 → 9.3 → 9.4 (Portfolio UI) → 9.5 (Inspect UI). Inspect is last in the UI section.
+
+**Argument for promoting Inspect to FIRST in the UI section (before Portfolio):**
+
+1. **Tighter scope**: 2-3 days vs Portfolio's ~1.5 weeks. Cheaper to ship and learn from.
+2. **Smaller dependency surface**: Inspect needs the sweep parquet + IV cache + events cache (all already shipped per §24.10). Portfolio needs the aggregator + metrics + 2-D diagnostic + drilldown + several UI commits stacked.
+3. **Validates the data plumbing before depending on aggregates**: if the observed per-leg premium series, IV-read, IVP-read, event-markers don't display correctly on ONE trade, they won't aggregate correctly across 1.1M trades either. Find the data bugs at the 1-trade level first.
+4. **Immediately useful standalone**: operator can use Inspect TODAY against the existing sweep parquet. Portfolio tab's value depends on the regime + earnings + IVP filter pipeline being fully working; Inspect's value is intrinsic to "look at this trade."
+5. **Per-cell research workflow lands sooner**: the AI bucket-analyst (Phase 9.7) wants to feed AI per-trade context. Inspect builds the "extract per-trade context" plumbing as a side effect of its chart — making Phase 9.7 cheaper later.
+6. **No regression risk**: Inspect doesn't touch any existing module. Pure additive. If it ships and we revert, no harm.
+
+**Argument against** (for completeness):
+- Portfolio is the headline deliverable from a "what does the strategy actually do?" standpoint. Building Inspect first delays the regime / earnings / IVP gate empirical answers by 2-3 days.
+
+**Net read**: **build Inspect first.** The empirical-answer delay is small (Portfolio still ships 2-3 days later than it would have); the data-plumbing-validation benefit is large; the AI-workflow setup benefit is real.
+
+Once the operator approves the re-sequencing, PLAN.md Phase 9 sub-sequence becomes:
+- 9.0 pre-flight (done)
+- 9.1 IV infra (in progress; IVP commit pending)
+- 9.2 Filter infra
+- 9.3 Aggregator + metrics
+- **9.5 Inspect tab** *(promoted ahead of 9.4)*
+- 9.4 Portfolio tab
+- 9.6 India VIX regime v2
+
+The deeplink from Portfolio to Inspect remains in 9.5 nominally but actually lands inside the Portfolio drilldown commit (the deeplink SOURCE is in Portfolio).
+
+---
+
 ## 22. Pre-build IV visualization research step *[ADDED 2026-06-04]*
 
 Before building `src/engine/iv_materializer.py` (the production IV history materializer), build a research notebook to verify the methodology empirically on Indian single-stock data. **Don't bake the 7-DTE exclusion, the forward-PCP construction, or the interpolation convention into production code until they're visually validated.**
@@ -1210,7 +1416,7 @@ Optionally promote to a permanent Inspect-tab page later if the visualization st
 
 ### 22.5 Validation results — BUILT + RUN + reviewer-verified *[ADDED 2026-06-04]*
 
-Built as `scripts/research_iv_visualization.py` (not a notebook) and run on RELIANCE / PNB / HDFCBANK over the last ~6 months → `scripts/research_iv_<SYMBOL>.png`. The script **upgraded over the F2/F3 sketch** in three ways the reviewer confirmed are improvements (now back-ported into F2/F3 above):
+Built as `scripts/research_iv_visualization.ipynb` (operator-validated notebook, committed + tracked at `3625f3e`) and run on RELIANCE / PNB / HDFCBANK over the last ~6 months → `scripts/research_iv_<SYMBOL>.png`. The script **upgraded over the F2/F3 sketch** in three ways the reviewer confirmed are improvements (now back-ported into F2/F3 above):
 - **`brentq` bracketed root-find** instead of hand-rolled Newton-Raphson (can't stall in the flat-vega tail).
 - **Put-call-parity synthetic forward + Black-76**, inverting the **call only** (parity guarantees equal call/put σ) — no dividend/`q` input needed.
 - **`T = dte/365`** (calendar) throughout — consistent with the corrected day-count note under F2.
@@ -1223,7 +1429,7 @@ Built as `scripts/research_iv_visualization.py` (not a notebook) and run on RELI
 - **C (30D CMI + 7-DTE exclusion, blue)** — smooth across expiry transitions; the regime-faithful level series. **This is the IV level to use.**
 - **D (trailing-252-TD IVP of C, green)** — pins near 100 during the clear Feb→Apr IV uptrends (correct), oscillates 0–100 by construction. **This is the filter signal you threshold on.** Caveat: D is jumpy day-to-day (percentile transform amplifies small level moves) → sample it once at **cycle entry** (the monthly cadence already does this); never use it as a continuous/daily signal.
 
-**Decision (now locked): ship C → D. The 7-DTE exclusion is load-bearing, not hygiene.** `scripts/research_iv_visualization.py` is the **validated reference implementation** — production `src/engine/iv.py` + `iv_materializer.py` must mirror its brentq + parity-forward + `dte/365` construction (NOT the older Newton/spot-BS phrasing that lingered in earlier drafts).
+**Decision (now locked): ship C → D. The 7-DTE exclusion is load-bearing, not hygiene.** `scripts/research_iv_visualization.ipynb` is the **validated reference implementation** — production `src/engine/iv.py` + `iv_materializer.py` must mirror its brentq + parity-forward + `dte/365` construction (NOT the older Newton/spot-BS phrasing that lingered in earlier drafts).
 
 **Minor carry-forward notes (non-blocking, for the materializer build):**
 - `trailing_ivp` NaN-on-today already guarded (F5); the script does the same via the self-excluded `(Σ≤today − 1)/(N − 1)` percentile.
