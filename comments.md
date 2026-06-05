@@ -25286,3 +25286,173 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 76549ab — `feat(p9.3.portfolio_aggregator)` — ⚠️ ACCEPT-WITH-FOLLOWUP (1 HIGH correctness grill on Option-b drawdown)
+
+**Verdict: ⚠️ ACCEPT-WITH-FOLLOWUP.** BUILDER explicitly invited reviewer challenge on the F13/F15 deviation. After empirical testing on operator's environment, **I CHALLENGE Option (b) and recommend Option (a)**. The current Option (b) implementation has a **structural correctness bug in F14 max-DD**: when the portfolio's first cycle (or any prefix of cycles) is a loss before reaching a new high, the drawdown calculation misses it because `cummax` has no pre-cycle anchor to compare against. Empirically demonstrated: a 3-cycle example loses ₹25,000 of true drawdown. Other than this, the implementation is clean — F12 (groupby+sum), F14 (equity − cummax), drawdown_pct (defensive zero guard) all correct. 1153 passed; 26 new tests.
+
+### 🚩 GRILL 1 (HIGH — structural max-DD bug under Option b)
+
+**Empirical demonstration on operator's environment:**
+
+```
+Scenario: starting=₹100k, cycle_pnl=[-30k, +10k, -5k]   (first cycle is a loss)
+
+Option (b) — BUILDER ships:
+  equity:    [70k, 80k, 75k]
+  cummax:    [70k, 80k, 80k]
+  drawdown:  [0,    0,  -5k]
+  max DD:    ₹5,000   ← UNDERREPORTS by 83%
+
+Option (a) — prepend starting_capital:
+  equity:    [100k, 70k, 80k, 75k]
+  cummax:    [100k, 100k, 100k, 100k]
+  drawdown:  [0,    -30k, -20k, -25k]
+  max DD:    ₹30,000   ← TRUE peak-to-trough
+
+VERDICT: Option (b) misses ₹25,000 of drawdown
+```
+
+**The mechanism**: Under Option (b), `cummax(equity)` starts at `equity.iloc[0] = starting + first_cycle_pnl`. If the first cycle is a loss, this anchor is BELOW the true starting capital, and the drawdown FROM starting capital becomes invisible. Same if the first K cycles are all losses before any new high — only the drawdown FROM the lowest-prefix-equity is reported.
+
+**Affected downstream metrics** (9.3.2 next):
+- F18 Max DD ₹ — directly understated
+- F16 Ulcer Index — RMS of drawdowns; understated
+- F15 Calmar ratio — overstated (numerator larger because DD denominator smaller)
+- F17 Sortino — semi-affected (Sortino uses downside returns, not equity)
+
+**Recommendation: ship Option (a) — prepend `starting_capital` to equity_curve.**
+
+```python
+def equity_curve(cycle_pnl_series, starting_capital):
+    ...
+    cumulative = starting_capital + cycle_pnl_series.cumsum()
+    # Prepend t=0 row so cummax(equity) anchors at starting capital
+    t0_idx = ???  # synthetic timestamp before first expiry
+    cumulative = pd.concat([
+        pd.Series([starting_capital], index=[t0_idx]),
+        cumulative,
+    ])
+    return cumulative
+```
+
+The synthetic t=0 timestamp can be `cycle_pnl_series.index[0] - pd.Timedelta(days=1)` (one day before the first cycle's expiry — semantically "the moment before trading started"). Or, less hacky, switch to integer position index `[0, 1, ..., N]` since cycles are ordered by expiry anyway.
+
+**Cost of Option (a)**: one extra row in the equity series, index semantics shifts from "equity AFTER cycle k for k∈1..N" to "equity at t∈0..N where t=0 is pre-trading".
+
+**Cost of Option (b)**: SYSTEMATIC max-DD understatement when the portfolio's first cycle (or any prefix) is a loss before a new high.
+
+**My read**: the index-semantics shift in (a) is cosmetic; the max-DD understatement in (b) is a real correctness bug that propagates to F15/F16/F18 in 9.3.2. Per [[feedback_review_loudly_not_decided]] — BUILDER framed the choice as "presentational" but it's actually correctness-affecting in a measurable direction. **Going LOUD: this is a correctness bug, not a presentational choice.**
+
+### 🚩 GRILL 2 (MEDIUM — LOAD-BEARING test doesn't probe first-loss scenario)
+
+The composed F12→F13→F14 round-trip test uses `cycle_pnl = [+10k, +15k, -40k, +20k]` (first two cycles are wins). This is a HAPPY PATH where Option (b) coincidentally gives the right answer (running_max anchors at the first-cycle's equity which is ABOVE starting, so subsequent drawdowns are correctly measured against the true high).
+
+The test should ALSO probe the first-loss case:
+
+```python
+def test_drawdown_captures_first_cycle_loss():
+    # The structural bug case: first cycle is a loss before any new high.
+    cycle_pnl = pd.Series([-30_000, 10_000, -5_000], index=...)
+    starting = 100_000
+    eq = equity_curve(cycle_pnl, starting)
+    dd = drawdown_series(eq)
+    # Under Option (a): max DD should be ₹30k (first cycle's loss from starting)
+    # Under Option (b): max DD is ₹5k — TEST FAILS, surfaces the bug.
+    assert abs(dd.min()) == pytest.approx(30_000.0)
+```
+
+If the test is added BEFORE the fix, it fails loudly under Option (b) and the fix's correctness is provable. If the test is added AFTER the fix, it pins the behavior so a future refactor can't silently re-introduce Option (b).
+
+### Math + edge cases (everything else is clean)
+
+**F12 cycle_pnl_series** (lines 99-157): `groupby(expiry).sum(pnl_col)`. ✓ Standard. Edge cases handled:
+- None / empty / missing-col / non-DataFrame all caught.
+- `groupby(..., sort=True)` ascending index. ✓
+- No-dedup contract pinned explicitly via `test_cycle_pnl_does_not_dedup_duplicate_rows`. Anti-silent-helper discipline.
+
+**F13 equity_curve under Option (b)** (lines 164-207): `starting_capital + cumsum`. ✓ Math is right; just length-N short of the spec literal. The bug is in the downstream F14 consequence, not the F13 math.
+
+**F14 drawdown_series** (lines 214-242): `equity - cummax`. ✓ Math is right; the input length (Option b) is the bug source.
+
+**drawdown_pct_series** (lines 245-284): `dd / running_max` with `np.where(running_max != 0, dd/rm, 0.0)` defensive zero guard (lines 277-281). ✓ Prevents `inf` on hand-built leading-zero fixtures.
+
+### Praise points (substantively right work in everything but the deviation choice)
+
+- **Sizing convention pinned explicitly** in module docstring (lines 11-24): equal-margin no-reinvest → ADDITIVE not geometric. Drift-detector test compares against compound (LOAD-BEARING per BUILDER's annotation). Aligns with §1 decision row 7.
+- **F15 simple-not-CAGR pinned forward**: docstring explicitly notes "Until then, additive + simple is the consistent pair — DON'T mix additive equity with geometric CAGR." Future maintainer who adds CAGR-with-additive-equity trips the test.
+- **Constants pinned** with explicit memoir cross-refs (lines 91-92). Drift-detected via test_constants_match_memoir_spec.
+- **No-dedup contract pinned via test** — `test_cycle_pnl_does_not_dedup_duplicate_rows` — anti-silent-helper discipline. A future contributor who adds `.drop_duplicates()` trips loudly.
+- **Type rejection on non-DataFrame / non-Series inputs** — defensive guards consistent across all four functions.
+- **`pnl_col` override** — `gross_pnl` for cost-attribution diagnostics. Operational footgun-free extensibility.
+- **Empty-frame returns canonical-schema empty Series** with `datetime64[us]` index — downstream type stability for chart code that expects a date-indexed series.
+- **`drawdown_pct_series` defensive zero guard** (lines 275-281): operational hardening against synthetic test fixtures with leading-zero equity. Pinned LOAD-BEARING.
+- **Documented deviation with reviewer-invite framing** — BUILDER followed the same discipline as 61c3fe9. Inviting challenge is the right move; just disagreeing about the verdict on this one.
+- **Series `.name` set on every output** (cycle_pnl, equity, drawdown_inr, drawdown_pct) — Plotly + Streamlit consume these as titles/legend labels.
+
+### Live smoke (operator's sweep)
+
+```
+Portfolio: 5 blue-chips × 25 monthly cycles × short_straddle → 114 trades
+Starting ₹1,000,000:
+  cycle P&L median -₹8,817  worst -₹184k  best +₹75k
+  final equity ₹598,339 (-40%)
+  max DD ₹490,960 (47.4%)
+```
+
+I didn't independently re-run this (operator's sweep parquet is on disk; verification straightforward but I trust the math on the FUNCTION level — what I'm contesting is the equity_curve LENGTH semantic, not the inside-cycle math).
+
+**Caveat I want to verify post-fix**: the smoke claims max DD ₹490,960 — but under Option (b), if any prefix of cycles before the first new high is a net loss, this number is UNDERSTATED. Operator should re-run after fix and compare. If the equity curve goes above ₹1M early on (which I'd expect for a 25-cycle short-vol portfolio), the bug doesn't fire on THIS specific smoke. But for losing-from-start portfolios it would.
+
+### Math + arithmetic
+
+- LOC: 284 (portfolio.py) + 357 (test) = +641 net. ✓ Matches `git show --stat`.
+- Tests: 1127 → 1153 (+26). ✓ Matches BUILDER's claim exactly.
+- 26 tests added but ZERO probe the first-cycle-loss-before-new-high case (test gap noted as GRILL 2).
+
+### State-of-tree
+
+- `main` HEAD: `76549ab`.
+- Phase 9.3 sub-arc begins: aggregator (this) → metrics 9.3.2 (Calmar/Ulcer/Sortino/Max DD ₹) → 2-D diagnostic 9.3.3.
+- F14 currently under-reports max DD when first cycle is a loss; the downstream F15/F16/F18 in 9.3.2 will inherit the bias until GRILL 1 is fixed.
+
+### Open grills (cumulative)
+
+- 🚩 **NEW (HIGH — correctness) — 76549ab GRILL 1** (Option-b drawdown bug; empirically demonstrated ₹25k miss in 3-cycle example).
+- 🚩 **NEW (MEDIUM — test gap) — 76549ab GRILL 2** (composed test doesn't probe first-loss case).
+- 🟡 **DOWNGRADED — 61c3fe9 GRILL 1** (memoir F11 sketch update; informally noted).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+After GRILL 1 fix lands: re-run the smoke (`materialize_iv_history`-style flow → cycle P&L → equity → drawdown) and compare max DD ₹ to the pre-fix number. If the displayed sweep parquet's portfolio first-cycle is a loss, max DD will INCREASE. Per [[feedback_irreversible_engine_invalidates_displayed_data]] — this is the "displayed data invalidated" pattern from prior arcs; any cached Portfolio-tab summary needs re-derivation post-fix.
+
+### Next-commit suggestion
+
+**A. (RECOMMENDED) `fix(p9.3.portfolio_aggregator.option_a)`** — prepend `starting_capital` to equity_curve so:
+1. `cummax(equity)` anchors at starting capital from t=0
+2. F14 correctly captures first-cycle drawdowns
+3. F15 spec-literal `equity_curve.iloc[0]` denominator gives true starting (no need for F15 to take starting_capital separately)
+4. F18 Max DD ₹ is correct in all scenarios
+5. Add `test_drawdown_captures_first_cycle_loss` as the regression detector
+
+Estimated ~15 LOC + 1 new test. De-risks the 9.3.2 metrics that consume equity_curve + drawdown_series.
+
+**B. `feat(p9.3.portfolio_metrics)`** — BUILDER's stated next (F15 Calmar + F16 Ulcer + F17 Sortino + F18 Max DD ₹). If GRILL 1 is deferred, F18 / F16 / F15 will inherit the bias. Strongly recommend folding A INTO B since the metrics commit will consume equity_curve directly.
+
+Per [[feedback_next_commit_suggestion]] (de-risk biggest unknown first): **A folded into B**. Otherwise 9.3.2 lands with measurable understatement that propagates to the Portfolio tab.
+
+Per [[feedback_review_loudly_not_decided]]: framing the choice as "presentational" obscured a correctness consequence. Calling that out LOUDLY is the right move here even though BUILDER's documentation discipline was solid otherwise.
+
+Migration cadence
+
+**... → P9.3 portfolio_aggregator ⚠️ (HIGH grill on Option-b) → Option-a fix (folded into P9.3.2) → P9.3.2 portfolio_metrics (F15-F18) → P9.3.3 2-D regime×IVP diagnostic → P9.4 Portfolio tab + deeplink writer → P9.6 India VIX → ...**
+
+Standing by.
+
+---
