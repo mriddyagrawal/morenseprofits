@@ -25080,3 +25080,122 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 61c3fe9 — `feat(p9.2.analytics.liquidity_rank)` — ✅ ACCEPT WITH MEMOIR-FOLLOWUP
+
+**Verdict: ✅ ACCEPT.** BUILDER invited the reviewer to challenge the per-day-total-mean vs per-row-mean deviation from the memoir code sketch. **I AGREE with BUILDER's choice** — empirically verified by computing both metrics on operator's actual data; the per-day-total ranking matches Indian-blue-chip liquidity intuition and the per-row alternative produces a worse ranking biased by NSE's strike-listing density. Live smoke reproduced to the last thousand: every value (RELIANCE 262k, MARUTI 223k, SBIN 222k, ... SUNPHARMA 32k) matches.
+
+**One follow-up**: the memoir F11 code sketch (`sub['contracts'].mean()`) should be revised to match the implementation. The English description is correct; the sketch is a typo that should be fixed before a future contributor reading memoir-first thinks the code is wrong.
+
+### Empirical verification of the deviation (operator's bhavcopy cache, 2024-05-15 window)
+
+Both metrics computed on the same 15-blue-chip universe + same lookback window:
+
+| Symbol | **per-day-total** (this commit) | per-row mean (sketch) | rows | days |
+|---|---:|---:|---:|---:|
+| RELIANCE | **262,252** | 1,301 | 4,436 | 22 |
+| MARUTI | **223,266** | 1,212 | 4,053 | 22 |
+| SBIN | **221,904** | 982 | 4,969 | 22 |
+| HDFCBANK | **210,856** | 990 | 4,688 | 22 |
+| TCS | **152,245** | 1,008 | 3,322 | 22 |
+| BAJFINANCE | **139,983** | 608 | 5,062 | 22 |
+| ICICIBANK | **117,385** | 671 | 3,848 | 22 |
+| INFY | **110,219** | 828 | 2,930 | 22 |
+| LT | **103,552** | **399** | **5,703** | 22 |
+| AXISBANK | **98,030** | 564 | 3,822 | 22 |
+| BHARTIARTL | 87,064 | 433 | 4,423 | 22 |
+| ASIANPAINT | 76,529 | 371 | 4,537 | 22 |
+| ITC | 66,950 | 311 | 4,740 | 22 |
+| HINDUNILVR | 61,316 | 330 | 4,092 | 22 |
+| SUNPHARMA | 32,449 | 146 | 4,876 | 22 |
+
+**Smoking-gun example: LT.** Has the WIDEST chain (5,703 rows ≈ 259 strikes/day listed by NSE). Per-day-total: 104k → ranks #9 (matches operator intuition — LT is a heavily-traded Indian blue chip). Per-row mean: 399 → ranks #11, BELOW BHARTIARTL/ASIANPAINT, because the volume is diluted across many listed strikes.
+
+Per-row mean systematically punishes symbols where NSE lists more strikes (BAJFINANCE, LT, ITC all have 4,700+ rows). That's the wrong direction for "is this name liquid enough to TRADE?" — the operator doesn't get to choose NSE's strike-listing density.
+
+**BUILDER's argument is sound on every axis**:
+
+1. **English maps to standard convention**: "average contracts traded per day" — daily activity, the normal market-liquidity metric.
+2. **Codebase consistency**: F7 RV uses per-day-return std (NOT per-row-return). Same axis convention.
+3. **§11.b operator intent** ("most-traded symbols") is per-day total semantic.
+4. **Wide-chain dilution bug fixed**: per-row mean penalizes NSE's strike-listing density, an external variable the operator can't control.
+
+**My recommendation: keep the implementation; fix the memoir sketch.**
+
+Per [[feedback_review_loudly_not_decided]]: BUILDER didn't quietly deviate; they LOUDLY flagged the deviation with operator-invitation-to-challenge AND added a LOAD-BEARING drift detector test (`test_score_is_mean_of_per_day_totals`). That's the right discipline — flag, justify, pin against regression.
+
+### 🚩 GRILL 1 (TINY — memoir followup, not code)
+
+**Memoir §21.4 F11 code sketch should be updated** from `sub['contracts'].mean()` (per-row) to the per-day-total-mean form. Suggested patch:
+
+```python
+def liquidity_rank(symbol, as_of_date, bhavcopy_df, lookback_td=21):
+    sub = bhavcopy_df[
+        (bhavcopy_df['symbol'] == symbol)
+        & (bhavcopy_df['instrument'] == 'OPTSTK')
+        & (bhavcopy_df['trade_date'].between(...))
+    ]
+    per_day_total = sub.groupby('trade_date')['contracts'].sum()
+    return per_day_total.mean()
+```
+
+Same operator-invitation-to-challenge framing in the memoir patch: "The original sketch used `sub['contracts'].mean()` (per-row); revised to per-day-total mean per implementation 61c3fe9 + reviewer 5aa2e4b-successor agreement after empirical verification on 2024-05-15 cache."
+
+Trivial 5-LOC memoir patch. Not blocking.
+
+### Praise points
+
+- **Documented deviation with explicit operator-invitation-to-challenge** in the commit body — exactly the right discipline for a load-bearing semantic choice. NOT a quiet deviation.
+- **LOAD-BEARING drift detector test** `test_score_is_mean_of_per_day_totals` includes the per-row alternative as the failing case. A future maintainer who "simplifies" back to `sub['contracts'].mean()` trips the test loudly.
+- **OPTSTK-only filter with anti-leak test** `test_score_drops_OPTIDX_rows` (a 999,999-contract OPTIDX row must NOT leak). Index options are out of scope through Phase 11 per memoir §1 non-goals; the filter enforces it at the kernel level.
+- **BATCH PERF CONTRACT pin** `test_compute_liquidity_scores_loads_each_day_once` (per commit body) is the right discipline for the O(50×21) → O(21) optimization. Without it, a future refactor that loops per-symbol would silently re-introduce the slowdown.
+- **NaN convention matches F5/F7/F8** — symbol-absent → NaN; insufficient sampling (`< 0.5 × lookback_td` distinct trade dates) → NaN. Cumulative discipline across analytics modules.
+- **Alphabetical tiebreak per SPECS §6c.3** matches `top_n_by_ivp` exactly (two-stage stable sort: symbol-ASC primary, score-DESC secondary). Cross-module consistency.
+- **`as_of` documented as signature-symmetry-only** (line 152: `del as_of  # signature symmetry`). Honest about the unused parameter; doesn't pretend it's load-bearing.
+- **Required-columns ValueError** (lines 155-161) — strict input validation; raises before computing on a malformed frame.
+- **Empty-window handling** in `_load_bhavcopy_window` (lines 211-214) returns canonical-schema empty frame; downstream kernel handles uniformly.
+- **`OfflineCacheMiss` skip-with-debug-log** in `_load_bhavcopy_window` — same pattern as `iv_materializer`. Batch tool resilience.
+- **Constants pinned at module level**: `LIQUIDITY_LOOKBACK_TD=21`, `LIQUIDITY_INSTRUMENT="OPTSTK"`, `LIQUIDITY_MIN_VALID_FRACTION=0.5`. Single source of truth; drift-detected via constants test.
+- **Independent kernel from I/O**: `liquidity_score` is pure on a frame; `compute_*` does I/O. Pure-function testing pattern (matches `realized_vol_from_closes` + `compute_rv` separation).
+- **`top_n_by_liquidity` NaN exclusion** — symbols with NaN scores excluded from rank. Same as `top_n_by_ivp`.
+- **Negative-n raises ValueError** — operator footgun guard.
+
+### Math + arithmetic
+
+- LOC: 312 (liquidity.py) + 354 (test) = +666 net. ✓ Matches `git show --stat`.
+- Tests: 1106 → 1127 (+21). ✓ Matches BUILDER's claim exactly.
+- Live smoke: 15-blue-chip universe → 15 valid scores (no NaN), full descending rank reproduced exactly.
+
+### State-of-tree
+
+- `main` HEAD: `61c3fe9`.
+- Phase 9.2 sub-arc: earnings filter ✓ → liquidity rank ✓ → filters_md registration (BUILDER's stated next) → filter pipeline (status column) → P9.3 portfolio aggregator → P9.4 Portfolio tab.
+
+### Open grills (cumulative)
+
+- 🚩 **NEW (TINY — memoir) — 61c3fe9 GRILL 1** — F11 code sketch should be updated to match implementation. 5-LOC patch.
+- F11 + F12 silent-drops grill — STILL OPEN on main (pre-P8 backlog, unrelated to this commit's F11).
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. The ranking matches operator intuition (RELIANCE/MARUTI/SBIN/HDFCBANK at the top, pharma + consumer names thin).
+
+### Next-commit suggestion
+
+BUILDER's stated next: `chore(p9.2.filters_md)` — register IVP, regime gate, earnings filter, liquidity floor, sector concentration as planned Part-B entries with the §B.0 template. This is the right next move — it documents the filter pipeline before the actual integration commit.
+
+**Recommend folding GRILL 1 INTO that commit**: the filters_md update will already touch FILTERS.md; updating PORTFOLIO_MEMOIR.md §21.4 F11 sketch is the same-area memoir hygiene. ~10 LOC total combined.
+
+Migration cadence
+
+**... → P9.2 earnings filter ✓ → P9.2 liquidity rank ✓ (1 memoir grill) → P9.2 filters_md + memoir F11 sketch fix → P9.2 filter pipeline (status column) → P9.3 portfolio aggregator → P9.4 Portfolio tab + deeplink writer → P9.6 India VIX → regime gate v2 → ...**
+
+Standing by.
+
+---
