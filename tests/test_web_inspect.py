@@ -296,6 +296,330 @@ def test_clear_inspect_state_drops_private_keys_only(monkeypatch):
     assert fake_ss["_unrelated_user_key"] == "preserved"
 
 
+# ============================================================
+# Position map (Commit 2 — memoir §24.2 + §24.3 + §24.4 + §24.5)
+# ============================================================
+
+def _spot_window_df(start, end) -> pd.DataFrame:
+    """Tiny date-close frame for spot-path tests."""
+    dates = pd.date_range(start, end, freq="B")
+    return pd.DataFrame({
+        "date": dates,
+        "close": [1400.0 + i * 5 for i in range(len(dates))],
+    })
+
+
+def _build_strangle_row(
+    symbol="RELIANCE", expiry="2026-04-28",
+    entry_date="2026-04-07", exit_date="2026-04-25",
+    K_call=1450.0, K_put=1350.0, ce_credit=25.0, pe_credit=20.0,
+) -> dict:
+    return _row(
+        strategy="short_strangle", symbol=symbol, expiry=expiry,
+        entry_date=entry_date, exit_date=exit_date,
+        entry=15, exit_=3,
+        legs=[
+            _leg("SELL", "CE", K_call, ce_credit, 5.0),
+            _leg("SELL", "PE", K_put, pe_credit, 4.0),
+        ],
+    )
+
+
+def test_per_share_credit_is_signed_sum_of_realized_entry_pxs():
+    """Net per-share credit anchors the static BE lines. SELL legs add
+    credit; BUY legs subtract (memoir §24.2)."""
+    from src.web.inspect import _per_share_credit
+    row = _row(legs=[
+        _leg("SELL", "CE", 1450.0, 25.0, 5.0),
+        _leg("SELL", "PE", 1350.0, 20.0, 4.0),
+        _leg("BUY",  "CE", 1500.0, 8.0,  1.0),
+    ])
+    # 25 + 20 - 8 = 37
+    assert _per_share_credit(row["legs_json"]) == pytest.approx(37.0)
+
+
+def test_short_legs_extracts_short_ce_and_short_pe():
+    from src.web.inspect import _short_legs
+    row = _row(legs=[
+        _leg("SELL", "CE", 1450.0, 25.0, 5.0),
+        _leg("SELL", "PE", 1350.0, 20.0, 4.0),
+    ])
+    sc, sp = _short_legs(row["legs_json"])
+    assert sc is not None and sc["option_type"] == "CE" and sc["side"] == "SELL"
+    assert sp is not None and sp["option_type"] == "PE" and sp["side"] == "SELL"
+    assert float(sc["strike"]) == 1450.0
+    assert float(sp["strike"]) == 1350.0
+
+
+def test_short_legs_returns_none_when_no_short_call():
+    from src.web.inspect import _short_legs
+    # Only short put + long call → no short call.
+    row = _row(legs=[
+        _leg("BUY",  "CE", 1500.0, 8.0,  1.0),
+        _leg("SELL", "PE", 1350.0, 20.0, 4.0),
+    ])
+    sc, sp = _short_legs(row["legs_json"])
+    assert sc is None and sp is not None
+
+
+def test_position_map_iron_condor_renders_blocked_card(
+    monkeypatch, fixture_sweep,
+):
+    """§24.4: iron condor's 4-leg / 2-BE-pair structure makes a single
+    spot-vs-leg chart misleading. The position map slot must render a
+    blocked-state card; no Plotly chart is added."""
+    import src.web.inspect as ins
+    captured_markdown: list[str] = []
+    chart_calls: list[object] = []
+    monkeypatch.setattr(
+        ins.st, "markdown", lambda body, **k: captured_markdown.append(body),
+    )
+    monkeypatch.setattr(
+        ins.st, "plotly_chart",
+        lambda fig, **k: chart_calls.append(fig),
+    )
+    row = fixture_sweep[
+        fixture_sweep["strategy"] == "iron_condor"
+    ].iloc[0]
+    ins._render_position_map(
+        row, "iron_condor", row["symbol"], row["expiry"],
+    )
+    assert any("condor" in m.lower() for m in captured_markdown), (
+        "iron condor blocked-state card did not render"
+    )
+    assert chart_calls == [], (
+        "iron condor must NOT render a position map chart"
+    )
+
+
+def test_position_map_warns_when_no_short_legs(monkeypatch):
+    """When legs_json lacks a short CE / short PE pair (e.g. a long-vol
+    structure), the position map must warn rather than crash."""
+    import src.web.inspect as ins
+    warnings: list[str] = []
+    chart_calls: list[object] = []
+    monkeypatch.setattr(ins.st, "warning", lambda m, **k: warnings.append(m))
+    monkeypatch.setattr(
+        ins.st, "plotly_chart", lambda fig, **k: chart_calls.append(fig),
+    )
+    row = _row(legs=[
+        _leg("BUY", "CE", 1500.0, 8.0, 1.0),
+        _leg("BUY", "PE", 1300.0, 6.0, 1.0),
+    ])
+    ins._render_position_map(
+        row, "long_strangle", row["symbol"], row["expiry"],
+    )
+    assert any("short CE" in w and "short PE" in w for w in warnings)
+    assert chart_calls == []
+
+
+# ============================================================
+# _build_position_map_figure — pure builder verifies trace structure
+# ============================================================
+
+def test_build_position_map_figure_has_spot_call_put_traces():
+    from src.web.inspect import _build_position_map_figure
+    K_call, K_put, credit = 1450.0, 1350.0, 45.0
+    sc = _leg("SELL", "CE", K_call, 25.0, 5.0)
+    sp = _leg("SELL", "PE", K_put, 20.0, 4.0)
+    spot = _spot_window_df("2026-04-07", "2026-04-15")
+    cdays = list(spot["date"].dt.date)
+    fig = _build_position_map_figure(
+        symbol="RELIANCE",
+        short_call=sc, short_put=sp,
+        per_share_credit=credit,
+        spot_df=spot,
+        call_days=cdays, call_closes=[20.0, 18.0, 15.0, 13.0, 11.0, 9.0, 7.0],
+        put_days=cdays, put_closes=[18.0, 17.0, 14.0, 12.0, 10.0, 8.0, 6.0],
+        events_df=pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    names = [t.name for t in fig.data]
+    assert "spot" in names
+    assert any("call" in n.lower() for n in names), names
+    assert any("put" in n.lower() for n in names), names
+
+
+def test_build_position_map_figure_static_BEs_are_horizontal():
+    """§24.2: BE lines are LOCKED AT ENTRY — drawn as horizontals
+    (y0 == y1, single y-value)."""
+    from src.web.inspect import _build_position_map_figure
+    K_call, K_put, credit = 1450.0, 1350.0, 45.0
+    sc = _leg("SELL", "CE", K_call, 25.0, 5.0)
+    sp = _leg("SELL", "PE", K_put, 20.0, 4.0)
+    spot = _spot_window_df("2026-04-07", "2026-04-09")
+    days = list(spot["date"].dt.date)
+    fig = _build_position_map_figure(
+        symbol="RELIANCE",
+        short_call=sc, short_put=sp,
+        per_share_credit=credit,
+        spot_df=spot,
+        call_days=days, call_closes=[20.0, 18.0, 15.0],
+        put_days=days, put_closes=[18.0, 17.0, 14.0],
+        events_df=pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    # add_hline + add_hrect both create entries in fig.layout.shapes.
+    # Match by y0==y1 to find the BE lines.
+    horizontals = [
+        s for s in fig.layout.shapes
+        if getattr(s, "y0", None) is not None
+        and getattr(s, "y1", None) is not None
+        and s.y0 == s.y1
+    ]
+    assert len(horizontals) >= 2, (
+        f"expected at least 2 horizontal BE lines; got {len(horizontals)}"
+    )
+    ys = sorted({float(s.y0) for s in horizontals})
+    assert K_call + credit in ys, f"upper BE missing; ys={ys}"
+    assert K_put - credit in ys, f"lower BE missing; ys={ys}"
+
+
+def test_build_position_map_figure_profit_zone_between_BEs():
+    """The profit zone is the rectangle between upper and lower BE.
+    add_hrect produces a shape with y0=lower_BE, y1=upper_BE (or
+    vice-versa) — the y-extent must match the BE spread."""
+    from src.web.inspect import _build_position_map_figure
+    K_call, K_put, credit = 1450.0, 1350.0, 45.0
+    spot = _spot_window_df("2026-04-07", "2026-04-09")
+    days = list(spot["date"].dt.date)
+    fig = _build_position_map_figure(
+        symbol="RELIANCE",
+        short_call=_leg("SELL", "CE", K_call, 25.0, 5.0),
+        short_put=_leg("SELL", "PE", K_put, 20.0, 4.0),
+        per_share_credit=credit,
+        spot_df=spot,
+        call_days=days, call_closes=[20.0, 18.0, 15.0],
+        put_days=days, put_closes=[18.0, 17.0, 14.0],
+        events_df=pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    # Find a shape whose y-extent equals the BE spread (the profit-zone
+    # hrect). add_hrect produces a shape spanning the full x-range.
+    upper_be, lower_be = K_call + credit, K_put - credit
+    rects = [
+        s for s in fig.layout.shapes
+        if (
+            getattr(s, "y0", None) is not None
+            and getattr(s, "y1", None) is not None
+            and {float(s.y0), float(s.y1)} == {upper_be, lower_be}
+        )
+    ]
+    assert len(rects) == 1, (
+        f"expected one profit-zone rect spanning [{lower_be}, {upper_be}]; "
+        f"got {len(rects)}"
+    )
+
+
+def test_build_position_map_figure_leg_lines_NaN_propagates():
+    """A NaN in the leg-closes input must produce NaN in the trace's y
+    so connectgaps=False makes the line break visibly (memoir §24.5).
+    """
+    from src.web.inspect import _build_position_map_figure
+    spot = _spot_window_df("2026-04-07", "2026-04-09")
+    days = list(spot["date"].dt.date)
+    fig = _build_position_map_figure(
+        symbol="RELIANCE",
+        short_call=_leg("SELL", "CE", 1450.0, 25.0, 5.0),
+        short_put=_leg("SELL", "PE", 1350.0, 20.0, 4.0),
+        per_share_credit=45.0,
+        spot_df=spot,
+        call_days=days, call_closes=[20.0, float("nan"), 15.0],
+        put_days=days, put_closes=[18.0, 17.0, float("nan")],
+        events_df=pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+    call_trace = next(t for t in fig.data if "call" in (t.name or "").lower())
+    put_trace = next(t for t in fig.data if "put" in (t.name or "").lower())
+    assert call_trace.connectgaps is False, (
+        "call trace MUST set connectgaps=False so the FILTERS §A gap "
+        "renders as a visible break per memoir §24.5"
+    )
+    assert put_trace.connectgaps is False
+    # NaN entries propagate to the y values.
+    import math
+    assert any(math.isnan(y) for y in call_trace.y)
+    assert any(math.isnan(y) for y in put_trace.y)
+
+
+def test_build_position_map_figure_event_markers_at_event_dates():
+    """Earnings event in window adds a vertical line at the event date."""
+    from src.web.inspect import _build_position_map_figure
+    spot = _spot_window_df("2026-04-07", "2026-04-15")
+    days = list(spot["date"].dt.date)
+    events = pd.DataFrame({
+        "SYMBOL": ["RELIANCE"],
+        "DATE": [pd.Timestamp("2026-04-10")],
+        "PURPOSE": ["Financial Results"],
+    })
+    fig = _build_position_map_figure(
+        symbol="RELIANCE",
+        short_call=_leg("SELL", "CE", 1450.0, 25.0, 5.0),
+        short_put=_leg("SELL", "PE", 1350.0, 20.0, 4.0),
+        per_share_credit=45.0,
+        spot_df=spot,
+        call_days=days, call_closes=[20.0] * len(days),
+        put_days=days, put_closes=[18.0] * len(days),
+        events_df=events,
+    )
+    # add_vline creates a shape with x0 == x1 at the event date.
+    verticals = [
+        s for s in fig.layout.shapes
+        if getattr(s, "x0", None) is not None
+        and getattr(s, "x1", None) is not None
+        and s.x0 == s.x1
+    ]
+    assert len(verticals) >= 1, "expected at least 1 vertical event marker"
+
+
+# ============================================================
+# Per-leg gap handling — full _render_position_map round-trip
+# ============================================================
+
+def test_render_position_map_caption_reports_gap_count(monkeypatch):
+    """When the per-leg-closes helper returns gap rows, the render
+    function must surface them as a caption below the chart so the
+    operator sees data-quality breaks explicitly (memoir §24.5)."""
+    import src.web.inspect as ins
+
+    # Make the per-leg helper return one synthetic gap on day 2 of 3.
+    sample_days = [
+        date(2026, 4, 7), date(2026, 4, 8), date(2026, 4, 9),
+    ]
+    def fake_per_leg(symbol, expiry, strike, option_type, entry_d, exit_d):
+        # 1 NaN in the middle, simulating a FILTERS §A #8 zero-turnover day.
+        return (
+            sample_days,
+            [20.0, float("nan"), 15.0],
+            [(sample_days[1], "FILTERS §A #8 zero turnover")],
+        )
+    monkeypatch.setattr(ins, "_per_leg_observed_closes", fake_per_leg)
+    monkeypatch.setattr(
+        ins, "_spot_path",
+        lambda symbol, e, x: _spot_window_df("2026-04-07", "2026-04-09"),
+    )
+    monkeypatch.setattr(
+        ins, "_earnings_events_in_window",
+        lambda symbol, e, x: pd.DataFrame(columns=["SYMBOL", "DATE"]),
+    )
+
+    captions: list[str] = []
+    monkeypatch.setattr(ins.st, "caption", lambda m, **k: captions.append(m))
+    monkeypatch.setattr(ins.st, "plotly_chart", lambda *a, **k: None)
+
+    row = _build_strangle_row()
+    ins._render_position_map(
+        row, "short_strangle", "RELIANCE", row["expiry"],
+    )
+    # One gap each on call AND put legs → 2 captions.
+    call_caps = [c for c in captions if "Call leg" in c]
+    put_caps = [c for c in captions if "Put leg" in c]
+    assert len(call_caps) == 1, f"expected one Call leg gap caption; got {call_caps}"
+    assert len(put_caps) == 1, f"expected one Put leg gap caption; got {put_caps}"
+    assert "zero turnover" in call_caps[0]
+    assert "zero turnover" in put_caps[0]
+
+
+# ============================================================
+# Existing tests resume below
+# ============================================================
+
 def test_clear_then_seed_picks_up_new_url(fixture_sweep, monkeypatch):
     """End-to-end for the deeplink-rewrite flow Phase 9.4 will use:
     a fresh URL + ``clear_inspect_state()`` + re-call seed → new URL

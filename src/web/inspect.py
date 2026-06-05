@@ -34,10 +34,18 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.analytics.ivp import compute_ivp
+from src.data.errors import (
+    IlliquidLegError, MissingDataError, MissingTurnoverError, OfflineCacheMiss,
+)
+from src.data.events_loader import load_events
 from src.data.iv_materializer import load_iv_history
+from src.data.options_loader import load_option
+from src.data.spot_loader import load_spot
+from src.data.trading_calendar import trading_days
 
 
 # ============================================================
@@ -536,6 +544,343 @@ def _render_stat_strip(row, symbol: str) -> None:
 
 
 # ============================================================
+# Position map — price-space chart (memoir §24.2 + §24.3 + §24.4 + §24.5)
+# ============================================================
+
+# Visual palette — matches the operator-validated mockup at
+# DESIGN/Complete/components/inspect.jsx lines 418, 432-433 + 454-455.
+# (We extract palette only; the mockup's bsPremium() synthetic-data
+# math is NOT ported per CONSTRAINT 1.)
+_COLOR_CALL = "#ffaa4d"   # warm orange — short call & upper BE
+_COLOR_PUT = "#7cd6ff"    # cool blue   — short put  & lower BE
+_COLOR_SPOT = "#1f2937"   # heavy neutral — spot path
+_COLOR_PROFIT_ZONE = "rgba(46, 160, 67, 0.07)"
+_COLOR_EVENT = "#f59e0b"  # amber — earnings / event markers
+
+
+def _short_legs(legs_json_str: str):
+    """Return (short_call_leg, short_put_leg) from legs_json or
+    (None, None) if either is missing. Used by the position map to
+    locate the two legs whose strikes anchor the chart."""
+    legs = json.loads(legs_json_str)
+    short_call = next(
+        (l for l in legs
+         if l.get("option_type") == "CE" and l.get("side") == "SELL"),
+        None,
+    )
+    short_put = next(
+        (l for l in legs
+         if l.get("option_type") == "PE" and l.get("side") == "SELL"),
+        None,
+    )
+    return short_call, short_put
+
+
+def _per_share_credit(legs_json_str: str) -> float:
+    """Net entry credit per share = sum of leg.entry_px_realized with
+    side_sign(SELL)=+1, side_sign(BUY)=−1 across all legs. Anchors the
+    static breakeven lines in the position map: upper_BE = K_call +
+    credit, lower_BE = K_put − credit. Per memoir §24.2 the credit is
+    locked at entry, so both BE lines are horizontal.
+
+    Assumes both legs share the same lot_size + qty_lots (the
+    strangle/straddle convention); the chart is a per-share view so
+    qty/lot scaling cancels."""
+    legs = json.loads(legs_json_str)
+    total = 0.0
+    for leg in legs:
+        s = 1.0 if leg.get("side") == "SELL" else -1.0
+        total += s * float(leg["entry_px_realized"])
+    return total
+
+
+@st.cache_data(show_spinner=False)
+def _per_leg_observed_closes(
+    symbol: str, expiry: pd.Timestamp, strike: float, option_type: str,
+    entry_date, exit_date,
+):
+    """For each trading day t in [entry_date, exit_date], load the
+    option contract's close via ``options_loader.load_option(...)`` and
+    NaN-fill days that fail FILTERS.md Part A gates. Cached by the
+    full 6-tuple per CONSTRAINT 9 so selector changes don't re-pay
+    the parquet-loop cost.
+
+    Returns ``(days, closes, gaps)``:
+      days   — list of ``date`` objects from trading_calendar
+      closes — list[float|NaN] aligned with days
+      gaps   — list of (date, reason_str) for days that failed Part A;
+               operator-facing annotation captions read from this
+
+    Per memoir §24.5: per-leg gap handling. The OTHER leg's series
+    continues normally on the same day; the static BE lines, spot
+    path, and the legs table are not subject to per-leg gaps."""
+    exp_date = pd.to_datetime(expiry).date()
+    # Normalise dates to plain ``date`` so the @st.cache_data key is
+    # consistent across Timestamp / date / str call shapes.
+    entry_d = pd.to_datetime(entry_date).date()
+    exit_d = pd.to_datetime(exit_date).date()
+    days = trading_days(entry_d, exit_d)
+    closes: list[float] = []
+    gaps: list[tuple] = []
+    for t in days:
+        try:
+            df = load_option(
+                symbol, exp_date, strike, option_type, t, t,
+            )
+            if df.empty:
+                closes.append(float("nan"))
+                gaps.append((t, "FILTERS §A #6 missing row"))
+            else:
+                closes.append(float(df["close"].iloc[0]))
+        except MissingTurnoverError:
+            closes.append(float("nan"))
+            gaps.append((t, "FILTERS §A #8 zero turnover"))
+        except IlliquidLegError:
+            closes.append(float("nan"))
+            gaps.append((t, "FILTERS §A #10 oi=0 + thin trades"))
+        except MissingDataError:
+            closes.append(float("nan"))
+            gaps.append((t, "FILTERS §A missing data"))
+        except OfflineCacheMiss:
+            closes.append(float("nan"))
+            gaps.append((t, "OfflineCacheMiss"))
+    return days, closes, gaps
+
+
+@st.cache_data(show_spinner=False)
+def _spot_path(symbol: str, entry_date, exit_date) -> pd.DataFrame:
+    """Window-load spot via spot_loader. Cached at the Inspect layer
+    per CONSTRAINT 9 (spot_loader is fast, but Streamlit's per-render
+    fresh call still adds up across selector changes)."""
+    return load_spot(symbol, entry_date, exit_date)
+
+
+@st.cache_data(show_spinner=False)
+def _earnings_events_in_window(
+    symbol: str, entry_date, exit_date,
+) -> pd.DataFrame:
+    """Subset of events with PURPOSE containing Financial Results for
+    ``symbol`` whose DATE falls in ``[entry_date, exit_date]``. Empty
+    frame on cache miss — operator still sees the chart, just without
+    event markers."""
+    try:
+        events = load_events()
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["SYMBOL", "DATE"])
+    if events.empty:
+        return events
+    mask = (
+        (events["SYMBOL"] == symbol)
+        & (events["DATE"] >= pd.Timestamp(entry_date))
+        & (events["DATE"] <= pd.Timestamp(exit_date))
+    )
+    return events.loc[mask].copy()
+
+
+def _build_position_map_figure(
+    *,
+    symbol: str,
+    short_call: dict,
+    short_put: dict,
+    per_share_credit: float,
+    spot_df: pd.DataFrame,
+    call_days, call_closes,
+    put_days, put_closes,
+    events_df: pd.DataFrame,
+) -> go.Figure:
+    """Pure builder: assemble the position-map figure from already-
+    fetched data. Separating the build from the Streamlit render
+    surface lets tests verify the trace + shape + annotation structure
+    directly without mocking ``st.plotly_chart``."""
+    K_call = float(short_call["strike"])
+    K_put = float(short_put["strike"])
+    upper_be = K_call + per_share_credit
+    lower_be = K_put - per_share_credit
+
+    # K_call + observed_call_close[t] — the line decays toward K_call
+    # as expiry approaches because the call premium shrinks. Per §24.3.
+    call_line = [
+        K_call + c if not pd.isna(c) else float("nan")
+        for c in call_closes
+    ]
+    # K_put − observed_put_close[t] — mirror image; line rises toward
+    # K_put as put premium shrinks.
+    put_line = [
+        K_put - p if not pd.isna(p) else float("nan")
+        for p in put_closes
+    ]
+
+    fig = go.Figure()
+
+    # Profit zone shading between BEs. Drawn FIRST so the lines render
+    # on top.
+    fig.add_hrect(
+        y0=lower_be, y1=upper_be,
+        fillcolor=_COLOR_PROFIT_ZONE, line_width=0,
+        annotation_text="profit zone", annotation_position="top left",
+        annotation=dict(font_size=10, font_color="#2ea043"),
+    )
+
+    # Spot path — heavy neutral.
+    if not spot_df.empty:
+        fig.add_trace(go.Scatter(
+            x=spot_df["date"], y=spot_df["close"],
+            mode="lines", name="spot",
+            line=dict(color=_COLOR_SPOT, width=2.5),
+        ))
+
+    # Call-leg line (K_call + observed close), connectgaps=False so a
+    # FILTERS Part A NaN breaks the trace cleanly per §24.5.
+    fig.add_trace(go.Scatter(
+        x=call_days, y=call_line, mode="lines",
+        name="K_call + observed call close",
+        line=dict(color=_COLOR_CALL, width=2),
+        connectgaps=False,
+    ))
+
+    # Put-leg line.
+    fig.add_trace(go.Scatter(
+        x=put_days, y=put_line, mode="lines",
+        name="K_put − observed put close",
+        line=dict(color=_COLOR_PUT, width=2),
+        connectgaps=False,
+    ))
+
+    # Static breakeven horizontals — locked at entry, no time variation.
+    fig.add_hline(
+        y=upper_be, line=dict(color=_COLOR_CALL, dash="dot", width=1.5),
+        annotation_text=f"↑BE {upper_be:.0f}",
+        annotation_position="right",
+        annotation_font_color=_COLOR_CALL, annotation_font_size=11,
+    )
+    fig.add_hline(
+        y=lower_be, line=dict(color=_COLOR_PUT, dash="dot", width=1.5),
+        annotation_text=f"↓BE {lower_be:.0f}",
+        annotation_position="right",
+        annotation_font_color=_COLOR_PUT, annotation_font_size=11,
+    )
+
+    # Earnings event markers (Financial Results only — §17.5 filter).
+    # Plotly's ``add_vline(annotation_text=...)`` codepath calls
+    # ``_mean(x)`` on the line endpoints to position the annotation;
+    # that path is broken for ``pd.Timestamp`` (TypeError in pandas
+    # 3.x) AND for ISO-date strings (sum() can't add strings to 0).
+    # Workaround: place the line via add_shape and the label via
+    # add_annotation separately, so no midpoint math runs.
+    for _, ev in events_df.iterrows():
+        ev_date_iso = pd.Timestamp(ev["DATE"]).strftime("%Y-%m-%d")
+        fig.add_shape(
+            type="line", xref="x", yref="paper",
+            x0=ev_date_iso, x1=ev_date_iso, y0=0, y1=1,
+            line=dict(color=_COLOR_EVENT, dash="dot", width=1),
+        )
+        fig.add_annotation(
+            x=ev_date_iso, xref="x", y=1.0, yref="paper",
+            text="⚠ earnings", showarrow=False,
+            font=dict(color=_COLOR_EVENT, size=10),
+            yanchor="bottom",
+        )
+
+    fig.update_layout(
+        title=f"Position map · {symbol}",
+        xaxis_title="Trading day",
+        yaxis_title="₹ per share",
+        height=420,
+        margin=dict(l=60, r=60, t=50, b=50),
+        showlegend=True,
+        legend=dict(orientation="h", y=-0.18),
+    )
+
+    return fig
+
+
+def _render_position_map(row, strategy: str, symbol: str, expiry) -> None:
+    """Render the position map per memoir §24.2 + §24.3 + §24.4 + §24.5.
+
+    Iron condor: blocked-state card per §24.4 — a 4-leg structure has
+    two breakeven pairs and would mislead on a single spot-vs-leg view.
+    The P&L path and legs table in Phase 9.5.3 still render.
+
+    Strangle / straddle: full position map. All series are OBSERVED
+    (CONSTRAINT 1) — spot from spot_loader, leg closes from
+    options_loader, BE lines from legs_json entry_px_realized. NO BS.
+    """
+    if strategy == "iron_condor":
+        st.markdown(
+            "⊘ **Can't inspect a condor here.** "
+            "The position map plots one short call and one short put "
+            "against spot. An iron condor has **4 legs** and **two** "
+            "breakeven pairs — a single spot-vs-leg view would "
+            "misrepresent it. The **P&L path** and **legs table** "
+            "below still apply. "
+            "*switch strategy → Strangle or Straddle to see the map*"
+        )
+        return
+
+    short_call, short_put = _short_legs(row["legs_json"])
+    if short_call is None or short_put is None:
+        st.warning(
+            "Position map requires both a short CE leg and a short PE "
+            "leg in this trade; one or both are missing from legs_json."
+        )
+        return
+
+    entry_date = pd.to_datetime(row["entry_date"]).date()
+    exit_date = pd.to_datetime(row["exit_date"]).date()
+    per_share_credit = _per_share_credit(row["legs_json"])
+
+    # Per-leg gap-aware observed closes. Each call is cached per
+    # (symbol, expiry, strike, type, entry_date, exit_date) — typical
+    # 30-day window does 30 parquet reads on first render, O(1) on
+    # selector changes.
+    try:
+        call_days, call_closes, call_gaps = _per_leg_observed_closes(
+            symbol, expiry, float(short_call["strike"]), "CE",
+            entry_date, exit_date,
+        )
+        put_days, put_closes, put_gaps = _per_leg_observed_closes(
+            symbol, expiry, float(short_put["strike"]), "PE",
+            entry_date, exit_date,
+        )
+    except Exception as e:  # noqa: BLE001 — surface raw failure
+        st.error(
+            f"Could not load observed leg closes for the position map: "
+            f"{type(e).__name__}: {e}"
+        )
+        return
+
+    spot_df = _spot_path(symbol, entry_date, exit_date)
+    events_df = _earnings_events_in_window(symbol, entry_date, exit_date)
+
+    fig = _build_position_map_figure(
+        symbol=symbol,
+        short_call=short_call, short_put=short_put,
+        per_share_credit=per_share_credit,
+        spot_df=spot_df,
+        call_days=call_days, call_closes=call_closes,
+        put_days=put_days, put_closes=put_closes,
+        events_df=events_df,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Per-§24.5 gap annotations below the chart so the operator sees
+    # data-quality breaks explicitly rather than mistaking the line gap
+    # for a chart bug.
+    if call_gaps:
+        reasons = sorted({r for _, r in call_gaps})
+        st.caption(
+            f"Call leg: {len(call_gaps)} day(s) no observed premium "
+            f"({'; '.join(reasons)})"
+        )
+    if put_gaps:
+        reasons = sorted({r for _, r in put_gaps})
+        st.caption(
+            f"Put leg: {len(put_gaps)} day(s) no observed premium "
+            f"({'; '.join(reasons)})"
+        )
+
+
+# ============================================================
 # Footer caption (§24.1 + §9)
 # ============================================================
 
@@ -599,5 +944,7 @@ def render_inspect_tab(df: pd.DataFrame) -> None:
     _render_header(row, strategy, symbol, expiry, entry, exit_)
     st.divider()
     _render_stat_strip(row, symbol)
+    st.divider()
+    _render_position_map(row, strategy, symbol, expiry)
     st.divider()
     _render_footer()
