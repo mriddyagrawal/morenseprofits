@@ -49,33 +49,30 @@ Public API:
       (defensive — prevents inf when equity hasn't been
       positive yet).
 
-Memoir-deviation note (documented loudly for reviewer):
+Option-a prepend (REVISED 2026-06-06 — closes reviewer 70dc408 grill):
 
-  §21.4 F13's literal Python returns ``starting_capital +
-  cycle_pnl_series.cumsum()`` (length = len(cycle_pnl_series)).
-  §21.4 F15 then uses ``equity_curve.iloc[0]`` as the denominator
-  in ``total_return_pct``, which under the F13 literal would
-  divide by ``starting_capital + first_cycle_pnl``, NOT the actual
-  starting capital — overstating the return by the first cycle's
-  P&L proportion.
+  ``equity_curve`` PREPENDS ``starting_capital`` as a synthetic t=0
+  point so ``iloc[0] == starting_capital``. The 9.3.1 initial
+  commit (76549ab) shipped option (b) (no prepend, length = N
+  cycles); reviewer flagged this empirically — a NEGATIVE first
+  cycle hides ₹{first_cycle_loss}k from the drawdown because
+  ``cummax`` starts at ``starting + first_cycle_pnl`` (below the
+  true peak). The 3-cycle case the reviewer exhibited:
 
-  Two ways to reconcile: (a) prepend equity_curve with
-  ``starting_capital`` so iloc[0] is the true t=0, or (b) keep
-  F13 literal and have F15 take ``starting_capital`` as a
-  separate parameter.
+      Cycles: -₹25k, +₹5k, +₹10k on ₹100k starting.
+      Option b: equity = [75k, 80k, 90k]; cummax = [75k, 80k, 90k];
+                DD = [0, 0, 0]; max DD = 0  ← WRONG.
+      Option a: equity = [100k, 75k, 80k, 90k]; cummax = [100k]×4;
+                DD = [0, -25k, -20k, -10k]; max DD = ₹25k  ← RIGHT.
 
-  This module ships option (b): equity_curve returns the literal
-  F13 formula (no prepend, length = N cycles). Phase 9.3.2 F15
-  will accept ``starting_capital`` as a separate parameter for
-  its denominator. Rationale: the equity series semantically
-  represents "equity AFTER cycle k's P&L is realized" for k in
-  1..N, which is the natural per-cycle view; injecting a
-  synthetic t=0 row with no associated cycle would muddle the
-  index semantics.
+  Matches the memoir literal: §21.4 F15 uses ``iloc[0]`` as the
+  return-denominator (== starting_capital under the prepend) and
+  ``len(equity_curve) - 1`` as the cycle count.
 
-  Reviewer: please challenge if option (a) is preferred — both
-  are internally consistent, the choice is presentational.
-"""
+  Synthetic prepended index value: ``cycle_pnl_series.index[0] −
+  1 day`` for a DatetimeIndex; integer-index falls back to
+  ``index[0] − 1``. Callers who want a specific t=0 date pass
+  ``start_date=``."""
 from __future__ import annotations
 
 from datetime import date
@@ -164,27 +161,38 @@ def cycle_pnl_series(
 def equity_curve(
     cycle_pnl_series: pd.Series,
     starting_capital: float,
+    *,
+    start_date: date | pd.Timestamp | None = None,
 ) -> pd.Series:
-    """Cumulative additive equity per cycle.
+    """Cumulative additive equity, PREPENDED with starting_capital.
 
-    F13 (REVISED 2026-06-04) per PORTFOLIO_MEMOIR.md §21.4:
+    F13 (REVISED 2026-06-04, FIXED 2026-06-06 reviewer 70dc408):
 
-        equity_t = starting_capital + cumsum_{i=1..t}(cycle_pnl_i)
+        equity_0   = starting_capital            ← prepended t=0
+        equity_t   = starting_capital + cumsum_{i=1..t}(cycle_pnl_i)
+                     for t in 1..N
 
-    Semantically each element is "book equity AFTER cycle k's P&L
-    is realized" for k in 1..N. The t=0 starting capital is NOT
-    in the series — see module docstring memoir-deviation note.
+    Length = N + 1 (one starting-capital row at t=0, then one row
+    per cycle). The prepend is LOAD-BEARING for ``drawdown_series``:
+    without it, a NEGATIVE first cycle hides the true peak from
+    ``cummax`` (cummax starts at ``starting + first_cycle_pnl``
+    instead of the true ``starting_capital`` peak), under-counting
+    max DD. See module docstring for the empirical 3-cycle case.
 
     Args:
-        cycle_pnl_series: F12 output (or compatible). Index is
-            preserved; values are floats.
+        cycle_pnl_series: F12 output (or compatible).
         starting_capital: book capital before any cycle runs.
-            Must be > 0 (a zero-capital book has no meaningful
-            equity curve; a negative-capital book is a bug).
+            Must be > 0.
+        start_date: index value for the prepended t=0 row.
+            Defaults to ``cycle_pnl_series.index[0] - 1 day``
+            for a DatetimeIndex; ``index[0] - 1`` for integer
+            index. Callers who want a specific date pass it
+            explicitly.
 
     Returns:
-        Same-length Series with the same index as input, dtype
-        float64. Empty input → empty series.
+        Series of length N+1, dtype float64, name ``"equity"``.
+        Empty cycle_pnl_series → empty Series (no prepend; the
+        "no cycles" case has no equity history to render).
     """
     if not isinstance(cycle_pnl_series, pd.Series):
         raise TypeError(
@@ -200,9 +208,25 @@ def equity_curve(
             [], index=cycle_pnl_series.index, dtype="float64",
             name="equity",
         )
-    out = (
+    cycle_equity = (
         starting_capital + cycle_pnl_series.astype("float64").cumsum()
     )
+    # Synthetic t=0 index value.
+    if start_date is not None:
+        prepend_idx = pd.Timestamp(start_date)
+    elif isinstance(cycle_pnl_series.index, pd.DatetimeIndex):
+        prepend_idx = cycle_pnl_series.index[0] - pd.Timedelta(days=1)
+    else:
+        first = cycle_pnl_series.index[0]
+        try:
+            prepend_idx = first - 1
+        except TypeError:
+            # Hard-coded fallback for exotic indexes — keep going,
+            # but the index is meaningless if the caller hand-built
+            # an unusual one.
+            prepend_idx = first
+    prepend = pd.Series([float(starting_capital)], index=[prepend_idx])
+    out = pd.concat([prepend, cycle_equity])
     out.name = "equity"
     return out
 

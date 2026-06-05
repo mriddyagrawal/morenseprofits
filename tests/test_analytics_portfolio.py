@@ -151,32 +151,49 @@ def test_equity_curve_is_additive_not_geometric():
     """LOAD-BEARING memoir §7 sizing convention pin: equal-margin
     no-reinvest → additive cumsum. Cycle P&L [1000, 2000, 3000]
     on starting=100000:
-      Additive:  101000, 103000, 106000
-      Geometric (compounded): 101000 → 103020 → 106110.6 (~2k drift)
-    Test pins the additive path explicitly."""
+      Post-prepend (2026-06-06 reviewer 70dc408 fix):
+        Additive:  [100000, 101000, 103000, 106000]
+      Geometric (compounded) would diverge after 3 cycles.
+    Test pins the additive path."""
     pnl = pd.Series(
         [1000.0, 2000.0, 3000.0],
         index=pd.to_datetime(["2024-04-25", "2024-05-30", "2024-06-27"]),
     )
     eq = equity_curve(pnl, starting_capital=100_000.0)
-    assert eq.tolist() == [101_000.0, 103_000.0, 106_000.0]
+    assert eq.tolist() == [100_000.0, 101_000.0, 103_000.0, 106_000.0]
     assert eq.name == "equity"
 
 
-def test_equity_curve_preserves_index():
-    """Output index matches input — downstream metrics align
-    drawdown to the same expiry dates."""
+def test_equity_curve_preserves_cycle_index_plus_prepend():
+    """Output is N+1 long: a synthetic t=0 row + one row per
+    cycle. The cycle dates are preserved in positions 1..N."""
     idx = pd.to_datetime(["2024-04-25", "2024-05-30", "2024-06-27"])
     pnl = pd.Series([100.0, 200.0, 300.0], index=idx)
     eq = equity_curve(pnl, starting_capital=10_000.0)
-    assert list(eq.index) == list(idx)
+    assert len(eq) == 4
+    # The prepended index is first_expiry - 1 day by default.
+    assert eq.index[0] == pd.Timestamp("2024-04-24")
+    assert list(eq.index[1:]) == list(idx)
+
+
+def test_equity_curve_accepts_explicit_start_date():
+    """Caller-supplied start_date overrides the default
+    `first_expiry - 1 day`."""
+    idx = pd.to_datetime(["2024-04-25", "2024-05-30"])
+    pnl = pd.Series([100.0, 200.0], index=idx)
+    eq = equity_curve(
+        pnl, starting_capital=10_000.0, start_date="2024-04-01",
+    )
+    assert eq.index[0] == pd.Timestamp("2024-04-01")
+    assert eq.iloc[0] == 10_000.0
 
 
 def test_equity_curve_handles_losses():
     """Negative cycles drag equity below starting — no clamping."""
     pnl = pd.Series([5000.0, -8000.0, -3000.0])
     eq = equity_curve(pnl, starting_capital=100_000.0)
-    assert eq.tolist() == [105_000.0, 97_000.0, 94_000.0]
+    # Length 4 (prepend + 3 cycles).
+    assert eq.tolist() == [100_000.0, 105_000.0, 97_000.0, 94_000.0]
 
 
 def test_equity_curve_empty_input_returns_empty():
@@ -297,8 +314,8 @@ def test_drawdown_pct_empty_input_returns_empty():
 # ============================================================
 
 def test_equity_curve_then_drawdown_round_trip():
-    """LOAD-BEARING end-to-end pin: a hand-checked 4-cycle
-    portfolio.
+    """LOAD-BEARING end-to-end pin (post-2026-06-06 prepend fix):
+    a hand-checked 4-cycle portfolio.
 
     Cycles:
       2024-04-25:   5 syms,  +₹10,000  net cycle
@@ -308,10 +325,10 @@ def test_equity_curve_then_drawdown_round_trip():
 
     Starting ₹100,000:
       cycle_pnl =        [10k,    15k,    -40k,   20k]
-      equity   =         [110k,   125k,   85k,    105k]
-      cummax   =         [110k,   125k,   125k,   125k]
-      drawdown ₹ =       [0,     0,      -40k,    -20k]
-      drawdown % =       [0,     0,      -0.32,   -0.16]
+      equity   =         [100k,   110k,   125k,   85k,    105k]   ← prepend
+      cummax   =         [100k,   110k,   125k,   125k,   125k]
+      drawdown ₹ =       [0,     0,      0,      -40k,    -20k]
+      drawdown % =       [0,     0,      0,      -0.32,   -0.16]
       max DD ₹ =         ₹40,000
       max DD % =         32%
     """
@@ -328,12 +345,12 @@ def test_equity_curve_then_drawdown_round_trip():
 
     eq = equity_curve(pnl, starting_capital=100_000.0)
     assert eq.tolist() == pytest.approx(
-        [110_000.0, 125_000.0, 85_000.0, 105_000.0]
+        [100_000.0, 110_000.0, 125_000.0, 85_000.0, 105_000.0]
     )
 
     dd_inr = drawdown_series(eq)
     assert dd_inr.tolist() == pytest.approx(
-        [0.0, 0.0, -40_000.0, -20_000.0]
+        [0.0, 0.0, 0.0, -40_000.0, -20_000.0]
     )
     assert abs(dd_inr.min()) == pytest.approx(40_000.0)
 
@@ -341,9 +358,39 @@ def test_equity_curve_then_drawdown_round_trip():
     # cycle 3 underwater = -40k / 125k = -0.32
     # cycle 4 underwater = -20k / 125k = -0.16
     assert dd_pct.tolist() == pytest.approx(
-        [0.0, 0.0, -0.32, -0.16], abs=1e-9
+        [0.0, 0.0, 0.0, -0.32, -0.16], abs=1e-9
     )
     assert abs(dd_pct.min()) == pytest.approx(0.32)
+
+
+def test_equity_curve_prepend_catches_drawdown_from_negative_first_cycle():
+    """LOAD-BEARING regression for reviewer 70dc408 grill.
+
+    Without the prepend fix (the original Option-b shipped at
+    76549ab), this 3-cycle portfolio reported max DD ₹0 — but
+    the true peak was the starting capital (₹100k) and the book
+    dipped to ₹75k after cycle 1. Reviewer flagged the ₹25k
+    miss empirically; this test pins the post-fix behavior so
+    a future revert can't sneak the bug back in.
+
+    Cycles:                                  -25k, +5k, +10k
+    Starting ₹100k:
+      equity (prepended) = [100k, 75k, 80k, 90k]
+      cummax             = [100k, 100k, 100k, 100k]
+      DD ₹               = [0, -25k, -20k, -10k]
+      max DD ₹           = 25,000 ← THE BUG FIX RESULT
+
+    Without prepend (Option-b):
+      equity = [75k, 80k, 90k]; cummax = [75k, 80k, 90k]
+      DD     = [0, 0, 0]; max DD = 0  ← BUG
+    """
+    pnl = pd.Series([-25_000.0, 5_000.0, 10_000.0])
+    eq = equity_curve(pnl, starting_capital=100_000.0)
+    dd = drawdown_series(eq)
+    assert abs(dd.min()) == pytest.approx(25_000.0)
+    assert dd.tolist() == pytest.approx(
+        [0.0, -25_000.0, -20_000.0, -10_000.0]
+    )
 
 
 # ============================================================
