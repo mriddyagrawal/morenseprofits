@@ -25599,3 +25599,149 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of 5f8af50 — `feat(p9.3.regime_x_ivp_diagnostic)` — ✅ ACCEPT (closes Phase 9.3)
+
+**Verdict: ✅ ACCEPT.** F19 2-D regime×IVP diagnostic — the canonical empirical test of whether the IVP edge survives the regime gate (memoir §18.4 + §18.5 — "non-negotiable" per §15 #15). Clean implementation: full retrospective qcut for THIS diagnostic with the look-ahead caveat pinned loudly (live filter MUST use trailing-only boundaries per §F5); thin-bucket quintile fallback per §F19; surface-the-count contract via `caveat_text()`; 4 stats per cell (count + mean + median + CVaR-5%). 1199 passed; 15 new tests; **Phase 9.3 CLOSED** (3/3 commits).
+
+### Pipeline verification
+
+```
+Per trade:
+  1. regime_state at entry_date (memoized by unique date)
+  2. IVP[symbol].asof(entry_date) — non-trading day rounds DOWN
+  3. qcut bucket (with thin-bucket quintile fallback)
+  4. groupby(regime_state, ivp_bucket).agg([count, mean, median, cvar_5])
+```
+
+✓ Matches memoir §F19 spec verbatim. Memoization on regime (line 299-307) is a smart perf detail — many trades in a portfolio share entry_dates, so unique-date lookup vs per-row lookup matters.
+
+### Look-ahead caveat pinned loudly (the load-bearing call)
+
+Module docstring lines 26-39:
+> "pd.qcut uses the FULL retrospective sample for decile boundaries. CORRECT for THIS diagnostic — we WANT to see how trades grouped by their TRUE IVP percentile performed in retrospect. But the resulting boundaries MUST NOT be used for LIVE trade selection... Using full-sample boundaries live = peeking at future periods = backtest fraud. The diagnostic and the live filter are two different operations."
+
+Plus a functional test (`test_look_ahead_caveat_functional_pin` per body) that exercises different-length IVP histories without crashing — the qcut is on the full sample, confirmed via behavior.
+
+**This is exactly the discipline §F19's 2026-06-04 caveat block required.** Future contributor copy-pasting this code into a live filter trips both the docstring and a memoir reference.
+
+### CVaR-5% math verified
+
+`_cvar_5` (lines 138-145): `nsmallest(n_tail).mean()` where `n_tail = max(1, int(N × 0.05))`. Hand-checkable:
+- 100 trades range[-50, 49] → 5% tail = 5 trades = [-50, -49, -48, -47, -46]
+- mean = -240/5 = **-48.0** ✓ matches BUILDER's `test_cvar_5_pins_exact_tail_mean` claim
+- N=10: max(1, int(10×0.05)) = max(1, 0) = 1 — at least 1 trade ✓ defensive on small samples
+
+### Thin-bucket fallback discipline
+
+`_bucket_with_thin_fallback` (lines 170-205):
+1. Try qcut at n_buckets (10).
+2. If any bucket < threshold (50), re-run at fallback_n (5).
+3. If qcut raises ValueError (degenerate distribution), return NaN labels.
+4. `duplicates="drop"` lets qcut silently produce fewer buckets on tied edges.
+
+**One-shot fallback** — if quintiles are ALSO thin, no further fallback. Matches memoir §F19 spec (fall back to quintiles, period). Operator triages from the count column if cells remain thin.
+
+### NaN handling — surface-the-count
+
+```python
+valid_mask = ivp_values.notna() & regime_labels.notna()
+n_dropped = int((~valid_mask).sum())
+```
+
+Trades with NaN IVP at entry / NaN regime / pre-series entry_date are excluded AND counted in `n_trades_dropped`. `caveat_text()` joins (fallback notice, drop count) with `"; "` for UI banner display. Empty string when nothing's worth surfacing — operator can `if r.caveat_text(): show_it` idiom (same as earnings_filter).
+
+### `RegimeIvpBreakdown` dataclass — frozen + structured
+
+`table` (multi-indexed by `[regime_state, ivp_bucket]`) + 4 metadata fields + `n_trades_total` property + `caveat_text()` method. Frozen → safe to thread through caller code without defensive copy.
+
+### Live smoke verification
+
+```
+340 short_straddle trades × 5 blue-chips × 3 entry offsets:
+  used: 340  dropped: 0  buckets: 5 (quintile fallback fired)
+  caveat: "quintile fallback (deciles produced bucket(s) < 50 trades)"
+```
+
+Math check: 340 trades / 10 decile-buckets / 2 regime states = 17 trades/cell on deciles → < 50 → fallback to quintiles fires. 340 / 5 / 2 = 34 trades/cell at quintiles (still < 50, but spec says one-shot fallback). ✓ Internally consistent.
+
+### Praise points
+
+- **Look-ahead caveat is the highest-leverage hazard** in any percentile-based filter, and BUILDER pinned it in 3 places: module docstring (operator-facing rationale), code comment near qcut call, and a functional test. Anti-amnesia discipline.
+- **regime_state memoization by unique date** (lines 298-307) — `entry_dates.unique()` gives ~25 unique dates for 340 trades in BUILDER's smoke, so the regime computation runs 25× instead of 340×. Free perf win.
+- **`pd.qcut(..., duplicates="drop")`** handles degenerate distributions silently (e.g., all values equal in a thin sample) — `counts.size` reflects actual bucket count, falls back to quintiles if any is thin. Defensive against real-world IVP distributions.
+- **`_empty_table()` returns canonical multi-indexed empty DataFrame** — schema-stable for downstream UI consumers that expect the MultiIndex shape.
+- **`caveat_text()` semicolon-joined** — multiple caveats (fallback + drop count) compose cleanly. Empty when clean. Same idiom as `earnings_filter`.
+- **`Series.asof(entry_date)`** for IVP lookup (line 164) — correctly rounds DOWN to the most recent trading day for non-trading entries. Matches the F5 lookup convention.
+- **`symbols = trades_df[symbol_col].astype(str).str.upper()`** (line 293) — case-normalization at input matches the d824ef8 cache uppercase fix from the opposite side. Cross-module consistency.
+- **`thin_bucket_threshold` + `cvar_fraction` + `regime_lookback_td` ALL exposed as parameters** — operator can tune the diagnostic without touching constants. Defaults pinned at module level.
+- **Frozen dataclass + properties + method** for `RegimeIvpBreakdown` — clean API surface; downstream UI code can treat it as an immutable record.
+- **Multi-index table preserves ordering** via `groupby([...], sort=True)` — deterministic output for SPECS §6c.3 byte-identical sweep contract.
+- **Tests cover ALL the load-bearing contracts**:
+  - thin-bucket fallback (LOAD-BEARING memoir §F19)
+  - NaN exclusion + count (LOAD-BEARING contract)
+  - CVaR-5% exact tail mean
+  - look-ahead caveat functional pin
+  - caveat_text empty vs surfaces
+  - multi-index contract + column set
+  - count column sums to n_trades_used (internal consistency drift detector)
+
+### Tiny notes (NOT grills)
+
+- **NaN-regime path is unreachable given `analytics.regime.regime_state`** — that function always returns "ON" or "OFF" (the NaN→OFF guard we ratified at 70ae5f8). So `regime_labels.notna()` never drops on regime grounds in practice. Defensive code that never fires; docstring slightly over-promises NaN-regime drops. Verified by smoke: 340 trades → 0 dropped — IVP-NaN didn't fire either (every symbol+date had a valid IVP cached). Doesn't affect correctness.
+- **Quintile fallback is one-shot** — if quintiles are ALSO thin (e.g., 340 / 5 / 2 = 34 trades/cell, still < 50), no further fallback. Matches spec. `caveat_text` doesn't surface "thin quintiles" separately; operator reads the count column. Could enhance caveat in future to surface "even quintile buckets thin", but not in scope here.
+- **`grouped_df.dropna(subset=["ivp_bucket"])`** (line 351) — defensive against qcut returning NaN labels. With `duplicates="drop"` this shouldn't happen for non-NaN inputs, but the guard keeps the schema clean.
+
+### Math + arithmetic
+
+- LOC: 394 (regime_ivp_diagnostic.py) + 307 (test) = +701 net. ✓ Matches `git show --stat`.
+- Tests: 1184 → 1199 (+15). ✓ Matches BUILDER's claim exactly.
+- 71 tests in Phase 9.3 stack (27 aggregator + 28 metrics + 15 diagnostic + 1 overlap; BUILDER says 71 total including overlaps).
+
+### State-of-tree
+
+- `main` HEAD: `5f8af50`.
+- **Phase 9.3 CLOSED** (3/3 commits): aggregator → metrics + Option-a fix → diagnostic.
+- Backend math complete for v1 Portfolio Foundation:
+  - F1-F11 (Phases 1-8 + 9.1-9.2)
+  - F12-F14 aggregator (9.3.1)
+  - F15-F18 metrics (9.3.2)
+  - F19 diagnostic (9.3.3) ← this
+- Phase 9.5 Inspect tab already shipped. Phase 9.4 Portfolio tab UI is the next operator-facing surface.
+
+### Open grills (cumulative)
+
+- No new grills.
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update; informally noted; B.4 Caveat covers operationally).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+None required. The diagnostic is consumed by the Phase 9.4 Portfolio tab; the operator-facing surface is what evaluates "does IVP add signal beyond regime?"
+
+### Next-commit suggestion
+
+Per BUILDER's stated next: **Phase 9.4 Portfolio tab UI** (10 commits). This is the operator-facing surface that consumes the entire 9.1-9.3 backend stack:
+- Stat strip (uses metrics F15-F18)
+- Equity curve chart (uses F13 + Option-a prepend)
+- Drawdown chart (uses F14)
+- 2-D regime×IVP diagnostic table (uses F19)
+- Sidebar regime/IVP/earnings/liquidity filter banners (uses Phase 9.2 outputs)
+- Portfolio→Inspect deeplink writer (consumes `clear_inspect_state()` from b52386d)
+
+The session memory entry `feedback_next_commit_suggestion` (de-risk biggest unknown first) would suggest starting with the deeplink writer's contract test against `clear_inspect_state()` since that's the cross-phase coupling point most likely to surface unexpected behavior under operator-driven flows.
+
+But BUILDER may have a different sequencing in mind for Phase 9.4. Standing by for the first 9.4 commit to determine the recommended order.
+
+Migration cadence
+
+**... → P9.3 aggregator ⚠️ → metrics + fix ✓ → P9.3.3 F19 diagnostic ✓ (PHASE 9.3 CLOSED) → P9.4 Portfolio tab UI (10 commits) → P9.6 India VIX → regime gate v2 → ...**
+
+Standing by.
+
+---
