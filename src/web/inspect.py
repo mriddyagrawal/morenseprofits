@@ -217,29 +217,55 @@ def _read_url_params() -> dict:
 
 
 def _initialize_session_state(df: pd.DataFrame) -> None:
-    """Seed Inspect's private session state on first render.
+    """Seed Inspect's private session state on FIRST RENDER ONLY.
 
-    Precedence: URL params (deeplink) > existing session state
-    (sticky across reruns) > cascading defaults (per §24.8).
+    Precedence on first render: URL params (deeplink) > cascading
+    defaults (per §24.8). After first render, the selectbox widgets in
+    ``_render_selectors`` own their keys via Streamlit's widget binding;
+    that function's pre-clip pattern handles validity on every render,
+    so re-seeding here would only clobber user clicks.
 
-    The cascading-validity snap is applied last so the final session
-    state is ALWAYS a valid 5-tuple in the sweep grid (or None for an
-    empty frame)."""
+    Why first-render-only (closes 7aef085 GRILL 1, "URL-precedence
+    locks user clicks post-deeplink"): the previous ``url.get(k) or
+    session_state.get(k)`` pattern made URL always win when present.
+    Sequence that exposed the bug:
+
+      1. Operator opens ``?strategy=A&...`` deeplink.
+      2. First render: URL ``A`` wins → ``session_state.strategy = A``.
+      3. Operator clicks the strategy selectbox to ``B`` → widget
+         binding writes ``session_state.strategy = B`` and triggers
+         rerun.
+      4. Rerun: this function ran again. URL still has ``A`` (Streamlit
+         doesn't auto-clear ``st.query_params``). ``A or B`` → ``A``
+         wins → clobbers operator's click.
+
+    Mirrors ``app.py``'s tab-routing seed:
+
+        if "mp_active_tab" not in st.session_state:
+            st.session_state["mp_active_tab"] = url_tab
+
+    The cascading-validity snap is still applied (so a malformed
+    deeplink lands on a real sweep row), but only at seed time.
+
+    Phase 9.4 / future deeplink writers MUST call
+    ``clear_inspect_state()`` immediately before ``st.rerun()`` so a
+    fresh URL is honored. Reaching into ``mp_inspect_*`` keys directly
+    would violate the §24.9 contract that session-state is private to
+    this module.
+    """
+    if _SS_STRATEGY in st.session_state:
+        # Already seeded; widget binding owns the keys from here.
+        return
+
     url = _read_url_params()
-
-    strategy = url.get("strategy") or st.session_state.get(_SS_STRATEGY)
-    symbol = url.get("symbol") or st.session_state.get(_SS_SYMBOL)
-    expiry = url.get("expiry")
-    if expiry is None:
-        expiry = st.session_state.get(_SS_EXPIRY)
-    entry = url.get("entry_offset_td")
-    if entry is None:
-        entry = st.session_state.get(_SS_ENTRY)
-    exit_ = url.get("exit_offset_td")
-    if exit_ is None:
-        exit_ = st.session_state.get(_SS_EXIT)
-
-    snapped = _snap_to_valid(df, strategy, symbol, expiry, entry, exit_)
+    snapped = _snap_to_valid(
+        df,
+        url.get("strategy"),
+        url.get("symbol"),
+        url.get("expiry"),
+        url.get("entry_offset_td"),
+        url.get("exit_offset_td"),
+    )
     if snapped is None:
         return
     s, sym, exp, en, ex = snapped
@@ -248,6 +274,28 @@ def _initialize_session_state(df: pd.DataFrame) -> None:
     st.session_state[_SS_EXPIRY] = exp
     st.session_state[_SS_ENTRY] = en
     st.session_state[_SS_EXIT] = ex
+
+
+def clear_inspect_state() -> None:
+    """Drop Inspect's private session-state keys so the next render
+    re-seeds from URL.
+
+    Public helper for deeplink writers (Phase 9.4 Portfolio → Inspect,
+    any future source). Lets them write new ``st.query_params`` + call
+    ``st.rerun()`` without violating the §24.9 contract that
+    ``mp_inspect_*`` keys are private to this module.
+
+    Usage in a deeplink writer:
+
+        for k, v in deeplink_url_params.items():
+            st.query_params[k] = v
+        st.query_params["tab"] = "Inspect"
+        from src.web.inspect import clear_inspect_state
+        clear_inspect_state()
+        st.rerun()
+    """
+    for k in _PRIVATE_SS_KEYS:
+        st.session_state.pop(k, None)
 
 
 # ============================================================

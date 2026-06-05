@@ -220,6 +220,107 @@ def test_read_url_params_drops_unparseable_date(monkeypatch):
 
 
 # ============================================================
+# 7aef085 GRILL 1 regression — URL-precedence locks user clicks
+# ============================================================
+
+def test_user_click_overrides_deeplink_on_subsequent_render(
+    fixture_sweep, monkeypatch,
+):
+    """Regression test for 7aef085 GRILL 1.
+
+    The previous ``url.get(k) or session_state.get(k)`` pattern in
+    ``_initialize_session_state`` made the URL always win on every
+    render, clobbering the operator's selectbox clicks because
+    ``st.query_params`` doesn't auto-clear after a deeplink load.
+
+    Sequence:
+      1. Deeplink URL: strategy=short_strangle.
+      2. First call to ``_initialize_session_state`` seeds session
+         state from URL → strategy = short_strangle.
+      3. Operator clicks the strategy selectbox → Streamlit's widget
+         binding writes session_state.strategy = short_straddle.
+      4. Rerun → ``_initialize_session_state`` runs again.
+      5. URL still has strategy=short_strangle (no auto-clear).
+      6. With the fix (first-render-only seed) session_state stays
+         short_straddle. Without the fix, it gets clobbered.
+    """
+    import src.web.inspect as ins
+
+    fake_ss: dict = {}
+    monkeypatch.setattr(ins.st, "session_state", fake_ss)
+    _stub_query_params(
+        monkeypatch,
+        strategy="short_strangle", symbol="RELIANCE",
+    )
+
+    # First render: URL seeds session state.
+    ins._initialize_session_state(fixture_sweep)
+    assert fake_ss[ins._SS_STRATEGY] == "short_strangle"
+
+    # Operator click: widget binding writes new value to session state.
+    # (URL stays at short_strangle — Streamlit doesn't auto-clear it.)
+    fake_ss[ins._SS_STRATEGY] = "short_straddle"
+
+    # Rerun: _initialize_session_state runs again. With first-render-
+    # only guard, URL is ignored and the operator's click stands.
+    ins._initialize_session_state(fixture_sweep)
+    assert fake_ss[ins._SS_STRATEGY] == "short_straddle", (
+        "operator's selectbox click was clobbered by stale URL param "
+        "on the second render — 7aef085 GRILL 1 regression"
+    )
+
+
+def test_clear_inspect_state_drops_private_keys_only(monkeypatch):
+    """``clear_inspect_state()`` is the public helper for deeplink
+    writers per §24.9. It must remove all 5 private inspect keys, and
+    must NOT touch unrelated session-state keys."""
+    import src.web.inspect as ins
+
+    fake_ss: dict = {
+        ins._SS_STRATEGY: "short_strangle",
+        ins._SS_SYMBOL: "RELIANCE",
+        ins._SS_EXPIRY: pd.Timestamp("2026-04-28"),
+        ins._SS_ENTRY: 15,
+        ins._SS_EXIT: 3,
+        # Unrelated keys that MUST NOT be cleared.
+        "mp_active_tab": "Inspect",
+        "mp_selected_sweep": "test_sweep.parquet",
+        "_unrelated_user_key": "preserved",
+    }
+    monkeypatch.setattr(ins.st, "session_state", fake_ss)
+    ins.clear_inspect_state()
+    for k in ins._PRIVATE_SS_KEYS:
+        assert k not in fake_ss, f"{k!r} should have been cleared"
+    assert fake_ss["mp_active_tab"] == "Inspect"
+    assert fake_ss["mp_selected_sweep"] == "test_sweep.parquet"
+    assert fake_ss["_unrelated_user_key"] == "preserved"
+
+
+def test_clear_then_seed_picks_up_new_url(fixture_sweep, monkeypatch):
+    """End-to-end for the deeplink-rewrite flow Phase 9.4 will use:
+    a fresh URL + ``clear_inspect_state()`` + re-call seed → new URL
+    wins. Closes the question "how do future deeplink writers force
+    Inspect to re-read the URL?" raised by the first-render-only guard.
+    """
+    import src.web.inspect as ins
+
+    fake_ss: dict = {}
+    monkeypatch.setattr(ins.st, "session_state", fake_ss)
+
+    # First deeplink: strategy=short_strangle.
+    _stub_query_params(monkeypatch, strategy="short_strangle")
+    ins._initialize_session_state(fixture_sweep)
+    assert fake_ss[ins._SS_STRATEGY] == "short_strangle"
+
+    # Second deeplink (simulated by Portfolio): writes new URL +
+    # clears Inspect state + reruns.
+    _stub_query_params(monkeypatch, strategy="short_straddle")
+    ins.clear_inspect_state()
+    ins._initialize_session_state(fixture_sweep)
+    assert fake_ss[ins._SS_STRATEGY] == "short_straddle"
+
+
+# ============================================================
 # Stat strip — values round-trip from a known sweep row
 # ============================================================
 
