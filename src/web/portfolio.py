@@ -448,6 +448,176 @@ _CONCENTRATION_TOP_K_SYMBOLS = 15
 _CORRELATION_PLOT_HEIGHT_PX = 360
 
 
+def _per_decile_metrics(
+    trades_df: pd.DataFrame,
+    ivp_per_sym: dict[str, pd.Series],
+    *,
+    n_buckets: int = 10,
+) -> pd.DataFrame:
+    """Per-IVP-decile metrics for the sensitivity strip.
+
+    For each decile (0..n_buckets-1):
+      - Filter trades whose entry-day IVP falls in that decile.
+      - Compute cycle P&L → equity → metrics on the slice.
+      - Record (count, median_pnl, calmar, max_dd, cvar_5_pnl).
+
+    Per memoir §2.5 + §F19 caveat: qcut uses the FULL retrospective
+    sample, correct for THIS retrospective sensitivity scan but
+    NOT for live filtering.
+
+    Args:
+        trades_df: per-trade frame already config-filtered.
+        ivp_per_sym: per-symbol IVP series from
+            ``_build_ivp_per_symbol``.
+        n_buckets: 10 deciles (default) or 5 quintiles for thin
+            data — caller can override.
+
+    Returns:
+        DataFrame with columns:
+          decile, count, median_pnl, calmar, max_dd_inr,
+          cvar_5_pnl.
+        One row per non-empty decile.
+    """
+    if trades_df.empty or not ivp_per_sym:
+        return pd.DataFrame(columns=[
+            "decile", "count", "median_pnl", "calmar",
+            "max_dd_inr", "cvar_5_pnl",
+        ])
+    # Per-trade IVP lookup (same logic as the diagnostic function).
+    entry_dates = pd.to_datetime(trades_df["entry_date"])
+    symbols = trades_df["symbol"].astype(str).str.upper()
+    ivps: list[float] = []
+    for sym, d in zip(symbols, entry_dates):
+        s = ivp_per_sym.get(sym)
+        if s is None or s.empty:
+            ivps.append(float("nan"))
+            continue
+        try:
+            v = s.asof(d)
+        except (TypeError, KeyError):
+            v = float("nan")
+        ivps.append(float(v) if pd.notna(v) else float("nan"))
+    ivp_series = pd.Series(ivps, index=trades_df.index, dtype="float64")
+    valid_mask = ivp_series.notna()
+    if not valid_mask.any():
+        return pd.DataFrame(columns=[
+            "decile", "count", "median_pnl", "calmar",
+            "max_dd_inr", "cvar_5_pnl",
+        ])
+
+    valid_trades = trades_df[valid_mask].copy()
+    valid_ivp = ivp_series[valid_mask]
+    try:
+        deciles = pd.qcut(
+            valid_ivp, q=n_buckets, labels=False, duplicates="drop",
+        )
+    except ValueError:
+        return pd.DataFrame(columns=[
+            "decile", "count", "median_pnl", "calmar",
+            "max_dd_inr", "cvar_5_pnl",
+        ])
+    valid_trades["ivp_bucket"] = deciles.values
+
+    rows: list[dict] = []
+    for bucket, sub in valid_trades.dropna(subset=["ivp_bucket"]).groupby(
+        "ivp_bucket", sort=True,
+    ):
+        bucket = int(bucket)
+        pnl = cycle_pnl_series(sub)
+        if pnl.empty:
+            continue
+        eq = equity_curve(pnl, starting_capital=_DEFAULT_STARTING_CAPITAL)
+        dd = drawdown_series(eq)
+        n_tail = max(1, int(len(pnl) * 0.05))
+        cvar = float(pnl.nsmallest(n_tail).mean())
+        rows.append({
+            "decile": bucket,
+            "count": int(len(sub)),
+            "median_pnl": float(pnl.median()),
+            "calmar": calmar(eq),
+            "max_dd_inr": max_drawdown_inr(eq),
+            "cvar_5_pnl": cvar,
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_ivp_sensitivity_strip(df_filtered: pd.DataFrame) -> None:
+    """4-panel sensitivity strip: median P&L / Calmar / max DD /
+    CVaR-5% as functions of IVP decile.
+
+    Memoir §2.5 + PLAN.md Phase 9.4.8. Lets the operator scan
+    "where is the IVP sweet spot?" empirically — if the 80-100
+    deciles produce the best Calmar without hurting CVaR, that's
+    the empirical default to ship.
+
+    Cold cache / empty filter → skip silently.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        return
+
+    st.markdown("##### IVP-decile sensitivity")
+    with st.spinner("Bucketing trades by entry-day IVP..."):
+        ivp_per_sym = _build_ivp_per_symbol(sub)
+    if not ivp_per_sym:
+        st.caption(
+            "_No per-symbol IVP cache available. Run the IV "
+            "materializer first._"
+        )
+        return
+
+    metrics = _per_decile_metrics(sub, ivp_per_sym)
+    if metrics.empty:
+        st.caption(
+            "_Insufficient trades with valid IVP for the "
+            "sensitivity scan._"
+        )
+        return
+
+    # 2×2 grid of small line charts (median / Calmar / max DD /
+    # CVaR-5%). Each maps decile (x) → metric value (y).
+    c1, c2 = st.columns(2)
+    c3, c4 = st.columns(2)
+    panels = [
+        (c1, "Median cycle P&L", "median_pnl",
+            "Higher is better. Per-decile median cycle P&L.",
+        ),
+        (c2, "Calmar", "calmar",
+            "Higher is better. Simple-annualized return / max DD %.",
+        ),
+        (c3, "Max DD ₹", "max_dd_inr",
+            "Lower is better. Peak-to-trough rupee loss.",
+        ),
+        (c4, "CVaR-5% (cycle P&L)", "cvar_5_pnl",
+            "Higher is better. Mean of worst-5% cycle outcomes.",
+        ),
+    ]
+    for col, label, key, help_text in panels:
+        with col:
+            fig = go.Figure(go.Scatter(
+                x=metrics["decile"], y=metrics[key],
+                mode="lines+markers",
+                line=dict(width=2),
+                hovertemplate=(
+                    "decile %{x}<br>" + label + ": %{y:,.2f}<extra></extra>"
+                ),
+            ))
+            fig.update_layout(
+                height=220,
+                margin=dict(l=10, r=10, t=30, b=10),
+                title=label,
+                xaxis_title="IVP decile",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+    st.caption(
+        "Pick the decile range that maximizes Calmar / CVaR-5% "
+        "without exploding max DD. Memoir §2.5 + §F19: qcut uses "
+        "FULL-SAMPLE boundaries (retrospective only); live filter "
+        "needs trailing-only boundaries (memoir §F5)."
+    )
+
+
 def _build_regime_signal_for_window(
     trades_df: pd.DataFrame,
 ) -> pd.Series:
@@ -1210,3 +1380,4 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     _render_worst_10_cycles(df_filtered)
     _render_concentration_correlation(df_filtered)
     _render_regime_x_ivp_diagnostic(df_filtered)
+    _render_ivp_sensitivity_strip(df_filtered)

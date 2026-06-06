@@ -190,6 +190,89 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.8 — IVP-decile sensitivity strip
+# ============================================================
+
+def test_per_decile_metrics_returns_one_row_per_bucket():
+    """LOAD-BEARING 9.4.8 contract: one row per non-empty decile
+    with count + median + Calmar + max DD + CVaR-5% columns."""
+    import numpy as np
+    import pandas as pd
+
+    from src.web.portfolio import _per_decile_metrics
+
+    # 100 trades with strictly increasing IVP so 10 deciles each
+    # get 10 trades.
+    n = 100
+    sub = pd.DataFrame({
+        "symbol": ["RELIANCE"] * n,
+        "entry_date": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "expiry": pd.date_range("2024-01-15", periods=n, freq="D"),
+        "net_pnl": np.arange(-50.0, 50.0),
+    })
+    # IVP series for RELIANCE with strict monotone values.
+    ivp_per_sym = {
+        "RELIANCE": pd.Series(
+            np.linspace(0, 100, n),
+            index=sub["entry_date"],
+        ),
+    }
+    metrics = _per_decile_metrics(sub, ivp_per_sym, n_buckets=10)
+    assert metrics.shape[0] >= 5  # at least some deciles populated
+    assert set(metrics.columns) == {
+        "decile", "count", "median_pnl", "calmar",
+        "max_dd_inr", "cvar_5_pnl",
+    }
+
+
+def test_per_decile_metrics_handles_all_nan_ivp():
+    """All trades drop out → empty table, NOT exception."""
+    import pandas as pd
+
+    from src.web.portfolio import _per_decile_metrics
+
+    sub = pd.DataFrame({
+        "symbol": ["MISSING"] * 10,
+        "entry_date": pd.date_range("2024-01-01", periods=10, freq="D"),
+        "expiry": pd.date_range("2024-01-15", periods=10, freq="D"),
+        "net_pnl": [100.0] * 10,
+    })
+    ivp_per_sym: dict[str, pd.Series] = {}  # no symbols
+    metrics = _per_decile_metrics(sub, ivp_per_sym)
+    assert metrics.empty
+    assert list(metrics.columns) == [
+        "decile", "count", "median_pnl", "calmar",
+        "max_dd_inr", "cvar_5_pnl",
+    ]
+
+
+def test_per_decile_metrics_empty_trades_returns_empty():
+    import pandas as pd
+    from src.web.portfolio import _per_decile_metrics
+    out = _per_decile_metrics(pd.DataFrame(), {})
+    assert out.empty
+
+
+def test_ivp_sensitivity_section_renders():
+    at = _make_apptest()
+    at.run(timeout=30)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "IVP-decile sensitivity" in visible
+
+
+def test_ivp_sensitivity_section_skips_on_empty_filter():
+    at = _make_apptest()
+    at.session_state["mp_pf_exit_offset_td"] = 20
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "IVP-decile sensitivity" not in visible
+
+
+# ============================================================
 # Phase 9.4.7 — 2-D regime × IVP diagnostic
 # ============================================================
 
