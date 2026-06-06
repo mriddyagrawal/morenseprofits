@@ -51,6 +51,14 @@ from src.analytics.portfolio import (
     drawdown_series,
     equity_curve,
 )
+from src.analytics.portfolio_metrics import (
+    calmar,
+    cycle_returns,
+    max_drawdown_inr,
+    simple_annualized_return,
+    sortino,
+    ulcer_index,
+)
 from src.analytics.regime import (
     current_regime_state,
     default_regime_signal,
@@ -423,6 +431,134 @@ def _regime_off_cycle_dates(
     return off_cycles
 
 
+def _fmt_inr_compact(value: float) -> str:
+    """Indian rupee compact formatter — ₹1L for lakh, ₹1Cr for crore.
+    Per the mockup convention so the headline strip's cards fit in
+    one line on a typical-width screen."""
+    if pd.isna(value):
+        return "—"
+    sign = "-" if value < 0 else ""
+    a = abs(value)
+    if a >= 1e7:
+        return f"{sign}₹{a / 1e7:.2f}Cr"
+    if a >= 1e5:
+        return f"{sign}₹{a / 1e5:.2f}L"
+    if a >= 1e3:
+        return f"{sign}₹{a / 1e3:.1f}k"
+    return f"{sign}₹{a:.0f}"
+
+
+def _fmt_ratio(value: float, *, decimals: int = 2) -> str:
+    """Calmar / Sortino / Ulcer formatter. Renders inf cleanly."""
+    if pd.isna(value):
+        return "—"
+    if value == float("inf"):
+        return "∞"
+    if value == float("-inf"):
+        return "-∞"
+    return f"{value:.{decimals}f}"
+
+
+def _render_headline_strip(df_filtered: pd.DataFrame) -> None:
+    """6-card headline metrics strip per memoir §4 + mockup §A.
+
+    Cards: Total return / Calmar / Ulcer / Sortino / Max DD ₹ /
+    Worst cycle. Win-rate + avg-positions land in Phase 9.4.9
+    cycle drilldown (which has the candidate-selection pipeline
+    needed for per-cycle position counts).
+
+    Renders an empty-state info banner when the strategy config
+    matches no cycles — mirrors _render_equity_curve's degrade-
+    gracefully contract.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        # Equity curve already rendered the explanatory banner;
+        # don't double-render here. Just skip silently.
+        return
+
+    pnl = cycle_pnl_series(sub)
+    if pnl.empty:
+        return
+
+    eq = equity_curve(pnl, starting_capital=_DEFAULT_STARTING_CAPITAL)
+    rets = cycle_returns(pnl, _DEFAULT_STARTING_CAPITAL)
+
+    # Metrics. Each metric handles its own empty-input → NaN /
+    # 0.0 fallback per the analytics layer's contract.
+    total_return_inr = float(eq.iloc[-1]) - _DEFAULT_STARTING_CAPITAL
+    ann_return = simple_annualized_return(eq)
+    calmar_val = calmar(eq)
+    ulcer_val = ulcer_index(eq)
+    sortino_val = sortino(rets)
+    max_dd_val = max_drawdown_inr(eq)
+    worst_cycle = float(pnl.min())
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        st.metric(
+            "Total return",
+            _fmt_inr_compact(total_return_inr),
+            delta=(
+                f"{ann_return * 100:+.2f}%/yr (simple)"
+                if not pd.isna(ann_return) else None
+            ),
+            help=(
+                "Total absolute ₹ return + simple annualized "
+                "rate. Memoir §21.4 F15 REVISED — additive sizing "
+                "implies simple, NOT geometric CAGR."
+            ),
+        )
+    with c2:
+        st.metric(
+            "Calmar",
+            _fmt_ratio(calmar_val),
+            help=(
+                "Simple annualized return / max DD %. Higher = "
+                "better return per unit of pain. Memoir §21.4 F15."
+            ),
+        )
+    with c3:
+        st.metric(
+            "Ulcer",
+            _fmt_ratio(ulcer_val),
+            help=(
+                "RMS of underwater drawdown %. Lower = better. "
+                "Penalizes BOTH depth and duration. Memoir §21.4 F16."
+            ),
+        )
+    with c4:
+        st.metric(
+            "Sortino",
+            _fmt_ratio(sortino_val),
+            help=(
+                "Annualized excess return / target-downside-"
+                "deviation. Higher = better. Memoir §21.4 F17 "
+                "REVISED — N_total denominator, (r−target)² "
+                "squared term."
+            ),
+        )
+    with c5:
+        st.metric(
+            "Max DD ₹",
+            _fmt_inr_compact(-max_dd_val) if max_dd_val > 0 else "₹0",
+            help=(
+                "Peak-to-trough rupee loss. Memoir §21.4 F18. "
+                "Positive ₹ amount shown with leading minus."
+            ),
+        )
+    with c6:
+        st.metric(
+            "Worst cycle",
+            _fmt_inr_compact(worst_cycle),
+            help=(
+                "Single worst cycle's P&L. Operator-facing tail "
+                "signal beyond the smoothed Calmar / Ulcer / "
+                "Sortino numbers."
+            ),
+        )
+
+
 def _render_equity_curve(df_filtered: pd.DataFrame) -> None:
     """Equity curve + underwater drawdown subplot per memoir
     §4 + §21.4 F13 + F14. Regime-OFF cycles rendered as gray
@@ -567,4 +703,5 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     st.markdown("---")
     _render_strategy_config()
     st.markdown("---")
+    _render_headline_strip(df_filtered)
     _render_equity_curve(df_filtered)

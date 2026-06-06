@@ -190,6 +190,66 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.3 — headline metrics strip
+# ============================================================
+
+def test_headline_strip_renders_six_metric_cards():
+    """LOAD-BEARING 9.4.3 contract: 6 st.metric cards above the
+    equity curve when the strategy config matches data."""
+    at = _make_apptest()
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    # st.metric widgets exposed via at.metric.
+    metric_labels = [m.label for m in at.metric]
+    expected = {"Total return", "Calmar", "Ulcer", "Sortino",
+                "Max DD ₹", "Worst cycle"}
+    missing = expected - set(metric_labels)
+    assert not missing, (
+        f"headline strip missing cards: {missing}; got {metric_labels}"
+    )
+
+
+def test_headline_strip_skips_silently_on_empty_filter():
+    """When the strategy config matches nothing, the headline strip
+    skips silently (the equity_curve already rendered the
+    explanatory banner; double-rendering would be noise)."""
+    at = _make_apptest()
+    at.session_state["mp_pf_exit_offset_td"] = 20  # empty path
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    metric_labels = [m.label for m in at.metric]
+    # None of the headline-strip card labels should appear.
+    forbidden = {"Total return", "Calmar", "Ulcer", "Sortino",
+                 "Max DD ₹", "Worst cycle"}
+    assert not (set(metric_labels) & forbidden), (
+        f"headline strip leaked under empty filter: {metric_labels}"
+    )
+
+
+def test_fmt_inr_compact_handles_lakh_crore_thousand():
+    """Pin the formatter so the headline strip doesn't drift."""
+    from src.web.portfolio import _fmt_inr_compact
+    assert _fmt_inr_compact(50_000) == "₹50.0k"
+    assert _fmt_inr_compact(150_000) == "₹1.50L"
+    assert _fmt_inr_compact(2_500_000) == "₹25.00L"
+    assert _fmt_inr_compact(15_000_000) == "₹1.50Cr"
+    assert _fmt_inr_compact(-150_000) == "-₹1.50L"
+    assert _fmt_inr_compact(float("nan")) == "—"
+
+
+def test_fmt_ratio_handles_inf_and_nan():
+    """Calmar can return inf on monotone-up curves; Sortino can
+    return inf on no-downside. Both render cleanly."""
+    from src.web.portfolio import _fmt_ratio
+    assert _fmt_ratio(1.234) == "1.23"
+    assert _fmt_ratio(float("inf")) == "∞"
+    assert _fmt_ratio(float("-inf")) == "-∞"
+    assert _fmt_ratio(float("nan")) == "—"
+
+
+# ============================================================
 # Phase 9.4.2 — equity curve + drawdown subplot
 # ============================================================
 
