@@ -84,6 +84,7 @@ _SS_REGIME_GATE = "mp_pf_regime_gate"
 _SS_IVP_BAND = "mp_pf_ivp_band"
 _SS_EARNINGS_FILTER = "mp_pf_earnings_filter"
 _SS_AS_OF = "mp_pf_as_of"
+_SS_DRILLDOWN_CYCLE = "mp_pf_drilldown_cycle"
 
 # Defaults match the mockup's pfCfg in DESIGN/Complete/app.jsx
 # lines 30-38. Override via the strategy config block UI.
@@ -96,6 +97,7 @@ _DEFAULTS: dict[str, Any] = {
     _SS_REGIME_GATE: True,
     _SS_IVP_BAND: (60, 100),
     _SS_EARNINGS_FILTER: True,
+    _SS_DRILLDOWN_CYCLE: None,
 }
 
 # Strategy display labels mirror the mockup's labels.
@@ -446,6 +448,134 @@ _ATTRIBUTION_TOP_K_SYMBOLS = 3
 # Concentration + correlation visualization sizing.
 _CONCENTRATION_TOP_K_SYMBOLS = 15
 _CORRELATION_PLOT_HEIGHT_PX = 360
+
+
+def _per_cycle_summary(sub: pd.DataFrame) -> pd.DataFrame:
+    """Per-cycle summary table: date, cycle P&L, positions count,
+    win-rate within cycle.
+
+    Returns:
+        DataFrame with columns:
+          expiry, cycle_pnl, n_positions, n_winners, win_rate_pct.
+        Sorted descending by expiry (most recent cycle first).
+    """
+    if sub.empty:
+        return pd.DataFrame(columns=[
+            "expiry", "cycle_pnl", "n_positions",
+            "n_winners", "win_rate_pct",
+        ])
+    grouped = sub.groupby("expiry")
+    out = pd.DataFrame({
+        "expiry": grouped["net_pnl"].sum().index,
+        "cycle_pnl": grouped["net_pnl"].sum().values,
+        "n_positions": grouped["symbol"].nunique().values,
+        "n_winners": grouped["net_pnl"].apply(
+            lambda x: int((x > 0).sum())
+        ).values,
+    })
+    out["win_rate_pct"] = (
+        out["n_winners"] / out["n_positions"] * 100.0
+    )
+    return out.sort_values("expiry", ascending=False).reset_index(drop=True)
+
+
+def _per_symbol_in_cycle(
+    sub: pd.DataFrame, expiry: pd.Timestamp,
+) -> pd.DataFrame:
+    """Per-symbol breakdown for ONE cycle. Sorted descending by
+    contribution so the top contributors / detractors render at
+    top.
+
+    Returns:
+        DataFrame with columns: symbol, net_pnl, roi_pct (if
+        present in source).
+    """
+    cycle = sub[sub["expiry"] == expiry]
+    if cycle.empty:
+        return pd.DataFrame(columns=["symbol", "net_pnl", "roi_pct"])
+    cols_present = [c for c in ("roi_pct",) if c in cycle.columns]
+    agg_spec = {"net_pnl": "sum"}
+    for c in cols_present:
+        agg_spec[c] = "mean"
+    out = (
+        cycle.groupby("symbol")
+             .agg(agg_spec)
+             .sort_values("net_pnl", ascending=False)
+             .reset_index()
+    )
+    return out
+
+
+def _render_cycle_drilldown(df_filtered: pd.DataFrame) -> None:
+    """Cycle table → cycle picker → per-symbol panel for the
+    selected cycle. PLAN.md Phase 9.4.9 + memoir §4 + mockup §E.
+
+    The selectbox holds the picked cycle in session state so the
+    selection persists across reruns.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        return
+
+    summary = _per_cycle_summary(sub)
+    if summary.empty:
+        return
+
+    st.markdown("##### Cycle drilldown")
+
+    # Cycle picker — default to most recent.
+    cycle_options = summary["expiry"].dt.strftime("%Y-%m-%d").tolist()
+    default_cycle = cycle_options[0]
+    if st.session_state.get(_SS_DRILLDOWN_CYCLE) not in cycle_options:
+        st.session_state[_SS_DRILLDOWN_CYCLE] = default_cycle
+    picked_str = st.selectbox(
+        "Cycle (expiry)",
+        options=cycle_options,
+        index=cycle_options.index(
+            st.session_state[_SS_DRILLDOWN_CYCLE]
+        ),
+        key=_SS_DRILLDOWN_CYCLE,
+    )
+    picked = pd.Timestamp(picked_str)
+
+    # Two-column layout: cycle summary table left, per-symbol panel right.
+    col_left, col_right = st.columns([2, 3])
+
+    with col_left:
+        disp = pd.DataFrame({
+            "Expiry": summary["expiry"].dt.strftime("%Y-%m-%d"),
+            "Cycle P&L": summary["cycle_pnl"].map(_fmt_inr_compact),
+            "Positions": summary["n_positions"],
+            "Winners": summary["n_winners"],
+            "Win %": summary["win_rate_pct"].map(
+                lambda v: f"{v:.0f}%"
+            ),
+        })
+        st.dataframe(disp, hide_index=True, width="stretch", height=350)
+
+    with col_right:
+        st.markdown(f"**Picked cycle:** {picked_str}")
+        per_sym = _per_symbol_in_cycle(sub, picked)
+        if per_sym.empty:
+            st.caption("_No trades in this cycle._")
+        else:
+            cols = {
+                "Symbol": per_sym["symbol"],
+                "Net P&L": per_sym["net_pnl"].map(_fmt_inr_compact),
+            }
+            if "roi_pct" in per_sym.columns:
+                cols["ROI %"] = per_sym["roi_pct"].map(
+                    lambda v: f"{v:+.2f}%" if pd.notna(v) else "—"
+                )
+            sym_disp = pd.DataFrame(cols)
+            st.dataframe(sym_disp, hide_index=True, width="stretch", height=350)
+
+    st.caption(
+        "Left: every cycle in the filtered view, sorted most-"
+        "recent first. Pick a cycle (left selectbox) → right "
+        "panel shows the symbols traded in that cycle with their "
+        "per-symbol P&L."
+    )
 
 
 def _per_decile_metrics(
@@ -1381,3 +1511,4 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     _render_concentration_correlation(df_filtered)
     _render_regime_x_ivp_diagnostic(df_filtered)
     _render_ivp_sensitivity_strip(df_filtered)
+    _render_cycle_drilldown(df_filtered)

@@ -190,6 +190,119 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.9 — cycle drilldown
+# ============================================================
+
+def test_per_cycle_summary_columns_and_sort():
+    """LOAD-BEARING 9.4.9 contract: per-cycle summary table
+    columns + descending-by-expiry sort."""
+    import pandas as pd
+
+    from src.web.portfolio import _per_cycle_summary
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime([
+            "2024-01-25", "2024-01-25",
+            "2024-03-28", "2024-03-28", "2024-03-28",
+            "2024-02-29", "2024-02-29",
+        ]),
+        "symbol": ["A", "B", "A", "B", "C", "A", "B"],
+        "net_pnl": [5000, -2000, 1000, -3000, 8000, 4000, 6000],
+    })
+    out = _per_cycle_summary(sub)
+    assert set(out.columns) == {
+        "expiry", "cycle_pnl", "n_positions",
+        "n_winners", "win_rate_pct",
+    }
+    # Sorted descending by expiry → most recent first.
+    assert list(out["expiry"]) == [
+        pd.Timestamp("2024-03-28"),
+        pd.Timestamp("2024-02-29"),
+        pd.Timestamp("2024-01-25"),
+    ]
+    # 2024-03-28: 1 + (-3) + 8 = 6k; 3 positions, 2 winners (A, C).
+    row = out[out["expiry"] == pd.Timestamp("2024-03-28")].iloc[0]
+    assert row["cycle_pnl"] == 6000
+    assert row["n_positions"] == 3
+    assert row["n_winners"] == 2
+
+
+def test_per_cycle_summary_empty_returns_empty():
+    import pandas as pd
+    from src.web.portfolio import _per_cycle_summary
+    out = _per_cycle_summary(pd.DataFrame(
+        columns=["expiry", "symbol", "net_pnl"]
+    ))
+    assert out.empty
+
+
+def test_per_symbol_in_cycle_filters_to_expiry():
+    import pandas as pd
+
+    from src.web.portfolio import _per_symbol_in_cycle
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime([
+            "2024-01-25", "2024-01-25",
+            "2024-02-29", "2024-02-29",
+        ]),
+        "symbol": ["A", "B", "A", "B"],
+        "net_pnl": [100, 200, 300, 400],
+    })
+    out = _per_symbol_in_cycle(sub, pd.Timestamp("2024-01-25"))
+    assert set(out["symbol"]) == {"A", "B"}
+    assert out["net_pnl"].sum() == 300  # 100 + 200
+
+
+def test_per_symbol_in_cycle_sorted_by_net_pnl_desc():
+    """Top contributor renders at top."""
+    import pandas as pd
+
+    from src.web.portfolio import _per_symbol_in_cycle
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime(["2024-01-25"] * 3),
+        "symbol": ["A", "B", "C"],
+        "net_pnl": [-100, 500, 200],
+    })
+    out = _per_symbol_in_cycle(sub, pd.Timestamp("2024-01-25"))
+    assert list(out["symbol"]) == ["B", "C", "A"]
+
+
+def test_per_symbol_in_cycle_missing_cycle_returns_empty():
+    import pandas as pd
+
+    from src.web.portfolio import _per_symbol_in_cycle
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime(["2024-01-25"]),
+        "symbol": ["A"],
+        "net_pnl": [100],
+    })
+    out = _per_symbol_in_cycle(sub, pd.Timestamp("2025-12-31"))
+    assert out.empty
+
+
+def test_cycle_drilldown_section_renders():
+    at = _make_apptest()
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Cycle drilldown" in visible
+
+
+def test_cycle_drilldown_section_skips_on_empty_filter():
+    at = _make_apptest()
+    at.session_state["mp_pf_exit_offset_td"] = 20
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Cycle drilldown" not in visible
+
+
+# ============================================================
 # Phase 9.4.8 — IVP-decile sensitivity strip
 # ============================================================
 
