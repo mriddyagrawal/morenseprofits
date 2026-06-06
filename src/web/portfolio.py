@@ -51,6 +51,7 @@ from src.analytics.portfolio import (
     drawdown_series,
     equity_curve,
 )
+from src.analytics.ivp import compute_ivp
 from src.analytics.portfolio_metrics import (
     calmar,
     cycle_returns,
@@ -58,6 +59,10 @@ from src.analytics.portfolio_metrics import (
     simple_annualized_return,
     sortino,
     ulcer_index,
+)
+from src.analytics.regime_ivp_diagnostic import (
+    RegimeIvpBreakdown,
+    regime_x_ivp_breakdown,
 )
 from src.analytics.regime import (
     current_regime_state,
@@ -441,6 +446,159 @@ _ATTRIBUTION_TOP_K_SYMBOLS = 3
 # Concentration + correlation visualization sizing.
 _CONCENTRATION_TOP_K_SYMBOLS = 15
 _CORRELATION_PLOT_HEIGHT_PX = 360
+
+
+def _build_regime_signal_for_window(
+    trades_df: pd.DataFrame,
+) -> pd.Series:
+    """Load the India VIX signal series covering the trades_df's
+    entry_date window + 252-TD backfill cushion. Memoized via
+    Streamlit cache so multi-section renders share the load.
+
+    Returns an empty Series on cold cache / loader failure — the
+    diagnostic function downstream handles empty signal cleanly.
+    """
+    if trades_df.empty:
+        return pd.Series([], dtype="float64",
+                          index=pd.DatetimeIndex([]))
+    min_date = pd.to_datetime(trades_df["entry_date"]).min().date()
+    max_date = pd.to_datetime(trades_df["entry_date"]).max().date()
+    backfill_days = int(
+        _REGIME_LOOKBACK_TD * 365 / 252,
+    ) + 30
+    from_date = min_date - timedelta(days=backfill_days)
+    try:
+        return default_regime_signal(
+            from_date, max_date, offline=True,
+        )
+    except Exception:
+        return pd.Series([], dtype="float64",
+                          index=pd.DatetimeIndex([]))
+
+
+def _build_ivp_per_symbol(
+    trades_df: pd.DataFrame,
+) -> dict[str, pd.Series]:
+    """Per-symbol IVP series indexed by entry_date.
+
+    For each unique (symbol, entry_date) pair in trades_df, calls
+    ``analytics.ivp.compute_ivp`` to get the trailing-252-TD IVP
+    rank. Symbols with no IVP cache (FileNotFoundError from
+    load_iv_history) get an empty Series — the diagnostic
+    function treats those trades as NaN-IVP and excludes them
+    from the bucketing (counted in n_trades_dropped).
+
+    The function is intentionally not @st.cache_data'd: the
+    Streamlit cache rejects DataFrame keys, and the inner
+    ``compute_ivp`` already memoizes the IV-history reads
+    per-symbol via pandas' parquet loader.
+    """
+    out: dict[str, pd.Series] = {}
+    if trades_df.empty:
+        return out
+    for sym, sub in trades_df.groupby("symbol"):
+        dates = pd.to_datetime(sub["entry_date"]).drop_duplicates().sort_values()
+        vals: list[float] = []
+        for d in dates:
+            try:
+                v = compute_ivp(str(sym), d.date())
+            except FileNotFoundError:
+                v = float("nan")
+            except Exception:
+                v = float("nan")
+            vals.append(v)
+        out[str(sym)] = pd.Series(vals, index=dates)
+    return out
+
+
+def _render_regime_x_ivp_diagnostic(df_filtered: pd.DataFrame) -> None:
+    """2-D diagnostic table (regime_state × IVP decile) per
+    memoir §18.4 + §21.4 F19 + PLAN.md Phase 9.4.7.
+
+    Composes:
+      1. _portfolio_trades_view → per-trade slice for config.
+      2. _build_regime_signal_for_window → India VIX signal.
+      3. _build_ivp_per_symbol → {symbol: IVP series}.
+      4. regime_x_ivp_breakdown → RegimeIvpBreakdown.
+
+    Renders the breakdown's table + the caveat banner (quintile
+    fallback / dropped trades count) so the operator sees the
+    honest sample sizing.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        return
+
+    st.markdown("##### Regime × IVP diagnostic")
+
+    # Building these series is comparatively expensive (one
+    # compute_ivp call per unique (symbol, entry_date) tuple).
+    # Surface a spinner so the operator sees the wait.
+    with st.spinner("Computing IVP at entry for each trade..."):
+        regime_signal = _build_regime_signal_for_window(sub)
+        ivp_per_sym = _build_ivp_per_symbol(sub)
+
+    if regime_signal.empty:
+        st.warning(
+            "Regime signal unavailable — `data/cache/india_vix.parquet` "
+            "missing or empty. Run `scripts/prefetch_universe.py --vix-only` "
+            "to populate."
+        )
+        return
+    if not ivp_per_sym:
+        st.warning(
+            "No per-symbol IVP cache found. Run the IV materializer "
+            "(Phase 9.1) to populate `data/cache/iv/{SYMBOL}.parquet`."
+        )
+        return
+
+    breakdown: RegimeIvpBreakdown = regime_x_ivp_breakdown(
+        sub, regime_signal, ivp_per_sym,
+    )
+
+    if breakdown.table.empty:
+        st.info(
+            "Diagnostic table empty — no trades survived the regime + "
+            "IVP lookup. "
+            f"{breakdown.n_trades_dropped} of {breakdown.n_trades_total} "
+            f"trades dropped."
+        )
+        return
+
+    # Surface the caveat banner FIRST so the operator sees the
+    # quintile-fallback + drop-count context before reading values.
+    caveat = breakdown.caveat_text()
+    if caveat:
+        st.caption(f"_{caveat}._")
+
+    # Format the table for display.
+    disp = breakdown.table.copy()
+    disp["count"] = disp["count"].astype(int)
+    disp["mean"] = disp["mean"].map(_fmt_inr_compact)
+    disp["median"] = disp["median"].map(_fmt_inr_compact)
+    disp["cvar_5"] = disp["cvar_5"].map(_fmt_inr_compact)
+    # Pretty column names.
+    disp = disp.rename(columns={
+        "count": "Count",
+        "mean": "Mean",
+        "median": "Median",
+        "cvar_5": "CVaR-5%",
+    })
+    # Bring the multi-index out as columns so st.dataframe can
+    # sort + filter cleanly.
+    disp = disp.reset_index()
+    disp = disp.rename(columns={
+        "regime_state": "Regime",
+        "ivp_bucket": "IVP bucket",
+    })
+
+    st.dataframe(disp, hide_index=True, width="stretch")
+    st.caption(
+        "Per-cell median (stable signal) AND CVaR-5% (worst-5% "
+        "tail) — judge each (regime × IVP) cell on both. "
+        "Memoir §18.4 + §F19. Bucket boundaries are FULL-SAMPLE "
+        "qcut (retrospective only — NOT used for live filter)."
+    )
 
 
 def _per_symbol_margin_share(sub: pd.DataFrame) -> pd.DataFrame:
@@ -1051,3 +1209,4 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     _render_yoy_stability(df_filtered)
     _render_worst_10_cycles(df_filtered)
     _render_concentration_correlation(df_filtered)
+    _render_regime_x_ivp_diagnostic(df_filtered)

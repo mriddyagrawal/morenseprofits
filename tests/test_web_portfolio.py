@@ -190,6 +190,99 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.7 — 2-D regime × IVP diagnostic
+# ============================================================
+
+def test_build_ivp_per_symbol_handles_missing_cache(monkeypatch):
+    """LOAD-BEARING: symbols with no IV cache yield empty IVP
+    series (NaN values) — diagnostic function downstream treats
+    them as dropped, NOT exceptions."""
+    import pandas as pd
+
+    from src.web import portfolio as pf_mod
+    from src.web.portfolio import _build_ivp_per_symbol
+
+    def fake_compute_ivp(symbol, as_of):
+        if symbol == "MISSING":
+            raise FileNotFoundError("no cache")
+        return 50.0  # arbitrary valid IVP
+
+    monkeypatch.setattr(pf_mod, "compute_ivp", fake_compute_ivp)
+    sub = pd.DataFrame({
+        "symbol": ["RELIANCE", "MISSING", "RELIANCE"],
+        "entry_date": pd.to_datetime([
+            "2024-06-01", "2024-06-02", "2024-07-01",
+        ]),
+        "net_pnl": [100.0, 200.0, 300.0],
+    })
+    out = _build_ivp_per_symbol(sub)
+    assert set(out.keys()) == {"RELIANCE", "MISSING"}
+    # MISSING symbol's series is all NaN.
+    assert out["MISSING"].isna().all()
+    # RELIANCE has 2 entries at 50.0.
+    assert (out["RELIANCE"] == 50.0).all()
+
+
+def test_build_ivp_per_symbol_empty_input_returns_empty_dict():
+    import pandas as pd
+    from src.web.portfolio import _build_ivp_per_symbol
+    out = _build_ivp_per_symbol(pd.DataFrame())
+    assert out == {}
+
+
+def test_build_regime_signal_for_window_handles_loader_failure(monkeypatch):
+    """Loader raises (e.g., cold VIX cache + offline=True) →
+    return empty series, NOT exception."""
+    import pandas as pd
+
+    from src.web import portfolio as pf_mod
+    from src.web.portfolio import _build_regime_signal_for_window
+
+    def fake_default_regime_signal(*args, **kwargs):
+        raise RuntimeError("VIX cache missing")
+
+    monkeypatch.setattr(
+        pf_mod, "default_regime_signal", fake_default_regime_signal,
+    )
+    sub = pd.DataFrame({
+        "entry_date": pd.to_datetime([
+            "2024-06-01", "2024-07-01",
+        ]),
+        "symbol": ["A", "B"],
+        "net_pnl": [100.0, 200.0],
+    })
+    out = _build_regime_signal_for_window(sub)
+    assert out.empty
+
+
+def test_build_regime_signal_for_window_empty_trades_returns_empty():
+    import pandas as pd
+    from src.web.portfolio import _build_regime_signal_for_window
+    assert _build_regime_signal_for_window(pd.DataFrame()).empty
+
+
+def test_regime_x_ivp_section_renders():
+    """The section renders (with whatever fallback the cache
+    state allows) — should not crash on a real Portfolio config."""
+    at = _make_apptest()
+    at.run(timeout=30)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Regime × IVP diagnostic" in visible
+
+
+def test_regime_x_ivp_section_skips_on_empty_filter():
+    at = _make_apptest()
+    at.session_state["mp_pf_exit_offset_td"] = 20
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Regime × IVP diagnostic" not in visible
+
+
+# ============================================================
 # Phase 9.4.6 — concentration + correlation
 # ============================================================
 
