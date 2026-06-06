@@ -26476,3 +26476,82 @@ Standing by.
 
 ---
 
+## Review of ce3824a — `feat(p9.4.cycle_drilldown)` — ✅ ACCEPT (cycle/symbol math verified; consistency with worst-10 confirmed)
+
+**Verdict: ✅ ACCEPT.** Per-cycle table + cycle picker + per-symbol panel for the picked cycle. Pure-function helpers compose over the sidebar-filtered sweep. Foundation for the 9.4.10 deeplink writer (picked cycle + symbol → URL params → switch to Inspect tab). 7 new tests including 2 LOAD-BEARING sort contracts (cycles desc by expiry, symbols desc by net_pnl). 1264 passed; CONSTRAINT 1 still 0.
+
+**Watch-point correction from a31a3f8**: I predicted this would compose the candidate-selection pipeline (top_n_by_liquidity → top_n_by_ivp → filter_universe_by_earnings). It does NOT — the drilldown reads TAKEN trades from the already-computed sweep parquet. The candidate-selection pipeline is presumably for live trade selection, not retrospective drilldown. Cleaner scope; my prediction was wrong.
+
+### Math verified on operator's sweep
+
+**Per-cycle summary** (top 5 most recent):
+```
+expiry      cycle_pnl    n_positions  n_winners  win_rate_pct
+2026-05-26  +₹313,050    41           33         80.5%   ← good cycle
+2026-04-28  -₹568,680    37           14         37.8%   ← BHEL blow-up cycle (per e49246d)
+2026-03-30  -₹662,612    40           12         30.0%   ← WORST cycle (matches 03c54dc/e49246d)
+2026-02-24  -₹167,174    41           31         75.6%
+2026-01-27  -₹180,769    43           24         55.8%
+```
+
+Sort: descending by expiry ✓ matches LOAD-BEARING test pin.
+
+**Cross-commit consistency verified**:
+- 2026-03-30 cycle_pnl = -₹662,612 ✓ **matches e49246d's worst-cycle value EXACTLY** + **03c54dc's "Worst cycle: -₹6.63L" headline card**
+- n_positions = 40 → 12 winners + 28 losers; 12/40 = 30.0% ✓
+- Sum of per-symbol contributions = -₹662,612 ✓ (40 rows summed)
+
+**Per-symbol top 5 for 2026-03-30** (descending by net_pnl):
+```
+symbol     net_pnl    roi_pct
+ONGC       +₹18,514   10.9%
+RELIANCE   +₹15,877    9.0%
+HCLTECH    +₹12,431    9.7%
+INFY       +₹12,405    8.2%
+TATASTEEL   +₹9,248    2.9%
+```
+
+These are the 5 WINNERS in the worst cycle (sorted top→bottom by net_pnl per LOAD-BEARING pin). The losers (BUILDER's worst-10 attribution from e49246d named INDUSINDBK -₹61.9k, BAJFINANCE -₹53.5k, AXISBANK -₹52k) live at the BOTTOM of the descending list. **Cross-commit consistency**: e49246d's attribution semantic (bottom-N) and ce3824a's per-symbol semantic (top-N descending) compose the same data correctly viewed from opposite ends.
+
+### Session state contract
+
+`_SS_DRILLDOWN_CYCLE = "mp_pf_drilldown_cycle"` — picked expiry as ISO date string. Defaults to most-recent on first render. Persists across reruns. `mp_pf_*` namespace consistent with 22ff990 + b52386d. Same first-render-only pattern.
+
+### Praise points
+
+- **Schema-adaptive ROI %** — `_per_symbol_in_cycle` includes `roi_pct` (mean) IF the column exists in the sweep; defaults to `(symbol, net_pnl)` otherwise. Forward-compatibility with older sweep parquets.
+- **Selectbox uses session-state key directly** — Streamlit's widget binding manages read/write. No manual seeding loops beyond the first-render default. Same idiom as inspect.py + 22ff990.
+- **Layout 2/5 left + 3/5 right** — gives the per-symbol panel more space (it's typically wider with 3 columns + N rows; the cycle table is narrower with 5 cols + 25 rows max).
+- **`n_winners` from `(net_pnl > 0).sum()`** + **`win_rate_pct` from `n_winners / n_positions × 100`** — straightforward, no off-by-one risks (strict `>` excludes exact-zero pnl rows from winners; reasonable).
+- **2 LOAD-BEARING sort pins**:
+  - `test_per_cycle_summary_columns_and_sort` (descending expiry + the 5 columns)
+  - `test_per_symbol_in_cycle_sorted_by_net_pnl_desc` (top contributor at top)
+- **Empty-state UX**: section skips on empty filter; same coordination as the rest of the tab.
+- **`_per_symbol_in_cycle(sub, expiry)` returns empty on missing cycle** — defensive against operator-passed bad expiry. Pinned via test.
+
+### Math + arithmetic
+
+- LOC: +131 portfolio.py + 113 test = +244 net. ✓ Matches `git show --stat`.
+- Tests: 1257 → 1264 (+7). ✓ Matches BUILDER's claim exactly.
+- 55 Portfolio tests now (was 48).
+
+### Next-commit suggestion
+
+`feat(p9.4.deeplink_to_inspect)` per BUILDER's stated next (9.4.10) — **closes Phase 9.4 (10/10)**. Picked cycle + symbol writes the 5-tuple `(strategy, symbol, expiry, entry_offset_td, exit_offset_td)` to URL params + switches active tab to Inspect. Per memoir §24.9 deeplink contract.
+
+**Critical**: this commit MUST call `clear_inspect_state()` from b52386d before `st.rerun()`. That's the public helper added precisely for this Portfolio→Inspect flow. The `test_clear_then_seed_picks_up_new_url` regression from b52386d pins the end-to-end behavior — Portfolio writes URL + clears Inspect state + reruns → Inspect re-reads the new URL.
+
+The 5-tuple is fully available from this commit's selections:
+- strategy from `_SS_STRATEGY`
+- entry / exit from `_SS_ENTRY_OFFSET` / `_SS_EXIT_OFFSET`
+- expiry from `_SS_DRILLDOWN_CYCLE`
+- symbol from a per-row click handler on the right-column per-symbol table (or operator picks)
+
+Migration cadence
+
+**... → P9.4.8 sensitivity ✓ → P9.4.9 drilldown ✓ → P9.4.10 deeplink writer (closes Phase 9.4; consumes b52386d's clear_inspect_state) → v1 Portfolio Foundation SHIPPED → ...**
+
+Standing by.
+
+---
+
