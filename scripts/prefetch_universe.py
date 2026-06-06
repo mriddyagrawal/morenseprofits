@@ -35,7 +35,7 @@ sys.path.insert(0, str(REPO))
 from tqdm import tqdm  # noqa: E402
 
 from src.data import bhavcopy_fo_loader, expiry_calendar, india_vix_loader, options_loader, spot_loader, trading_calendar  # noqa: E402
-from src.data import iv_materializer  # noqa: E402
+from src.data import fo_universe, iv_materializer  # noqa: E402
 from src.data.strike_planner import strikes_around_spot_hybrid  # noqa: E402
 from src.data.errors import MissingDataError  # noqa: E402
 
@@ -404,8 +404,28 @@ def _prefetch_iv_history(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--symbols", nargs="+", default=DEFAULT_SYMBOLS,
-        help=f"NSE F&O symbols (default: top-10 blue chips: {DEFAULT_SYMBOLS})",
+        "--symbols", nargs="+", default=None,
+        help=(
+            "Explicit NSE F&O symbol list. Mutually exclusive with "
+            "--universe (pass one or the other). Defaults to the "
+            "--universe choice when --symbols is omitted."
+        ),
+    )
+    ap.add_argument(
+        "--universe", choices=["blue_chip", "full"],
+        default="blue_chip",
+        help=(
+            "Named universe (Phase 10.1):\n"
+            "  blue_chip (default): the curated 50-symbol list "
+            "(48 NIFTY-50 + PNB + BHEL). Survivor-biased. "
+            "  full: enumerate every OPTSTK symbol that appears in "
+            "any cached bhavcopy in [--start, --end]. Survivorship-"
+            "free per memoir §11 walk-back (~180-220 names "
+            "depending on the date range). Requires the bhavcopy "
+            "cache to be warm — run the prefetch once with "
+            "--universe blue_chip first to populate the cache, "
+            "then re-run with --universe full to widen."
+        ),
     )
     ap.add_argument(
         "--strikes-per-side", type=int, default=DEFAULT_STRIKES_PER_SIDE,
@@ -517,9 +537,48 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    symbols: list[str] = args.symbols
+    # Resolve the symbol list: --symbols wins if given, else use
+    # --universe (blue_chip = curated 50-list, full = enumerate
+    # from cached bhavcopies per memoir §11 walk-back).
+    if args.symbols is not None:
+        symbols: list[str] = args.symbols
+        universe_label = "explicit --symbols"
+    elif args.universe == "full":
+        # Enumerate offline from cached bhavcopies. Requires the
+        # bhavcopy cache to already cover [start, end]; if cold,
+        # the enumerator returns [] and we abort with a clear
+        # operator-facing message.
+        print(
+            f"  enumerating full F&O universe from cached "
+            f"bhavcopies in [{args.start} → {args.end}]..."
+        )
+        symbols = fo_universe.enumerate_fo_universe(
+            args.start, args.end, today_fn=TODAY_FN, offline=True,
+        )
+        if not symbols:
+            print(
+                f"\n  ✗ --universe full found 0 symbols in the "
+                f"bhavcopy cache for the requested window.",
+                file=sys.stderr,
+            )
+            print(
+                f"    The bhavcopy cache may be cold for "
+                f"[{args.start} → {args.end}]. Run:\n"
+                f"      python scripts/prefetch_universe.py "
+                f"--universe blue_chip --start {args.start.isoformat()} "
+                f"--end {args.end.isoformat()}\n"
+                f"    to populate the bhavcopies first, THEN re-run "
+                f"with --universe full to widen.",
+                file=sys.stderr,
+            )
+            return 1
+        universe_label = f"--universe full (enumerated, {len(symbols)} symbols)"
+    else:
+        symbols = DEFAULT_SYMBOLS
+        universe_label = f"--universe blue_chip (curated, {len(symbols)} symbols)"
 
     _h(f"Pre-cache universe — {len(symbols)} symbols × ~24 expiries")
+    print(f"  universe          = {universe_label}")
     print(f"  symbols           = {symbols}")
     print(f"  strikes_per_side  = {args.strikes_per_side}  (per-day rule, min N strikes each side of ATM)")
     print(f"  strikes_pct       = {args.strikes_pct:.2%}  (per-day rule, min %-of-spot window each side)")
