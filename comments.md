@@ -26951,3 +26951,114 @@ Standing by.
 
 ---
 
+## Review of eb28173 — `feat(p9.1.iv_prefetch_step)` — ✅ ACCEPT (closes the 6db71f6 "fallback to liquidity-only" silent degradation)
+
+**Verdict: ✅ ACCEPT.** Operator-driven follow-up reveals that 6db71f6's IVP fallback to liquidity-only was firing for ~98% of cycles because only RELIANCE had an IV parquet built. This commit adds the missing prefetch step (Step 5) so the full 50-symbol universe gets its IV history materialized, enabling the IVP filter to actually do its job per memoir §2.5. 1281 passed (same as 6db71f6 — script-only addition, no new tests).
+
+### What this fix reveals about 6db71f6's silent degradation
+
+My 6db71f6 review noted the "Cold-IVP-cache fallback to liquidity-only top-N with transparent caption — gracefully degrades when IVP cache is partial." I praised that pattern as a graceful-fallback discipline. **What I didn't catch**: the fallback was firing for ~98% of cycles in the operator's actual environment because only 1 symbol had an IV parquet.
+
+The transparent caption surfaces the fallback per-cycle in the UI (which is correct discipline), but doesn't surface the *aggregate scope* — "you think you ran v1, but 49/50 symbols silently fell through." This is the kind of insight that only shows up when operator actually runs the strategy end-to-end and notices the candidate basket doesn't look IVP-ranked. **The combined 6db71f6 + eb28173 pair is what actually completes the v1 wire-up.**
+
+Per [[feedback_grep_code_before_accepting_calibration]]: I should have grep'd `ls data/cache/iv/` against the universe size at 6db71f6 review. Would have shown 1 file where 50 were expected. Noting for future cross-commit audit discipline.
+
+### Pipeline + prefetch flow now complete
+
+| Step | Role | Cost | Flag |
+|---|---|---|---|
+| 0 | india_vix prefetch | ~3s | implicit (always runs) |
+| 1-3 | spot / bhavcopy / options | minutes | `--skip-*` per layer |
+| 4 | lot_sizes | seconds | implicit |
+| **5 (NEW)** | **iv history materializer** | **~5 min for 50 syms** | **`--skip-iv` / `--iv-only`** |
+
+Step 5 runs AFTER 3+4 — the materializer needs the populated bhavcopy + spot + options caches. Order is correct.
+
+### Non-fatal per-symbol discipline
+
+`_prefetch_iv_history`:
+- Iterates symbols, calls `materialize_iv_history(sym, ..., offline=True)` per symbol
+- tqdm progress (~6s/symbol)
+- Single-symbol failure (cold options, OfflineCacheMiss on bhavcopy gap) → skip + surface reason
+- Doesn't abort the batch
+
+Same discipline as Step 0 india_vix prefetch (per ffb24d5): "research infrastructure failure does NOT break the trading pipeline." Cross-step idiom consistency.
+
+### CLI flag design
+
+- `--iv-only`: short-circuit Steps 1-4, run ONLY Steps 0+5. Use case: fast iv-only refresh when adding a new symbol or after a sweep config change.
+- `--skip-iv`: skip Step 5 entirely. Use case: quick re-prefetch of lower layers; operator accepts Portfolio-tab degradation caveat.
+
+Both flags handle the natural operator workflows. Symmetric with the existing `--vix-only` from ffb24d5.
+
+### Live smoke validates the contract
+
+```
+3-symbol run --iv-only --start 2024-04-15 --end 2026-05-31:
+  Step 0 vix:     526 rows (cached, ~3s)
+  Step 5 iv:      3/3 in 17s (5.9s/symbol)
+  Output:         23K parquet × 3 → data/cache/iv/{RELIANCE,INFY,TCS}.parquet
+  RELIANCE iv:    523 rows, iv_cmi30_excl7 0.0984..0.3648 (median 0.2041)
+```
+
+RELIANCE iv range matches the 3625f3e research-notebook empirical study (the iv_cmi30_excl7 series I verified at the earlier review). ✓ Cross-commit consistency preserved.
+
+### Praise points
+
+- **Operator-facing bug surfaced with the actual scope** ("~98% of cycles falling through") — quantifies the silent degradation that 6db71f6's transparent-fallback caption couldn't surface at aggregate level.
+- **Non-fatal per-symbol pattern** matches Step 0 india_vix convention — single bad symbol doesn't kill the universe-wide prefetch.
+- **tqdm progress** for the 5-minute wall clock — operator sees the wait, not a hung script.
+- **`--iv-only` + `--skip-iv` flag pair** — symmetric with existing `--vix-only`. Operator workflow-friendly.
+- **Step 5 sits after Steps 3+4** — materializer's dependencies (bhavcopy + spot + options) are populated first. Correct ordering.
+- **Honest cost estimate** in body (50 symbols × ~6s = ~5 min, 1.2 MB disk).
+- **After-action operator instructions** in body — `python scripts/prefetch_universe.py --iv-only` is the explicit invocation operator needs to run.
+
+### Tiny notes (NOT grills)
+
+- **No new pytest tests** — consistent with the project's pattern (prefetch_universe.py is operator-facing tooling, not pytest-covered). The Step 0 india_vix prefetch (ffb24d5) similarly didn't add tests. Acceptable per project convention.
+- **Until operator runs `--iv-only`**, the "Selected per cycle" panel will keep showing liquidity-only fallback (per [[feedback_irreversible_engine_invalidates_displayed_data]]). Operator instruction is the trigger; no automated reload.
+
+### State-of-tree
+
+- `main` HEAD: `eb28173`.
+- Phase 9 v1 Portfolio Foundation **structurally + semantically COMPLETE**. Only operator-side cache refresh remains to unlock the IVP filter end-to-end.
+- 6db71f6 silent-degradation tail — closed by this commit + operator's prefetch run.
+
+### Open grills (cumulative — unchanged)
+
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1.
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate — STILL OPEN.
+
+### Operator action
+
+**Required for the v1 strategy to actually run with the IVP filter active:**
+
+```
+python scripts/prefetch_universe.py --iv-only
+```
+
+~5 minutes wall clock; produces `data/cache/iv/{SYM}.parquet` for the full universe. After this completes + Streamlit reload, the "Selected per cycle" panel will show IVP-ranked selections instead of liquidity-only fallback. The "IVP band 60-100" config knob will then narrow the candidate pool to vol-rich names per memoir §2.5.
+
+### Lessons for next-time review discipline
+
+Per [[feedback_grep_code_before_accepting_calibration]]: when reviewing a commit that uses a graceful-fallback pattern, verify the FALLBACK FREQUENCY by checking the precondition (cache state on disk) — not just that the fallback path works correctly. At 6db71f6 I should have run `ls data/cache/iv/ | wc -l` against the universe size. Adding to future review checklist.
+
+### Next-commit suggestion
+
+Either:
+- **(A) Operator runs the prefetch** (~5 min) + reloads Portfolio tab to validate the IVP filter end-to-end. Not a commit; an operator action.
+- **(B) Perf optimization carry-over** from 6db71f6 (`@st.cache_data` on `load_iv_history`, bhavcopy-window pre-batching) — cuts the 7.4s cold render once the IV cache is fully populated.
+- **(C) Phase 10 / 11** — sizing variants or Tier-3 strategies per PLAN.md. Awaiting operator direction.
+
+Recommend operator does (A), then BUILDER lands (B). Phase shift to (C) after.
+
+Migration cadence
+
+**... → 6db71f6 candidate selection ✓ → eb28173 IV prefetch step ✓ → [operator runs --iv-only ~5min] → (B) perf optimization OR (C) Phase 10 / 11 → ...**
+
+Standing by.
+
+---
+
