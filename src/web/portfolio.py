@@ -38,16 +38,24 @@ coexist without key collisions.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
+from src.analytics.portfolio import (
+    cycle_pnl_series,
+    drawdown_series,
+    equity_curve,
+)
 from src.analytics.regime import (
     current_regime_state,
     default_regime_signal,
     regime_percentile,
+    regime_state,
 )
 
 
@@ -99,6 +107,20 @@ _SIZING_KEYS = list(_SIZING_LABELS.keys())
 # can override via the future sensitivity strip (Phase 9.4.8).
 _REGIME_THRESHOLD_PCT = 75.0
 _REGIME_LOOKBACK_TD = 252
+
+# v1 starting capital for the equity curve. ₹10L is a realistic
+# Indian retail-trader allocation; pinned here as a constant so a
+# future change is greppable. NOT user-tunable in 9.4.2 — the
+# Calmar / Ulcer / Sortino ratios in 9.4.3 are scale-invariant
+# under equal-margin sizing, so the chart's y-axis labels are the
+# only thing affected.
+_DEFAULT_STARTING_CAPITAL = 1_000_000.0
+
+# Plot dimensions — match the mockup's aspect ratio. The
+# drawdown subplot gets ~30% of the height per Martin's
+# canonical convention (Ulcer Index paper).
+_EQUITY_PLOT_HEIGHT_PX = 380
+_EQUITY_SUBPLOT_ROW_HEIGHTS = (0.7, 0.3)
 
 
 def _seed_session_state() -> None:
@@ -335,15 +357,196 @@ def _render_strategy_config() -> None:
             st.session_state[_SS_IVP_BAND] = new_band
 
 
-def _render_skeleton_footer(df_filtered: pd.DataFrame) -> None:
-    """Placeholder footer pointing at the work still to ship.
-    Replaced by the equity curve + headline strip in 9.4.2 / 9.4.3."""
-    st.markdown("---")
+def _portfolio_trades_view(df_filtered: pd.DataFrame) -> pd.DataFrame:
+    """Slice the sidebar-filtered sweep frame to the Portfolio
+    config's (strategy, entry_offset_td, exit_offset_td) tuple.
+
+    v1 Portfolio backtest is single-(strategy, entry, exit) per
+    memoir §5 — the strategy config picks ONE tuple, so this
+    function reduces df_filtered to the matching rows.
+
+    Returns:
+        DataFrame of per-trade rows. May be empty if no rows
+        match the config (e.g., sidebar excludes the chosen
+        strategy, or the entry/exit slider lands on offsets the
+        sweep doesn't have).
+    """
+    strategy = st.session_state[_SS_STRATEGY]
+    entry_offset = int(st.session_state[_SS_ENTRY_OFFSET])
+    exit_offset = int(st.session_state[_SS_EXIT_OFFSET])
+    return df_filtered[
+        (df_filtered["strategy"] == strategy)
+        & (df_filtered["entry_offset_td"] == entry_offset)
+        & (df_filtered["exit_offset_td"] == exit_offset)
+    ]
+
+
+def _regime_off_cycle_dates(
+    cycle_dates: pd.DatetimeIndex,
+    *,
+    lookback_td: int = _REGIME_LOOKBACK_TD,
+    threshold_pct: float = _REGIME_THRESHOLD_PCT,
+) -> list[pd.Timestamp]:
+    """For each cycle's expiry date, look up the regime state at
+    expiry (per memoir §3 v1 — the gate fires at cycle entry, but
+    for visualization we mark the cycle's expiry on the equity
+    x-axis since that's the cycle's natural label).
+
+    Returns the list of expiry timestamps where regime was OFF.
+    Empty list on cold cache (graceful — no overlay rendered).
+    """
+    if cycle_dates.empty:
+        return []
+    try:
+        # Load the VIX signal over the full window + 252-TD
+        # backfill so each regime lookup is realized.
+        backfill_days = int(lookback_td * 365 / 252) + 30
+        from_date = cycle_dates.min().date() - timedelta(days=backfill_days)
+        to_date = cycle_dates.max().date()
+        signal = default_regime_signal(
+            from_date, to_date, offline=True,
+        )
+    except Exception:
+        return []
+    off_cycles: list[pd.Timestamp] = []
+    for ts in cycle_dates:
+        try:
+            state = regime_state(
+                signal, ts.date(),
+                threshold_pct=threshold_pct,
+                lookback_td=lookback_td,
+            )
+        except Exception:
+            continue
+        if state == "OFF":
+            off_cycles.append(ts)
+    return off_cycles
+
+
+def _render_equity_curve(df_filtered: pd.DataFrame) -> None:
+    """Equity curve + underwater drawdown subplot per memoir
+    §4 + §21.4 F13 + F14. Regime-OFF cycles rendered as gray
+    vertical bands per Phase 9.4.2 spec (PLAN.md line 343).
+
+    Composition:
+      1. Slice df_filtered to the (strategy, entry, exit) tuple
+         from the strategy config.
+      2. Build cycle_pnl_series (F12) → equity_curve (F13) →
+         drawdown_series (F14) from analytics.portfolio.
+      3. Plot equity on the top subplot, underwater DD on the
+         bottom subplot (shared x-axis).
+      4. Overlay gray vertical bands for OFF cycles.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        st.info(
+            "No trades match the current strategy + entry/exit "
+            "configuration. Adjust the strategy or offsets in the "
+            "config block above, or widen the sidebar filters."
+        )
+        return
+
+    pnl = cycle_pnl_series(sub)
+    if pnl.empty:
+        st.info(
+            "Cycle P&L series is empty — no priced expiries in "
+            "the filtered view. This usually means the strategy "
+            "config's offsets don't match any rows in the sweep."
+        )
+        return
+
+    eq = equity_curve(pnl, starting_capital=_DEFAULT_STARTING_CAPITAL)
+    dd = drawdown_series(eq)
+
+    # Regime-OFF cycles for the overlay.
+    if st.session_state[_SS_REGIME_GATE]:
+        off_dates = _regime_off_cycle_dates(pnl.index)
+    else:
+        off_dates = []
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=list(_EQUITY_SUBPLOT_ROW_HEIGHTS),
+        subplot_titles=(
+            "Equity (₹, additive)",
+            "Underwater drawdown (₹)",
+        ),
+    )
+
+    # Equity line.
+    fig.add_trace(
+        go.Scatter(
+            x=eq.index, y=eq.values,
+            mode="lines",
+            name="Equity",
+            line=dict(width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>Equity: ₹%{y:,.0f}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+    # Starting capital reference.
+    fig.add_hline(
+        y=_DEFAULT_STARTING_CAPITAL,
+        line=dict(color="gray", dash="dot", width=1),
+        row=1, col=1,
+    )
+
+    # Drawdown area (filled negative).
+    fig.add_trace(
+        go.Scatter(
+            x=dd.index, y=dd.values,
+            mode="lines",
+            name="Drawdown",
+            line=dict(width=1, color="rgba(220, 60, 60, 0.9)"),
+            fill="tozeroy",
+            fillcolor="rgba(220, 60, 60, 0.25)",
+            hovertemplate="%{x|%Y-%m-%d}<br>DD: ₹%{y:,.0f}<extra></extra>",
+        ),
+        row=2, col=1,
+    )
+
+    # Regime-OFF overlay — gray vertical bands. One band per OFF
+    # cycle centered on its expiry.
+    # Plotly's vrect needs an x0/x1 pair; use ±15 days as a visual
+    # span representing the cycle.
+    band_half_width = pd.Timedelta(days=15)
+    for ts in off_dates:
+        fig.add_vrect(
+            x0=ts - band_half_width, x1=ts + band_half_width,
+            fillcolor="rgba(140, 140, 140, 0.18)",
+            line_width=0,
+            row="all", col=1,
+        )
+
+    fig.update_layout(
+        height=_EQUITY_PLOT_HEIGHT_PX,
+        margin=dict(l=10, r=10, t=30, b=10),
+        showlegend=False,
+        hovermode="x unified",
+    )
+    fig.update_yaxes(tickformat=",.0f", row=1, col=1)
+    fig.update_yaxes(tickformat=",.0f", row=2, col=1)
+
+    st.plotly_chart(fig, width="stretch")
+
+    # Footer caption with the diagnostic counts so the operator
+    # can see how the chart maps to the data.
+    cycles_n = len(pnl)
+    off_n = len(off_dates)
+    final_equity = float(eq.iloc[-1])
+    delta_pct = (
+        (final_equity - _DEFAULT_STARTING_CAPITAL)
+        / _DEFAULT_STARTING_CAPITAL * 100.0
+    )
+    delta_sign = "+" if delta_pct >= 0 else ""
     st.caption(
-        f"Skeleton commit (Phase 9.4.1). "
-        f"Filtered sweep frame available: **{len(df_filtered):,} rows**. "
-        f"Equity curve + headline metrics + 2-D diagnostic land in "
-        f"Phase 9.4.2 - 9.4.7."
+        f"**{cycles_n}** cycles · **{off_n}** regime-OFF · "
+        f"start ₹{_DEFAULT_STARTING_CAPITAL:,.0f} → "
+        f"end ₹{final_equity:,.0f} ({delta_sign}{delta_pct:.2f}%) · "
+        f"max DD ₹{abs(dd.min()):,.0f}. "
+        f"Headline metrics (Calmar / Ulcer / Sortino / Max DD) "
+        f"land in Phase 9.4.3."
     )
 
 
@@ -363,4 +566,5 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     _render_regime_banner()
     st.markdown("---")
     _render_strategy_config()
-    _render_skeleton_footer(df_filtered)
+    st.markdown("---")
+    _render_equity_curve(df_filtered)
