@@ -26164,3 +26164,93 @@ When the strategy config matches no cycles, the headline strip **skips silently*
 
 ---
 
+## Review of 24855f7 — `feat(p9.4.yoy_stability)` — ✅ ACCEPT (cumulative equity forward verified end-to-end)
+
+**Verdict: ✅ ACCEPT.** Year-by-year table surfaces "is this strategy STABLE across years, or does the headline Calmar come from one good year?" Each calendar year treated as a STANDALONE book with prior-year-ending equity as starting capital. Thin-year Calmar guards against over-annualization noise. 6 new tests including LOAD-BEARING cumulative-forward pin.
+
+### Cumulative equity forward verified on operator's sweep
+
+```
+year   cycles   return_inr   return_pct   max_dd_inr   calmar    ulcer
+2024     8     -₹68,997      -6.90%      ₹479,177    -0.264    18.35
+2025    12     +₹449,786    +48.31%      ₹657,414    +0.708    29.93
+2026     5    -₹1,266,184   -91.70%    ₹1,579,235     NaN      67.89  ← thin-year guard fires
+```
+
+Chain verification:
+- 2024: ₹1,000,000 × (1 - 6.90%) = ₹931,003
+- 2025: ₹931,003 × (1 + 48.31%) = ₹1,380,789
+- 2026: ₹1,380,789 × (1 - 91.70%) = ₹114,605 ✓ **matches cbf411f's final equity exactly**
+
+Each year's metrics computed against ITS OWN starting capital — that's the LOAD-BEARING `_carries_cumulative_equity_forward` test pin.
+
+**Operator-facing observation made possible by this view**: 2025 was actually +48% profitable. The headline -88% loss is entirely from 2024 partial year + 2026 partial-year crash. The smoothed headline Calmar in 03c54dc hides this; the YoY table surfaces it.
+
+### Thin-year guard verified
+
+2026 has only 5 cycles (< 6 threshold). Calmar correctly renders NaN to avoid over-annualization (annualizing a 5-cycle partial year by 12/5 would amplify noise). `test_yoy_calmar_nan_when_year_has_few_cycles` pins it. Operator sees `—` instead of a misleading ratio.
+
+### Praise points
+
+- **Per-year fresh-book semantic** documented at length in commit body — sidesteps multi-year compounding question + makes inter-year comparisons honest.
+- **LOAD-BEARING cumulative-forward pin** (`test_yoy_per_year_stats_carries_cumulative_equity_forward`) verifies the chain — 2 years × 2 cycles each with hand-computed equity trajectory pinned.
+- **`_per_year_stats` is pure** — no Streamlit, no I/O. Future refactor that pushes Streamlit calls into the helper trips on the test isolation.
+- **Calmar surfaces only when cycles ≥ 6** — half a year of monthly data. Documented threshold + test pin.
+
+---
+
+## Review of e49246d — `feat(p9.4.worst_10_days)` — ✅ ACCEPT (attribution verified)
+
+**Verdict: ✅ ACCEPT.** Tail-risk surface beyond the smoothed ratios — 10 worst cycles + top-3 symbol attribution per cycle. Composes cleanly over the existing per-trade frame. 6 new tests including LOAD-BEARING ascending-sort + attribution semantic pin. 1238 passed; CONSTRAINT 1 still 0.
+
+### Attribution math verified on operator's sweep
+
+```
+2026-03-30  -₹662,612  INDUSINDBK (-₹61.9k) · BAJFINANCE (-₹53.5k) · AXISBANK (-₹52.0k)
+2025-03-27  -₹600,891  ICICIBANK (-₹65.1k) · KOTAKBANK (-₹58.2k) · SUNPHARMA (-₹53.1k)
+2026-04-28  -₹568,680  BHEL (-₹1.76L) · ADANIENT (-₹81.5k) · HINDUNILVR (-₹56.7k)
+2024-10-31  -₹479,177  INDUSINDBK (-₹1.09L) · M&M (-₹83.5k) · BAJAJ-AUTO (-₹79.2k)
+2026-01-27  -₹180,769  RELIANCE (-₹68.3k) · WIPRO (-₹48.5k) · LT (-₹42.1k)
+```
+
+**Worst cycle -₹662,612 (2026-03-30) matches 03c54dc's "Worst cycle: -₹6.63L" exactly.** ✓ Headline-strip and worst-10 panel agree on the worst-cycle anchor.
+
+Attribution surfaces concentrated bank/finance contributors on the 2026-03-30 spike — INDUSINDBK + BAJFINANCE + AXISBANK = -₹167k (25% of the cycle's -₹663k loss). 2026-04-28 shows BHEL contributing -₹1.76L solo — a single-name blow-up exceeding most other cycles' totals.
+
+**This is operator-actionable insight**: "Was the worst cycle a market-wide event or a single-name blow-up?" The attribution column answers directly.
+
+### Praise points
+
+- **`_worst_cycles_with_attribution` pure helper** — no Streamlit, no I/O. Tests can drive it directly without `AppTest` overhead.
+- **No zero-padding when fewer than n cycles** (`test_worst_10_returns_fewer_than_n_when_universe_smaller`) — honest scoping vs fake "n=10" rows of zeros.
+- **Ascending-sort contract pinned** by `test_worst_10_returns_n_or_fewer_cycles` on a 15-cycle fixture. Future refactor that descending-sorts trips loudly.
+- **Hand-checked attribution pin** (`test_worst_10_attribution_includes_symbol_with_loss`) on a 2-cycle 3-symbol fixture — drift detector for the "largest contributor first" semantic.
+- **`_fmt_inr_compact` reuse** from 03c54dc — single formatter across the whole tab. Cross-commit consistency.
+- **Empty-state UX**: silently skips when no cycles match. Same coordination discipline as the headline strip — equity-curve banner is the single source of truth for "no data" messaging.
+- **Constants pinned**: `_DEFAULT_WORST_N_CYCLES = 10` and `_ATTRIBUTION_TOP_K_SYMBOLS = 3`. Refactor-safe.
+
+### Math
+
+- LOC: +94 portfolio.py + 121 test (24855f7) = +215; +91 + 103 (e49246d) = +194 net. ✓ Matches `git show --stat`.
+- Tests: 1226 → 1238 (+12 across both = +6 each). ✓ Matches.
+- 29 Portfolio tests now (was 17 before these two commits).
+
+### Open grills (cumulative — unchanged across both)
+
+- No new grills.
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log, P1.8b smoke gate — STILL OPEN.
+
+### Next-commit suggestion
+
+`feat(p9.4.concentration)` per BUILDER's stated plan (9.4.6). Concentration + correlation matrix — answers "is the portfolio concentrated in one sector/factor?" Composes from per-trade contributions (similar to the attribution surface here) but in matrix form.
+
+Migration cadence
+
+**... → P9.4.2 equity ✓ → P9.4.3 headline ✓ → P9.4.4 YoY ✓ → P9.4.5 worst-10 ✓ → P9.4.6 concentration → 9.4.7 2-D diagnostic → ... → 9.4.10 deeplink writer → v1 Portfolio Foundation SHIPPED → ...**
+
+Standing by.
+
+---
+
