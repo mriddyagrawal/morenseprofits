@@ -431,6 +431,99 @@ def _regime_off_cycle_dates(
     return off_cycles
 
 
+def _per_year_stats(
+    pnl_series: pd.Series, starting_capital: float,
+) -> pd.DataFrame:
+    """Build the year-by-year stability table per memoir §4 +
+    mockup §C.
+
+    Each year is treated as a STANDALONE book starting at the
+    prior year's ending equity (or ``starting_capital`` for the
+    first year). This gives honest per-year Calmar / Ulcer that
+    reflect what would have happened if you started the year at
+    that balance — sidesteps the multi-year compounding question.
+
+    Calmar per year is reported only when the year has ≥ 6
+    cycles (half a year of monthly data); thinner samples surface
+    as NaN to avoid optical noise.
+
+    Returns:
+        DataFrame with one row per year, columns:
+          year, cycles, return_inr, return_pct,
+          max_dd_inr, calmar, ulcer.
+    """
+    if pnl_series.empty:
+        return pd.DataFrame(
+            columns=[
+                "year", "cycles", "return_inr", "return_pct",
+                "max_dd_inr", "calmar", "ulcer",
+            ],
+        )
+    rows: list[dict] = []
+    cumulative = float(starting_capital)
+    for year, year_pnl in pnl_series.groupby(pnl_series.index.year):
+        year_start = cumulative
+        eq = equity_curve(year_pnl, starting_capital=year_start)
+        dd = drawdown_series(eq)
+        year_total = float(year_pnl.sum())
+        rows.append({
+            "year": int(year),
+            "cycles": int(len(year_pnl)),
+            "return_inr": year_total,
+            "return_pct": (year_total / year_start * 100.0) if year_start else float("nan"),
+            "max_dd_inr": float(abs(dd.min())),
+            "calmar": calmar(eq) if len(year_pnl) >= 6 else float("nan"),
+            "ulcer": ulcer_index(eq),
+        })
+        cumulative += year_total
+    return pd.DataFrame(rows)
+
+
+def _render_yoy_stability(df_filtered: pd.DataFrame) -> None:
+    """Year-by-year stability table per memoir §4 + mockup §C.
+
+    Columns: Year / Cycles / Return ₹ / Return % / Max DD ₹ /
+    Calmar / Ulcer. Surfaces "is this strategy STABLE across
+    years, or does the headline Calmar come from one good year?"
+
+    Empty-state: skip silently. The equity-curve renderer above
+    already surfaced the explanation banner.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        return
+    pnl = cycle_pnl_series(sub)
+    if pnl.empty:
+        return
+
+    table = _per_year_stats(pnl, _DEFAULT_STARTING_CAPITAL)
+    if table.empty:
+        return
+
+    st.markdown("##### Year-by-year stability")
+    # Build a display frame with formatted strings so st.dataframe
+    # renders aligned + parses sort cleanly.
+    disp = pd.DataFrame({
+        "Year": table["year"],
+        "Cycles": table["cycles"],
+        "Return": table["return_inr"].map(_fmt_inr_compact),
+        "Return %": table["return_pct"].map(
+            lambda v: "—" if pd.isna(v) else f"{v:+.2f}%"
+        ),
+        "Max DD ₹": table["max_dd_inr"].map(
+            lambda v: _fmt_inr_compact(-v) if v > 0 else "₹0"
+        ),
+        "Calmar": table["calmar"].map(_fmt_ratio),
+        "Ulcer": table["ulcer"].map(_fmt_ratio),
+    })
+    st.dataframe(disp, hide_index=True, width="stretch")
+    st.caption(
+        "Each year is treated as a standalone book starting at "
+        "the prior year's ending equity. Calmar surfaces only "
+        "when ≥ 6 cycles in the year (half a year of monthly data)."
+    )
+
+
 def _fmt_inr_compact(value: float) -> str:
     """Indian rupee compact formatter — ₹1L for lakh, ₹1Cr for crore.
     Per the mockup convention so the headline strip's cards fit in
@@ -705,3 +798,4 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     st.markdown("---")
     _render_headline_strip(df_filtered)
     _render_equity_curve(df_filtered)
+    _render_yoy_stability(df_filtered)

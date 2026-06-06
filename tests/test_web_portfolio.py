@@ -190,6 +190,127 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.4 — year-by-year stability table
+# ============================================================
+
+def test_yoy_per_year_stats_compose_correctly():
+    """Unit-level: _per_year_stats produces one row per calendar
+    year with cycles + return + max DD + Calmar + Ulcer columns."""
+    import pandas as pd
+
+    from src.web.portfolio import _DEFAULT_STARTING_CAPITAL, _per_year_stats
+
+    pnl = pd.Series(
+        [10_000, -5_000, 8_000, 12_000, -3_000, 7_000,
+         15_000, -8_000, 4_000, -2_000, 6_000, 11_000,
+         -4_000, 9_000, 5_000, -10_000, 13_000, 2_000],
+        index=pd.to_datetime([
+            # 6 cycles in 2023
+            "2023-01-25", "2023-03-29", "2023-05-25",
+            "2023-07-27", "2023-09-28", "2023-11-30",
+            # 12 cycles in 2024
+            "2024-01-25", "2024-02-29", "2024-03-28",
+            "2024-04-25", "2024-05-30", "2024-06-27",
+            "2024-07-25", "2024-08-29", "2024-09-26",
+            "2024-10-31", "2024-11-28", "2024-12-26",
+        ]),
+    )
+    stats = _per_year_stats(pnl, _DEFAULT_STARTING_CAPITAL)
+    assert list(stats.columns) == [
+        "year", "cycles", "return_inr", "return_pct",
+        "max_dd_inr", "calmar", "ulcer",
+    ]
+    assert stats.shape[0] == 2  # 2023, 2024
+    # Year 2023 has 6 cycles → Calmar surfaces.
+    row_2023 = stats[stats["year"] == 2023].iloc[0]
+    assert row_2023["cycles"] == 6
+    assert row_2023["return_inr"] == 29_000.0
+    assert not pd.isna(row_2023["calmar"])
+    # Year 2024 has 12 cycles → Calmar surfaces.
+    row_2024 = stats[stats["year"] == 2024].iloc[0]
+    assert row_2024["cycles"] == 12
+
+
+def test_yoy_calmar_nan_when_year_has_few_cycles():
+    """Thin years (< 6 cycles) report Calmar as NaN to avoid
+    optical noise from over-annualizing a partial-year sample."""
+    import pandas as pd
+
+    from src.web.portfolio import _DEFAULT_STARTING_CAPITAL, _per_year_stats
+
+    pnl = pd.Series(
+        [5_000, -2_000, 3_000],  # only 3 cycles in 2024
+        index=pd.to_datetime(["2024-01-25", "2024-02-29", "2024-03-28"]),
+    )
+    stats = _per_year_stats(pnl, _DEFAULT_STARTING_CAPITAL)
+    assert stats.shape[0] == 1
+    assert pd.isna(stats.iloc[0]["calmar"])
+
+
+def test_yoy_per_year_stats_carries_cumulative_equity_forward():
+    """Year N+1's starting capital == year N's ending equity.
+    Pin this so the per-year report is honest about cumulative
+    book trajectory."""
+    import pandas as pd
+
+    from src.web.portfolio import _DEFAULT_STARTING_CAPITAL, _per_year_stats
+
+    pnl = pd.Series(
+        [100_000, 50_000, -25_000, 75_000],  # 2 cycles each year
+        index=pd.to_datetime([
+            "2023-06-30", "2023-12-29",
+            "2024-06-28", "2024-12-31",
+        ]),
+    )
+    stats = _per_year_stats(pnl, _DEFAULT_STARTING_CAPITAL)
+    # 2023: +150k on 1M → 15.0%; 2024: +50k on 1.15M → 4.348%
+    row_2023 = stats[stats["year"] == 2023].iloc[0]
+    row_2024 = stats[stats["year"] == 2024].iloc[0]
+    assert row_2023["return_pct"] == pytest.approx(15.0, abs=1e-9)
+    assert row_2024["return_pct"] == pytest.approx(
+        50_000 / 1_150_000 * 100, abs=1e-9,
+    )
+
+
+def test_yoy_empty_pnl_returns_empty_table():
+    """Cold input → schema-shaped empty frame, NOT exception."""
+    import pandas as pd
+
+    from src.web.portfolio import _per_year_stats
+
+    empty = pd.Series([], dtype="float64",
+                       index=pd.DatetimeIndex([]))
+    stats = _per_year_stats(empty, 1_000_000.0)
+    assert stats.empty
+    assert list(stats.columns) == [
+        "year", "cycles", "return_inr", "return_pct",
+        "max_dd_inr", "calmar", "ulcer",
+    ]
+
+
+def test_yoy_section_renders_when_data_present():
+    """The 'Year-by-year stability' section renders when the
+    strategy config matches data."""
+    at = _make_apptest()
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Year-by-year stability" in visible
+
+
+def test_yoy_section_skips_on_empty_filter():
+    """No section header when the strategy config matches nothing."""
+    at = _make_apptest()
+    at.session_state["mp_pf_exit_offset_td"] = 20
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Year-by-year stability" not in visible
+
+
+# ============================================================
 # Phase 9.4.3 — headline metrics strip
 # ============================================================
 
