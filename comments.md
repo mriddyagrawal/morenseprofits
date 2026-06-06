@@ -26254,3 +26254,82 @@ Standing by.
 
 ---
 
+## Review of a706ab0 — `feat(p9.4.concentration_correlation)` — ✅ ACCEPT (EXACT match on all margin shares + correlation matrix)
+
+**Verdict: ✅ ACCEPT.** Two-panel diagnostic — per-symbol margin share bar (top-15) + pairwise Pearson cycle-P&L correlation heatmap (top-15, RdBu colorscale). Surfaces the "diversified or illusory?" question the headline ratios can't answer alone. 8 new tests including LOAD-BEARING `share_pct sums to 100` + correlation matrix shape + diagonal=1 pin. 1246 passed; CONSTRAINT 1 still 0.
+
+### Independent reproduction (operator's sweep)
+
+```
+Top 5 margin share:
+   symbol  margin_total  share_pct
+ HINDALCO   ₹6,249,419     2.886543
+    TECHM   ₹6,184,470     2.856544
+      PNB   ₹6,105,523     2.820079
+ ADANIENT   ₹5,991,636     2.767476
+BAJFINANCE  ₹5,831,633     2.693572
+ total share: 100.00   ← LOAD-BEARING pin verified
+```
+
+EXACT match with BUILDER's smoke (2.89, 2.86, 2.82, 2.77, 2.69 to 2 decimals). Sum = 100.00 ✓.
+
+```
+Pairwise correlation (top 5):
+            HINDALCO  TECHM   PNB  ADANIENT  BAJFINANCE
+HINDALCO        1.00  -0.17  0.44      0.11        0.07
+TECHM          -0.17   1.00 -0.30     -0.32       -0.01
+PNB             0.44  -0.30  1.00      0.17        0.62
+ADANIENT        0.11  -0.32  0.17      1.00       -0.02
+BAJFINANCE      0.07  -0.01  0.62     -0.02        1.00
+```
+
+**Every cell matches BUILDER's smoke to 2 decimals.** Diagonal = 1.00 ✓. Symmetric ✓.
+
+### Operator-facing insight verified
+
+**PNB ↔ BAJFINANCE correlation 0.62** (both PSU banking / financials). This confirms the worst-10 attribution pattern from e49246d (the 2026-03-30 cycle's worst contributors were INDUSINDBK + BAJFINANCE + AXISBANK — all bank/finance). **The heatmap surfaces the structural sector concentration that the equal-margin sizing fails to diversify away.**
+
+The correlation matrix is exactly the kind of diagnostic that motivates FILTERS.md §B.5 (sector concentration cap). Operator can now point at the cell PNB↔BAJFINANCE=0.62 and say "yes, this is real, we need the sector cap." Math grounds the policy decision.
+
+### Math verification
+
+`_per_symbol_margin_share`: groupby symbol → sum margin_at_entry → divide by total → multiply by 100. Sorts descending. Test pin: `test_per_symbol_margin_share_sums_to_100_pct`. Verified 100.00 ✓.
+
+`_pairwise_correlation_matrix`: pivot (expiry × symbol) → net_pnl → `.corr()` (Pearson). Square symmetric frame; diagonal = 1.0 by construction (corr(X,X)=1). Test pins: shape + diagonal + anti-correlation case (LOAD-BEARING).
+
+Edge cases covered:
+- Empty trades_df → empty frames; section skips.
+- Missing `margin_at_entry` column → concentration empty + caption "_No margin column in this sweep_". Older-sweep compatibility ✓.
+- < 2 symbols → correlation empty + caption "_Correlation requires ≥ 2 symbols_".
+- Total margin sum ≤ 0 → division-by-zero defensive guard.
+
+### Praise points
+
+- **Top-15 truncation for visual readability** — without it, the heatmap would be 50×50 = 2500 cells, unreadable. Top-15 by margin captures the largest contributors; the long tail is implicitly diversified anyway.
+- **RdBu colorscale on [-1, 1]** — the standard correlation-matrix palette. Red = positive correlation (concentration risk); Blue = negative (real diversification); white at 0.
+- **`_per_symbol_margin_share` + `_pairwise_correlation_matrix` are pure helpers** — testable without `AppTest` overhead. Cross-helper composition reusable for other tabs.
+- **No single name > 3% margin share** in BUILDER's smoke — equal-margin sizing working as designed. Operator sees concentration is NOT from sizing; it's from sector correlation. Diagnostic correctly separates the two channels.
+- **`share_pct.sum() == 100` LOAD-BEARING pin** — any future bug that drops a symbol or fails to normalize trips immediately.
+- **Caption pins the semantic**: "high pairwise correlation = illusory diversification". Operator who hasn't internalized the concept gets the lesson at the UI.
+- **Sub-helper signature `(sub: pd.DataFrame) → pd.DataFrame`** — clean composition surface. Future commits can compose these with the equity/metrics chain.
+
+### Math + arithmetic
+
+- LOC: +161 portfolio.py + 121 test = +282. ✓ Matches `git show --stat`.
+- Tests: 1238 → 1246 (+8). ✓ Matches BUILDER's claim exactly.
+- 37 Portfolio tests now (was 29).
+
+### Next-commit suggestion
+
+`feat(p9.4.2d_diagnostic_ui)` per BUILDER's stated plan (9.4.7) — wires `analytics.regime_ivp_diagnostic.regime_x_ivp_breakdown` (the F19 backend from 5f8af50) into the UI. This is the "non-negotiable" diagnostic per memoir §15 #15 — answers "does IVP add signal beyond the regime gate?" at the operator-facing surface.
+
+Watch for: the F19 backend includes a thin-bucket quintile fallback. The UI commit should surface the `RegimeIvpBreakdown.caveat_text()` value (which I praised at 5f8af50 review for being the right surfacing pattern) prominently when the fallback fires.
+
+Migration cadence
+
+**... → P9.4.5 worst-10 ✓ → P9.4.6 concentration ✓ → P9.4.7 2-D diagnostic (F19 UI) → 9.4.8 sensitivity strip → 9.4.9 drilldown → 9.4.10 deeplink writer → v1 SHIPPED → ...**
+
+Standing by.
+
+---
+
