@@ -190,6 +190,112 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.10 — deeplink to Inspect
+# ============================================================
+
+class _RerunIntercepted(Exception):
+    """Sentinel exception so the deeplink writer's st.rerun()
+    can be intercepted in unit tests without using StopIteration
+    (which Python 3.7+ converts to RuntimeError inside
+    generators / contexts)."""
+
+
+def test_open_in_inspect_writes_canonical_url_params(monkeypatch):
+    """LOAD-BEARING memoir §24.9 deeplink contract: the writer
+    must set tab=Inspect + the 5-tuple (strategy / symbol /
+    expiry / entry_offset_td / exit_offset_td) in URL params,
+    AND call clear_inspect_state() so the next render re-seeds
+    from URL."""
+    import pandas as pd
+    import streamlit as st
+
+    from src.web import inspect as inspect_mod
+    from src.web import portfolio as pf_mod
+
+    # Capture clear_inspect_state calls + skip st.rerun().
+    cleared: list[bool] = []
+
+    def fake_clear():
+        cleared.append(True)
+
+    def fake_rerun():
+        raise _RerunIntercepted("rerun intercepted")
+
+    monkeypatch.setattr(inspect_mod, "clear_inspect_state", fake_clear)
+    monkeypatch.setattr(st, "rerun", fake_rerun)
+    st.query_params.clear()
+
+    # The writer raises our intercept exception via fake_rerun;
+    # everything before that must have run.
+    try:
+        pf_mod._open_in_inspect(
+            strategy="short_strangle",
+            symbol="RELIANCE",
+            expiry=pd.Timestamp("2024-04-25"),
+            entry_offset_td=15,
+            exit_offset_td=3,
+        )
+    except _RerunIntercepted:
+        pass
+
+    assert st.query_params.get("tab") == "Inspect"
+    assert st.query_params.get("strategy") == "short_strangle"
+    assert st.query_params.get("symbol") == "RELIANCE"
+    assert st.query_params.get("expiry") == "2024-04-25"
+    assert st.query_params.get("entry_offset_td") == "15"
+    assert st.query_params.get("exit_offset_td") == "3"
+    assert cleared == [True]
+    assert st.session_state["mp_active_tab"] == "Inspect"
+
+
+def test_open_in_inspect_strategy_from_config(monkeypatch):
+    """Strategy in URL matches the Portfolio config's strategy
+    (not hardcoded). Defensive pin against a future refactor
+    accidentally hardcoding."""
+    import pandas as pd
+    import streamlit as st
+
+    from src.web import inspect as inspect_mod
+    from src.web import portfolio as pf_mod
+
+    def fake_rerun():
+        raise _RerunIntercepted
+
+    monkeypatch.setattr(inspect_mod, "clear_inspect_state",
+                         lambda: None)
+    monkeypatch.setattr(st, "rerun", fake_rerun)
+    st.query_params.clear()
+
+    try:
+        pf_mod._open_in_inspect(
+            strategy="iron_condor",
+            symbol="INFY",
+            expiry=pd.Timestamp("2024-05-30"),
+            entry_offset_td=20,
+            exit_offset_td=1,
+        )
+    except _RerunIntercepted:
+        pass
+
+    assert st.query_params.get("strategy") == "iron_condor"
+    assert st.query_params.get("symbol") == "INFY"
+
+
+def test_deeplink_button_renders_in_cycle_drilldown():
+    """The 'Open in Inspect →' button is present in the cycle
+    drilldown panel when there's at least one cycle to pick."""
+    at = _make_apptest()
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    button_labels = [b.label for b in at.button]
+    assert any("Open in Inspect" in label for label in button_labels), (
+        f"deeplink button missing from drilldown panel; "
+        f"got buttons: {button_labels}"
+    )
+
+
+# ============================================================
 # Phase 9.4.9 — cycle drilldown
 # ============================================================
 

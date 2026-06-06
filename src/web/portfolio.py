@@ -85,6 +85,7 @@ _SS_IVP_BAND = "mp_pf_ivp_band"
 _SS_EARNINGS_FILTER = "mp_pf_earnings_filter"
 _SS_AS_OF = "mp_pf_as_of"
 _SS_DRILLDOWN_CYCLE = "mp_pf_drilldown_cycle"
+_SS_DRILLDOWN_SYMBOL = "mp_pf_drilldown_symbol"
 
 # Defaults match the mockup's pfCfg in DESIGN/Complete/app.jsx
 # lines 30-38. Override via the strategy config block UI.
@@ -98,6 +99,7 @@ _DEFAULTS: dict[str, Any] = {
     _SS_IVP_BAND: (60, 100),
     _SS_EARNINGS_FILTER: True,
     _SS_DRILLDOWN_CYCLE: None,
+    _SS_DRILLDOWN_SYMBOL: None,
 }
 
 # Strategy display labels mirror the mockup's labels.
@@ -450,6 +452,46 @@ _CONCENTRATION_TOP_K_SYMBOLS = 15
 _CORRELATION_PLOT_HEIGHT_PX = 360
 
 
+def _open_in_inspect(
+    *,
+    strategy: str,
+    symbol: str,
+    expiry: pd.Timestamp,
+    entry_offset_td: int,
+    exit_offset_td: int,
+) -> None:
+    """Write the canonical 5-tuple to ``st.query_params`` and
+    switch the active tab to Inspect.
+
+    Per PORTFOLIO_MEMOIR.md §24.9 deeplink contract: writes
+    ``?tab=Inspect&strategy=...&symbol=...&expiry=...&
+    entry_offset_td=...&exit_offset_td=...``. Inspect's
+    ``clear_inspect_state()`` is called immediately before
+    ``st.rerun()`` so the next render re-seeds from URL —
+    the contract memoir §24.9 documents.
+
+    Args:
+        strategy: from cfg.strategy.
+        symbol: picked from the per-symbol panel.
+        expiry: picked cycle's expiry (cycle drilldown).
+        entry_offset_td / exit_offset_td: from cfg (Portfolio
+            globally-fixed window per memoir §5).
+    """
+    from src.web.inspect import clear_inspect_state
+
+    st.query_params["strategy"] = strategy
+    st.query_params["symbol"] = symbol
+    st.query_params["expiry"] = pd.Timestamp(expiry).strftime("%Y-%m-%d")
+    st.query_params["entry_offset_td"] = str(int(entry_offset_td))
+    st.query_params["exit_offset_td"] = str(int(exit_offset_td))
+    st.query_params["tab"] = "Inspect"
+    # Switch the radio-routed active tab key so app.py's
+    # st.radio binding picks "Inspect" on the next render.
+    st.session_state["mp_active_tab"] = "Inspect"
+    clear_inspect_state()
+    st.rerun()
+
+
 def _per_cycle_summary(sub: pd.DataFrame) -> pd.DataFrame:
     """Per-cycle summary table: date, cycle P&L, positions count,
     win-rate within cycle.
@@ -568,7 +610,44 @@ def _render_cycle_drilldown(df_filtered: pd.DataFrame) -> None:
                     lambda v: f"{v:+.2f}%" if pd.notna(v) else "—"
                 )
             sym_disp = pd.DataFrame(cols)
-            st.dataframe(sym_disp, hide_index=True, width="stretch", height=350)
+            st.dataframe(sym_disp, hide_index=True, width="stretch", height=300)
+
+            # Phase 9.4.10 deeplink writer — picks ONE symbol from
+            # the per-symbol panel and opens Inspect pre-seeded
+            # with the 5-tuple. Memoir §24.9 contract.
+            sym_options = per_sym["symbol"].tolist()
+            default_sym = (
+                st.session_state.get(_SS_DRILLDOWN_SYMBOL)
+                if st.session_state.get(_SS_DRILLDOWN_SYMBOL) in sym_options
+                else sym_options[0]
+            )
+            picked_sym = st.selectbox(
+                "Symbol to inspect",
+                options=sym_options,
+                index=sym_options.index(default_sym),
+                key=_SS_DRILLDOWN_SYMBOL,
+                help=(
+                    "Pick a symbol → 'Open in Inspect' opens the "
+                    "Inspect tab pre-seeded with this trade's "
+                    "5-tuple per memoir §24.9 deeplink contract."
+                ),
+            )
+            if st.button(
+                "Open in Inspect →",
+                key="mp_pf_open_inspect_btn",
+                use_container_width=False,
+            ):
+                _open_in_inspect(
+                    strategy=st.session_state[_SS_STRATEGY],
+                    symbol=picked_sym,
+                    expiry=picked,
+                    entry_offset_td=int(
+                        st.session_state[_SS_ENTRY_OFFSET]
+                    ),
+                    exit_offset_td=int(
+                        st.session_state[_SS_EXIT_OFFSET]
+                    ),
+                )
 
     st.caption(
         "Left: every cycle in the filtered view, sorted most-"
