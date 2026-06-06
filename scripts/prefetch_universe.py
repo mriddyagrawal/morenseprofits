@@ -35,6 +35,7 @@ sys.path.insert(0, str(REPO))
 from tqdm import tqdm  # noqa: E402
 
 from src.data import bhavcopy_fo_loader, expiry_calendar, india_vix_loader, options_loader, spot_loader, trading_calendar  # noqa: E402
+from src.data import iv_materializer  # noqa: E402
 from src.data.strike_planner import strikes_around_spot_hybrid  # noqa: E402
 from src.data.errors import MissingDataError  # noqa: E402
 
@@ -349,6 +350,57 @@ def _prefetch_india_vix(start_date: date, end_date: date) -> None:
         )
 
 
+def _prefetch_iv_history(
+    symbols: list[str], start_date: date, end_date: date,
+) -> None:
+    """Step-5 helper: build per-symbol 30D constant-maturity ATM IV
+    history per memoir §21.4 F2-F4. Writes
+    ``data/cache/iv/{SYMBOL}.parquet`` for each symbol covering
+    [start_date, end_date].
+
+    Per memoir §21.3 row C2-C3 + §F5: the IV history is the input
+    to the IVP trailing-percentile rank that gates portfolio
+    candidate selection. Without per-symbol IV history, the
+    Portfolio tab's candidate-selection IVP layer falls through
+    to liquidity-only (operator-flagged 2026-06-06 as "we are
+    wasting almost all the IV stuff we did").
+
+    Non-fatal per symbol: a single-symbol failure (FileNotFoundError
+    on missing options cache, OfflineCacheMiss on bhavcopy gap)
+    skips that symbol and reports. The Portfolio tab degrades
+    gracefully when a symbol's IV parquet is absent.
+
+    Runs in offline mode so the materializer reuses the bhavcopy /
+    spot cache built by Steps 1+2 instead of touching NSE.
+    """
+    n_built = 0
+    n_skipped = 0
+    skip_details: list[tuple[str, str]] = []
+    for sym in tqdm(symbols, desc="iv history", unit="symbol"):
+        try:
+            df = iv_materializer.materialize_iv_history(
+                sym, start_date, end_date,
+                today_fn=TODAY_FN, offline=True,
+            )
+            if df.empty:
+                n_skipped += 1
+                skip_details.append((sym, "empty (no usable expiries)"))
+            else:
+                n_built += 1
+        except Exception as e:
+            n_skipped += 1
+            skip_details.append((sym, f"{type(e).__name__}: {str(e)[:120]}"))
+    print(
+        f"  iv history materialized: {n_built}/{len(symbols)}  "
+        f"(skipped: {n_skipped})"
+    )
+    if skip_details:
+        for sym, why in skip_details[:5]:
+            print(f"    skip: {sym} ({why})")
+        if len(skip_details) > 5:
+            print(f"    ... and {len(skip_details) - 5} more")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -442,6 +494,27 @@ def main() -> int:
             "prefetch (i.e., omitting --vix-only does NOT skip VIX)."
         ),
     )
+    ap.add_argument(
+        "--iv-only", action="store_true",
+        help=(
+            "Run ONLY the IV history materializer (Step 5) and return. "
+            "Useful when adding a new symbol to the universe — fast-"
+            "path the IV cache without re-walking spot/bhavcopy/options. "
+            "Requires Steps 1+2 already-cached output. Pairs with "
+            "--symbols + --start + --end. IV materializer is also run "
+            "UNCONDITIONALLY as Step 5 of the full prefetch."
+        ),
+    )
+    ap.add_argument(
+        "--skip-iv", action="store_true",
+        help=(
+            "Skip the IV history materializer (Step 5). Useful for a "
+            "quick re-prefetch where the operator only wants to refresh "
+            "spot / bhavcopy / options + lot_sizes. The Portfolio tab's "
+            "IVP filter will degrade to liquidity-only ranking on any "
+            "symbol whose iv parquet is stale or missing."
+        ),
+    )
     args = ap.parse_args()
 
     symbols: list[str] = args.symbols
@@ -473,6 +546,19 @@ def main() -> int:
     _prefetch_india_vix(args.start, args.end)
     if args.vix_only:
         _h(f"--vix-only set; skipping spot / bhavcopy / options prefetch")
+        elapsed = time.perf_counter() - t_start
+        print(f"\nTotal wall-clock: {elapsed:.1f}s")
+        return 0
+
+    # ============================================================
+    # --iv-only short-circuit — skip Steps 1-4 and go straight to
+    # Step 5. Requires Steps 1+2 already cached on disk (no network
+    # touch in iv-only mode; the materializer runs offline=True).
+    # ============================================================
+    if args.iv_only:
+        _h(f"--iv-only set; skipping Steps 1-4 (spot/bhavcopy/lot/options)")
+        _h(f"Step 5 — build per-symbol IV history  [{args.start} → {args.end}]")
+        _prefetch_iv_history(symbols, args.start, args.end)
         elapsed = time.perf_counter() - t_start
         print(f"\nTotal wall-clock: {elapsed:.1f}s")
         return 0
@@ -695,6 +781,28 @@ def main() -> int:
             n_skipped_missing += pair_n_miss
             n_skipped_other += pair_n_other
             skip_log.extend(pair_skips)
+
+    # ============================================================
+    # Step 5 — build per-symbol IV history (memoir §21.4 F2-F4)
+    # ============================================================
+    # Per memoir §21.3 row C2-C3: per-symbol 30D constant-maturity
+    # ATM IV history is the input to the IVP trailing-percentile
+    # rank that gates portfolio candidate selection. Runs AFTER
+    # Steps 3+4 so the materializer reads from a fully-populated
+    # bhavcopy + spot + options cache.
+    #
+    # Operator can skip via --skip-iv if they only want to refresh
+    # the lower layers; the Portfolio tab's IVP filter will degrade
+    # to liquidity-only ranking on stale/missing IV parquets.
+    if args.skip_iv:
+        _h("Step 5 — IV history materializer  [SKIPPED via --skip-iv]")
+        print(
+            "  Portfolio tab IVP filter will fall through to "
+            "liquidity-only on symbols without iv parquet."
+        )
+    else:
+        _h(f"Step 5 — build per-symbol IV history  [{args.start} → {args.end}]")
+        _prefetch_iv_history(symbols, args.start, args.end)
 
     # ============================================================
     # Summary
