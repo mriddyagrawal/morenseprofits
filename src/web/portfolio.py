@@ -431,6 +431,96 @@ def _regime_off_cycle_dates(
     return off_cycles
 
 
+# Worst-N cycle drilldown sizing — 10 by default per PLAN.md
+# 9.4.5. Caller can override for narrower / wider views.
+_DEFAULT_WORST_N_CYCLES = 10
+# Attribution depth — top 3 symbols contributing to each cycle's
+# loss surfaces enough context without overwhelming the table.
+_ATTRIBUTION_TOP_K_SYMBOLS = 3
+
+
+def _worst_cycles_with_attribution(
+    sub: pd.DataFrame, *, n: int = _DEFAULT_WORST_N_CYCLES,
+    top_k: int = _ATTRIBUTION_TOP_K_SYMBOLS,
+) -> pd.DataFrame:
+    """Top-N worst cycles by total cycle P&L with per-symbol
+    "what blew up" attribution.
+
+    For each of the n worst cycles, identifies the top_k symbols
+    with the largest negative net_pnl contributions and surfaces
+    them in a compact 'SYM (-₹X) · SYM (-₹X) · …' string. Memoir
+    §4 + PLAN.md 9.4.5: the operator-facing tail-event view.
+
+    Args:
+        sub: per-trade frame already filtered to the Portfolio
+            config tuple (strategy, entry, exit).
+        n: how many worst cycles to surface. Default 10.
+        top_k: how many symbol contributors per cycle.
+
+    Returns:
+        DataFrame with columns:
+          expiry, cycle_pnl, attribution.
+        Sorted ascending by cycle_pnl (worst first). May have
+        fewer than n rows if fewer cycles exist.
+    """
+    if sub.empty:
+        return pd.DataFrame(
+            columns=["expiry", "cycle_pnl", "attribution"],
+        )
+    cycle_totals = (
+        sub.groupby("expiry", sort=False)["net_pnl"].sum()
+           .sort_values(ascending=True)
+           .head(n)
+    )
+    rows: list[dict] = []
+    for expiry, total in cycle_totals.items():
+        cycle_trades = sub[sub["expiry"] == expiry]
+        # Aggregate per-symbol P&L within this cycle, sort
+        # ascending so the largest losses come first.
+        per_sym = (
+            cycle_trades.groupby("symbol")["net_pnl"]
+                        .sum().sort_values(ascending=True).head(top_k)
+        )
+        chunks = [
+            f"{sym} ({_fmt_inr_compact(val)})"
+            for sym, val in per_sym.items()
+        ]
+        rows.append({
+            "expiry": pd.Timestamp(expiry),
+            "cycle_pnl": float(total),
+            "attribution": " · ".join(chunks) if chunks else "—",
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_worst_10_cycles(df_filtered: pd.DataFrame) -> None:
+    """Worst-10 cycles + per-symbol attribution panel per
+    PLAN.md Phase 9.4.5.
+
+    Renders silently on empty filter — equity-curve renderer
+    already surfaced the explanation banner.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        return
+    table = _worst_cycles_with_attribution(sub)
+    if table.empty:
+        return
+
+    st.markdown("##### Worst 10 cycles")
+    disp = pd.DataFrame({
+        "Expiry": table["expiry"].dt.strftime("%Y-%m-%d"),
+        "Cycle P&L": table["cycle_pnl"].map(_fmt_inr_compact),
+        "What blew up": table["attribution"],
+    })
+    st.dataframe(disp, hide_index=True, width="stretch")
+    st.caption(
+        "Cycle expiry · total P&L across symbols traded in that "
+        "cycle · top-3 per-symbol loss contributors. The tail-"
+        "risk surface beyond the smoothed Calmar / Ulcer ratios."
+    )
+
+
 def _per_year_stats(
     pnl_series: pd.Series, starting_capital: float,
 ) -> pd.DataFrame:
@@ -799,3 +889,4 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     _render_headline_strip(df_filtered)
     _render_equity_curve(df_filtered)
     _render_yoy_stability(df_filtered)
+    _render_worst_10_cycles(df_filtered)

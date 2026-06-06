@@ -190,6 +190,109 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.5 — worst-10 cycles with attribution
+# ============================================================
+
+def test_worst_10_returns_n_or_fewer_cycles():
+    """LOAD-BEARING 9.4.5 contract: top-N worst cycles sorted
+    ascending by cycle_pnl with per-symbol attribution."""
+    import pandas as pd
+
+    from src.web.portfolio import _worst_cycles_with_attribution
+
+    # 15 cycles, varying outcomes — ask for worst 10.
+    sub = pd.DataFrame({
+        "strategy": ["short_strangle"] * 30,
+        "expiry": pd.to_datetime(
+            [f"2024-{m:02d}-25" for m in range(1, 13)
+             for _ in range(2)] + [
+                "2025-01-25", "2025-01-25",
+                "2025-02-28", "2025-02-28",
+                "2025-03-28", "2025-03-28",
+            ]
+        ),
+        "symbol": ["A", "B"] * 15,
+        "net_pnl": list(range(-150_000, 150_000, 10_000)),
+    })
+    out = _worst_cycles_with_attribution(sub, n=10)
+    assert len(out) == 10
+    # Ascending by cycle_pnl.
+    assert out["cycle_pnl"].is_monotonic_increasing
+
+
+def test_worst_10_attribution_includes_symbol_with_loss():
+    """Attribution string surfaces the symbol with the largest
+    contribution to the loss."""
+    import pandas as pd
+
+    from src.web.portfolio import _worst_cycles_with_attribution
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime(
+            ["2024-01-25"] * 3 + ["2024-02-29"] * 3
+        ),
+        "symbol": ["RELIANCE", "INFY", "TCS",
+                    "RELIANCE", "INFY", "TCS"],
+        "net_pnl": [-50_000, -10_000, 5_000,
+                     5_000, 10_000, -20_000],
+    })
+    out = _worst_cycles_with_attribution(sub, n=10)
+    # Cycle 2024-01-25 is the worst (-55k); attribution should
+    # mention RELIANCE first (largest contributor).
+    worst = out.iloc[0]
+    assert worst["cycle_pnl"] == -55_000.0
+    assert "RELIANCE" in worst["attribution"]
+
+
+def test_worst_10_empty_returns_empty_table():
+    import pandas as pd
+
+    from src.web.portfolio import _worst_cycles_with_attribution
+
+    empty = pd.DataFrame(columns=["expiry", "symbol", "net_pnl"])
+    out = _worst_cycles_with_attribution(empty)
+    assert out.empty
+    assert list(out.columns) == ["expiry", "cycle_pnl", "attribution"]
+
+
+def test_worst_10_returns_fewer_than_n_when_universe_smaller():
+    """5 cycles available; ask for 10 → return 5."""
+    import pandas as pd
+
+    from src.web.portfolio import _worst_cycles_with_attribution
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime(
+            ["2024-01-25", "2024-02-29", "2024-03-28",
+             "2024-04-25", "2024-05-30"]
+        ),
+        "symbol": ["A"] * 5,
+        "net_pnl": [-5_000, -3_000, -1_000, 2_000, 4_000],
+    })
+    out = _worst_cycles_with_attribution(sub, n=10)
+    assert len(out) == 5
+
+
+def test_worst_10_section_renders_when_data_present():
+    at = _make_apptest()
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Worst 10 cycles" in visible
+
+
+def test_worst_10_section_skips_on_empty_filter():
+    at = _make_apptest()
+    at.session_state["mp_pf_exit_offset_td"] = 20
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Worst 10 cycles" not in visible
+
+
+# ============================================================
 # Phase 9.4.4 — year-by-year stability table
 # ============================================================
 
