@@ -26399,3 +26399,80 @@ Standing by.
 
 ---
 
+## Review of a561f0f — `feat(p9.4.ivp_sensitivity_strip)` — ✅ ACCEPT (per-decile composition + edge cases clean)
+
+**Verdict: ✅ ACCEPT.** 4-panel sensitivity strip (median P&L / Calmar / Max DD ₹ / CVaR-5% vs IVP decile) per memoir §2.5. Operator scans the IVP cutoff to find the empirical sweet spot. Per-decile metrics compose cycle_pnl_series → equity_curve → drawdown_series per bucket (each treated as its own standalone book). 3 edge cases handled: empty trades, all-NaN IVP, all-same IVP (qcut ValueError). 1257 passed (+5 ✓); CONSTRAINT 1 still 0.
+
+### Math composition per decile
+
+```
+for each decile in qcut(ivp_at_entry, n_buckets=10, duplicates='drop'):
+    decile_trades = trades_df[trades_df.bucket == decile]
+    pnl = cycle_pnl_series(decile_trades)
+    eq  = equity_curve(pnl, starting_capital=₹1M)  # Option-a prepend from 3309dd9
+    dd  = drawdown_series(eq)
+    calmar     = simple_annualized_return(eq) / abs(dd_pct.min())
+    max_dd_inr = abs(dd.min())
+    median_pnl = pnl.median()
+    cvar_5_pnl = pnl.nsmallest(max(1, N×0.05)).mean()  # same as F19's CVaR
+```
+
+Each decile gets the FULL composition stack (F12 → F13 → F14 + F15 + F18). The Option-a prepend means even thin deciles correctly anchor at ₹1M for the cummax. ✓
+
+### Edge cases — clean degradation
+
+- **Empty trades / no ivp_per_sym** → schema-shaped empty frame; section skips.
+- **All-NaN IVP** (no symbol has IV cache) → empty frame + caption `"_No per-symbol IVP cache available_"`.
+- **All-same IVP** (degenerate distribution) → qcut raises ValueError → caught → empty frame + sensitivity-scan-impossible caption.
+
+`duplicates='drop'` on qcut handles the "fewer-than-N-unique-values" case (silently produces fewer buckets), and the explicit ValueError catch handles the all-same case where qcut fails entirely. Defensive surface ✓.
+
+### Look-ahead caveat pinned (4th place)
+
+The footer caption surfaces the qcut FULL-SAMPLE caveat for the 4th time across the codebase:
+1. memoir §F19 caveat block (5f8af50 backend docstring)
+2. inline code comment near qcut call (5f8af50)
+3. functional test (`test_look_ahead_caveat_functional_pin` in 5f8af50 backend)
+4. Portfolio tab UI footer caption (c1a1611 + this commit)
+
+Operator cannot miss it. Future contributor copy-pasting the qcut bucket math into a LIVE filter would trip all 4 references.
+
+### Reasonable v1 trade-offs
+
+- **Thin-decile Max DD ₹ caveat (implicit)**: with qcut + duplicates='drop' on uneven distributions, deciles can have wildly different N. Max DD ₹ is structurally smaller for thin deciles (fewer cycles). The sensitivity strip is for SHAPE-of-curve scanning, not absolute decile-vs-decile comparison. Not flagged as a grill because (a) qcut keeps buckets roughly equal in the typical case, and (b) the strip's purpose is shape-driven (where does Calmar maximize?), not absolute-magnitude.
+- **Starting capital ₹1M for every decile** — Calmar / Ulcer are scale-invariant per F15/F16, so the per-decile choice is consistent with the rest of the tab.
+
+### Praise points
+
+- **Pure helper `_per_decile_metrics(trades_df, ivp_per_sym, *, n_buckets=10) → pd.DataFrame`** — testable without `AppTest`, composable for future features (e.g., regime-conditional sensitivity).
+- **CVaR-5% via `nsmallest(int(N×0.05)).mean()`** — matches the F19 backend convention. `max(1, ...)` defensive on small samples.
+- **2×2 grid of small charts** — visual layout matches the 4-metric polarity (higher/higher/lower/higher better). Right altitude for "scan the shape."
+- **Per-decile equity_curve reuses Option-a prepend** automatically from 3309dd9's portfolio.py. The architectural fix from my 70dc408 grill flows into this new surface for free.
+- **LOAD-BEARING column-set + row-count contract** (`test_per_decile_metrics_returns_one_row_per_bucket`) — drift detector for future schema changes.
+- **`duplicates='drop'` on qcut** — silently produces fewer buckets on tied edges. Same defensive convention as 5f8af50.
+- **3 graceful-degrade paths** match the typical degradation hierarchy (no trades → no IVP → degenerate distribution). Each has its own caption naming the failure mode.
+
+### Math + arithmetic
+
+- LOC: +171 portfolio.py + 83 test = +254 net. ✓ Matches `git show --stat`.
+- Tests: 1252 → 1257 (+5). ✓ Matches BUILDER's claim exactly.
+- 48 Portfolio tests now (was 43).
+
+### Next-commit suggestion
+
+`feat(p9.4.cycle_drilldown)` per BUILDER's stated next (9.4.9). The "heaviest single commit left in 9.4" because it's the first commit that needs the **candidate-selection pipeline** (top-N by liquidity → IVP rank). Per BUILDER's roadmap: cycle-by-cycle table → click → 5-stocks panel with per-stock cycle P&L.
+
+This is also the commit that will replace the "positions today: — / N" em-dash placeholder from 22ff990 with a real number — operator finally sees which symbols got selected per cycle.
+
+Watch points:
+- The pipeline composes top_n_by_liquidity (61c3fe9) → top_n_by_ivp (52a9036) → filter_universe_by_earnings (c7563d7). Cross-module composition; possible drift surface.
+- The 9.4.6 concentration matrix and 9.4.5 worst-10 panels already show per-symbol contributions of TAKEN trades. Cycle drilldown should be consistent with those — same per-symbol P&L attribution semantics.
+
+Migration cadence
+
+**... → P9.4.7 2-D ✓ → P9.4.8 sensitivity ✓ → P9.4.9 drilldown (candidate-selection pipeline) → P9.4.10 deeplink writer → v1 Portfolio Foundation SHIPPED → ...**
+
+Standing by.
+
+---
+
