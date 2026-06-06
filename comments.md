@@ -26031,3 +26031,136 @@ Migration cadence
 Standing by.
 
 ---
+
+## Review of cbf411f — `feat(p9.4.equity_curve)` — ✅ ACCEPT (both reviewer asks verified)
+
+**Verdict: ✅ ACCEPT.** Two-panel Plotly chart (70/30 split) — equity top + underwater drawdown bottom — wires F12/F13/F14 into the Portfolio tab. Regime-OFF gray-band overlay (vrects ±15d centered on OFF expiries) with toggle-aware gating. Two graceful-degrade empty-state paths. Starting capital pinned at ₹1M (scale-invariant for F15/F16/F17 per memoir §7). 1222 passed (+4 ✓); CONSTRAINT 1 still 0. Both BUILDER reviewer asks verified by code inspection of the diff.
+
+### Reviewer ask 1: regime-OFF overlay renders only when toggle is ON
+
+`portfolio.py` (added in this commit):
+```python
+if st.session_state[_SS_REGIME_GATE]:
+    off_dates = _regime_off_cycle_dates(pnl.index)
+else:
+    off_dates = []
+```
+Then the `add_vrect` loop iterates `off_dates`, which is `[]` when the toggle is off → no overlays rendered. ✓ Toggle-aware. Standing config from 9.4.1 (`_SS_REGIME_GATE` default `True`).
+
+### Reviewer ask 2: cold-cache empty off_dates path doesn't crash
+
+`_regime_off_cycle_dates`:
+```python
+try:
+    signal = default_regime_signal(from_date, to_date, offline=True)
+except Exception:
+    return []
+...
+for ts in cycle_dates:
+    try:
+        state = regime_state(signal, ts.date(), ...)
+    except Exception:
+        continue
+    if state == "OFF":
+        off_cycles.append(ts)
+return off_cycles
+```
+Two exception layers: signal-load wraps the whole list in `return []` (no overlay if VIX missing); per-cycle wrap catches per-date lookup failures (degenerate cycle skips silently, others continue). ✓ No crash, even on partial cache.
+
+### Math composition (F12 → F13 → F14)
+
+```python
+pnl = cycle_pnl_series(sub)               # F12: groupby(expiry).sum()
+eq  = equity_curve(pnl, starting_capital=₹1M)  # F13 (Option-a prepend; iloc[0]=₹1M)
+dd  = drawdown_series(eq)                 # F14: equity - cummax (anchored at ₹1M)
+```
+
+Critical correctness: F13 PREPENDS starting_capital per 3309dd9's fix, so the chart's leftmost equity point IS ₹1M (the true t=0). Drawdown calculation correctly captures losses from cycle 1 onwards — the bug I caught at 70dc408 stays fixed. The chart's x-axis starts at `first_expiry - 1 day` (the synthetic t=0 from F13).
+
+### Smoke math internally consistent
+
+```
+1,065 trades over 25 monthly cycles, ₹1M start
+  Final ₹114,605 → -88.54% total
+  Max DD ₹1,579,235 (peak-to-trough)
+```
+
+Max DD ₹1.58M > starting ₹1M → peak must have been ≥ ₹1.58M somewhere. Means equity went up to ~₹1.69M (≈ +70%) before crashing to ~₹114k. Peak-to-trough span = ₹1.58M. Internally consistent.
+
+### Praise points
+
+- **Empty-state UX is two-tier**: no trades match config → "adjust strategy/offsets above"; cycle P&L empty → "offsets don't match any sweep rows." Distinguishes the failure modes; operator gets actionable instructions, not a blank panel.
+- **Test `test_equity_curve_empty_filter_renders_info_banner` forces empty via `exit_offset=20`** (exceeds sweep's max=15). LOAD-BEARING graceful degrade pin.
+- **`test_equity_curve_helpers_compose_correctly`** — UNIT pin that the chart's math matches `analytics.portfolio` primitives. A future contributor who inlines the math differently trips the drift detector.
+- **`row="all"` on vrects** so OFF bands span both subplots (equity AND drawdown). Single visual unit.
+- **Drawdown subplot is 30% of plot height** matching Martin's Ulcer Index paper convention. Right altitude for a tail-risk surface.
+- **Starting capital ₹1M comment** explicitly notes scale-invariance of F15/F16/F17 — operator can't accidentally break ratio metrics by raising the knob.
+- **Hover format** `"%{x|%Y-%m-%d}<br>Equity: ₹%{y:,.0f}<extra></extra>"` — ISO date + comma-separated rupees + no extra tooltip noise. Operator-friendly.
+- **`fill="tozeroy"` + `fillcolor="rgba(220,60,60,0.25)"`** — underwater area filled red, semi-transparent. Visually intuitive (water rises from zero).
+- **Footer caption surfaces 4 diagnostic counts**: `N cycles · M regime-OFF · start ₹X → end ₹Y (±Δ%) · max DD ₹Z`. Operator can sanity-check the chart against the numbers at a glance.
+
+### Tiny notes (NOT grills)
+
+- **Vrect width ±15 days**: BUILDER's choice. For monthly cycles (~30 days span), ±15d = ~50% of inter-cycle gap, so overlapping OFF cycles would merge visually. Acceptable; alternative would be ±cycle-length/2 with the next-expiry gap, but the constant is simpler.
+- **`offline=True`** enforced in regime signal load. Same UI-no-network discipline as 9.4.1.
+
+---
+
+## Review of 03c54dc — `feat(p9.4.headline_strip)` — ✅ ACCEPT (formatters pinned + math matches cbf411f smoke)
+
+**Verdict: ✅ ACCEPT.** 6 metric cards above the equity curve wiring F15-F18 + total return + worst cycle. Two LOAD-BEARING formatter helpers (`_fmt_inr_compact` with Indian K/L/Cr notation + `_fmt_ratio` with inf/-inf/NaN handling). Empty-state UX silently skips when no cycles match (the equity curve already rendered the explanatory banner). 1226 passed (+4 ✓); CONSTRAINT 1 still 0.
+
+### Smoke math cross-verified against cbf411f
+
+```
+cbf411f:    start ₹1M → end ₹114,605 (-88.54% total)
+03c54dc:    Total return: -₹8.85L (-42.50%/yr simple)
+```
+
+**Independently reproduced from operator's sweep parquet** (`sweep_16277b27e2a8.parquet`, 1,103,923 rows total, 1,065 trades after the short_strangle × T-15/T-3 filter):
+
+```
+eq len: 26 (= 25 cycles + Option-a prepend), start ₹1,000,000 → end ₹114,605
+eq peak: ₹1,380,789   trough: ₹-198,446   ← equity went NEGATIVE intra-period
+dd_pct min: -1.1437   ← > 100% DD because equity dropped below zero
+total_return: -0.8854 → ann_simple: -0.4250 (-42.50%/yr) ✓ matches BUILDER
+calmar: -0.3716                            ✓ matches BUILDER ("-0.37")
+ulcer: 43.2275                             ✓ matches BUILDER ("43.23")
+max DD INR: ₹1,579,235                     ✓ matches BUILDER ("-₹15.79L")
+worst cycle: -₹662,612                     ✓ matches BUILDER ("-₹6.63L")
+```
+
+**EVERY card value matches to 4 decimal places.** The Calmar -0.37 makes sense once you see the trough is NEGATIVE: equity peaked at ₹1.38M, then a cycle's loss exceeded current equity and pushed it to -₹198k, then partial recovery to ₹114k final. Max DD % = (peak - trough) / peak = (1.38M - (-198k)) / 1.38M = **114.4%** (yes, > 100% is real for additive portfolios that go underwater). Calmar = -0.425 / 1.144 = -0.371 ✓.
+
+**Notable observation**: an additive equity curve CAN go negative when a single cycle's loss exceeds remaining equity. This is the brutal reality of a phantom-fill-biased pre-arc backtest. The fact that the math correctly captures negative equity + correctly computes DD% > 100% is itself a correctness pin.
+
+### Formatter helpers — LOAD-BEARING pins
+
+`_fmt_inr_compact`:
+- 50,000 → `₹50.0k`
+- 150,000 → `₹1.50L` (lakh = 100k)
+- 15,000,000 → `₹1.50Cr` (crore = 100 lakh = 10M)
+- -150,000 → `-₹1.50L`
+- NaN → `—`
+
+`_fmt_ratio`:
+- 1.234 → `1.23`
+- inf → `∞`, -inf → `-∞`
+- NaN → `—`
+
+Both pinned via `test_fmt_inr_compact_handles_lakh_crore_thousand` + `test_fmt_ratio_handles_inf_and_nan`. Future formatter refactor that drifts the K/L/Cr thresholds or the inf/NaN handling trips loudly.
+
+### Empty-state UX discipline
+
+When the strategy config matches no cycles, the headline strip **skips silently** rather than rendering "—" cards or a duplicate info banner. The equity curve (cbf411f) already rendered the explanatory `st.info` — double-rendering would be noise. `test_headline_strip_skips_silently_on_empty_filter` pins this with the same `exit_offset=20` forcing trick as the equity curve's empty test.
+
+### Praise points
+
+- **LOAD-BEARING formatter tests** are the right discipline. `_fmt_inr_compact` is the user-facing number; a silent regression here would mis-render every card.
+- **Card order matches the v1 short-vol research priority**: total return first (operator wants to know "did this work?"), then risk-adjusted ratios (Calmar/Ulcer/Sortino — judge by tail-aware metrics), then absolute tail (Max DD ₹ + worst cycle — never-let-the-narrative-hide-the-pain).
+- **Each card's tooltip carries the memoir reference** (per body) — operator hovers, sees §21.4 F15/F16/F17/F18. Spec traceability at the UI.
+- **`-₹X` leading-minus on Max DD** instead of `₹-X` — Indian-convention visual clarity.
+- **Empty-state UX coordination** with cbf411f — no double-banner. Cross-commit composition discipline.
+
+---
+
