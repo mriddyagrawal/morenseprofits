@@ -26716,3 +26716,106 @@ Standing by.
 
 ---
 
+## Review of df8d429 — `fix(p9.4.regime_banner.as_of_snap)` — ✅ ACCEPT (operator-driven bug; transparent snap is the right discipline)
+
+**Verdict: ✅ ACCEPT.** Operator-reported false-negative on the regime banner. Today's date (2026-06-06) exceeded the VIX cache high-water mark (2026-05-29) by 8 days (weekend + NSE publishing lag) → `OfflineCacheMiss` → cold-cache caption fired even though the cache WAS populated. Fix snaps `as_of` to `min(date.today(), latest_cached_vix_date)` with transparent operator-facing caption. 4 new LOAD-BEARING tests; 1271/1271 pass.
+
+### Bug reproduction (operator's machine, 2026-06-06)
+
+```
+Today               : 2026-06-06
+Latest cached VIX   : 2026-05-29   ← 8 days behind (weekend + NSE lag)
+Pre-fix banner      : "Regime signal unavailable: OfflineCacheMiss. Run
+                      scripts/prefetch_universe.py --vix-only..."
+                      REGIME: OFF  pctile: —  as of: 2026-06-06
+```
+
+False-negative — cache IS populated (526 rows). The `_render_regime_banner` `except Exception` from 22ff990 caught the `OfflineCacheMiss` and rendered the cold-cache caption. **My a31a3f8 review noted this except-broad pattern as a v1-acceptable trade-off**; the operator's bug report confirms the trade-off had a real-world cost (the broad except was hiding a false-positive cache-miss signal).
+
+### Fix is operator-transparent
+
+`_resolve_as_of()` precedence:
+1. Operator-supplied `mp_pf_as_of` (future date picker — Phase 10+).
+2. `min(date.today(), latest_cached_vix_date)` — auto-snap.
+3. `date.today()` — fallback when cache absent entirely.
+
+Banner caption when the snap fires:
+> "India VIX cache currently ends on 2026-05-29; regime banner evaluated against that date. Re-run prefetch after NSE's EOD publish to advance to 2026-06-06."
+
+**This is the right discipline**: the snap is NOT silent. Operator sees:
+1. Which day the banner is actually evaluating (₹2026-05-29, not "today")
+2. The reason for the snap (cache high-water mark)
+3. The operator-actionable fix (re-run prefetch after EOD publish)
+
+Contrast with what could have gone wrong:
+- Silent snap → operator confused why "today's regime" shows old data
+- Hardcoded fallback to `today() - 7 days` → arbitrary, fragile
+- Refusing to render → strictly worse UX than the snap+caption
+
+### LOAD-BEARING test pins
+
+- `test_resolve_as_of_snaps_to_latest_cached_vix_date` — bug regression. Pins `min(today, latest_vix)` semantics. Future refactor that "simplifies" by removing the snap trips loudly.
+- `test_resolve_as_of_uses_today_when_vix_cache_missing` — cold-cache fallback path still fires (the original 22ff990 cold-cache caption still works when the cache is genuinely absent).
+- `test_resolve_as_of_explicit_override_wins` — date-picker contract for Phase 10+ extensions.
+- `test_latest_cached_vix_date_handles_missing_parquet` — None not exception. Defensive against a fresh-clone with no cache at all.
+
+### Honest scope: carry-over issue acknowledged
+
+BUILDER's commit body explicitly names the OTHER operator-reported issue:
+> "I don't see which stocks were selected for each month — the cycle drilldown currently shows ALL trades per cycle, not the v1 candidate-selection top-N. That's a structurally larger change (wires top_n_by_liquidity + top_n_by_ivp + earnings filter into the Portfolio cycle simulator) and lands as its own commit."
+
+**This was my prediction at a31a3f8 review** (I wrote that the candidate-selection pipeline composition would be in 9.4.9, and I was wrong — ce3824a just reads taken trades from the sweep parquet). My prediction was structurally right; just on the wrong commit. The operator has now flagged it, and BUILDER honestly scopes it as "structurally larger change" deferred to its own commit.
+
+This is the right scoping discipline:
+- Don't conflate a small banner-snap fix with a structural pipeline addition
+- Acknowledge the carry-over by name so it's tracked
+- Defer to its own commit per [[feedback_nuclear_commits]]
+
+### Praise points
+
+- **Transparent snap caption** — operator sees BOTH the evaluated date AND the high-water mark AND the actionable fix. Best-of-three UX.
+- **`_latest_cached_vix_date()` reads parquet header only** — no full signal load, no kernel round-trip. Cheap to call on every render.
+- **3-tier precedence with explicit override** — operator-driven date picker (Phase 10+) wins; auto-snap is the middle; today() is the last-resort fallback. Forward-compatible.
+- **Cold-cache fallback path STILL works** — explicit test pin. The 22ff990 cold-cache caption fires when cache is genuinely absent (not just outdated).
+- **Operator-reported bug with explicit reproduction in commit body** — the exact pre-fix banner text + the cache state + the failure mode trail. Reproducible audit.
+- **Carry-over issue scoped honestly** — separate commit, not hidden bundling.
+
+### Math + arithmetic
+
+- LOC: +63 portfolio.py + 84 test = +141 net. ✓ Matches `git show --stat`.
+- Tests: 1267 → 1271 (+4). ✓ Matches BUILDER's claim exactly.
+- 62 Portfolio tests now (was 58).
+
+### State-of-tree
+
+- `main` HEAD: `df8d429`.
+- **Phase 9 v1 Portfolio Foundation still CLOSED.** This is a post-ship operator-driven fix; doesn't reopen phase scope.
+- Carry-over noted: candidate-selection pipeline composition is its own pending commit.
+
+### Open grills (cumulative — final state unchanged)
+
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate — STILL OPEN.
+
+### Next-commit suggestion
+
+The candidate-selection pipeline composition that BUILDER named as carry-over. Per memoir §3 / §11.b / §2.5 the live selection runs:
+1. Universe → top_n_by_liquidity (per 61c3fe9)
+2. Liquidity survivors → filter_universe_by_earnings (per c7563d7)
+3. Earnings survivors → top_n_by_ivp (per 52a9036)
+4. IVP-ranked top N → the candidate basket for the cycle
+
+This is exactly what should replace the "shows ALL trades per cycle" semantic in the drilldown. The candidate-basket-per-cycle becomes the "5-stocks panel" memoir §24 calls out. Once this lands, the "positions today: — / N" em-dash placeholder from 22ff990 can finally be replaced with a real number.
+
+Per [[feedback_next_commit_suggestion]]: A. follows operator's reported issue; B. de-risks the biggest cross-module composition surface (4 analytics modules); C. fits as one nuclear commit.
+
+Migration cadence
+
+**... → df8d429 banner snap ✓ → candidate-selection pipeline (carry-over) → P10 sizing variants OR P11 Tier-3 → ...**
+
+Standing by.
+
+---
+
