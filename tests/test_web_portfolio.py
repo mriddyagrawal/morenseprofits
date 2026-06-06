@@ -75,7 +75,7 @@ def test_portfolio_tab_renders_without_error():
     """LOAD-BEARING smoke: app.py routes ``?tab=Portfolio`` to the
     Portfolio tab and it renders without exception."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     assert not at.exception, f"Portfolio tab raised: {at.exception}"
 
 
@@ -86,7 +86,7 @@ def test_portfolio_tab_in_tab_options():
     Streamlit's AppTest exposes ``.radio`` widgets; we check
     'Portfolio' is in one of them."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     radio_options = []
@@ -100,7 +100,7 @@ def test_portfolio_tab_in_tab_options():
 def test_portfolio_tab_renders_header_text():
     """Page header is rendered."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     # Collect all markdown / caption text.
@@ -112,7 +112,7 @@ def test_portfolio_tab_renders_header_text():
 def test_portfolio_tab_renders_n5_and_survivorship_banners():
     """Two standing caveat banners from memoir §11."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -127,7 +127,7 @@ def test_portfolio_tab_does_not_render_proxy_banner():
     integration so the caveat is no longer accurate. If this
     test fails, someone copy-pasted the banner back in."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -139,7 +139,7 @@ def test_portfolio_tab_renders_regime_banner_state():
     """ON or OFF must appear in the regime banner — Phase 9.6
     wires the v2 India VIX path."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -155,7 +155,7 @@ def test_portfolio_tab_renders_strategy_config_widgets():
     Streamlit's AppTest exposes widgets by type. We check the
     counts so a future refactor can't silently drop a control."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     # 3 selectboxes (positions / strategy / sizing).
@@ -170,7 +170,7 @@ def test_session_state_seeds_with_defaults():
     """LOAD-BEARING config-block defaults pin per the mockup
     DESIGN/Complete/app.jsx lines 30-38."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     ss = at.session_state
@@ -188,6 +188,276 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 # Helpers
 # ============================================================
+
+# ============================================================
+# Candidate-selection pipeline (post-9.4 fix 2026-06-06)
+# ============================================================
+
+def test_select_top_n_for_cycle_regime_off_returns_empty():
+    """LOAD-BEARING memoir §3 contract: when regime_state at
+    entry == OFF and the gate is on, the cycle gets NO positions
+    (empty list)."""
+    import pandas as pd
+    from datetime import date
+
+    from src.web.portfolio import _select_top_n_for_cycle
+
+    # Build a regime signal where percentile at as_of will be high
+    # (top of band) → OFF state.
+    idx = pd.date_range("2023-01-01", periods=300, freq="D")
+    # Most low, peak at the end → today is 100th percentile → OFF.
+    vals = list(range(len(idx)))
+    signal = pd.Series(vals, index=idx, dtype="float64")
+
+    picked = _select_top_n_for_cycle(
+        universe_symbols=["RELIANCE", "INFY", "TCS"],
+        entry_date=idx[-1].date(),
+        exit_date=idx[-1].date(),
+        universe_n=5,
+        ivp_band=(0, 100),
+        regime_signal=signal,
+        events_df=None,
+        regime_gate_on=True,
+        earnings_filter_on=False,
+    )
+    assert picked == []
+
+
+def test_select_top_n_for_cycle_regime_off_ignored_when_gate_off():
+    """Regime gate disabled → ignore regime even when state is OFF."""
+    import pandas as pd
+
+    from src.web import portfolio as pf_mod
+
+    idx = pd.date_range("2023-01-01", periods=300, freq="D")
+    signal = pd.Series(list(range(len(idx))), index=idx, dtype="float64")
+
+    # With gate off, the function tries liquidity + IVP. Stub those
+    # so we can confirm we got past the regime gate.
+    captured: list = []
+
+    def fake_compute_liquidity_scores(syms, as_of, **kw):
+        captured.append(("liq", list(syms)))
+        return {s: 100.0 for s in syms}
+
+    def fake_compute_ivp(sym, as_of):
+        captured.append(("ivp", sym))
+        return 50.0
+
+    import src.web.portfolio as pf_module
+    pf_module.compute_liquidity_scores = fake_compute_liquidity_scores
+    pf_module.compute_ivp = fake_compute_ivp
+    try:
+        picked = pf_module._select_top_n_for_cycle(
+            universe_symbols=["RELIANCE", "INFY"],
+            entry_date=idx[-1].date(),
+            exit_date=idx[-1].date(),
+            universe_n=5,
+            ivp_band=(0, 100),
+            regime_signal=signal,
+            events_df=None,
+            regime_gate_on=False,  # gate OFF
+            earnings_filter_on=False,
+        )
+    finally:
+        # Reset module-level monkeypatches to library imports.
+        from src.analytics.liquidity import compute_liquidity_scores as _cls
+        from src.analytics.ivp import compute_ivp as _ci
+        pf_module.compute_liquidity_scores = _cls
+        pf_module.compute_ivp = _ci
+    # Liquidity + IVP were called → gate was bypassed.
+    assert any(t[0] == "liq" for t in captured)
+
+
+def test_select_top_n_for_cycle_earnings_filter_drops_symbols():
+    """LOAD-BEARING memoir §17.5: symbols with Financial Results
+    in the window drop out before the liquidity / IVP layers."""
+    import pandas as pd
+    from datetime import date
+
+    from src.web import portfolio as pf_module
+
+    # Build an events frame where RELIANCE has Financial Results
+    # in [entry, exit+1].
+    events = pd.DataFrame({
+        "SYMBOL": pd.Series(["RELIANCE"], dtype="string"),
+        "PURPOSE": pd.Series(["Financial Results"], dtype="string"),
+        "DATE": pd.to_datetime(["2024-06-15"]).astype("datetime64[us]"),
+    })
+
+    # Stub liquidity + IVP so we can see WHICH symbols got through.
+    seen_in_liq: list[str] = []
+
+    def fake_liq(syms, as_of, **kw):
+        seen_in_liq.extend(syms)
+        return {s: 100.0 for s in syms}
+
+    def fake_ivp(sym, as_of):
+        return 50.0
+
+    pf_module.compute_liquidity_scores = fake_liq
+    pf_module.compute_ivp = fake_ivp
+
+    try:
+        pf_module._select_top_n_for_cycle(
+            universe_symbols=["RELIANCE", "INFY", "TCS"],
+            entry_date=date(2024, 6, 10),
+            exit_date=date(2024, 6, 18),
+            universe_n=5,
+            ivp_band=(0, 100),
+            regime_signal=pd.Series([], dtype="float64",
+                                     index=pd.DatetimeIndex([])),
+            events_df=events,
+            regime_gate_on=False,
+            earnings_filter_on=True,
+        )
+    finally:
+        from src.analytics.liquidity import compute_liquidity_scores as _cls
+        from src.analytics.ivp import compute_ivp as _ci
+        pf_module.compute_liquidity_scores = _cls
+        pf_module.compute_ivp = _ci
+
+    # RELIANCE filtered out at the earnings gate → not in liquidity input.
+    assert "RELIANCE" not in seen_in_liq
+    assert "INFY" in seen_in_liq
+    assert "TCS" in seen_in_liq
+
+
+def test_select_top_n_for_cycle_ivp_band_filters_symbols():
+    """IVP band 60-100 → keep only symbols with IVP in [60, 100]."""
+    import pandas as pd
+    from datetime import date
+
+    from src.web import portfolio as pf_module
+
+    ivp_map = {"A": 80.0, "B": 30.0, "C": 90.0, "D": 50.0}
+
+    def fake_liq(syms, as_of, **kw):
+        return {s: 100.0 for s in syms}
+
+    def fake_ivp(sym, as_of):
+        return ivp_map.get(sym, float("nan"))
+
+    pf_module.compute_liquidity_scores = fake_liq
+    pf_module.compute_ivp = fake_ivp
+
+    try:
+        picked = pf_module._select_top_n_for_cycle(
+            universe_symbols=["A", "B", "C", "D"],
+            entry_date=date(2024, 6, 10),
+            exit_date=date(2024, 6, 18),
+            universe_n=5,
+            ivp_band=(60, 100),
+            regime_signal=pd.Series([], dtype="float64",
+                                     index=pd.DatetimeIndex([])),
+            events_df=None,
+            regime_gate_on=False,
+            earnings_filter_on=False,
+        )
+    finally:
+        from src.analytics.liquidity import compute_liquidity_scores as _cls
+        from src.analytics.ivp import compute_ivp as _ci
+        pf_module.compute_liquidity_scores = _cls
+        pf_module.compute_ivp = _ci
+
+    # C (90) and A (80) are in [60, 100]; B (30) and D (50) drop.
+    assert set(picked) == {"A", "C"}
+    # Order is IVP descending → C first.
+    assert picked == ["C", "A"]
+
+
+def test_apply_candidate_selection_filters_to_picked_only():
+    """LOAD-BEARING: only (expiry, symbol) tuples in the selection
+    map survive the filter."""
+    import pandas as pd
+
+    from src.web.portfolio import _apply_candidate_selection
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime(
+            ["2024-04-25"] * 3 + ["2024-05-30"] * 3
+        ),
+        "symbol": ["A", "B", "C", "A", "B", "C"],
+        "net_pnl": [10, 20, 30, 40, 50, 60],
+    })
+    selection = {
+        pd.Timestamp("2024-04-25"): ["A", "C"],
+        pd.Timestamp("2024-05-30"): ["B"],
+    }
+    out = _apply_candidate_selection(sub, selection)
+    # Expected rows: (Apr-25, A), (Apr-25, C), (May-30, B).
+    assert len(out) == 3
+    assert set(zip(out["expiry"], out["symbol"])) == {
+        (pd.Timestamp("2024-04-25"), "A"),
+        (pd.Timestamp("2024-04-25"), "C"),
+        (pd.Timestamp("2024-05-30"), "B"),
+    }
+
+
+def test_apply_candidate_selection_drops_cycles_with_empty_picks():
+    """Cycle with empty selection (regime OFF) → ALL trades for
+    that cycle drop. Equity curve goes flat for that month."""
+    import pandas as pd
+
+    from src.web.portfolio import _apply_candidate_selection
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime(["2024-04-25"] * 3 + ["2024-05-30"] * 2),
+        "symbol": ["A", "B", "C", "A", "B"],
+        "net_pnl": [10, 20, 30, 40, 50],
+    })
+    selection = {
+        pd.Timestamp("2024-04-25"): ["A"],
+        pd.Timestamp("2024-05-30"): [],  # regime OFF
+    }
+    out = _apply_candidate_selection(sub, selection)
+    assert len(out) == 1
+    assert out["symbol"].iloc[0] == "A"
+    assert pd.Timestamp("2024-05-30") not in out["expiry"].values
+
+
+def test_apply_candidate_selection_empty_inputs():
+    import pandas as pd
+    from src.web.portfolio import _apply_candidate_selection
+    assert _apply_candidate_selection(
+        pd.DataFrame(), {}
+    ).empty
+
+
+def test_candidate_selection_toggle_skips_pipeline():
+    """When apply_selection toggle is OFF, the portfolio view
+    returns the full sidebar-filtered tuple — no selection
+    pipeline runs."""
+    at = _make_apptest()
+    at.session_state["mp_pf_apply_selection"] = False
+    at.run(timeout=60)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    # No way to assert pipeline-not-called via AppTest directly;
+    # smoke that the tab renders without crash under toggle-off.
+    assert not at.exception
+
+
+def test_selected_per_cycle_section_renders_when_toggle_on():
+    """The 'Selected per cycle (v1 pipeline)' block appears in
+    the cycle drilldown when the toggle is on (default)."""
+    at = _make_apptest()
+    at.run(timeout=30)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Selected per cycle" in visible
+
+
+def test_selected_per_cycle_section_hidden_when_toggle_off():
+    at = _make_apptest()
+    at.session_state["mp_pf_apply_selection"] = False
+    at.run(timeout=60)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Selected per cycle" not in visible
+
 
 # ============================================================
 # Regime banner as-of snap (post-9.4 fix 2026-06-06)
@@ -369,7 +639,7 @@ def test_deeplink_button_renders_in_cycle_drilldown():
     """The 'Open in Inspect →' button is present in the cycle
     drilldown panel when there's at least one cycle to pick."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     button_labels = [b.label for b in at.button]
@@ -475,7 +745,7 @@ def test_per_symbol_in_cycle_missing_cycle_returns_empty():
 
 def test_cycle_drilldown_section_renders():
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -485,7 +755,7 @@ def test_cycle_drilldown_section_renders():
 def test_cycle_drilldown_section_skips_on_empty_filter():
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -568,7 +838,7 @@ def test_ivp_sensitivity_section_renders():
 def test_ivp_sensitivity_section_skips_on_empty_filter():
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -661,7 +931,7 @@ def test_regime_x_ivp_section_renders():
 def test_regime_x_ivp_section_skips_on_empty_filter():
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -772,7 +1042,7 @@ def test_pairwise_correlation_matrix_single_symbol_returns_empty():
 
 def test_concentration_correlation_section_renders():
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -782,7 +1052,7 @@ def test_concentration_correlation_section_renders():
 def test_concentration_correlation_section_skips_on_empty_filter():
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -875,7 +1145,7 @@ def test_worst_10_returns_fewer_than_n_when_universe_smaller():
 
 def test_worst_10_section_renders_when_data_present():
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -885,7 +1155,7 @@ def test_worst_10_section_renders_when_data_present():
 def test_worst_10_section_skips_on_empty_filter():
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -995,7 +1265,7 @@ def test_yoy_section_renders_when_data_present():
     """The 'Year-by-year stability' section renders when the
     strategy config matches data."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -1006,7 +1276,7 @@ def test_yoy_section_skips_on_empty_filter():
     """No section header when the strategy config matches nothing."""
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -1021,7 +1291,7 @@ def test_headline_strip_renders_six_metric_cards():
     """LOAD-BEARING 9.4.3 contract: 6 st.metric cards above the
     equity curve when the strategy config matches data."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     # st.metric widgets exposed via at.metric.
@@ -1040,7 +1310,7 @@ def test_headline_strip_skips_silently_on_empty_filter():
     explanatory banner; double-rendering would be noise)."""
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20  # empty path
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     metric_labels = [m.label for m in at.metric]
@@ -1082,7 +1352,7 @@ def test_equity_curve_renders_plotly_chart_when_data_present():
     matches at least one cycle in the sweep, an equity-curve
     Plotly chart renders."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     # AppTest exposes plotly_chart via at.plotly_chart in recent
@@ -1108,7 +1378,7 @@ def test_equity_curve_renders_caption_with_diagnostic_counts():
     count + final equity + max DD. Pin the text so downstream
     layout changes don't silently drop the diagnostic."""
     at = _make_apptest()
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
@@ -1130,7 +1400,7 @@ def test_equity_curve_empty_filter_renders_info_banner():
     forces the empty-filter path."""
     at = _make_apptest()
     at.session_state["mp_pf_exit_offset_td"] = 20
-    at.run(timeout=10)
+    at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)

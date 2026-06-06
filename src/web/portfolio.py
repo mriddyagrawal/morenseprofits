@@ -51,7 +51,9 @@ from src.analytics.portfolio import (
     drawdown_series,
     equity_curve,
 )
+from src.analytics.earnings_filter import filter_universe_by_earnings
 from src.analytics.ivp import compute_ivp
+from src.analytics.liquidity import compute_liquidity_scores
 from src.analytics.portfolio_metrics import (
     calmar,
     cycle_returns,
@@ -86,6 +88,16 @@ _SS_EARNINGS_FILTER = "mp_pf_earnings_filter"
 _SS_AS_OF = "mp_pf_as_of"
 _SS_DRILLDOWN_CYCLE = "mp_pf_drilldown_cycle"
 _SS_DRILLDOWN_SYMBOL = "mp_pf_drilldown_symbol"
+# When True, the Portfolio tab applies the v1 candidate-selection
+# pipeline (regime → earnings → liquidity → IVP) before aggregating.
+# When False (or unavailable), the tab shows the legacy "trade
+# every symbol in the filtered universe" behavior — useful as a
+# baseline diagnostic.
+_SS_APPLY_SELECTION = "mp_pf_apply_selection"
+# Liquidity oversampling factor: pick top (universe_n × K) by
+# liquidity before applying IVP rank. Memoir §11: liquidity is
+# the FLOOR, IVP is the SIGNAL.
+_LIQUIDITY_OVERSAMPLE_FACTOR = 4
 
 # Defaults match the mockup's pfCfg in DESIGN/Complete/app.jsx
 # lines 30-38. Override via the strategy config block UI.
@@ -100,6 +112,7 @@ _DEFAULTS: dict[str, Any] = {
     _SS_EARNINGS_FILTER: True,
     _SS_DRILLDOWN_CYCLE: None,
     _SS_DRILLDOWN_SYMBOL: None,
+    _SS_APPLY_SELECTION: True,
 }
 
 # Strategy display labels mirror the mockup's labels.
@@ -424,29 +437,266 @@ def _render_strategy_config() -> None:
             )
             st.session_state[_SS_IVP_BAND] = new_band
 
+        # The v1 candidate-selection toggle. Default ON — without it
+        # the Portfolio aggregates reflect "trade everything," which
+        # is NOT the v1 strategy (memoir §11). Operator can disable
+        # for a baseline comparison.
+        st.markdown("&nbsp;")
+        st.session_state[_SS_APPLY_SELECTION] = st.toggle(
+            "Apply v1 candidate selection (regime → earnings → "
+            "liquidity → IVP)",
+            value=bool(
+                st.session_state.get(_SS_APPLY_SELECTION, True)
+            ),
+            help=(
+                "ON: each cycle picks top-N symbols via the v1 "
+                "pipeline. Equity / metrics reflect the actual "
+                "strategy. OFF: every symbol in the filtered "
+                "universe trades every cycle (memoir §11 "
+                "baseline)."
+            ),
+        )
+
+
+def _select_top_n_for_cycle(
+    *,
+    universe_symbols: list[str],
+    entry_date: date,
+    exit_date: date,
+    universe_n: int,
+    ivp_band: tuple[int, int],
+    regime_signal: pd.Series,
+    events_df: pd.DataFrame | None,
+    regime_gate_on: bool,
+    earnings_filter_on: bool,
+) -> list[str]:
+    """v1 candidate-selection pipeline per memoir §11 + §3.7 + §17.
+
+    Layer order is load-bearing — change requires a memoir
+    revision:
+
+      0. Regime gate (universe-wide) — if regime_state(VIX, entry)
+         == "OFF" and regime_gate_on, return [] (skip cycle).
+      1. Earnings filter — drop symbols with Financial Results
+         event in [entry_date, exit_date + 1d] per §17.5.
+      2. Liquidity floor — top-K = universe_n × 4 by trailing-21-TD
+         avg OPTSTK contracts (memoir §11: liquidity is the
+         FLOOR, IVP is the SIGNAL).
+      3. IVP filter — drop symbols whose entry-day IVP is outside
+         ivp_band. Rank survivors by IVP descending; take top
+         universe_n.
+
+    Returns the ordered list of selected symbols (may be fewer
+    than universe_n if filters trim deeply; empty if regime OFF
+    or all symbols filtered out).
+    """
+    if regime_gate_on and not regime_signal.empty:
+        state = regime_state(
+            regime_signal, entry_date,
+            threshold_pct=_REGIME_THRESHOLD_PCT,
+            lookback_td=_REGIME_LOOKBACK_TD,
+        )
+        if state == "OFF":
+            return []
+
+    # Layer 1: earnings filter (no-op if cache absent — conservative
+    # pass-through per analytics.earnings_filter contract).
+    if earnings_filter_on:
+        result = filter_universe_by_earnings(
+            universe_symbols, entry_date, exit_date,
+            events_df=events_df,
+        )
+        survivors = result.kept
+    else:
+        survivors = [s.upper() for s in universe_symbols]
+    if not survivors:
+        return []
+
+    # Layer 2: liquidity oversample. Take top (N × oversample)
+    # so the IVP rank has room to pick from.
+    top_k = universe_n * _LIQUIDITY_OVERSAMPLE_FACTOR
+    try:
+        liq_scores = compute_liquidity_scores(
+            survivors, entry_date, offline=True,
+        )
+    except Exception:
+        liq_scores = {}
+    valid_liq = [
+        (s, sc) for s, sc in liq_scores.items()
+        if not pd.isna(sc)
+    ]
+    if not valid_liq:
+        # No liquidity data → fall through to IVP rank on the
+        # earnings-filtered universe.
+        liquidity_survivors = survivors
+    else:
+        valid_liq.sort(key=lambda kv: kv[0])  # alpha tiebreak
+        valid_liq.sort(key=lambda kv: kv[1], reverse=True)
+        liquidity_survivors = [s for s, _ in valid_liq[:top_k]]
+
+    # Layer 3: IVP filter + rank. Compute per-symbol IVP at the
+    # entry date; drop NaN and out-of-band; sort by IVP descending.
+    ivp_low, ivp_high = ivp_band
+    ivp_scores: list[tuple[str, float]] = []
+    for sym in liquidity_survivors:
+        try:
+            v = compute_ivp(sym, entry_date)
+        except (FileNotFoundError, Exception):
+            v = float("nan")
+        if pd.isna(v):
+            continue
+        if v < ivp_low or v > ivp_high:
+            continue
+        ivp_scores.append((sym, v))
+    if not ivp_scores:
+        # No IVP-banded survivor — degrade gracefully by taking
+        # the top liquidity-ranked names. Operator-facing
+        # transparency note: this means IVP did NOT actually
+        # filter, but the cycle still gets positions.
+        return liquidity_survivors[:universe_n]
+    ivp_scores.sort(key=lambda kv: kv[0])  # alpha tiebreak
+    ivp_scores.sort(key=lambda kv: kv[1], reverse=True)
+    return [s for s, _ in ivp_scores[:universe_n]]
+
+
+def _candidate_selection_per_cycle(
+    sub: pd.DataFrame,
+) -> dict[pd.Timestamp, list[str]]:
+    """For each cycle (expiry) in ``sub``, run the v1 selection
+    pipeline and return {expiry: [selected symbols]}.
+
+    Reads cfg from session state. Loads regime + events caches
+    once and reuses across cycles. Per-cycle uses
+    ``_select_top_n_for_cycle``.
+
+    Empty cycles (regime OFF, all symbols filtered) appear with
+    an empty list — preserves the cycle's slot in downstream
+    equity / drawdown computations (zero P&L for the cycle).
+    """
+    if sub.empty:
+        return {}
+
+    universe_n = int(st.session_state[_SS_UNIVERSE_N])
+    ivp_band = tuple(st.session_state[_SS_IVP_BAND])
+    regime_gate_on = bool(st.session_state[_SS_REGIME_GATE])
+    earnings_filter_on = bool(st.session_state[_SS_EARNINGS_FILTER])
+
+    # Load regime + events once.
+    regime_signal = _build_regime_signal_for_window(sub)
+    try:
+        from src.data.events_loader import load_events
+        events_df: pd.DataFrame | None = load_events()
+    except Exception:
+        events_df = None
+
+    selection: dict[pd.Timestamp, list[str]] = {}
+    for expiry, cycle in sub.groupby("expiry", sort=True):
+        universe_symbols = sorted(cycle["symbol"].astype(str).str.upper().unique())
+        entry_date = pd.Timestamp(cycle["entry_date"].iloc[0]).date()
+        exit_date = pd.Timestamp(cycle["exit_date"].iloc[0]).date()
+        picked = _select_top_n_for_cycle(
+            universe_symbols=universe_symbols,
+            entry_date=entry_date,
+            exit_date=exit_date,
+            universe_n=universe_n,
+            ivp_band=ivp_band,  # type: ignore[arg-type]
+            regime_signal=regime_signal,
+            events_df=events_df,
+            regime_gate_on=regime_gate_on,
+            earnings_filter_on=earnings_filter_on,
+        )
+        selection[pd.Timestamp(expiry)] = picked
+    return selection
+
+
+def _apply_candidate_selection(
+    sub: pd.DataFrame,
+    selection: dict[pd.Timestamp, list[str]],
+) -> pd.DataFrame:
+    """Filter ``sub`` to only (expiry, symbol) pairs in the
+    selection map. Cycles with empty selection (regime OFF /
+    fully filtered) drop ALL their trades — equity curve goes
+    flat for that cycle."""
+    if sub.empty or not selection:
+        return sub.iloc[0:0]
+    keep_mask = pd.Series(False, index=sub.index)
+    for expiry, picked in selection.items():
+        if not picked:
+            continue
+        picked_upper = {p.upper() for p in picked}
+        cycle_mask = (
+            (sub["expiry"] == expiry)
+            & sub["symbol"].astype(str).str.upper().isin(picked_upper)
+        )
+        keep_mask = keep_mask | cycle_mask
+    return sub[keep_mask]
+
+
+def _get_cached_selection(
+    sub: pd.DataFrame,
+) -> dict[pd.Timestamp, list[str]]:
+    """Memoize candidate selection by the cfg + sub-shape key so
+    every aggregate section reuses one pass instead of re-running
+    the pipeline. Keyed on the Portfolio config tuple + the row
+    count + the run_id of the first row (cheap-and-stable proxy
+    for sweep identity)."""
+    if sub.empty:
+        return {}
+    cfg_key = (
+        st.session_state[_SS_STRATEGY],
+        int(st.session_state[_SS_ENTRY_OFFSET]),
+        int(st.session_state[_SS_EXIT_OFFSET]),
+        int(st.session_state[_SS_UNIVERSE_N]),
+        bool(st.session_state[_SS_REGIME_GATE]),
+        bool(st.session_state[_SS_EARNINGS_FILTER]),
+        tuple(st.session_state[_SS_IVP_BAND]),
+        len(sub),
+        str(sub["run_id"].iloc[0]) if "run_id" in sub.columns else "",
+    )
+    cache_key = f"mp_pf_selection_cache_{hash(cfg_key)}"
+    cached = st.session_state.get(cache_key)
+    if cached is not None:
+        return cached
+    selection = _candidate_selection_per_cycle(sub)
+    st.session_state[cache_key] = selection
+    return selection
+
 
 def _portfolio_trades_view(df_filtered: pd.DataFrame) -> pd.DataFrame:
     """Slice the sidebar-filtered sweep frame to the Portfolio
-    config's (strategy, entry_offset_td, exit_offset_td) tuple.
+    config's (strategy, entry_offset_td, exit_offset_td) tuple,
+    then OPTIONALLY apply the v1 candidate-selection pipeline
+    when ``mp_pf_apply_selection`` is True (default).
 
     v1 Portfolio backtest is single-(strategy, entry, exit) per
-    memoir §5 — the strategy config picks ONE tuple, so this
-    function reduces df_filtered to the matching rows.
+    memoir §5 + top-N candidate selection per cycle per memoir
+    §11. The selection pipeline (regime → earnings → liquidity →
+    IVP rank) reduces the per-cycle universe from "every symbol
+    that traded" to "the N actually picked." Without it, the
+    Portfolio aggregates reflect "trade everything," which is
+    NOT the v1 strategy.
+
+    Operator can toggle off via the strategy config block —
+    useful as a "trade everything" baseline for diagnostic
+    comparison against the v1 strategy's selection.
 
     Returns:
         DataFrame of per-trade rows. May be empty if no rows
-        match the config (e.g., sidebar excludes the chosen
-        strategy, or the entry/exit slider lands on offsets the
-        sweep doesn't have).
+        match the config OR if every cycle's selection is empty
+        (regime OFF the whole window, or all symbols filtered).
     """
     strategy = st.session_state[_SS_STRATEGY]
     entry_offset = int(st.session_state[_SS_ENTRY_OFFSET])
     exit_offset = int(st.session_state[_SS_EXIT_OFFSET])
-    return df_filtered[
+    sub = df_filtered[
         (df_filtered["strategy"] == strategy)
         & (df_filtered["entry_offset_td"] == entry_offset)
         & (df_filtered["exit_offset_td"] == exit_offset)
     ]
+    if not st.session_state.get(_SS_APPLY_SELECTION, True):
+        return sub
+    selection = _get_cached_selection(sub)
+    return _apply_candidate_selection(sub, selection)
 
 
 def _regime_off_cycle_dates(
@@ -599,6 +849,59 @@ def _per_symbol_in_cycle(
     return out
 
 
+def _render_selected_per_cycle(df_filtered: pd.DataFrame) -> None:
+    """Stand-alone block: every cycle in the filtered window
+    with its v1-selected symbols listed in order. Renders WHICH
+    5 (or fewer, on regime-OFF / heavy filtering) actually
+    traded each month.
+
+    Reads the cached selection map built by
+    ``_get_cached_selection`` so this is a free read once the
+    aggregates have computed.
+    """
+    strategy = st.session_state[_SS_STRATEGY]
+    entry_offset = int(st.session_state[_SS_ENTRY_OFFSET])
+    exit_offset = int(st.session_state[_SS_EXIT_OFFSET])
+    pre_selection = df_filtered[
+        (df_filtered["strategy"] == strategy)
+        & (df_filtered["entry_offset_td"] == entry_offset)
+        & (df_filtered["exit_offset_td"] == exit_offset)
+    ]
+    if pre_selection.empty:
+        return
+    selection = _get_cached_selection(pre_selection)
+    if not selection:
+        return
+
+    rows: list[dict] = []
+    for expiry in sorted(selection.keys(), reverse=True):
+        picked = selection[expiry]
+        if picked:
+            label = " · ".join(picked)
+            n_str = str(len(picked))
+        else:
+            label = "_(regime OFF or all symbols filtered)_"
+            n_str = "0"
+        rows.append({
+            "Expiry": pd.Timestamp(expiry).strftime("%Y-%m-%d"),
+            "N": n_str,
+            "Selected symbols": label,
+        })
+    st.markdown("**Selected per cycle (v1 pipeline):**")
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, width="stretch",
+        height=240,
+    )
+    st.caption(
+        "Per-cycle output of the v1 candidate-selection pipeline: "
+        "regime gate → earnings filter → top-K by 21-TD liquidity → "
+        "top-N by IVP within band. Empty rows = regime OFF or "
+        "every candidate filtered. Toggle the pipeline off in the "
+        "config block to compare against 'trade everything.'"
+    )
+    st.markdown("---")
+
+
 def _render_cycle_drilldown(df_filtered: pd.DataFrame) -> None:
     """Cycle table → cycle picker → per-symbol panel for the
     selected cycle. PLAN.md Phase 9.4.9 + memoir §4 + mockup §E.
@@ -615,6 +918,13 @@ def _render_cycle_drilldown(df_filtered: pd.DataFrame) -> None:
         return
 
     st.markdown("##### Cycle drilldown")
+
+    # When the v1 selection is active, surface the per-cycle picks
+    # in a stand-alone block at the top of the drilldown so the
+    # operator can see "which 5 names actually traded each month"
+    # without having to click through the per-cycle picker first.
+    if st.session_state.get(_SS_APPLY_SELECTION, True):
+        _render_selected_per_cycle(df_filtered)
 
     # Cycle picker — default to most recent.
     cycle_options = summary["expiry"].dt.strftime("%Y-%m-%d").tolist()
@@ -1634,6 +1944,21 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     st.markdown("---")
     _render_strategy_config()
     st.markdown("---")
+
+    # First-render warm-up of the candidate-selection cache. With
+    # the v1 pipeline ON, the first sub-section that calls
+    # ``_portfolio_trades_view`` would otherwise pay the full
+    # cold-render cost silently — surface a spinner here so the
+    # operator sees the wait and knows it's the selection compute,
+    # not a hung tab. Once cached in session_state, every
+    # subsequent aggregate / drilldown re-render is instant.
+    if st.session_state.get(_SS_APPLY_SELECTION, True):
+        with st.spinner(
+            "Computing v1 candidate selection (regime → earnings → "
+            "liquidity → IVP) per cycle..."
+        ):
+            _portfolio_trades_view(df_filtered)
+
     _render_headline_strip(df_filtered)
     _render_equity_curve(df_filtered)
     _render_yoy_stability(df_filtered)
