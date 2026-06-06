@@ -26555,3 +26555,164 @@ Standing by.
 
 ---
 
+## Review of 30282d7 — `feat(p9.4.deeplink_to_inspect)` — ✅ ACCEPT — **PHASE 9 v1 PORTFOLIO FOUNDATION CLOSED**
+
+**Verdict: ✅ ACCEPT.** Final 9.4 commit. All 3 reviewer asks verified by code inspection. Deeplink writer is exactly the design I anticipated at b52386d review (the `clear_inspect_state()` public helper added there is consumed here). 1267 passed (+3 ✓); CONSTRAINT 1 still 0.
+
+### Reviewer ask 1: URL schema matches §24.9
+
+`_open_in_inspect`:
+```python
+st.query_params["strategy"]        = strategy
+st.query_params["symbol"]          = symbol
+st.query_params["expiry"]          = pd.Timestamp(expiry).strftime("%Y-%m-%d")
+st.query_params["entry_offset_td"] = str(int(entry_offset_td))
+st.query_params["exit_offset_td"]  = str(int(exit_offset_td))
+st.query_params["tab"]             = "Inspect"
+```
+
+Cross-check vs Inspect's URL schema constants from 74ea59e:
+```python
+URL_PARAM_STRATEGY = "strategy"
+URL_PARAM_SYMBOL   = "symbol"
+URL_PARAM_EXPIRY   = "expiry"
+URL_PARAM_ENTRY    = "entry_offset_td"
+URL_PARAM_EXIT     = "exit_offset_td"
+```
+
+✓ **EXACT MATCH** — all 5 param names + the tab routing. Cross-tab schema consistency across two modules.
+
+### Reviewer ask 2: clear_inspect_state() BEFORE st.rerun()
+
+Code order:
+```python
+st.session_state["mp_active_tab"] = "Inspect"
+clear_inspect_state()              # ← drops mp_inspect_* keys
+st.rerun()                         # ← next render re-seeds from URL
+```
+
+✓ Correct ordering. The `test_clear_then_seed_picks_up_new_url` regression I asked for at b52386d review pins this end-to-end behavior: Portfolio writes URL + Inspect state cleared + rerun → Inspect re-seeds from the new URL via the first-render-only seed pattern (b52386d fix from 74ea59e GRILL 1).
+
+### Reviewer ask 3: mp_active_tab swap
+
+`st.session_state["mp_active_tab"] = "Inspect"` set before `clear_inspect_state()` (line order is fine; both happen before rerun). app.py's `st.radio(key="mp_active_tab")` will pick "Inspect" on the next render.
+
+✓ Verified.
+
+### End-to-end cross-tab navigation closes the §24.9 loop
+
+Full operator flow:
+1. Operator picks cycle in drilldown → `mp_pf_drilldown_cycle` updates.
+2. Per-symbol panel surfaces top contributors; "Symbol to inspect" selectbox defaults to top.
+3. Operator clicks "Open in Inspect →" button.
+4. `_open_in_inspect()` writes 5-tuple URL + tab + clears Inspect state + reruns.
+5. Next render: app.py radio routes to Inspect tab; Inspect's `_initialize_session_state` finds session state empty (cleared) → seeds from URL → snaps to valid 5-tuple → renders the picked trade.
+
+**This is the cross-tab navigation contract memoir §24.9 specified, implemented end-to-end.** The Portfolio-Inspect coupling was the highest-risk cross-phase integration point in the v1 plan; it's now closed cleanly.
+
+### Praise points
+
+- **Anti-hardcode pin** (`test_open_in_inspect_strategy_from_config`) is LOAD-BEARING — verifies strategy + symbol come via param flow into URL, NOT stripped to hardcoded values. Future refactor that "simplifies" by hardcoding "short_strangle" trips loudly.
+- **Lazy import of `clear_inspect_state`** (function body, not module top) — avoids circular dependency between Portfolio and Inspect modules.
+- **New `_SS_DRILLDOWN_SYMBOL` session-state key** — symbol picker persists across reruns. Defaults to top-contributor row in the per-symbol panel.
+- **`_RerunIntercepted` sentinel exception** in test module — interrupts `st.rerun()` cleanly without raising StopIteration (which Python 3.7+ converts to RuntimeError per PEP 479). Smart test plumbing.
+- **`pd.Timestamp(expiry).strftime("%Y-%m-%d")`** — canonical ISO date format for URL portability. No locale dependency, no ambiguity.
+- **`str(int(entry_offset_td))`** — explicit int cast before stringification. Defensive against `np.int64` or similar numpy types that might serialize as `np.int64(15)` in some environments.
+- **All cross-tab state writes happen in `_open_in_inspect`** — single function = single source of truth = easy to audit + test.
+
+### Cross-tab consistency
+
+The b52386d `clear_inspect_state()` public helper (which I praised at 320ca76 for preserving the §24.9 private-state contract) is now consumed end-to-end. The 3 tests I asked for at b52386d:
+1. `test_user_click_overrides_deeplink_on_subsequent_render` ✓ (regression for the URL-precedence bug)
+2. `test_clear_inspect_state_drops_private_keys_only` ✓ (privacy boundary)
+3. `test_clear_then_seed_picks_up_new_url` ✓ (end-to-end deeplink-rewrite flow)
+
+All three pin the cross-module contract this commit now exercises.
+
+### Math + arithmetic
+
+- LOC: +81 portfolio.py + 106 test = +187 net. ✓ Matches `git show --stat`.
+- Tests: 1264 → 1267 (+3). ✓ Matches BUILDER's claim exactly.
+- 58 Portfolio tests now (was 55).
+
+---
+
+## 🎉 PHASE 9 v1 PORTFOLIO FOUNDATION — REVIEWER ACCEPT, ALL SUB-PHASES CLOSED
+
+| Sub-phase | Status | Notes |
+|---|---|---|
+| 9.0 Pre-flight | ✅ | events_loader, india_vix_loader, prefetch |
+| 9.1 IV infrastructure | ✅ | engine.iv, iv_materializer, ivp, realized_vol |
+| 9.2 Filter infrastructure | ✅ | earnings_filter, liquidity_rank, FILTERS.md |
+| 9.3 Aggregator + metrics | ✅ | portfolio (F12-F14), portfolio_metrics (F15-F18), regime×IVP diagnostic (F19) |
+| 9.4 Portfolio tab UI | ✅ | 10/10 commits (this batch) |
+| 9.5 Inspect tab | ✅ | Other builder — 3 commits (skeleton + position map + P&L/legs) + 1 URL-precedence fix |
+| 9.6 India VIX regime v2 | ✅ | 50d51c8 |
+
+### Reviewer milestones across the phase
+
+**HIGH-severity grills caught + closed**:
+- 76549ab GRILL 1 (Option-b drawdown bug — empirically demonstrated ₹25k miss in 3-cycle case) → closed by Option-a prepend in 3309dd9. Verified end-to-end.
+- d8620f8 GRILL 1+3 (F5 NaN-threshold citation drift + denominator semantic) → closed by 207d5c1. Pre-empted in IVP module.
+
+**MEDIUM-severity grills caught + closed**:
+- 74ea59e GRILL 1 (URL-precedence locks user clicks post-deeplink) → closed by b52386d's first-render-only seed + `clear_inspect_state()` helper. Now consumed end-to-end by 30282d7's deeplink writer.
+- f126fa6 GRILL 3 (F3 None vs NaN drift) → resolved via BUILDER's documented None-vs-NaN rationale in 68c5c2d.
+- c79e1ce concern (None→NaN cache boundary) → closed by 9d65809's translation at materializer write.
+- 3625f3e GRILL 1 (§22.5 citation residue) → closed by 3720be8 memoir patch.
+
+**Other closures**:
+- 68a97a7 GRILL 1 (events_loader SYMBOL case-norm asymmetry) → closed by d824ef8.
+- f126fa6 GRILL 1+2 (research_iv .ipynb untracked + PNG evidence) → closed by 3625f3e (notebook tracked with embedded PNGs).
+- 7aef085 GRILL 1 (URL-precedence pattern) → closed by b52386d.
+
+**Empirical reproductions verified across sessions** (sample):
+- v2 India VIX election spike: 2024-06-04 VIX=26.75 pct=99.6 OFF — EXACT match
+- Earnings filter: 6 drops including MARUTI Apr 26 caught by exit+1 buffer — EXACT match
+- Liquidity rank: top-15 margin shares to 2 decimals — EXACT match
+- Concentration matrix: every cell of pairwise correlation — EXACT match
+- Portfolio metrics (F15-F18): every digit reproduced — EXACT match
+- Worst-cycle cross-commit consistency: 2026-03-30 = -₹662,612 EXACT across worst-10, headline strip, drilldown
+- YoY cumulative-forward chain: ₹1M → ₹931k → ₹1.38M → ₹114k EXACT
+
+### Open grills (cumulative — final state)
+
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update; informally noted; B.4 Caveat covers operationally).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate redesign — STILL OPEN.
+
+**ZERO open grills from Phase 9.** All caught grills were closed within-phase. No technical debt being shipped.
+
+### MCP arc state
+
+16/16.
+
+### Operator action
+
+**v1 Portfolio Foundation is shippable.** `streamlit run app.py` lands on a working Portfolio tab with:
+- Strategy config block (8 controls)
+- Equity curve with regime-gated bands
+- Headline metrics (6 cards)
+- YoY stability table
+- Worst-10 + concentration + correlation
+- 2-D regime×IVP diagnostic with quintile fallback
+- IVP-decile sensitivity strip
+- Cycle drilldown + "Open in Inspect →" deeplink
+
+The deeplink writer just shipped; round-trip Portfolio → Inspect navigation is the v1 final UX surface.
+
+### Next-phase suggestion
+
+Per BUILDER's body: Phase 10 (Portfolio Calibration & Sizing Variants) or Phase 11 (Strategy Tier-3 Variants gated on greeks.py). PLAN.md doesn't pin order beyond 9. **Awaiting operator direction.**
+
+Per [[feedback_next_commit_suggestion]] without explicit operator guidance: Phase 10 is the natural progression (sizing variants — vol-targeted vs equal-margin — exercise the existing equity_curve / metrics pipeline; Phase 11 needs greeks.py which is a separate concern).
+
+Migration cadence
+
+**... → PHASE 9 v1 Portfolio Foundation CLOSED 🎉 → P10 (sizing variants) or P11 (Tier-3 strategies via greeks.py) — awaiting operator direction → ...**
+
+Standing by.
+
+---
+
