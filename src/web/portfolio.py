@@ -150,16 +150,55 @@ def _seed_session_state() -> None:
             st.session_state[key] = default
 
 
+def _latest_cached_vix_date() -> date | None:
+    """Return the most recent date present in the India VIX cache,
+    or ``None`` if the cache is missing / empty.
+
+    NSE publishes India VIX on a T+0 EOD basis but the cache lags
+    by 1-3 days for weekends + holidays + the operator's prefetch
+    cadence. Snapping ``as_of`` to this date sidesteps the
+    OfflineCacheMiss path when today() falls into the lag window.
+
+    Reads the parquet header directly — no signal-loader round
+    trip — so this is cheap on every render.
+    """
+    from src.data import cache as _cache  # local import: keeps top-level deps minimal
+    path = _cache.india_vix_path()
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path, columns=["date"])
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    return pd.Timestamp(df["date"].max()).date()
+
+
 def _resolve_as_of() -> date:
     """Resolve the 'as-of' date for the regime banner.
 
-    For v1 skeleton: use today (date.today()). Phase 9.4 future
-    commits may add an explicit date picker; until then the banner
-    surfaces "today's regime" against the cached India VIX
-    history. Cold-cache (no VIX data for today) → ``current_regime_state``
-    returns OFF per memoir §F9 skip-when-uncertain.
+    Order of precedence:
+      1. Operator-supplied ``_SS_AS_OF`` (future explicit date
+         picker — currently unused).
+      2. ``min(date.today(), latest_cached_vix_date)`` — snaps
+         down when today's VIX hasn't been published yet (weekend,
+         holiday, or operator hasn't re-run the prefetch). Without
+         this snap, ``load_india_vix(offline=True)`` raises
+         OfflineCacheMiss for any date past the cache's high-water
+         mark and the regime banner falls into its cold-cache
+         caption even when the cache IS populated.
+      3. ``date.today()`` — fallback when the VIX cache is missing
+         entirely (the cold-cache caption path correctly fires).
     """
-    return st.session_state.get(_SS_AS_OF) or date.today()
+    explicit = st.session_state.get(_SS_AS_OF)
+    if explicit:
+        return explicit
+    today = date.today()
+    latest_vix = _latest_cached_vix_date()
+    if latest_vix is None:
+        return today
+    return min(today, latest_vix)
 
 
 def _render_header() -> None:
@@ -216,6 +255,18 @@ def _render_regime_banner() -> None:
     """
     as_of = _resolve_as_of()
     universe_n = int(st.session_state[_SS_UNIVERSE_N])
+
+    # Surface the as-of snap when today's VIX hasn't been published
+    # yet — operator-facing transparency about which day the
+    # regime banner is actually evaluating.
+    today = date.today()
+    if as_of < today:
+        st.caption(
+            f"_India VIX cache currently ends on **{as_of}**; "
+            f"regime banner evaluated against that date. Re-run "
+            f"`scripts/prefetch_universe.py --vix-only` after "
+            f"NSE's EOD publish to advance to {today}._"
+        )
 
     try:
         state = current_regime_state(

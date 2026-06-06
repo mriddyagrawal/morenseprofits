@@ -190,6 +190,90 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Regime banner as-of snap (post-9.4 fix 2026-06-06)
+# ============================================================
+
+def test_resolve_as_of_snaps_to_latest_cached_vix_date(monkeypatch):
+    """LOAD-BEARING: when today's VIX hasn't been published yet
+    (lag / weekend / holiday), _resolve_as_of returns the cache's
+    high-water mark so the regime banner doesn't fall into the
+    cold-cache caption path.
+
+    Fixes the bug exhibited 2026-06-06: VIX cache ended on
+    2026-05-29, today() = 2026-06-06 → load_india_vix(offline=True)
+    raised OfflineCacheMiss → banner showed 'Regime signal
+    unavailable' despite the cache being populated."""
+    from datetime import date
+    import streamlit as st
+
+    from src.web import portfolio as pf_mod
+
+    # Stub today() in pf_mod.date to be 2026-06-06.
+    # Stub _latest_cached_vix_date to return 2026-05-29.
+    monkeypatch.setattr(
+        pf_mod, "_latest_cached_vix_date",
+        lambda: date(2026, 5, 29),
+    )
+    # Override date.today via a class swap is brittle; easier to
+    # ensure mp_pf_as_of is unset and let the function take its
+    # own date.today() route.
+    st.session_state.pop("mp_pf_as_of", None)
+    # We can't easily monkeypatch date.today() across the module
+    # boundary, so just assert the snap holds whenever today() >
+    # latest_vix. Use a synthesized today via mp_pf_as_of=None
+    # path; the assertion checks min(today, latest_vix).
+    resolved = pf_mod._resolve_as_of()
+    today = date.today()
+    expected = min(today, date(2026, 5, 29))
+    assert resolved == expected
+
+
+def test_resolve_as_of_uses_today_when_vix_cache_missing(monkeypatch):
+    """When India VIX cache is absent, _resolve_as_of falls
+    through to today() — the cold-cache caption path correctly
+    fires downstream."""
+    from datetime import date
+    import streamlit as st
+
+    from src.web import portfolio as pf_mod
+
+    monkeypatch.setattr(
+        pf_mod, "_latest_cached_vix_date", lambda: None,
+    )
+    st.session_state.pop("mp_pf_as_of", None)
+    assert pf_mod._resolve_as_of() == date.today()
+
+
+def test_resolve_as_of_explicit_override_wins(monkeypatch):
+    """Operator-supplied mp_pf_as_of session-state value wins
+    over the auto-snap (future date-picker contract)."""
+    from datetime import date
+    import streamlit as st
+
+    from src.web import portfolio as pf_mod
+
+    monkeypatch.setattr(
+        pf_mod, "_latest_cached_vix_date",
+        lambda: date(2026, 5, 29),
+    )
+    st.session_state["mp_pf_as_of"] = date(2024, 6, 1)
+    assert pf_mod._resolve_as_of() == date(2024, 6, 1)
+    # Cleanup so other tests aren't affected.
+    st.session_state.pop("mp_pf_as_of", None)
+
+
+def test_latest_cached_vix_date_handles_missing_parquet(monkeypatch, tmp_path):
+    """Cold cache (no parquet) → None, NOT exception."""
+    from src.data import cache
+
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
+    cache._reset_root_memo()
+
+    from src.web.portfolio import _latest_cached_vix_date
+    assert _latest_cached_vix_date() is None
+
+
+# ============================================================
 # Phase 9.4.10 — deeplink to Inspect
 # ============================================================
 
