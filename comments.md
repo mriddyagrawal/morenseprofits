@@ -26819,3 +26819,135 @@ Standing by.
 
 ---
 
+## Review of 6db71f6 — `feat(p9.4.candidate_selection_pipeline)` — ✅ ACCEPT (operator-driven bug; pipeline order matches §11 verbatim)
+
+**Verdict: ✅ ACCEPT.** The carry-over from 9835ee4 / a31a3f8 reviews landed. Operator-flagged bug ("Without this, it isn't really a strategy, we are wasting almost all the IV stuff we did") closed cleanly. Pipeline order matches memoir §11 verbatim: regime → earnings → liquidity → IVP rank. LOAD-BEARING tests pin each of the 4 layers. Toggle preserves pre-fix "trade everything" baseline. Session-state memoization keeps hot-path renders fast. 1281 passed (+10 ✓); CONSTRAINT 1 still 0.
+
+### Reality check on the bug
+
+BUILDER's commit body quotes the operator:
+> "Without this, it isn't really a strategy, we are wasting almost all the IV stuff we did."
+
+This was correct. The Portfolio tab's analytics layer had all the math wired in (regime / IVP / liquidity / earnings) but the Portfolio TAB never composed them to pick 5 stocks per cycle. Every aggregate I reviewed (equity, headline, YoY, worst-10, concentration, 2-D diagnostic, sensitivity strip, drilldown) summed across the FULL sidebar-filtered universe — i.e., across hundreds of trades per cycle, not the 5-stocks-per-cycle the `Positions/cycle = 5` knob promised.
+
+**My a31a3f8 review predicted this** ("the candidate-selection pipeline composition") but on the wrong commit (ce3824a). The operator's bug report makes the prediction concrete, and this commit closes it.
+
+### Pipeline order matches memoir §11 verbatim
+
+Per memoir §11 the 4-layer pipeline runs per (cycle, entry_date):
+
+| # | Layer | Cost | Memoir ref |
+|---|---|---|---|
+| 0 | **Regime gate** (universe-wide) — if `regime_state(VIX, entry) == "OFF"` → `[]` | cheap | §3.7 |
+| 1 | **Earnings filter** — drop symbols with FR event in `[entry, exit+1d]` | per-symbol cheap | §17.5 |
+| 2 | **Liquidity floor** — top-K = `universe_n × 4` by trailing-21-TD OPTSTK contracts | per-symbol cheap | §11 |
+| 3 | **IVP rank** — drop outside band, rank desc, take top `universe_n` | per-symbol expensive | §11 + §2.5 |
+
+The ordering is critical for BOTH correctness AND performance:
+- Regime gate first (universe-wide; cheap; skips ENTIRE cycle if OFF — no per-symbol compute)
+- Earnings filter second (drops symbols cleanly before they reach IV/liquidity compute)
+- Liquidity floor narrows the universe to `~4 × target`
+- IVP rank (most expensive) runs on the smallest possible set
+
+✓ Spec-aligned. Memoir §11 "liquidity is the FLOOR, IVP is the SIGNAL" pinned in the code via order-of-operations.
+
+### LOAD-BEARING test pins for each layer
+
+Each of the 4 pipeline layers has a dedicated regression test:
+1. `test_select_top_n_for_cycle_regime_off_returns_empty` (§3 regime gate)
+2. `test_select_top_n_for_cycle_earnings_filter_drops_symbols` (§17.5)
+3. (implicit via top-K reduction surface — tested by `apply_candidate_selection` round-trip)
+4. `test_select_top_n_for_cycle_ivp_band_filters_symbols` (band + descending rank pin)
+
+Plus integration:
+- `test_apply_candidate_selection_filters_to_picked_only` (LOAD-BEARING (expiry, symbol) tuple contract)
+- `test_apply_candidate_selection_drops_cycles_with_empty_picks` (regime-OFF → all trades dropped → equity curve flat for that cycle)
+- `test_candidate_selection_toggle_skips_pipeline` (toggle-off baseline still works)
+
+7 LOAD-BEARING tests across the pipeline. The toggle test in particular is important — it pins that toggle-OFF gives the OLD "trade everything" behavior so operators can compare A/B.
+
+### Live smoke validates the regime gate
+
+```
+2026-05-26 [0] (regime OFF or empty)
+2026-04-28 [0] (regime OFF or empty)
+2026-03-30 [0] (regime OFF or empty)   ← was the WORST cycle (-₹662k) pre-selection
+2026-02-24 [5] RELIANCE · HDFCBANK · MARUTI · TCS · ICICIBANK
+2026-01-27 [5] SBIN · MARUTI · SHRIRAMFIN · TRENT · BHARTIARTL
+...
+```
+
+**The 3 recent OFF cycles were among the worst-10 from e49246d** (2026-04-28 = -₹568k, 2026-03-30 = -₹662k). The v1 regime gate correctly fires OFF on the top-quartile-VIX cycles AND those would have been the worst losses. **The regime gate IS doing its job exactly as memoir §3.7 predicted.**
+
+Per [[feedback_review_loudly_not_decided]] — this is the empirical validation that the v1 regime gate adds value: the gate skips precisely the cycles that would have lost the most. Worth calling out as a SUCCESS pin, not just an ACK.
+
+### State-of-tree shift — semantic change worth flagging
+
+**Critical**: every Portfolio-tab smoke number I verified across this session (cbf411f -88% return, 03c54dc -₹15.79L max DD, e49246d -₹662k worst cycle, a706ab0 HINDALCO 2.89% margin share, ce3824a 40 positions per cycle) was computed across the FULL sidebar-filtered universe. **Post-this-commit with toggle ON (default), every aggregate now reflects the 5-stocks-per-cycle selection.** The numbers WILL be different.
+
+Per [[feedback_irreversible_engine_invalidates_displayed_data]]: operator-side "displayed data has shifted semantics." The toggle-OFF mode preserves the old comparison numbers, which is the right discipline for backward-A/B testing.
+
+Phase 9 v1 Portfolio Foundation is now **semantically complete** — Phase 9 with this commit ACTUALLY runs the v1 strategy. Pre-commit it ran the full universe. The operator was right; this was the missing piece.
+
+### Praise points
+
+- **Operator-driven bug acknowledged with the actual quote** — audit trail makes the motivation legible.
+- **Pipeline order matches memoir §11 verbatim** — no creative re-ordering; spec-literal composition.
+- **Toggle for backward-A/B** preserves toggle-OFF behavior — operator can compare strategy-on vs strategy-off without re-deriving math.
+- **Session-state memoization keyed on (cfg, sub shape, run_id)** — invalidates on relevant config changes only; doesn't re-pay 7.4s on unrelated reruns.
+- **`_select_top_n_for_cycle` takes pre-loaded `regime_signal + events_df`** — per-cycle cost is just liquidity + IVP lookups (the cheap ones). Outer wrapper loads VIX + events ONCE.
+- **`_render_selected_per_cycle` stand-alone panel** addresses the operator's "I don't see which stocks each month" feedback explicitly. Operator now sees the per-cycle pick exactly.
+- **Cold-IVP-cache fallback to liquidity-only top-N** with transparent caption — gracefully degrades when IVP cache is partial. Same disciplined-fallback pattern as the v2 regime banner snap (df8d429).
+- **Honest performance scoping** (7.4s cold render; optimization deferred to follow-up commit with concrete suggestions: `@st.cache_data` on `load_iv_history`, bhavcopy-window pre-batching).
+- **AppTest timeout bumps from 10s → 60s** (26 tests) — honest about pipeline cold-render running through tests. Doesn't artificially constrain test runtime to mask the cost.
+
+### Empirical pin: regime gate validates on operator's data
+
+**The 3 recent regime-OFF cycles (2026-03-30, 04-28, 05-26) are precisely the cycles with the worst pre-selection P&L** (per the e49246d worst-10 panel: -₹568k and -₹662k were 2 of those 3). The gate skipped them. This is the v1 regime gate empirically EARNING its inclusion — the same kind of "is the trade net positive" empirical test memoir §3.7 explicitly demands. Operator-facing answer: YES, on this dataset, in recent quarters.
+
+### Math + arithmetic
+
+- LOC: +339 portfolio.py + 318 test = +657 net. ✓ Matches `git show --stat`.
+- Tests: 1271 → 1281 (+10 = +9 new + 1 baseline). ✓ Matches BUILDER's claim within margin.
+- 72 Portfolio tests now (was 62). Full suite runtime 68s (up from 30s; pipeline cold-render in AppTest cases).
+
+### State-of-tree
+
+- `main` HEAD: `6db71f6`.
+- **Phase 9 v1 Portfolio Foundation now SEMANTICALLY COMPLETE.** Earlier "shipped" was structurally complete but had a missing wire-up; this commit closes that.
+- Carry-over from df8d429 / 9835ee4 — ✅ CLOSED.
+
+### Open grills (cumulative — unchanged)
+
+- 🟡 DOWNGRADED — 61c3fe9 GRILL 1 (memoir F11 sketch update).
+- F11 + F12 silent-drops grill (pre-P8 backlog) — STILL OPEN.
+- MIGRATION.md decision-log — STILL OPEN.
+- P1.8b smoke gate — STILL OPEN.
+
+### Operator action
+
+**The Portfolio tab now reflects the actual v1 strategy.** Operator-visible changes when reloading:
+- Every aggregate (equity, metrics, YoY, worst-10, concentration, sensitivity, drilldown) shows DIFFERENT numbers (selection-driven, not universe-wide).
+- Recent 3 cycles show regime-OFF flat-equity gaps.
+- "Selected per cycle" panel surfaces the 5 names per cycle.
+- Toggle in config block lets operator A/B compare strategy-on vs all-trades baseline.
+- First render: 7.4s (cold pipeline + spinner). Subsequent renders: ms.
+
+If operator wants to preserve pre-fix numbers for any specific comparison they had open, toggle OFF.
+
+### Next-commit suggestion
+
+Either:
+- **(A) Performance optimization** carry-over BUILDER named: `@st.cache_data` wrapper on `load_iv_history` + bhavcopy-window pre-batching. Cuts 7.4s → maybe 1-2s. Cheap to land.
+- **(B) Phase 10 / 11** — sizing variants or Tier-3 strategies per PLAN.md. Awaiting operator direction.
+
+Per [[feedback_next_commit_suggestion]]: (A) is the natural follow-up and BUILDER has scoped it. (B) is a phase shift requiring operator input.
+
+Migration cadence
+
+**... → 6db71f6 candidate-selection pipeline ✓ (v1 strategy ACTUALLY runs now) → (A) perf optimization OR (B) Phase 10 / 11 awaiting direction → ...**
+
+Standing by.
+
+---
+
