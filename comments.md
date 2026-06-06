@@ -26333,3 +26333,69 @@ Standing by.
 
 ---
 
+## Review of c1a1611 — `feat(p9.4.2d_diagnostic_ui)` — ✅ ACCEPT (caveat-text surfacing addresses my a7a81a2 watch point)
+
+**Verdict: ✅ ACCEPT.** Wires the F19 backend from 5f8af50 (`regime_x_ivp_breakdown`) into the Portfolio tab. Surfaces the "non-negotiable" diagnostic per memoir §15 #15 — "does IVP add signal beyond the regime gate?" — at the operator-facing UI. 6 new tests including 2 LOAD-BEARING graceful-degrade pins (VIX cold-cache → empty Series, IVP cold-cache → NaN). 1252 passed; CONSTRAINT 1 still 0. **BUILDER addresses the watch point from my a7a81a2 review**: optional caveat line surfaces when quintile fallback fires OR n_trades_dropped > 0.
+
+### Watch point closed
+
+From a7a81a2 review: "The UI commit should surface `RegimeIvpBreakdown.caveat_text()` value prominently when the fallback fires."
+
+BUILDER's commit body: "Optional caveat line (italic caption) when: quintile fallback fired (any decile had < 50 trades) OR n_trades_dropped > 0 (NaN IVP or NaN regime)."
+
+✓ The `caveat_text()` semicolon-joined output from 5f8af50 surfaces in the right place. Operator sees the "thin buckets → quintile fallback" + "X trades dropped" caveats immediately above the table.
+
+### Cold-cache UX — three graceful-degrade paths
+
+1. **VIX series empty** → `st.warning` pointing at prefetch script.
+2. **All symbols missing IVP cache** → `st.warning` pointing at iv_materializer.
+3. **Breakdown table empty** after filtering → `st.info` with drop count.
+
+Distinguishes three different failure modes, each with operator-actionable instruction. Same discipline as the regime banner in 22ff990.
+
+### Helper plumbing
+
+**`_build_regime_signal_for_window`**: VIX cushion `[min_entry - 365-30, max_entry]` matches Phase 9.6's `current_regime_state` convention (365+30 cal-day cushion for 252-TD lookback). Loader exception → empty Series. LOAD-BEARING pin: `test_build_regime_signal_for_window_handles_loader_failure`.
+
+**`_build_ivp_per_symbol`**: per (symbol, entry_date) `compute_ivp` call; `FileNotFoundError + Exception → NaN`. LOAD-BEARING pin: `test_build_ivp_per_symbol_handles_missing_cache`. **Critical NaN-NOT-propagation pin** — a single bad symbol can't poison the whole batch.
+
+### Performance trade-off acknowledged honestly
+
+BUILDER's body: "The diagnostic is the most-expensive section: O((unique symbols) × (unique entry_dates)) compute_ivp calls. NOT @st.cache_data'd because DataFrame cache keys are unreliable; inner load_iv_history already memoizes. Surfaced via st.spinner."
+
+Honest scoping. For 50 symbols × 25 unique entry_dates ≈ 1,250 compute_ivp calls per render. Inner `load_iv_history` parquet caching helps but doesn't eliminate per-call rank computation. **Streamlit reruns the tab on every widget change** — so changing the strategy in config block re-pays this cost.
+
+This is a v1-acceptable UX trade-off. The `st.spinner` makes the wait visible. Future optimization: `@st.cache_data` with explicit hash on `(strategy, entry, exit, frame_signature)`, or session-level memo. Not blocking.
+
+### Praise points
+
+- **Look-ahead caveat footer caption** (per commit body) — same discipline as 5f8af50's docstring. The qcut full-sample issue is pinned in 2 places (backend + UI) so the operator can't miss it.
+- **FileNotFoundError + Exception unified to NaN** in `_build_ivp_per_symbol` — operator-facing behavior is "missing IVP", so the failure-mode distinction doesn't matter. Right abstraction level for the wrapper.
+- **`_build_*` helpers are pure** — testable without `AppTest` overhead. LOAD-BEARING tests monkeypatch the inner loaders to drive specific failure modes.
+- **Section header + optional caveat + table + footer caption** layout matches the standard 4-layer "diagnostic surface" pattern: title, exceptions, data, methodology pin.
+- **3 graceful-degrade paths** match the data-availability hierarchy (no VIX → warning; some IVP missing → warning; result empty → info). Same triage discipline as cbf411f's 2-tier empty-state.
+- **`st.spinner`** for the expensive call — operator-facing latency surface vs silent slowness. The opposite of "hide the bug."
+- **Note about `@st.cache_data` and DataFrame keys** in the commit body is correct — Streamlit's hash-based cache is unreliable for DataFrame inputs without explicit `hash_funcs`. BUILDER chose the simpler path of relying on inner LRU + spinner. Acceptable v1.
+
+### Math (composition only — backend math from 5f8af50)
+
+c1a1611 is pure composition; no new math. The F19 backend math is from 5f8af50 (already accepted with look-ahead caveat pinned in 3 places). This commit just surfaces it.
+
+### Math + arithmetic
+
+- LOC: +159 portfolio.py + 93 test = +252 net. ✓ Matches `git show --stat`.
+- Tests: 1246 → 1252 (+6). ✓ Matches BUILDER's claim exactly.
+- 43 Portfolio tests now (was 37).
+
+### Next-commit suggestion
+
+`feat(p9.4.ivp_sensitivity_strip)` per BUILDER's stated next (9.4.8) — metric-vs-IVP-decile line chart per memoir §2.5. Operator scans the IVP cutoff and finds the empirical sweet spot for the IVP threshold (currently default 60+). The 2-D diagnostic here surfaces the BUCKET P&L distributions; the sensitivity strip will surface the BUCKET-vs-METRIC curve so the operator can pick the cutoff.
+
+Migration cadence
+
+**... → P9.4.6 concentration ✓ → P9.4.7 2-D diagnostic ✓ → P9.4.8 sensitivity strip → P9.4.9 drilldown → P9.4.10 deeplink writer → v1 SHIPPED → ...**
+
+Standing by.
+
+---
+
