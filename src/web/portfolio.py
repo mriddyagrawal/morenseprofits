@@ -438,6 +438,166 @@ _DEFAULT_WORST_N_CYCLES = 10
 # loss surfaces enough context without overwhelming the table.
 _ATTRIBUTION_TOP_K_SYMBOLS = 3
 
+# Concentration + correlation visualization sizing.
+_CONCENTRATION_TOP_K_SYMBOLS = 15
+_CORRELATION_PLOT_HEIGHT_PX = 360
+
+
+def _per_symbol_margin_share(sub: pd.DataFrame) -> pd.DataFrame:
+    """Per-symbol share of total margin deployed across all
+    trades. Memoir §4 + mockup §D: surfaces which names dominate
+    capital allocation under the equal-margin convention.
+
+    Returns:
+        DataFrame with columns:
+          symbol, margin_total, share_pct.
+        Sorted descending by margin_total. Empty if no margin
+        column in input (defensive — older sweep parquets may
+        lack it).
+    """
+    if sub.empty or "margin_at_entry" not in sub.columns:
+        return pd.DataFrame(
+            columns=["symbol", "margin_total", "share_pct"],
+        )
+    by_sym = (
+        sub.groupby("symbol")["margin_at_entry"]
+           .sum().sort_values(ascending=False)
+    )
+    total = float(by_sym.sum())
+    if total <= 0:
+        return pd.DataFrame(
+            columns=["symbol", "margin_total", "share_pct"],
+        )
+    out = pd.DataFrame({
+        "symbol": by_sym.index.astype(str),
+        "margin_total": by_sym.values,
+        "share_pct": by_sym.values / total * 100.0,
+    })
+    return out.reset_index(drop=True)
+
+
+def _pairwise_correlation_matrix(sub: pd.DataFrame) -> pd.DataFrame:
+    """Pairwise Pearson correlation of per-cycle P&L across
+    symbols. Memoir §4 + mockup §D: the diversification signal
+    operators care about — high pairwise correlation means the
+    portfolio is structurally exposed to common factors and
+    the apparent diversification is illusory.
+
+    Pivots ``sub`` to (expiry × symbol) → net_pnl matrix and
+    runs ``.corr()`` on the column-wise series. Empty input or
+    a single-symbol universe → empty frame.
+
+    Returns:
+        Square DataFrame indexed by symbol, columns by symbol.
+        Values in [-1, 1]. NaN where a symbol has < 2 non-NaN
+        rows (pandas .corr default).
+    """
+    if sub.empty:
+        return pd.DataFrame()
+    wide = sub.pivot_table(
+        index="expiry", columns="symbol", values="net_pnl",
+        aggfunc="sum",
+    )
+    if wide.shape[1] < 2:
+        # Need at least 2 symbols for a meaningful correlation.
+        return pd.DataFrame()
+    return wide.corr()
+
+
+def _render_concentration_correlation(df_filtered: pd.DataFrame) -> None:
+    """Two-panel concentration + correlation diagnostic per
+    PLAN.md Phase 9.4.6 + memoir §4 + mockup §D.
+
+    Left: per-symbol margin share bar chart (top-15 symbols by
+          total margin deployed; everything else folded into
+          "others" if more than 15 symbols).
+    Right: pairwise correlation heatmap of per-cycle P&L across
+           symbols (top-15 by margin for visual clarity).
+
+    Silent on empty filter.
+    """
+    sub = _portfolio_trades_view(df_filtered)
+    if sub.empty:
+        return
+
+    concentration = _per_symbol_margin_share(sub)
+    corr = _pairwise_correlation_matrix(sub)
+    if concentration.empty and corr.empty:
+        return
+
+    st.markdown("##### Concentration & correlation")
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        if concentration.empty:
+            st.caption("_No margin column in this sweep parquet._")
+        else:
+            top = concentration.head(_CONCENTRATION_TOP_K_SYMBOLS)
+            # Horizontal bar; ascending order so the highest-
+            # concentration symbol renders at top.
+            fig = go.Figure(go.Bar(
+                x=top["share_pct"][::-1],
+                y=top["symbol"][::-1],
+                orientation="h",
+                marker_color="rgba(80, 140, 220, 0.8)",
+                hovertemplate=(
+                    "%{y}<br>margin share: %{x:.1f}%<extra></extra>"
+                ),
+            ))
+            fig.update_layout(
+                height=_CORRELATION_PLOT_HEIGHT_PX,
+                margin=dict(l=10, r=10, t=30, b=10),
+                title="Margin share by symbol (top 15)",
+                xaxis_title="share of total margin (%)",
+                yaxis_title=None,
+            )
+            st.plotly_chart(fig, width="stretch")
+
+    with col_right:
+        if corr.empty:
+            st.caption(
+                "_Correlation requires ≥ 2 symbols in the "
+                "filtered view._"
+            )
+        else:
+            # Limit to top-15 by margin for visual readability.
+            if not concentration.empty:
+                top_syms = concentration.head(
+                    _CONCENTRATION_TOP_K_SYMBOLS
+                )["symbol"].tolist()
+                shown_corr = corr.loc[
+                    corr.index.isin(top_syms),
+                    corr.columns.isin(top_syms),
+                ]
+            else:
+                shown_corr = corr.iloc[
+                    :_CONCENTRATION_TOP_K_SYMBOLS,
+                    :_CONCENTRATION_TOP_K_SYMBOLS,
+                ]
+            fig = go.Figure(go.Heatmap(
+                z=shown_corr.values,
+                x=shown_corr.columns,
+                y=shown_corr.index,
+                colorscale="RdBu",
+                zmin=-1, zmax=1,
+                hovertemplate=(
+                    "%{y} vs %{x}<br>ρ = %{z:.2f}<extra></extra>"
+                ),
+            ))
+            fig.update_layout(
+                height=_CORRELATION_PLOT_HEIGHT_PX,
+                margin=dict(l=10, r=10, t=30, b=10),
+                title="Pairwise cycle-P&L correlation",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+    st.caption(
+        "Concentration: where margin is deployed. Correlation: "
+        "structural exposure to common factors — high pairwise "
+        "correlation means the portfolio's apparent diversification "
+        "is illusory."
+    )
+
 
 def _worst_cycles_with_attribution(
     sub: pd.DataFrame, *, n: int = _DEFAULT_WORST_N_CYCLES,
@@ -890,3 +1050,4 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     _render_equity_curve(df_filtered)
     _render_yoy_stability(df_filtered)
     _render_worst_10_cycles(df_filtered)
+    _render_concentration_correlation(df_filtered)

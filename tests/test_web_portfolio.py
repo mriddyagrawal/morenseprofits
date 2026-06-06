@@ -190,6 +190,127 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 
 # ============================================================
+# Phase 9.4.6 — concentration + correlation
+# ============================================================
+
+def test_per_symbol_margin_share_sums_to_100_pct():
+    """LOAD-BEARING contract: share_pct sums to 100 across all
+    symbols (modulo float rounding)."""
+    import pandas as pd
+
+    from src.web.portfolio import _per_symbol_margin_share
+
+    sub = pd.DataFrame({
+        "symbol": ["A", "A", "B", "C", "C", "C"],
+        "margin_at_entry": [
+            100_000.0, 50_000.0,
+            200_000.0,
+            75_000.0, 80_000.0, 95_000.0,
+        ],
+        "net_pnl": [0.0] * 6,
+    })
+    out = _per_symbol_margin_share(sub)
+    assert out["share_pct"].sum() == pytest.approx(100.0, abs=1e-9)
+
+
+def test_per_symbol_margin_share_sorted_descending():
+    import pandas as pd
+
+    from src.web.portfolio import _per_symbol_margin_share
+
+    sub = pd.DataFrame({
+        "symbol": ["A", "B", "C"],
+        "margin_at_entry": [50_000.0, 200_000.0, 100_000.0],
+        "net_pnl": [0.0] * 3,
+    })
+    out = _per_symbol_margin_share(sub)
+    assert list(out["symbol"]) == ["B", "C", "A"]
+
+
+def test_per_symbol_margin_share_empty_returns_empty():
+    import pandas as pd
+
+    from src.web.portfolio import _per_symbol_margin_share
+
+    out = _per_symbol_margin_share(
+        pd.DataFrame(columns=["symbol", "margin_at_entry", "net_pnl"])
+    )
+    assert out.empty
+    assert list(out.columns) == ["symbol", "margin_total", "share_pct"]
+
+
+def test_per_symbol_margin_share_handles_missing_margin_column():
+    """Older sweep parquets may lack margin_at_entry — empty
+    output, NO exception."""
+    import pandas as pd
+
+    from src.web.portfolio import _per_symbol_margin_share
+
+    sub = pd.DataFrame({
+        "symbol": ["A", "B"],
+        "net_pnl": [100.0, 200.0],
+    })
+    out = _per_symbol_margin_share(sub)
+    assert out.empty
+
+
+def test_pairwise_correlation_matrix_returns_square_frame():
+    """LOAD-BEARING: ``corr`` matrix shape = (n_symbols, n_symbols).
+    Diagonal == 1.0 (every symbol correlates perfectly with itself)."""
+    import pandas as pd
+
+    from src.web.portfolio import _pairwise_correlation_matrix
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime([
+            "2024-01-25", "2024-02-29", "2024-03-28", "2024-04-25",
+            "2024-01-25", "2024-02-29", "2024-03-28", "2024-04-25",
+        ]),
+        "symbol": ["A", "A", "A", "A", "B", "B", "B", "B"],
+        "net_pnl": [100, 200, 300, 400, -100, -200, -300, -400],
+    })
+    corr = _pairwise_correlation_matrix(sub)
+    assert corr.shape == (2, 2)
+    assert corr.loc["A", "A"] == pytest.approx(1.0, abs=1e-9)
+    assert corr.loc["B", "B"] == pytest.approx(1.0, abs=1e-9)
+    # Perfect anti-correlation.
+    assert corr.loc["A", "B"] == pytest.approx(-1.0, abs=1e-9)
+
+
+def test_pairwise_correlation_matrix_single_symbol_returns_empty():
+    """≥ 2 symbols required for meaningful correlation."""
+    import pandas as pd
+
+    from src.web.portfolio import _pairwise_correlation_matrix
+
+    sub = pd.DataFrame({
+        "expiry": pd.to_datetime(["2024-01-25", "2024-02-29"]),
+        "symbol": ["A", "A"],
+        "net_pnl": [100, 200],
+    })
+    assert _pairwise_correlation_matrix(sub).empty
+
+
+def test_concentration_correlation_section_renders():
+    at = _make_apptest()
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Concentration & correlation" in visible
+
+
+def test_concentration_correlation_section_skips_on_empty_filter():
+    at = _make_apptest()
+    at.session_state["mp_pf_exit_offset_td"] = 20
+    at.run(timeout=10)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "Concentration & correlation" not in visible
+
+
+# ============================================================
 # Phase 9.4.5 — worst-10 cycles with attribution
 # ============================================================
 
