@@ -28,7 +28,77 @@ from src.engine.results import (
     empty_results_frame,
     empty_skips_frame,
 )
-from src.web.discover import find_latest_sweep, read_sweep_with_skips
+from src.web.discover import find_latest_sweep, list_sweeps, read_sweep_with_skips
+
+
+# ============================================================
+# list_sweeps — multi-sweep enumeration for the topbar picker
+# ============================================================
+
+def test_list_sweeps_empty_results_dir_returns_empty_list(tmp_path: Path):
+    """No sweep_*.parquet files → empty list."""
+    assert list_sweeps(tmp_path) == []
+
+
+def test_list_sweeps_missing_results_dir_returns_empty_list(tmp_path: Path):
+    """Results dir doesn't exist → empty list, no exception."""
+    missing = tmp_path / "definitely_does_not_exist"
+    assert list_sweeps(missing) == []
+
+
+def test_list_sweeps_returns_all_candidates(tmp_path: Path):
+    """Multiple sweep parquets → all returned (and only sweep_*.parquet;
+    *_skipped.parquet excluded)."""
+    import time
+    a = tmp_path / "sweep_a123.parquet"
+    a.write_bytes(b"x")
+    time.sleep(0.01)
+    b = tmp_path / "sweep_b456.parquet"
+    b.write_bytes(b"y")
+    # Companion skips parquet — should NOT be in the result.
+    skips = tmp_path / "sweep_a123_skipped.parquet"
+    skips.write_bytes(b"z")
+    out = list_sweeps(tmp_path)
+    assert set(out) == {a, b}
+    assert skips not in out
+
+
+def test_list_sweeps_sorted_mtime_desc(tmp_path: Path):
+    """LOAD-BEARING: list_sweeps[0] is the freshest sweep — matches
+    find_latest_sweep's contract so callers can use list_sweeps[0]
+    as the default selection."""
+    import time
+    older = tmp_path / "sweep_old.parquet"
+    older.write_bytes(b"x")
+    time.sleep(0.05)
+    newer = tmp_path / "sweep_new.parquet"
+    newer.write_bytes(b"y")
+    out = list_sweeps(tmp_path)
+    assert out[0] == newer
+    assert out[-1] == older
+
+
+def test_list_sweeps_first_matches_find_latest_sweep(tmp_path: Path):
+    """LOAD-BEARING parity contract: ``list_sweeps[0] ==
+    find_latest_sweep()`` so the topbar picker's default agrees
+    with the single-sweep path."""
+    import time
+    a = tmp_path / "sweep_a.parquet"
+    a.write_bytes(b"x")
+    time.sleep(0.05)
+    b = tmp_path / "sweep_b.parquet"
+    b.write_bytes(b"y")
+    assert list_sweeps(tmp_path)[0] == find_latest_sweep(tmp_path)
+
+
+def test_list_sweeps_excludes_skipped_parquets(tmp_path: Path):
+    """Defensive pin: companion ``*_skipped.parquet`` files MUST
+    be excluded — they're metadata, not sweep results."""
+    a = tmp_path / "sweep_a.parquet"
+    a.write_bytes(b"x")
+    skips = tmp_path / "sweep_a_skipped.parquet"
+    skips.write_bytes(b"y")
+    assert list_sweeps(tmp_path) == [a]
 
 
 # ============================================================

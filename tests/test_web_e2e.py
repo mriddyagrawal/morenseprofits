@@ -70,6 +70,44 @@ def test_app_loads_without_crash():
 
 
 @SKIP_NO_SWEEP
+def test_sweep_picker_renders_selectbox_when_multiple_sweeps_present():
+    """LOAD-BEARING operator-reported bug fix (2026-06-06): when
+    ``data/results/`` contains MORE THAN ONE ``sweep_*.parquet``,
+    the topbar must render a ``st.selectbox`` so the operator can
+    switch between them.
+
+    Pre-fix the topbar hardcoded ``find_latest_sweep()`` so the
+    only addressable sweep was the freshest by mtime — even with
+    2 parquets on disk, the operator couldn't toggle.
+
+    This test skips gracefully when only one sweep is present
+    (the developer's clean checkout); fires its assertions only
+    when the operator (or CI) has a second sweep parquet, which is
+    the case where the regression would surface."""
+    from src.web.discover import list_sweeps
+    sweeps = list_sweeps()
+    if len(sweeps) < 2:
+        pytest.skip(
+            "test only meaningful with ≥ 2 sweep parquets on disk"
+        )
+    at = AppTest.from_file(str(APP_PY))
+    at.run(timeout=30)
+    assert not at.exception
+    sweep_select = [
+        s for s in at.selectbox if s.key == "mp_sweep_selectbox"
+    ]
+    assert len(sweep_select) == 1, (
+        f"expected one sweep selectbox; got {len(sweep_select)}. "
+        f"Without it the operator can't switch sweeps."
+    )
+    s = sweep_select[0]
+    assert len(s.options) == len(sweeps), (
+        f"selectbox has {len(s.options)} options but {len(sweeps)} "
+        f"sweep parquets exist — picker would silently hide sweeps."
+    )
+
+
+@SKIP_NO_SWEEP
 def test_app_renders_expected_tabs():
     """The 6-tab structure (Leaderboard / Per-stock / Heatmap / Trends
     / Portfolio / Inspect) is part of the v0.6+9.4+9.5 contract.

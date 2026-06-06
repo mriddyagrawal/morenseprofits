@@ -35,7 +35,7 @@ from src.analytics.aggregate import MIN_N_FOR_RANKING  # noqa: E402
 from src.config import RESULTS_DIR  # noqa: E402
 from src.strategies.registry import list_strategies  # noqa: E402
 from src.web.caveats import render_caveats  # noqa: E402
-from src.web.discover import find_latest_sweep, read_sweep_with_skips  # noqa: E402
+from src.web.discover import find_latest_sweep, list_sweeps, read_sweep_with_skips  # noqa: E402
 from src.web.heatmap import (  # noqa: E402
     _selector as render_heatmap_selector,
     cell_action_mode,
@@ -113,26 +113,59 @@ def _load_sweep(parquet_path_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 # Header — project name + sweep selector + status
 # ============================================================
 def _render_header() -> None:
-    latest = find_latest_sweep(RESULTS_DIR)
+    sweeps = list_sweeps(RESULTS_DIR)
     cols = st.columns([3, 4, 2])
     with cols[0]:
         st.markdown("### 📈 morenseprofits")
         st.caption("NSE options backtest research — Phase 6 v1")
     with cols[1]:
-        if latest is None:
+        if not sweeps:
             st.warning(
                 "No sweep parquets in `data/results/`. Run "
                 "`python scripts/verify_p4.py` to produce one."
             )
             st.session_state["mp_selected_sweep"] = None
-        else:
-            st.session_state["mp_selected_sweep"] = latest
-            mtime = datetime.fromtimestamp(latest.stat().st_mtime)
-            st.markdown(f"**Sweep:** `{latest.name}`")
+        elif len(sweeps) == 1:
+            # Single-sweep case — no point rendering a selectbox;
+            # auto-set and show the static label so the layout
+            # matches the multi-sweep case.
+            only = sweeps[0]
+            st.session_state["mp_selected_sweep"] = only
+            mtime = datetime.fromtimestamp(only.stat().st_mtime)
+            st.markdown(f"**Sweep:** `{only.name}`")
             st.caption(f"updated {mtime.strftime('%Y-%m-%d %H:%M')}")
+        else:
+            # Multi-sweep case — render a proper selectbox so the
+            # operator can switch between blue-chip / expanded
+            # universe sweeps (Phase 10.1) etc.
+            current = st.session_state.get("mp_selected_sweep")
+            # Default to the latest (sweeps[0] since list_sweeps
+            # sorts by mtime DESC) unless the operator has already
+            # picked one in this session.
+            if current not in sweeps:
+                current = sweeps[0]
+            options = sweeps
+            try:
+                idx = options.index(current)
+            except ValueError:
+                idx = 0
+            picked = st.selectbox(
+                "Sweep",
+                options=options,
+                index=idx,
+                format_func=lambda p: p.name,
+                key="mp_sweep_selectbox",
+                label_visibility="collapsed",
+            )
+            st.session_state["mp_selected_sweep"] = picked
+            mtime = datetime.fromtimestamp(picked.stat().st_mtime)
+            st.caption(
+                f"updated {mtime.strftime('%Y-%m-%d %H:%M')} · "
+                f"{len(sweeps)} sweep parquets available"
+            )
     with cols[2]:
         st.caption("")  # alignment spacer
-        st.caption("v0.6.1 skeleton")
+        st.caption("v0.6.2 sweep picker")
 
 
 # ============================================================

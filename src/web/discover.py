@@ -53,6 +53,28 @@ def find_latest_sweep(results_dir: Path = RESULTS_DIR) -> Path | None:
     return candidates[0]
 
 
+def list_sweeps(results_dir: Path = RESULTS_DIR) -> list[Path]:
+    """Return ALL ``sweep_*.parquet`` candidates under ``results_dir``
+    sorted (mtime DESC, name ASC) — same ordering as
+    ``find_latest_sweep`` but the full list, not just the head.
+
+    Excludes companion ``*_skipped.parquet`` files. Empty list if
+    ``results_dir`` doesn't exist or has no candidates.
+
+    Used by the topbar sweep selector (Phase-6 / post-Phase-9 UX)
+    so the operator can switch between v1 blue-chip and expanded-
+    universe sweeps (Phase 10.1) via a dropdown.
+    """
+    if not results_dir.exists():
+        return []
+    candidates = [
+        p for p in results_dir.glob("sweep_*.parquet")
+        if "_skipped" not in p.name
+    ]
+    candidates.sort(key=lambda p: (-p.stat().st_mtime, p.name))
+    return candidates
+
+
 def read_sweep_with_skips(
     parquet_path: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
