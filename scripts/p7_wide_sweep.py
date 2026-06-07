@@ -101,14 +101,31 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--symbols", nargs="+", default=SYMBOLS,
+        "--symbols", nargs="+", default=None,
         help=(
-            "NSE symbols to sweep (space-separated). Default: full "
-            "50-symbol universe (48 blue chips + PNB + BHEL). "
-            "Mirrors scripts/prefetch_universe.py's --symbols — pass "
-            "the same list to both scripts to keep prefetch and "
-            "sweep universes in lockstep (sweep against a non-"
-            "prefetched stock yields OfflineCacheMiss skips)."
+            "Explicit NSE symbol list. Mutually exclusive with "
+            "--universe (pass one or the other). When omitted, "
+            "falls back to --universe (default: blue_chip → 50)."
+        ),
+    )
+    p.add_argument(
+        "--universe", choices=["blue_chip", "full"],
+        default="blue_chip",
+        help=(
+            "Named universe (Phase 10.1, mirrors "
+            "scripts/prefetch_universe.py's --universe):\n"
+            "  blue_chip (default): the curated 50-symbol list "
+            "(48 NIFTY-50 + PNB + BHEL). Survivor-biased; matches "
+            "the v1 sweep parquet that's been the operator default.\n"
+            "  full: enumerate every OPTSTK symbol from cached "
+            "bhavcopies in [EXPIRY_FROM, EXPIRY_TO]. Survivorship-"
+            "free per memoir §11. Requires the bhavcopy cache to be "
+            "warm — run `python scripts/prefetch_universe.py "
+            "--universe full` first.\n"
+            "PARITY: the sweep --universe choice MUST match the "
+            "preceding prefetch --universe choice. Sweeping against "
+            "symbols whose options weren't prefetched yields "
+            "OfflineCacheMiss skips for every cell."
         ),
     )
     p.add_argument(
@@ -147,7 +164,41 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    symbols: list[str] = args.symbols
+    # Resolve the symbol list: --symbols wins if given, else apply
+    # --universe (blue_chip = curated 50, full = enumerate from
+    # cached bhavcopies per memoir §11 walk-back). Mirrors
+    # scripts/prefetch_universe.py.
+    if args.symbols is not None:
+        symbols: list[str] = args.symbols
+        universe_label = "explicit --symbols"
+    elif args.universe == "full":
+        from src.data import fo_universe
+        print(
+            f"  enumerating full F&O universe from cached "
+            f"bhavcopies in [{EXPIRY_FROM} → {EXPIRY_TO}]..."
+        )
+        symbols = fo_universe.enumerate_fo_universe(
+            EXPIRY_FROM, EXPIRY_TO, offline=True,
+        )
+        if not symbols:
+            print(
+                f"\n  ✗ --universe full found 0 symbols in the "
+                f"bhavcopy cache for the planned expiry window.",
+                file=sys.stderr,
+            )
+            print(
+                f"    The bhavcopy cache may be cold. Run:\n"
+                f"      python scripts/prefetch_universe.py "
+                f"--universe full --start {EXPIRY_FROM.isoformat()} "
+                f"--end {EXPIRY_TO.isoformat()}\n"
+                f"    first, then re-run the sweep.",
+                file=sys.stderr,
+            )
+            return 1
+        universe_label = f"--universe full (enumerated, {len(symbols)} symbols)"
+    else:
+        symbols = SYMBOLS
+        universe_label = f"--universe blue_chip (curated, {len(symbols)} symbols)"
     n_workers: int = args.workers
     profile_enabled: bool = args.profile
     if profile_enabled and n_workers != 1:
@@ -159,6 +210,7 @@ def main() -> int:
         )
         n_workers = 1
     _h("Phase-7 wide-grid sweep — heatmap 45×16")
+    print(f"  universe    = {universe_label}")
     print(f"  symbols     = {symbols}  (n={len(symbols)})")
     print(f"  strategies  = {STRATEGIES}")
     print(f"  entry_td    = T-{min(ENTRY_OFFSETS_TD)} … T-{max(ENTRY_OFFSETS_TD)} ({len(ENTRY_OFFSETS_TD)} values)")
