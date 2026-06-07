@@ -699,3 +699,30 @@ def test_fractional_strike_supported_via_cache_path(monkeypatch, tmp_path):
     assert p_frac.name == "2620.5-CE.parquet"
     # Fractional ≠ integer for adjacent values.
     assert p_int != p_frac
+
+
+# ============================================================
+# LRU cache sizing (Phase 10.1 wide-universe perf)
+# ============================================================
+
+def test_lru_maxsize_options_holds_full_universe_working_set():
+    """LOAD-BEARING perf pin per Phase 10.1 expansion (2026-06-07):
+
+    The wide-universe sweep (~273 symbols) has a unique-options
+    working set of ~196k. The LRU must be large enough to retain
+    a meaningful fraction so per-cell access doesn't thrash through
+    repeated disk reads of the same parquets.
+
+    Pre-bump (2048) → ~1% retention → 4× slowdown vs 5-sym warm-LRU.
+    Post-bump (25,000) → ~13% retention → ~3× throughput recovery.
+
+    If a future revision drops this below 10,000 a sweep across
+    >200 symbols will regress. Pin loud.
+    """
+    from src.data.options_loader import _LRU_MAXSIZE_OPTIONS
+    assert _LRU_MAXSIZE_OPTIONS >= 10_000, (
+        f"_LRU_MAXSIZE_OPTIONS = {_LRU_MAXSIZE_OPTIONS}; below 10k "
+        f"will thrash on the Phase 10.1 full F&O universe sweep "
+        f"(~196k unique options). Bump it back to 25,000 or "
+        f"justify the drop in a memoir / commit message."
+    )

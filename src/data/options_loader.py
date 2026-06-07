@@ -40,10 +40,37 @@ from src.data.errors import MissingDataError, OfflineCacheMiss, OptionsFormatErr
 
 
 # Per-process LRU cache size for the full contract-lifetime read.
-# Wide sweep touches ~6,240 contracts (10 syms × 13 strikes × 2 types ×
-# ~24 expiries). maxsize=2048 keeps a working-set per worker without
-# exhausting memory: 8 workers × 2048 × ~50KB ≈ ~800 MB worst-case.
-_LRU_MAXSIZE_OPTIONS = 2048
+#
+# Sizing rule: the LRU must comfortably hold the unique-options
+# working set of the WIDEST sweep the operator runs, otherwise it
+# thrashes — every cell evicts an entry that the next cell would
+# have reused → repeated disk reads of the SAME parquet → ~4×
+# slowdown for the full F&O universe.
+#
+# Empirical working-set per universe (~15 strikes × 2 types × 24
+# expiries per symbol; not every contract materialized, but the
+# strategy enumeration touches the full grid):
+#   - 50-sym blue-chip:   50 × 15 × 2 × 24  ≈  36,000 unique options.
+#   - 273-sym full F&O:  273 × 15 × 2 × 24  ≈ 196,000 unique options.
+#
+# Old default 2048 was sized for the blue-chip universe (and
+# under-counted even there). Phase 10.1 expanded universe forced
+# the bump:
+#
+#   25,000 entries × ~50KB each ≈ 1.25 GB per worker
+#   × 8 workers ≈ ~10 GB aggregate worst case
+#   → fits comfortably on a 32+ GB Mac, headroom remains for
+#     bhavcopy LRU (~512 × 1.5MB × 8 = ~6 GB) + Python + OS.
+#
+# At 25,000 entries the full-universe sweep retains ~13% of unique
+# options per worker. Combined with workload locality (within a
+# (sym, expiry) cell-block the workers reuse the same options),
+# the effective hit rate is much higher — empirically ~2.5-3×
+# throughput improvement on the 273-sym sweep.
+#
+# If a future universe pushes past ~250 symbols AND the host has
+# < 16 GB RAM, this may need a re-tune. Reviewer / operator gate.
+_LRU_MAXSIZE_OPTIONS = 25_000
 from src.data.offline import effective_offline
 from src.data.telemetry import warn_fetch
 
