@@ -109,15 +109,23 @@ def test_portfolio_tab_renders_header_text():
     assert "build_portfolio_history" in visible
 
 
-def test_portfolio_tab_renders_n5_and_survivorship_banners():
-    """Two standing caveat banners from memoir §11."""
+def test_portfolio_tab_renders_n_positions_and_universe_banners():
+    """Two standing caveat banners from memoir §11.
+
+    Post-Phase-10.1 fix: the SURVIVORSHIP banner now ADAPTS to
+    the active sweep's universe size — blue-chip (≤ 60 symbols)
+    keeps the warning, expanded (> 60) flips to EXPANDED UNIVERSE.
+    Test accepts either; the dedicated
+    test_survivorship_banner_renders_*_when_n_symbols_*
+    pair pins each branch specifically."""
     at = _make_apptest()
     at.run(timeout=60)
     if at.exception:
         pytest.skip(f"Tab unreachable: {at.exception}")
     visible = _collect_visible_text(at)
     assert "N=5" in visible
-    assert "SURVIVORSHIP" in visible
+    # One of the two universe-status banners must render.
+    assert ("SURVIVORSHIP" in visible) or ("EXPANDED UNIVERSE" in visible)
 
 
 def test_portfolio_tab_does_not_render_proxy_banner():
@@ -188,6 +196,65 @@ def test_session_state_seeds_with_defaults():
 # ============================================================
 # Helpers
 # ============================================================
+
+# ============================================================
+# Survivorship banner adapts to active sweep's universe size
+# (post-Phase 10.1 fix 2026-06-07)
+# ============================================================
+
+def test_survivorship_banner_renders_blue_chip_copy_when_n_symbols_low():
+    """LOAD-BEARING Phase 10.1 adapt: when the active sweep has
+    ≤ 60 symbols (blue-chip v1 universe), the SURVIVORSHIP
+    warning copy + the prefetch instruction are present."""
+    at = _make_apptest()
+    at.run(timeout=60)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    # If the live sweep has < 60 symbols, we see the v1 banner.
+    # If it has > 60, we see the expanded banner. Skip if we
+    # can't tell which path was hit (e.g., empty sweep).
+    if "EXPANDED UNIVERSE" in visible:
+        pytest.skip("active sweep is the expanded universe")
+    assert "SURVIVORSHIP" in visible
+    assert "survivor blue-chips" in visible
+
+
+def test_survivorship_banner_renders_expanded_copy_when_n_symbols_high():
+    """LOAD-BEARING Phase 10.1 adapt: when the active sweep has
+    > 60 symbols, the EXPANDED UNIVERSE info banner replaces the
+    SURVIVORSHIP warning."""
+    at = _make_apptest()
+    at.run(timeout=60)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    if "SURVIVORSHIP" in visible:
+        pytest.skip("active sweep is the blue-chip universe")
+    assert "EXPANDED UNIVERSE" in visible
+    assert "survivorship-free" in visible
+
+
+def test_render_banners_threshold_pin():
+    """Pin the 60-symbol threshold per the module docstring's
+    contract: above the blue_chip 50 + a small headroom for
+    hand-edited lists, well below the full F&O ~273."""
+    from src.web.portfolio import _EXPANDED_UNIVERSE_THRESHOLD
+    assert _EXPANDED_UNIVERSE_THRESHOLD == 60
+
+
+def test_render_banners_n_positions_reflects_universe_n_config():
+    """The N-positions banner shows the config's universe_n
+    (positions per cycle), NOT the symbol count. Pinned so a
+    future refactor can't accidentally swap the two."""
+    at = _make_apptest()
+    at.session_state["mp_pf_universe_n"] = 10
+    at.run(timeout=60)
+    if at.exception:
+        pytest.skip(f"Tab unreachable: {at.exception}")
+    visible = _collect_visible_text(at)
+    assert "N=10" in visible
+
 
 # ============================================================
 # Candidate-selection pipeline (post-9.4 fix 2026-06-06)

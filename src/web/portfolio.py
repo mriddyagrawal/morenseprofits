@@ -225,32 +225,71 @@ def _render_header() -> None:
     )
 
 
-def _render_banners() -> None:
+# Universe-size threshold for the SURVIVORSHIP banner adapt.
+# <= 60 → "v1 blue-chip" (survivor-biased) banner.
+# > 60  → "Phase 10.1 expanded" (survivorship-free) banner.
+# The 60-symbol threshold sits above the curated 50 (blue_chip
+# universe) + a small headroom for hand-edited symbol lists, and
+# well below the 273-symbol full F&O universe per the
+# fo_universe.enumerate_fo_universe enumeration in Phase 10.1.
+_EXPANDED_UNIVERSE_THRESHOLD = 60
+
+
+def _render_banners(df_filtered: pd.DataFrame) -> None:
     """The two standing caveat banners from mockup §banners.
+
+    The N-positions banner reflects the strategy config's
+    universe_n (positions per cycle, NOT total symbol count).
+
+    The SURVIVORSHIP banner adapts to the active sweep's universe
+    size: blue-chip (≤ 60 symbols) keeps the survivor-bias
+    warning; expanded (> 60 symbols, typically Phase 10.1's
+    full F&O ~273) flips to an "expanded universe in use" info
+    banner.
 
     Note: the mockup's PROXY banner ("regime gate uses trailing-21d
     realized vol as a stand-in for India VIX") is DROPPED here —
     Phase 9.6 (commit 50d51c8) shipped real India VIX integration,
     so the PROXY caveat is no longer accurate.
-
-    The N=5 and SURVIVORSHIP banners stay until Phase 10.1
-    universe-widening lands.
     """
+    universe_n = int(st.session_state.get(_SS_UNIVERSE_N, 5))
+    n_symbols = (
+        int(df_filtered["symbol"].nunique())
+        if not df_filtered.empty and "symbol" in df_filtered.columns
+        else 0
+    )
+
     col1, col2 = st.columns(2)
     with col1:
         st.info(
-            "**N=5** — Universe is 5 names. "
-            "Calmar / Ulcer / correlation are **directional only**. "
-            "Widen to ~30 names before trusting diversification claims. "
-            "*(memoir §11)*"
+            f"**N={universe_n}** — Positions per cycle "
+            f"= {universe_n}. "
+            f"Calmar / Ulcer / correlation are "
+            f"**directional only** for small N. "
+            f"Widen positions/cycle (config block) before "
+            f"trusting diversification claims. "
+            f"*(memoir §11)*"
         )
     with col2:
-        st.warning(
-            "**SURVIVORSHIP** — Universe is survivor blue-chips. "
-            "Delisted / merged names from 2023–24 excluded → "
-            "returns biased upward. Phase 10.1 widens to ~180–220 "
-            "names for honest survivorship-free analysis."
-        )
+        if n_symbols > _EXPANDED_UNIVERSE_THRESHOLD:
+            st.success(
+                f"**EXPANDED UNIVERSE — {n_symbols} symbols** · "
+                f"Phase 10.1 survivorship-free per memoir §11 "
+                f"walk-back. Sweep enumerated from cached "
+                f"bhavcopies; includes recent IPOs + delisted "
+                f"names + mid-cap F&O entrants the blue-chip "
+                f"v1 list omitted."
+            )
+        else:
+            st.warning(
+                f"**SURVIVORSHIP** — Universe is **{n_symbols} "
+                f"survivor blue-chips**. Delisted / merged names "
+                f"from 2023–24 excluded → returns biased upward. "
+                f"Run `python scripts/p7_wide_sweep.py --universe "
+                f"full --workers 8` to produce the Phase-10.1 "
+                f"expanded-universe sweep (toggle via the topbar "
+                f"sweep picker)."
+            )
 
 
 def _render_regime_banner() -> None:
@@ -1938,7 +1977,7 @@ def render_portfolio_tab(df_filtered: pd.DataFrame) -> None:
     """
     _seed_session_state()
     _render_header()
-    _render_banners()
+    _render_banners(df_filtered)
     st.markdown("---")
     _render_regime_banner()
     st.markdown("---")
